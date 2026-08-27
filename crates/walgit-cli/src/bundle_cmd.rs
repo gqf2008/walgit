@@ -371,19 +371,17 @@ mod tests {
             run_git(work.path(), &["add", "."]);
             run_git(work.path(), &["commit", "-q", "-m", &format!("c{i}")]);
             let c = run_git(work.path(), &["rev-parse", "HEAD"]);
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "git rev-list --objects {c} {} | git pack-objects --stdout",
-                    if prev.is_empty() {
-                        String::new()
-                    } else {
-                        format!("^{prev}")
-                    }
-                ))
-                .current_dir(work.path())
-                .output()
-                .unwrap();
+            // Bound first: a `&format!()` inline in the vec would dangle at the
+            // statement's end.
+            let excludes: Vec<String> = if prev.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!("^{prev}")]
+            };
+            let mut revs: Vec<&str> = vec!["rev-list", "--objects"];
+            revs.push(c.as_str());
+            revs.extend(excludes.iter().map(String::as_str));
+            let out = crate::testutil::git_pipe(work.path(), &revs, &["pack-objects", "--stdout"]);
             let ingested = handle
                 .local()
                 .ingest_pack(
@@ -441,14 +439,11 @@ mod tests {
         run_git(work.path(), &["add", "."]);
         run_git(work.path(), &["commit", "-q", "-m", "later"]);
         let later = run_git(work.path(), &["rev-parse", "HEAD"]);
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git rev-list --objects {later} ^{base_tip} | git pack-objects --stdout"
-            ))
-            .current_dir(work.path())
-            .output()
-            .unwrap();
+        let out = crate::testutil::git_pipe(
+            work.path(),
+            &["rev-list", "--objects", &later, &format!("^{base_tip}")],
+            &["pack-objects", "--stdout"],
+        );
         let ingested = handle
             .local()
             .ingest_pack(

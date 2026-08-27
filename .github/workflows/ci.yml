@@ -81,3 +81,39 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
       - run: just e2e
+
+  # Reachability for every cfg(windows) branch (issue #16): this leg compiles all
+  # targets and runs the fast hermetic tier on a real Windows host. Plain cargo +
+  # pnpm, not `just`: the recipes are bash-first and this job exists exactly so
+  # platform seams stop drifting unnoticed. Clippy joins once its gate is green
+  # workspace-wide (it currently trips pre-existing pedantic hits independent of OS).
+  windows:
+    name: windows fast tier
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
+      - shell: pwsh
+        run: rustup show; cargo --version; git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build the SPA and the SDK
+        run: just web-build
+        shell: bash
+      - name: Compile every target (lib/bins/tests)
+        run: cargo check --workspace --all-targets
+      - name: Fast hermetic tier
+        run: |
+          cargo test --workspace --lib --bins
+          cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+          cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain

@@ -21,6 +21,8 @@ mod import_direct;
 mod mirror;
 mod repo;
 mod serve;
+#[cfg(test)]
+mod testutil;
 mod wal_cmd;
 
 use std::path::PathBuf;
@@ -471,10 +473,11 @@ pub fn main_server() -> Result<()> {
 
 fn run(config: &std::path::Path, command: Command) -> Result<()> {
     // Install the rustls crypto provider before any TLS code runs (GCS gRPC, reqwest).
-    // Required for rustls 0.23+ — multiple providers in the dep tree; select one.
-    rustls::crypto::aws_lc_rs::default_provider()
+    // `ring` is the workspace's one provider (server/tokio-rustls/rcgen all select it);
+    // the explicit install makes the selection independent of how features resolve.
+    rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("install rustls aws_lc_rs provider");
+        .expect("install rustls ring crypto provider");
 
     let cfg = load_config(config);
     tracing_init(&cfg);

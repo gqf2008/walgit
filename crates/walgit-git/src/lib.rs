@@ -948,19 +948,65 @@ impl LocalRepo {
         let hex = checksum.to_hex();
         let pack_dir = self.objects_pack_dir();
         let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
-        for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
-            let p = pack_dir.join(format!("pack-{hex}.{ext}"));
-            match std::fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(GitError::Io(e)),
+        #[cfg(windows)]
+        {
+            // This process's own refresh() deliberately mmaps every pack index
+            // ("odb indices loaded") and keeps them behind the cached
+            // ThreadSafeRepository. On Unix those views vanish under an unlink;
+            // on Windows they are exactly what the deletes below must not
+            // fight — swap in a cold handle so this library releases its own
+            // maps first, then let remove_pack_file's bounded window absorb any
+            // reader clone that was mid-flight.
+            if let Ok(cold) = gix::ThreadSafeRepository::open(&self.inner.path) {
+                *self.inner.tsr.lock() = cold;
             }
+        }
+        for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
+            Self::remove_pack_file(&pack_dir.join(format!("pack-{hex}.{ext}")))?;
         }
         if was_history {
             // The midx must not name a pack that is gone.
             self.write_history_midx_blocking()?;
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_pack_file(p: &std::path::Path) -> Result<(), GitError> {
+        match std::fs::remove_file(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(GitError::Io(e)),
+        }
+    }
+
+    /// Unix removes an open file without ceremony. Windows cannot: a just-written
+    /// side-file is briefly held by whatever real-time scanner or indexer noticed
+    /// it (`ERROR_ACCESS_DENIED`, os error 5), and a reader's transient lock means
+    /// the caller-guarantees-no-readers contract failed a moment ago, not forever.
+    /// Give such contention one small, bounded window instead of failing the push
+    /// that triggered a supersede.
+    #[cfg(windows)]
+    fn remove_pack_file(p: &std::path::Path) -> Result<(), GitError> {
+        let mut attempt: u64 = 0;
+        loop {
+            match std::fs::remove_file(p) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                // ACCESS_DENIED (5) is what a scanner's transient hold reports
+                // here; SHARING_VIOLATION (32) / LOCK_VIOLATION (33) are its
+                // cousins. Wait twice at most — a persistent 5 (read-only bit,
+                // real ACL) still fails honestly after the window.
+                Err(e)
+                    if e.raw_os_error().is_some_and(|c| matches!(c, 5 | 32 | 33))
+                        && attempt < 2 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                }
+                Err(e) => return Err(GitError::Io(e)),
+            }
+        }
     }
 
     pub fn packs(&self) -> Result<Vec<PackInfo>, GitError> {

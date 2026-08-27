@@ -1346,6 +1346,54 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
     Ok(())
 }
 
+/// `git <first> | git <second>` without a POSIX shell: the suite also runs on
+/// Windows, where spawning `/bin/sh` simply fails. Collects the first
+/// process's whole output, then feeds it to the second through its stdin — a
+/// buffered hop avoids the flaky instant-EOF a live child-to-child pipe shows
+/// on Windows (see `crates/walgit-cli/src/testutil.rs`, the same shape; each
+/// integration binary is its own world, so these ~30 lines are duplicated).
+fn git_pipe(cwd: &std::path::Path, first: &[&str], second: &[&str]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let up = Command::new("git")
+        .args(first)
+        .current_dir(cwd)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run upstream git");
+    if !up.status.success() {
+        panic!(
+            "git {first:?} failed: {} — stderr: {}",
+            up.status,
+            String::from_utf8_lossy(&up.stderr)
+        );
+    }
+
+    let mut down = Command::new("git")
+        .args(second)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn downstream git");
+    // The whole input is already in memory: write it, close stdin, then wait.
+    // A write error means the child died early — its status says how.
+    if let Some(mut stdin) = down.stdin.take() {
+        let _ = stdin.write_all(&up.stdout);
+    }
+    let out = down.wait_with_output().expect("wait downstream git");
+    if !out.status.success() {
+        panic!(
+            "git {second:?} failed: {} — stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out
+}
+
 /// An incremental slot whose tip set equals the newest built incremental of
 /// the strategy on the same base is `skipped (unchanged since <id>)` — recorded
 /// like too-small, never cut. Without it an idle night cuts 23–48 identical
@@ -1397,15 +1445,12 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
     let hour = std::time::Duration::from_secs(3600);
     // History with explicit times: c1 ten days ago (so a weekly slot with state
     // exists — a full with no state is cut from now), c2 six hours ago, nothing since.
+    // Revs arrive as one shell-flavored string ("<tip> ^<base>"); the pipe
+    // takes argv, so tokenize here like `sh` used to.
     let pack_of = |revs: &str| -> anyhow::Result<Vec<u8>> {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git rev-list --objects {revs} | git pack-objects --stdout"
-            ))
-            .current_dir(src.path())
-            .output()?;
-        Ok(out.stdout)
+        let mut first: Vec<&str> = vec!["rev-list", "--objects"];
+        first.extend(revs.split_whitespace());
+        Ok(git_pipe(src.path(), &first, &["pack-objects", "--stdout"]).stdout)
     };
     let txn = |name: &str, old: &str, new: &str| walgit_proto::v1::RefTransaction {
         updates: vec![walgit_proto::v1::RefUpdate {

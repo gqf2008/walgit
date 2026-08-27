@@ -1813,6 +1813,11 @@ async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
 /// `multi-pack-index`, starts the install on a sibling, and asserts that an
 /// unrelated refs request answers in < 1 s meanwhile (prod: every request on
 /// the instance stalled for minutes, timers included).
+///
+/// Unix-only by mechanism, not by mood: the shim is a shebang script picked up
+/// from `PATH`, and there is no way to shadow a bare `git` name for arbitrary
+/// child processes on Windows (CreateProcess never resolves `.bat`).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     // git shim: slow only for multi-pack-index.

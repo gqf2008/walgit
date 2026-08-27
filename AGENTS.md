@@ -389,8 +389,9 @@ decision in §4 — or the PR is; never "fix later".
   nothing in front of it. (1) **TLS in-process** — `[server.tls] mode = off | self_signed | files`; self-signed
   certs are generated once under `<cache.dir>/tls/`, published at `/services/public/ca.pem`, pinned for git by the
   installer. (2) **Everything an upstream might take over is announced by the upstream, per request, in
-  `X-Walgit-Capabilities`** — never assumed. (3) `cache.dir` defaults to `/tmp/walgit`. (4) A missing `--config`
-  file is fatal (exit 2); `--config /dev/null` is the explicit defaults+env form. (5) The credential helper and
+  `X-Walgit-Capabilities`** — never assumed. (3) `cache.dir` defaults to `temp/walgit` (`/tmp` honouring TMPDIR,
+  `%TEMP%` elsewhere). (4) A missing `--config` file is fatal (exit 2); `--config /dev/null` is the explicit
+  defaults+env form (`NUL` plays that role on Windows). (5) The credential helper and
   token file are host-derived (`<host>-credential-helper`, `<host>-token`) so two walgit hosts coexist on one machine.
 - **D41** **Bundles: chained dailies, a clone list and a catch-up list, the chain through the weekly.** Dailies
   are cut on their predecessor (`chain = true`, default), hourlies on the newest daily (2 kept); at the tie between

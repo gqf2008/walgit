@@ -6,6 +6,7 @@ mod error;
 mod handle;
 pub mod lockwait;
 mod log_reader;
+pub mod platform;
 pub mod progress;
 mod publish;
 mod registry;

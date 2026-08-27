@@ -28,6 +28,7 @@ mod cm {
     pub use super::common::*;
 }
 
+#[cfg(unix)]
 fn max_rss_kb() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -39,6 +40,14 @@ fn max_rss_kb() -> u64 {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let kb = ru.ru_maxrss as u64;
     kb
+}
+
+/// No portable peak-RSS probe on Windows (rusage is a Unix concept); report 0 so
+/// the shapes still run and every `delta` stays 0 — the number is progress-log
+/// fodder in this suite, not an assertion operand.
+#[cfg(not(unix))]
+fn max_rss_kb() -> u64 {
+    0
 }
 
 /// Deterministic source via `git fast-import`: `commits` commits, each rewriting `files_per_commit`

@@ -441,7 +441,9 @@ fn parse_object_format(s: &str) -> ObjectFormat {
 
 /// Bytes a repo directory occupies: symlinks (mount-linked base packs) count
 /// as their link size, hard links (the pack index shared between the Serve
-/// level and the remote reader) once.
+/// level and the remote reader) once — on Unix, where `(device, inode)` makes
+/// them identifiable. The Windows twin overcounts such shares slightly.
+#[cfg(unix)]
 fn dir_size(path: &std::path::Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     fn walk(p: &std::path::Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
@@ -464,16 +466,35 @@ fn dir_size(path: &std::path::Path) -> u64 {
     walk(path, &mut std::collections::HashSet::new())
 }
 
-/// (used, total) bytes of the filesystem holding `path` (statvfs).
-fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
+/// The Windows `dir_size`: the same walk, minus hard-link dedup. NTFS file identity
+/// (`file_index`) sits behind the unstable `windows_by_handle`; rather than poke
+/// handles per entry, shared side-files (a pack index reused by the remote reader)
+/// are counted once per link. Eviction budgets only ever read high — conservative,
+/// never an overrun.
+#[cfg(windows)]
+fn dir_size(path: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // As on Unix: `DirEntry::metadata` does not follow symlinks, so a
+                // linked base pack contributes its few link bytes here.
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    total += walk(&path);
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+        total
     }
-    let total = st.f_blocks as u64 * st.f_frsize as u64;
-    let avail = st.f_bavail as u64 * st.f_frsize as u64;
-    Some((total.saturating_sub(avail), total))
+    walk(path)
+}
+
+/// `(used, total)` bytes of the filesystem holding `path`; see [`crate::platform`] for
+/// what "used" means per OS and why it is the caller's free bytes either way.
+fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+    crate::platform::capacity(path).map(|(free, total)| (total.saturating_sub(free), total))
 }

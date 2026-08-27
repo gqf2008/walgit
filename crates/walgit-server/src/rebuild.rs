@@ -119,21 +119,16 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
             // A mount-linked base (`pack-<sha>.pack` → store mount) is never rebuilt here:
             // the rebuild needs real files (compact_repo syncs Full first).
             let target = std::fs::read_link(&from)?;
-            std::os::unix::fs::symlink(target, &to)?;
+            walgit_wal::platform::symlink(&target, &to)?;
         }
     }
     Ok(bytes)
 }
 
+/// Bytes available to this (unprivileged) process on `path`'s filesystem; see
+/// [`walgit_wal::platform`] for what that means on each OS.
 fn disk_avail(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    Some(st.f_bavail as u64 * st.f_frsize as u64)
+    walgit_wal::platform::capacity(path).map(|(free, _total)| free)
 }
 
 /// Hard-link (or copy) every side-file of `pack` from `from` into `into`'s pack dir; existing

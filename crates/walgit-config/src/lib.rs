@@ -1109,7 +1109,10 @@ impl Default for S3Config {
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            dir: PathBuf::from("/tmp/walgit"),
+            // The temp dir (`/tmp` on Unix with TMPDIR honored, `%TEMP%` on
+            // Windows) — D39's disposable cache home; the standalone/example
+            // configs pin an absolute path for deployments that outlive it.
+            dir: std::env::temp_dir().join("walgit"),
             mode: CacheMode::Auto,
             max_bytes: ByteSize::gib(20),
             disk_high_watermark: 0.9,

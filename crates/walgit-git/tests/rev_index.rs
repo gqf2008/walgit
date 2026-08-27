@@ -3,6 +3,10 @@
 //! (a large repository's 32 GB base: `index-pack --rev-index` re-reads the whole pack —
 //! 4 GB in 52 min, 2026-08-21) and git accepts the file.
 
+mod common;
+
+use common::git_pipe;
+
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .current_dir(dir)
@@ -37,14 +41,20 @@ fn rev_from_idx_is_byte_identical_to_gits_and_accepted_by_it() {
     }
     let packs = tmp.path().join("p");
     std::fs::create_dir_all(&packs).unwrap();
-    // git's own .rev alongside the pack.
+    // git's own .rev alongside the pack. The trailing segment is pack-objects'
+    // base *prefix* (`…/p/pack` ⇒ `p/pack-<sha>.{pack,idx,rev}`), not a directory.
     let sha = {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("git rev-list --objects --all | git -c pack.writeReverseIndex=true pack-objects {}/pack", packs.display()))
-            .current_dir(&work)
-            .output()
-            .unwrap();
+        let prefix = packs.join("pack");
+        let out = git_pipe(
+            &work,
+            &["rev-list", "--objects", "--all"],
+            &[
+                "-c",
+                "pack.writeReverseIndex=true",
+                "pack-objects",
+                prefix.to_str().unwrap(),
+            ],
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     let idx = packs.join(format!("pack-{sha}.idx"));

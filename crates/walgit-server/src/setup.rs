@@ -395,6 +395,14 @@ mod tests {
     /// `sh -n` (and dash/bash when present): every generated script must parse.
     fn assert_posix(script: &str) {
         for sh in ["sh", "dash", "bash"] {
+            // The interpreter must answer for itself first: on Windows,
+            // `System32\bash.exe` is the WSL launcher and, with no distro
+            // installed, exits 1 with a console-encoding error a Rust pipe
+            // reads as noise — it must not masquerade as rejecting our script.
+            let sane = Command::new(sh).arg("-c").arg(":").output();
+            if !sane.map(|o| o.status.success()).unwrap_or(false) {
+                continue;
+            }
             let Ok(mut child) = Command::new(sh)
                 .arg("-n")
                 .stdin(Stdio::piped())
@@ -416,6 +424,18 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    /// Whether a POSIX `sh` answers on this host: the scripts under test ARE
+    /// POSIX sh, so a Windows box without one gets a spoken skip here instead
+    /// of four failures that would read like product bugs.
+    fn have_sh() -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(":")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -545,6 +565,10 @@ mod tests {
 
     #[test]
     fn helper_get_store_erase_roundtrip() {
+        if !have_sh() {
+            eprintln!("skipped: no POSIX sh on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("helper");
         std::fs::write(&helper, helper_script(&oidc_cfg(), BASE, HOST)).unwrap();
@@ -614,6 +638,10 @@ mod tests {
     /// same config after both runs, one helper, every key exactly once, the token asked for once.
     #[test]
     fn installer_is_idempotent() {
+        if !have_sh() {
+            eprintln!("skipped: no POSIX sh on PATH");
+            return;
+        }
         let dir = installer_harness();
         let gitconfig = dir.path().join("gitconfig");
         std::fs::write(dir.path().join("tty"), "wgt_pasted\n").unwrap();
@@ -633,7 +661,19 @@ mod tests {
         let tf = dir.path().join("xdg/git").join(token_file(HOST));
         assert_eq!(std::fs::read_to_string(&tf).unwrap(), "wgt_pasted\n");
         assert_eq!(first.matches("helper = \n").count(), 1, "{first}");
-        for key in ["helper = /", "bundleURI = true", "uriProtocols = https"] {
+        // The helper line is `$XDG/git/<name>` as the script interpolates it, and
+        // git's INI writer escapes every `\` (Windows temp paths) into `\\`.
+        let xdg = dir.path().join("xdg").display().to_string();
+        let helper_line = format!(
+            "helper = {}/git/{}",
+            xdg.replace('\\', "\\\\"),
+            helper_file(HOST)
+        );
+        for key in [
+            helper_line.as_str(),
+            "bundleURI = true",
+            "uriProtocols = https",
+        ] {
             assert_eq!(
                 first.matches(key).count(),
                 1,
@@ -657,6 +697,10 @@ mod tests {
 
     #[test]
     fn installer_takes_the_token_from_the_environment() {
+        if !have_sh() {
+            eprintln!("skipped: no POSIX sh on PATH");
+            return;
+        }
         let dir = installer_harness();
         let out = run_installer(
             &dir,
@@ -741,6 +785,10 @@ mod tests {
     /// prints what to do and exits 2.
     #[test]
     fn installer_without_a_terminal_and_no_token_exits_2_with_instructions() {
+        if !have_sh() {
+            eprintln!("skipped: no POSIX sh on PATH");
+            return;
+        }
         let dir = installer_harness();
         let script = install_script(&oidc_cfg(), BASE, Some("acme/monorepo"));
         let out = Command::new("sh")
