@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! `.rev` derived from the `.idx` alone must be byte-identical to git's
 //! (`index-pack --rev-index`), so a pack can get its reverse index in seconds
 //! (a large repository's 32 GB base: `index-pack --rev-index` re-reads the whole pack —

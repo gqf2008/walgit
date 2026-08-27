@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Upstream follow (`[upstream] follow`, `walgit_server::follow`): the maintaining
 //! host brings followed refs up to an upstream git host's through the WAL — the
 //! same PUSH entry a push produces — fast-forward only. The upstream here is a

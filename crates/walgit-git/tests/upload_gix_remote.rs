@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! The gix upload-pack engine over a repository whose base pack is *not*
 //! local: history from the commit-graph chain, `have`s from the faulter's
 //! index, object enumeration by tree diff against parents, base objects

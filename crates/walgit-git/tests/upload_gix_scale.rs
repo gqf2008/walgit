@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Reproducer for AGENTS §6 "gix large-fetch object-id corruption and 178 GB OOM" (2026-08-21
 //! 05:4xZ: a remainder pack carried an entry under another object's id; 07:0xZ: the same shape
 //! replayed over a large repository was OOM-killed at 178 GB anon RSS after `Enumerating objects: 113683`).

@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! End-to-end tests: real upstream `git` against a live walgit-server backed
 //! by the in-memory store. Covers clone/push/fetch (v2 and v0), non-ff reject,
 //! ref delete, tags, partial clone + lazy fetch, ls-remote, and the two-instance
