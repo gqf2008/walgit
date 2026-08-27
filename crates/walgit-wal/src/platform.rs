@@ -52,18 +52,20 @@ fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
+/// The only `unsafe` in the seam lives in these OS probes; each block carries a
+/// `// SAFETY:` line directly above it (clippy's `undocumented_unsafe_blocks`
+/// wants the comment to touch the block, so the allow sits on the function).
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `st` is a zeroed struct the next call fully initializes before any
     // field is read (statvfs fills it or returns nonzero).
-    #[allow(unsafe_code)] // a zeroed-bytes struct the next call initializes
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a live NUL-terminated path buffer; `st` a valid statvfs slot
     // handed to statvfs which fills it or returns nonzero.
-    #[allow(unsafe_code)]
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
@@ -82,7 +84,9 @@ fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
 
+/// See the unix twin for the allow/SAFETY layout.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
     // NUL-terminated UTF-16: what GetDiskFreeSpaceExW takes instead of a CString.
@@ -94,15 +98,14 @@ fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     let mut caller_free: u64 = 0;
     let mut total: u64 = 0;
     let mut volume_free: u64 = 0;
-    // SAFETY: `wide` is a live NUL-terminated UTF-16 buffer; the three out-params are
-    // valid u64 slots for the callee to fill.
-    #[allow(unsafe_code)] // one Win32 probe, reviewed at the platform seam
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 buffer; the three out-params
+    // are valid u64 slots the callee fills (addr_of_mut keeps the borrow explicit).
     let ok = unsafe {
         windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
             wide.as_ptr(),
-            &mut caller_free,
-            &mut total,
-            &mut volume_free,
+            std::ptr::addr_of_mut!(caller_free),
+            std::ptr::addr_of_mut!(total),
+            std::ptr::addr_of_mut!(volume_free),
         )
     };
     if ok == 0 {
@@ -141,8 +144,183 @@ fn write_all_at_impl(file: &std::fs::File, offset: u64, buf: &[u8]) -> io::Resul
                 ),
             ));
         }
-        remaining = &remaining[n..];
+        // n <= remaining.len() is a syscall invariant (it wrote n of our bytes).
+        let (_, rest) = remaining.split_at(n);
+        remaining = rest;
         at += n as u64;
+    }
+    Ok(())
+}
+
+/// Restrict `path` to the current user, the Windows shape of `chmod 0600`
+/// (POSIX mode bits don't exist; without this a file inherits the directory's
+/// ACL, typically readable by every local user — the private TLS key's whole
+/// point is that it is not). Replaces the DACL with exactly one entry: this
+/// process's user, `GENERIC_ALL`, no inheritance. Fails loudly: a key we cannot
+/// lock down is a key we refuse to write.
+///
+/// Built as an SDDL string — `D:P(A;;GA;;;<current-user-sid>)`, a protected
+/// DACL with one allow-all entry: windows-sys 0.61 generates the string
+/// round-trip APIs but not the `TRUSTEEW`/`EXPLICIT_ACCESSW` structs the
+/// hand-rolled alternative needs.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn restrict_owner_only(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SDDL_REVISION_1, the only revision ConvertStringSecurityDescriptor* accepts.
+    const SDDL_REVISION_1: u32 = 1;
+
+    // 1. This process's user SID.
+    let mut token: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo handle from GetCurrentProcess needs no cleanup.
+    let proc_handle = unsafe { GetCurrentProcess() };
+    // SAFETY: `token` is a valid out-slot for the handle.
+    let ok = unsafe { OpenProcessToken(proc_handle, TOKEN_QUERY, std::ptr::addr_of_mut!(token)) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut size: u32 = 0;
+    // SAFETY: sizing probe with a null buffer; `size` receives the length
+    // the real fetch below needs.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::addr_of_mut!(size),
+        );
+    }
+    // u64 backing so the TOKEN_USER view below meets its 8-byte alignment
+    // (a u8 Vec would trip the stricter-alignment lint even though the win32
+    // call only cares about byte length).
+    let mut buf = vec![0u64; size.div_ceil(8) as usize];
+    // SAFETY: `buf` is writable for exactly `size` bytes (u64 count covers it)
+    // and stays alive for the call; TOKEN_USER is the documented layout for
+    // TokenUser.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast::<core::ffi::c_void>(),
+            size,
+            std::ptr::addr_of_mut!(size),
+        )
+    };
+    // SAFETY: the query handle is done with; closing it cannot fail.
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation just validated `buf` as a TOKEN_USER.
+    let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+
+    // 2. SID -> "S-1-5-..." string, then the SDDL for a protected one-entry DACL.
+    let mut sid_str: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `sid_str` is an out-slot for a LocalAlloc'd string; freed below.
+    let ok = unsafe { ConvertSidToStringSidW(user.User.Sid, std::ptr::addr_of_mut!(sid_str)) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sid_str` is a valid NUL-terminated wide string owned by us;
+    // each step below stops at its own terminator, so every read is in-bounds.
+    let sid_len = {
+        let mut len = 0usize;
+        loop {
+            // SAFETY: `add` stays within the NUL-terminated string as long as
+            // we stop at the terminator, which the very next read checks.
+            let p = unsafe { sid_str.add(len) };
+            // SAFETY: `p` was just bounded by the loop's own terminator check.
+            let c = unsafe { *p };
+            if c == 0 {
+                break;
+            }
+            len += 1;
+        }
+        len
+    };
+    // SAFETY: `sid_len` was measured above, so the slice is exactly the string.
+    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_str, sid_len) });
+    let sddl = format!("D:P(A;;GA;;;{sid})");
+    let mut desc: *mut core::ffi::c_void = std::ptr::null_mut();
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `sddl_wide` is a live NUL-terminated UTF-16 string; `desc` an
+    // out-slot for the self-relative descriptor (freed below).
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            std::ptr::addr_of_mut!(desc),
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: the SID string is consumed; the buffer it lived in is freed.
+    unsafe {
+        LocalFree(sid_str.cast::<core::ffi::c_void>());
+    }
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut dacl_present: i32 = 0;
+    let mut dacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+    let mut dacl_defaulted: i32 = 0;
+    // SAFETY: `desc` is a live descriptor from the call above; the three
+    // out-params are valid slots.
+    let ok = unsafe {
+        GetSecurityDescriptorDacl(
+            desc,
+            std::ptr::addr_of_mut!(dacl_present),
+            std::ptr::addr_of_mut!(dacl),
+            std::ptr::addr_of_mut!(dacl_defaulted),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if dacl_present == 0 {
+        return Err(io::Error::other("SDDL produced no DACL"));
+    }
+
+    // 3. Apply it, replacing the inherited DACL.
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 path; `dacl` a live ACL
+    // inside the descriptor; the four optional pointer args are all None.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl.cast_const(),
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: the descriptor is no longer referenced once the call above
+    // returned; ConvertStringSecurityDescriptor* allocated it.
+    unsafe {
+        LocalFree(desc.cast::<core::ffi::c_void>());
+    }
+    if rc != 0 {
+        // Win32 error codes are u32; io::Error takes the signed form. A code
+        // above i32::MAX would wrap, but real win32 errors live far below it.
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
     }
     Ok(())
 }
@@ -159,7 +337,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (free, total) = capacity(dir.path()).expect("probe on an existing dir");
         assert!(total > 0, "a volume has a total size");
-        assert!(free <= total, "free-to-caller never exceeds the volume total");
+        assert!(
+            free <= total,
+            "free-to-caller never exceeds the volume total"
+        );
     }
 
     /// `capacity` answers None for a path no volume backs (both OS probes fail).
@@ -167,7 +348,10 @@ mod tests {
     fn capacity_is_none_for_a_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("does-not-exist");
-        assert!(capacity(&gone).is_none(), "a missing path has no volume answer");
+        assert!(
+            capacity(&gone).is_none(),
+            "a missing path has no volume answer"
+        );
     }
 
     /// `write_all_at` writes at an absolute offset without disturbing other
@@ -191,7 +375,7 @@ mod tests {
     }
 
     /// The write-zero path must fail loudly, not spin: a zero result is reported
-    /// as WriteZero (the loop only runs while there is data to write).
+    /// as `WriteZero` (the loop only runs while there is data to write).
     #[test]
     fn write_all_at_zero_write_fails_loudly() {
         // An empty buffer is a no-op, not an error.

@@ -740,19 +740,23 @@ pub(crate) async fn reconcile_packs_inner(
         })
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
-        match handle.rw.try_write() {
-            Ok(_w) => {
-                for (_, oid) in &to_remove {
-                    if local.pack_path(oid).exists() {
-                        local.remove_pack(oid)?;
-                        removed += 1;
-                    }
-                }
+        if let Ok(_w) = handle.rw.try_write() {
+            // One call for the whole superseded set: on Windows the cold
+            // handle swap inside remove_packs releases this process's own
+            // pack-index mmaps once, not once per pack (K swaps would drop
+            // and re-parse every surviving index K times).
+            let existing: Vec<gix_hash::ObjectId> = to_remove
+                .iter()
+                .filter(|(_, oid)| local.pack_path(oid).exists())
+                .map(|(_, oid)| *oid)
+                .collect();
+            if !existing.is_empty() {
+                local.remove_packs(&existing)?;
             }
-            Err(_) => {
-                tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
-                still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
-            }
+            removed = existing.len();
+        } else {
+            tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
+            still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
         }
     }
     span.record("removed", removed);

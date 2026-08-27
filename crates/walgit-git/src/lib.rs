@@ -948,9 +948,17 @@ impl LocalRepo {
     /// Delete `.pack/.idx/.rev/.bitmap` for `checksum`. Caller guarantees no
     /// readers.
     pub fn remove_pack(&self, checksum: &gix_hash::oid) -> Result<(), GitError> {
-        let hex = checksum.to_hex();
-        let pack_dir = self.objects_pack_dir();
-        let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
+        self.remove_packs(&[checksum.to_owned()])
+    }
+
+    /// Delete the side-files of every `checksum` in one batch, with a single
+    /// Windows cold-handle swap for the whole set. Callers that supersede many
+    /// packs under one write lock (compaction's GC pass) must use this: the
+    /// swap drops this process's pre-warmed pack-index mmaps, and doing it once
+    /// per pack would invalidate *all* warm maps K times for K packs, then
+    /// re-parse the survivors from disk on every subsequent refresh.
+    /// Caller guarantees no readers.
+    pub fn remove_packs(&self, checksums: &[gix_hash::ObjectId]) -> Result<(), GitError> {
         #[cfg(windows)]
         {
             // This process's own refresh() deliberately mmaps every pack index
@@ -966,15 +974,20 @@ impl LocalRepo {
                 // Keep the retry window honest: if the reopen fails we still hold
                 // this process's own mmaps, so the delete below may hit
                 // ACCESS_DENIED even after remove_pack_file's bounded wait.
-                tracing::warn!(repo = %self.inner.path.display(), "remove_pack: cold reopen failed; deleting with live pack-index mappings");
+                tracing::warn!(repo = %self.inner.path.display(), "remove_packs: cold reopen failed; deleting with live pack-index mappings");
             }
         }
-        for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
-            Self::remove_pack_file(&pack_dir.join(format!("pack-{hex}.{ext}")))?;
-        }
-        if was_history {
-            // The midx must not name a pack that is gone.
-            self.write_history_midx_blocking()?;
+        let pack_dir = self.objects_pack_dir();
+        for checksum in checksums {
+            let hex = checksum.to_hex();
+            let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
+            for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
+                Self::remove_pack_file(&pack_dir.join(format!("pack-{hex}.{ext}")))?;
+            }
+            if was_history {
+                // The midx must not name a pack that is gone.
+                self.write_history_midx_blocking()?;
+            }
         }
         Ok(())
     }
@@ -1008,8 +1021,7 @@ impl LocalRepo {
                 // Wait twice at most — a persistent 5 (read-only bit, real
                 // ACL) still fails honestly after the window.
                 Err(e)
-                    if e
-                        .raw_os_error()
+                    if e.raw_os_error()
                         .is_some_and(|c| matches!(c, 5 | 32 | 33 | 1224))
                         && attempt < 2 =>
                 {

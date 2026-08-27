@@ -133,7 +133,11 @@ fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
     }
     f.open(path)
         .and_then(|mut f| f.write_all(body.as_bytes()))
-        .with_context(|| format!("writing {}", path.display()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(windows)]
+    walgit_wal::platform::restrict_owner_only(path)
+        .with_context(|| format!("restricting {} to the current user", path.display()))?;
+    Ok(())
 }
 
 /// `axum::serve::Listener` that wraps every accepted TCP connection in a
@@ -258,6 +262,61 @@ mod tests {
                     & 0o777,
                 0o600
             );
+        }
+        // Clippy's undocumented_unsafe_blocks wants each SAFETY line to touch
+        // its block, so the allow lives on the whole read-back block.
+        #[cfg(windows)]
+        #[allow(unsafe_code)]
+        {
+            // The Windows twin of the 0600 assertion: the key's DACL must be
+            // protected against inheritance and hold exactly one entry — the
+            // current user with GENERIC_ALL. Anything else (inherited ACL,
+            // extra ACEs) is the world-readable gap this port closes.
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Security::Authorization::{
+                GetNamedSecurityInfoW, SE_FILE_OBJECT,
+            };
+            use windows_sys::Win32::Security::{
+                ACL, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+            };
+            let key = dir.path().join("key.pem");
+            let wide: Vec<u16> = key
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `wide` is a live NUL-terminated UTF-16 path; `dacl`/`sd`
+            // are out-slots the callee fills (sd is LocalFree'd below).
+            let rc = unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(dacl),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(sd),
+                )
+            };
+            assert_eq!(rc, 0, "GetNamedSecurityInfoW rc={rc}");
+            // SAFETY: sd was just filled by the call above; the descriptor's
+            // layout is the documented SECURITY_DESCRIPTOR.
+            let control = unsafe { (*(sd as *const SECURITY_DESCRIPTOR)).Control };
+            assert_ne!(
+                control & SE_DACL_PROTECTED,
+                0,
+                "DACL is protected against inheritance"
+            );
+            // SAFETY: dacl was just filled by the call above.
+            let aces = unsafe { (*dacl).AceCount };
+            assert_eq!(aces, 1, "exactly one DACL entry: the owning user");
+            // SAFETY: sd came from GetNamedSecurityInfoW and is no longer used.
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(sd as *mut core::ffi::c_void);
+            }
         }
     }
 

@@ -5968,6 +5968,7 @@ dependencies = [
  "walgit-proto",
  "walgit-store",
  "walgit-wal",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

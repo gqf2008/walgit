@@ -73,5 +73,9 @@ libc.workspace = true
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 
+# The windows ACL read-back assertion in src/tls.rs's tests.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
+
 [lints]
 workspace = true
