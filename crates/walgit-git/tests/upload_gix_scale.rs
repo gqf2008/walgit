@@ -30,7 +30,11 @@ mod cm {
 
 #[cfg(unix)]
 fn max_rss_kb() -> u64 {
+    #[allow(unsafe_code)] // a zeroed rusage the next call fills
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `ru` is a live rusage slot; getrusage fills it (its result is unused —
+    // a failed read yields the zeroed peak, which the caller's saturating_sub floors at 0).
+    #[allow(unsafe_code)]
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
@@ -42,12 +46,31 @@ fn max_rss_kb() -> u64 {
     kb
 }
 
-/// No portable peak-RSS probe on Windows (rusage is a Unix concept); report 0 so
-/// the shapes still run and every `delta` stays 0 — the number is progress-log
-/// fodder in this suite, not an assertion operand.
+/// Windows peak-RSS probe: `GetProcessMemoryInfo`'s `PeakWorkingSetSize` is the
+/// working-set analog of rusage's `ru_maxrss` (both are process-lifetime peaks, so
+/// the delta-of-peaks the bound below reads is meaningful the same way on both OSes).
 #[cfg(not(unix))]
 fn max_rss_kb() -> u64 {
-    0
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    #[allow(unsafe_code)] // a zeroed counters struct we size and let the callee fill
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `GetCurrentProcess()` is the always-valid pseudo-handle; `counters` is a
+    // live out-struct whose `cb` we just set to its own size, as the API requires.
+    #[allow(unsafe_code)]
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            &mut counters,
+            counters.cb,
+        )
+    };
+    if ok == 0 {
+        return 0;
+    }
+    (counters.PeakWorkingSetSize as u64) / 1024
 }
 
 /// Deterministic source via `git fast-import`: `commits` commits, each rewriting `files_per_commit`

@@ -393,6 +393,9 @@ mod tests {
     }
 
     /// `sh -n` (and dash/bash when present): every generated script must parse.
+    /// A host with no working POSIX shell (e.g. Windows with only the WSL
+    /// launcher) skips each interpreter *visibly* — per RULE_可达性, a silent
+    /// pass would let a broken script ship green.
     fn assert_posix(script: &str) {
         for sh in ["sh", "dash", "bash"] {
             // The interpreter must answer for itself first: on Windows,
@@ -401,6 +404,7 @@ mod tests {
             // reads as noise — it must not masquerade as rejecting our script.
             let sane = Command::new(sh).arg("-c").arg(":").output();
             if !sane.map(|o| o.status.success()).unwrap_or(false) {
+                eprintln!("skipped: no working POSIX {sh} on PATH");
                 continue;
             }
             let Ok(mut child) = Command::new(sh)

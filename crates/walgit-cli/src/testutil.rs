@@ -5,6 +5,34 @@
 
 #![cfg(test)]
 
+/// Whether this account may create a symlink in `dir` at all: NTFS needs
+/// Developer Mode or a privilege. Detect-and-report (never silently): a false
+/// return says exactly why, mirroring the probe in `walgit-wal/tests/wal.rs`.
+pub(crate) fn symlinks_available(dir: &std::path::Path) -> bool {
+    let target = dir.join(".symlink-probe-target");
+    let link = dir.join(".symlink-probe-link");
+    let _ = std::fs::remove_file(&link);
+    match std::fs::write(&target, b"probe") {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("skipped (probe target unwritable: {e})");
+            return false;
+        }
+    }
+    let created = walgit_wal::platform::symlink(&target, &link);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&target);
+    match created {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "skipped: creating symlinks failed ({e}); Windows needs Developer Mode or administrator rights"
+            );
+            false
+        }
+    }
+}
+
 /// `git <first> | git <second>` without a POSIX shell. Collects the first
 /// process's whole output, then feeds it to the second through its stdin:
 /// suites here exchange small packs, and a buffered hop avoids both pipe-volume

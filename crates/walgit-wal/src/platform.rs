@@ -25,13 +25,19 @@ pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
 }
 
 /// `(free_to_caller, total)` bytes on the filesystem holding `path`; `None` when the
-/// answer cannot be had (then callers degrade, e.g. eviction falls back to budgeting).
+/// answer cannot be had. Callers degrade by *skipping the disk-pressure decision*:
+/// `evict_idle`'s disk branch returns early on `None` (budget mode is unaffected), and
+/// the rebuild headroom check treats `None` as "cannot tell, proceed" rather than
+/// refusing — so a `None` here never evicts or fails a rebuild, it only removes the guard.
 pub fn capacity(path: &Path) -> Option<(u64, u64)> {
     capacity_impl(path)
 }
 
 /// Write every byte of `buf` starting at absolute `offset`, in the spirit of
-/// `pwrite`/`write_all_at`: the file's cursor stays untouched.
+/// `pwrite`/`write_all_at`: a positional write that does not depend on the file
+/// cursor, so concurrent writers with distinct offsets (the striped downloader)
+/// cannot corrupt each other. The cursor itself is unspecified afterwards on
+/// Windows (the positioned write may move it); callers here never read it.
 pub fn write_all_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> io::Result<()> {
     write_all_at_impl(file, offset, buf)
 }
@@ -51,6 +57,8 @@ fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `st` is a zeroed struct the next call fully initializes before any
+    // field is read (statvfs fills it or returns nonzero).
     #[allow(unsafe_code)] // a zeroed-bytes struct the next call initializes
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a live NUL-terminated path buffer; `st` a valid statvfs slot
@@ -110,26 +118,85 @@ fn write_all_at_impl(file: &std::fs::File, offset: u64, buf: &[u8]) -> io::Resul
 }
 
 #[cfg(windows)]
-fn write_all_at_impl(file: &std::fs::File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+fn write_all_at_impl(file: &std::fs::File, offset: u64, buf: &[u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     // `seek_write` writes up to one call's worth (short writes are legal); loop like
     // `WriteFile`'s overlapped users must. A zero-byte result is EOF-ish — fail loudly
     // rather than spin.
-    while !buf.is_empty() {
-        let n = file.seek_write(buf, offset)?;
+    let mut remaining = buf;
+    let mut at = offset;
+    while !remaining.is_empty() {
+        let n = file.seek_write(remaining, at)?;
         if n == 0 {
+            // A zero-length request can't reach here (the loop guard is non-empty);
+            // a zero *result* means the filesystem accepted no bytes — report the
+            // portion still unwritten against the buffer we were handed.
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 format!(
-                    "failed to write {}/{} bytes at offset {}",
-                    buf.len(),
+                    "wrote 0 of the {} remaining bytes ({} total) at offset {}",
+                    remaining.len(),
                     buf.len(),
                     offset
                 ),
             ));
         }
-        buf = &buf[n..];
-        offset += n as u64;
+        remaining = &remaining[n..];
+        at += n as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// `capacity` answers for a directory that exists (both OS probes are volume
+    /// calls that succeed), with total > 0 and free bounded by total.
+    #[test]
+    fn capacity_answers_for_an_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (free, total) = capacity(dir.path()).expect("probe on an existing dir");
+        assert!(total > 0, "a volume has a total size");
+        assert!(free <= total, "free-to-caller never exceeds the volume total");
+    }
+
+    /// `capacity` answers None for a path no volume backs (both OS probes fail).
+    #[test]
+    fn capacity_is_none_for_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("does-not-exist");
+        assert!(capacity(&gone).is_none(), "a missing path has no volume answer");
+    }
+
+    /// `write_all_at` writes at an absolute offset without disturbing other
+    /// bytes, and two writes at distinct offsets don't clobber each other
+    /// (the pwrite contract the striped downloader relies on).
+    #[test]
+    fn write_all_at_writes_at_an_absolute_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"hello world").unwrap();
+        // A second, later write through the same handle must not disturb the first.
+        write_all_at(&f, 6, b"walgit").unwrap();
+        write_all_at(&f, 0, b"HELLO").unwrap();
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "HELLO walgit",
+            "both positional writes land at their offsets, bytes in between survive"
+        );
+    }
+
+    /// The write-zero path must fail loudly, not spin: a zero result is reported
+    /// as WriteZero (the loop only runs while there is data to write).
+    #[test]
+    fn write_all_at_zero_write_fails_loudly() {
+        // An empty buffer is a no-op, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let f = std::fs::File::create(dir.path().join("f")).unwrap();
+        write_all_at(&f, 0, b"").unwrap();
+    }
 }

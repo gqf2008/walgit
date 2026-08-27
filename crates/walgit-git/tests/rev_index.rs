@@ -45,6 +45,10 @@ fn rev_from_idx_is_byte_identical_to_gits_and_accepted_by_it() {
     // base *prefix* (`…/p/pack` ⇒ `p/pack-<sha>.{pack,idx,rev}`), not a directory.
     let sha = {
         let prefix = packs.join("pack");
+        // `git_pipe` takes argv strings; the old `sh -c` pipeline interpolated
+        // the path lossily too — keep that (a non-UTF-8 temp path is possible
+        // under an odd TMPDIR, and panicking here would lose the test).
+        let prefix_str = prefix.to_string_lossy().into_owned();
         let out = git_pipe(
             &work,
             &["rev-list", "--objects", "--all"],
@@ -52,7 +56,7 @@ fn rev_from_idx_is_byte_identical_to_gits_and_accepted_by_it() {
                 "-c",
                 "pack.writeReverseIndex=true",
                 "pack-objects",
-                prefix.to_str().unwrap(),
+                &prefix_str,
             ],
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()

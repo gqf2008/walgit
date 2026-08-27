@@ -878,9 +878,12 @@ impl LocalRepo {
         // A ref-only push (`git push origin main:feature` with nothing new)
         // sends a 32-byte pack with zero objects. Nothing to publish.
         if object_count == 0 {
-            let _ = std::fs::remove_file(&pack_path);
-            let _ = std::fs::remove_file(&idx_path);
-            let _ = std::fs::remove_file(pack_path.with_extension("rev"));
+            // Best-effort (cleanup must not fail the push), but use the same
+            // bounded-window remover as supersede deletes: a just-written pack
+            // is exactly what a Windows real-time scanner holds briefly.
+            let _ = Self::remove_pack_file(&pack_path);
+            let _ = Self::remove_pack_file(&idx_path);
+            let _ = Self::remove_pack_file(&pack_path.with_extension("rev"));
             return Ok(None);
         }
         let pack_size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
@@ -959,6 +962,11 @@ impl LocalRepo {
             // reader clone that was mid-flight.
             if let Ok(cold) = gix::ThreadSafeRepository::open(&self.inner.path) {
                 *self.inner.tsr.lock() = cold;
+            } else {
+                // Keep the retry window honest: if the reopen fails we still hold
+                // this process's own mmaps, so the delete below may hit
+                // ACCESS_DENIED even after remove_pack_file's bounded wait.
+                tracing::warn!(repo = %self.inner.path.display(), "remove_pack: cold reopen failed; deleting with live pack-index mappings");
             }
         }
         for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
@@ -995,10 +1003,14 @@ impl LocalRepo {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 // ACCESS_DENIED (5) is what a scanner's transient hold reports
                 // here; SHARING_VIOLATION (32) / LOCK_VIOLATION (33) are its
-                // cousins. Wait twice at most — a persistent 5 (read-only bit,
-                // real ACL) still fails honestly after the window.
+                // cousins, and USER_MAPPED_FILE (1224) is what a reader's
+                // memory-mapped index reports until that reader drops it.
+                // Wait twice at most — a persistent 5 (read-only bit, real
+                // ACL) still fails honestly after the window.
                 Err(e)
-                    if e.raw_os_error().is_some_and(|c| matches!(c, 5 | 32 | 33))
+                    if e
+                        .raw_os_error()
+                        .is_some_and(|c| matches!(c, 5 | 32 | 33 | 1224))
                         && attempt < 2 =>
                 {
                     attempt += 1;

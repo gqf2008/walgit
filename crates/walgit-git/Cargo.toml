@@ -41,10 +41,13 @@ tempfile.workspace = true
 tempfile.workspace = true
 flate2.workspace = true
 
-# getrusage peak-RSS bookkeeping in tests/upload_gix_scale.rs (unix only; the
-# Windows branch of that helper reads no rusage at all).
+# Peak-RSS bookkeeping in tests/upload_gix_scale.rs: getrusage on unix,
+# GetProcessMemoryInfo on windows — both report this process's peak working set.
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true

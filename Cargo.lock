@@ -5892,6 +5892,7 @@ dependencies = [
  "uuid",
  "walgit-config",
  "walgit-proto",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

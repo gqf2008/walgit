@@ -94,7 +94,9 @@ schedule = "0 0 * * * *"
 chain = true
 
 [cache]
-dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else
+dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else.
+                                  # (The code default is <temp-dir>/walgit — `%TEMP%\walgit` on Windows — but a
+                                  # one-machine shape pins an absolute path so the cache outlives the shell.)
 max_bytes = "20GiB"
 
 [telemetry]
