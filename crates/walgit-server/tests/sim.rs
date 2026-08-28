@@ -2817,8 +2817,17 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
         let ho = front.registry.open(other).await?;
         drop(ho.sync_refs().await?);
         let took = t.elapsed();
+        // On Windows a just-evicted repo's refs read occasionally pays a
+        // real-time scanner opening the freshly written files (measured
+        // 2.5 s worst case vs ≈ 20 ms nominal); the 1 s bound is a
+        // regression guard for the refs-only path, not a latency SLA.
+        let limit = if cfg!(windows) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
         ensure!(
-            took < Duration::from_secs(1),
+            took < limit,
             "step {step}: refs read took {took:?} (eviction took {evict_took:?}; observed ≈ 20 ms)"
         );
         refs_latencies.push(took);
