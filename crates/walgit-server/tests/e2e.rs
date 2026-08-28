@@ -2846,14 +2846,28 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
 
     // A helper that logs every call and always mints the valid token; in front of it, git's cache
     // daemon pre-loaded with a dead token (what an expired gcloud ID token looks like to the server).
+    //
+    // One sh script serves both platforms: git resolves a helper value that
+    // contains `/` through its shell (use_shell), and git-for-windows ships
+    // msys sh — the same mechanism its hooks run under. Paths inside the
+    // script and the gitconfig must be forward-slash on Windows: a backslash
+    // is an escape in sh and in an unquoted gitconfig value.
     let home = tempfile::tempdir()?;
     let log = home.path().join("calls.log");
     let helper = home.path().join("helper");
+    let (log_spec, helper_spec) = if cfg!(windows) {
+        (
+            log.display().to_string().replace('\\', "/"),
+            helper.display().to_string().replace('\\', "/"),
+        )
+    } else {
+        (log.display().to_string(), helper.display().to_string())
+    };
     std::fs::write(
         &helper,
         format!(
             "#!/bin/sh\necho \"$1\" >> {log}\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=fresh\\n\\n' ;; esac\n",
-            log = log.display()
+            log = log_spec
         ),
     )?;
     #[cfg(unix)]
@@ -2870,14 +2884,20 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
         std::fs::set_permissions(&sockdir, std::fs::Permissions::from_mode(0o700))?;
     }
     let sock = sockdir.join("cache.sock");
-    let cache = format!("cache --socket={} --timeout=300", sock.display());
+    // gitconfig values: a backslash is an escape (an unknown one is a fatal
+    // "bad config line"), so the cache spec must use forward slashes too.
+    let sock_spec = if cfg!(windows) {
+        sock.display().to_string().replace('\\', "/")
+    } else {
+        sock.display().to_string()
+    };
+    let cache = format!("cache --socket={sock_spec} --timeout=300");
     let gitconfig = home.path().join("gitconfig");
     let base = &server.base_url;
     std::fs::write(
         &gitconfig,
         format!(
-            "[credential \"{base}\"]\n\thelper = \n\thelper = {cache}\n\thelper = {}\n[http \"{base}/\"]\n\tproactiveAuth = auto\n",
-            helper.display()
+            "[credential \"{base}\"]\n\thelper = \n\thelper = {cache}\n\thelper = {helper_spec}\n[http \"{base}/\"]\n\tproactiveAuth = auto\n",
         ),
     )?;
     let host = base.trim_start_matches("http://");
