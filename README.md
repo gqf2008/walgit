@@ -132,12 +132,15 @@ open https://walgit.localhost:8080/
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
 
-**Platforms.** Production targets Linux (containers, Nix). The code also builds and passes the fast test tier
-natively on Windows (`x86_64-pc-windows-msvc`): keep the repository on an **NTFS** volume and enable Developer
-Mode (or run elevated) — creating the store-mount symlinks needs the privilege *and* an NTFS filesystem;
-exFAT drives silently cannot host links. Pass `--config NUL` where docs say `/dev/null`. The developer
-`just dev-store` rig assumes podman on POSIX; on Windows bring your own S3-compatible store and point `[store]`
-at it.
+## Platforms
+
+Production targets Linux (containers, Nix). The code builds and passes the full test
+surface natively on Windows (`x86_64-pc-windows-msvc`): the fast tier, e2e and the sim
+suite run on CI's windows leg. Symlink-dependent store-mount tests need an NTFS volume
+(current Windows 10/11 allows non-admin symlink creation; on older builds enable
+Developer Mode or run elevated — exFAT drives silently cannot host links). Pass
+`--config NUL` where docs say `/dev/null`. The developer `just dev-store` rig assumes
+podman on POSIX; on Windows see `docs/WINDOWS.md` for the rustfs equivalent.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.

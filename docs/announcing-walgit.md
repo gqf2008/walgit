@@ -71,10 +71,10 @@ bytes: walgit answers a bundle or LFS download with `X-Accel-Redirect` and nginx
 from the bucket itself (S3 presigned or GCS with walgit's bearer). The example config documents the whole contract.
 
 ```sh
-nix run github:tobi/walgit -- --config walgit.toml     # or: podman build -f Containerfile .
+nix run github:gqf2008/walgit -- --config walgit.toml     # or: podman build -f Containerfile .
 ```
 
-The repository is at **github.com/tobi/walgit**, MIT licensed. `README.md` is the introduction; `AGENTS.md` is
+The repository is at **github.com/gqf2008/walgit**, MIT licensed. `README.md` is the introduction; `AGENTS.md` is
 the architecture and the list of design decisions with their reasoning; `docs/BUNDLE_URI_DESIGN.md` is the bundle
 scheduler's design of record. The numbers we quote — 8-second CI clones, 32 GB of clone bytes with 2.8 MB through
 the server — come from the monorepo it was built for; the simulation suite (crashes, partitions, stale reads,
