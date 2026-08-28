@@ -3108,9 +3108,12 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             }
             seen
         });
+        let mut push_oks = Vec::new();
         let mut winner = None;
-        for (_d, sha, h) in handles {
-            if h.join().unwrap() {
+        for (i, (_d, sha, h)) in handles.into_iter().enumerate() {
+            let ok = h.join().unwrap();
+            push_oks.push((i, ok, sha.clone()));
+            if ok {
                 winner = Some(sha);
             }
         }
@@ -3146,6 +3149,15 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     }
     // SAFETY: see above.
     unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
+    if !stale.is_empty() {
+        eprintln!("DIAG winner={winner} base={base} pushes={push_oks:?}");
+        eprintln!("DIAG after={after:?}");
+        let mut uniq: Vec<String> = seen.clone();
+        uniq.sort();
+        uniq.dedup();
+        eprintln!("DIAG seen_unique={uniq:?}");
+        eprintln!("DIAG seen_head={:?}", &seen[..seen.len().min(60)]);
+    }
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
     Ok(())
 }
