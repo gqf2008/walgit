@@ -16,7 +16,7 @@
     <a href="#run">Run it</a>
     <a href="#auth">Auth</a>
     <a href="#edge">Edge</a>
-    <a href="https://github.com/tobi/walgit">GitHub ↗</a>
+    <a href="https://github.com/gqf2008/walgit">GitHub ↗</a>
   </nav>
 </header>
 
@@ -54,7 +54,7 @@ WALGIT_TOKEN_ME=$(openssl rand -hex 24) walgit serve --config walgit.toml
 <span class="c"># 3. use it — a push to a new name creates the repository</span>
 git push https://git.example.com/acme/app.git main</code></pre>
     <p class="actions">
-      <a class="btn primary" href="https://github.com/tobi/walgit">Source on GitHub</a>
+      <a class="btn primary" href="https://github.com/gqf2008/walgit">Source on GitHub</a>
       <a class="btn" href="#run">Run it in five minutes</a>
     </p>
   </div>
@@ -135,7 +135,7 @@ open https://walgit.localhost:8080/</code></pre>
     </div>
     <div>
       <h3>Get it</h3>
-<pre><code>nix run github:tobi/walgit -- --config walgit.toml
+<pre><code>nix run github:gqf2008/walgit -- --config walgit.toml
 <span class="c"># or</span>
 podman build -t walgit -f Containerfile . &amp;&amp; podman run -p 8080:8080 walgit
 <span class="c"># or</span>
@@ -171,7 +171,7 @@ cargo build --release -p walgit-cli      <span class="c"># after `just web-build
 walgit → nginx   200 + X-Accel-Redirect: /_store/
                  X-Walgit-Store-Url: https://…        X-Walgit-Store-Key: repos/o/r/bundles/…
                  X-Walgit-Store-Authorization: Bearer … (GCS only)</code></pre>
-  <p><a href="https://github.com/tobi/walgit/blob/main/deploy/nginx.conf.example">deploy/nginx.conf.example</a>
+  <p><a href="https://github.com/gqf2008/walgit/blob/main/deploy/nginx.conf.example">deploy/nginx.conf.example</a>
   is the reference and documents the contract. Nothing is assumed from configuration: the edge announces what it
   took over, per request.</p>
 </section>
@@ -179,10 +179,10 @@ walgit → nginx   200 + X-Accel-Redirect: /_store/
 <section class="band">
   <h2>Read more</h2>
   <ul class="links">
-    <li><a href="https://github.com/tobi/walgit/blob/main/README.md">README</a> — the introduction, running it, the invariants.</li>
-    <li><a href="https://github.com/tobi/walgit/blob/main/AGENTS.md">AGENTS.md</a> — the architecture and every design decision with its reasoning.</li>
-    <li><a href="https://github.com/tobi/walgit/blob/main/docs/BUNDLE_URI_DESIGN.md">Bundle design</a> — slots, chains, the two lists, the numbers.</li>
-    <li><a href="https://github.com/tobi/walgit/blob/main/docs/announcing-walgit.md">The announcement post</a>.</li>
+    <li><a href="https://github.com/gqf2008/walgit/blob/main/README.md">README</a> — the introduction, running it, the invariants.</li>
+    <li><a href="https://github.com/gqf2008/walgit/blob/main/AGENTS.md">AGENTS.md</a> — the architecture and every design decision with its reasoning.</li>
+    <li><a href="https://github.com/gqf2008/walgit/blob/main/docs/BUNDLE_URI_DESIGN.md">Bundle design</a> — slots, chains, the two lists, the numbers.</li>
+    <li><a href="https://github.com/gqf2008/walgit/blob/main/docs/announcing-walgit.md">The announcement post</a>.</li>
     <li><a href="https://cursor.com/blog/git-at-any-scale">Git at any scale</a> — the design walgit descends from.</li>
   </ul>
 </section>
