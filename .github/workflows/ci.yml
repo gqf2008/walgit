@@ -172,3 +172,56 @@ jobs:
         shell: bash
         run: |
           cargo test -p walgit-server --test e2e || { echo "e2e failed once (possibly known-flaky); rerunning"; sleep 5; cargo test -p walgit-server --test e2e; }
+
+  # PR summary: one authoritative comment per PR instead of raw job colors.
+  # expected-red (clippy known debt) is annotated, everything else red is a
+  # regression. Idempotent: updates the bot's existing comment, never adds a
+  # new one. Runs only for pull_request events (push to main has no PR).
+  summary:
+    name: CI summary
+    runs-on: ubuntu-latest
+    needs: [build-test, clippy-known-red, e2e, windows]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const run = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+            });
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
+            });
+            const lines = [];
+            for (const j of jobs) {
+              const failed = j.steps.filter(s => s.conclusion === 'failure').map(s => s.name);
+              if (j.conclusion === 'success' || j.conclusion === 'skipped') {
+                lines.push(`- ✅ **${j.name}** (${j.conclusion})`);
+              } else if (j.name === 'clippy (known-red debt)') {
+                lines.push(`- ⚠️ **${j.name}** — expected-red (known debt, issue #1); not a merge blocker`);
+              } else {
+                lines.push(`- ❌ **${j.name}** — real red: ${failed.join(', ') || j.conclusion}`);
+              }
+            }
+            const red = jobs.filter(j => j.conclusion === 'failure' && j.name !== 'clippy (known-red debt)').length;
+            const verdict = red === 0
+              ? '**可合并**(无真实红;known-red clippy 除外)'
+              : `**需处理**:${red} 个 job 真实失败`;
+            const body = `## CI 摘要(agent 可读)\n${lines.join('\n')}\n\n${verdict}\n\n<!-- ci-summary -->`;
+            const pr = context.payload.pull_request;
+            const existing = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, per_page: 100,
+            });
+            const mine = existing.data.find(c => c.body.includes('<!-- ci-summary -->'));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: mine.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body,
+              });
+            }
