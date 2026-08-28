@@ -509,15 +509,16 @@ gh release create v0.1.0 --generate-notes
 
 ### 6.3 Reading CI signals
 
-The CI workflow posts a **summary comment** on every PR (see `ci-summary.yml`); treat it
-as authoritative, not raw job colors:
+The CI workflow posts a **summary comment** on every PR (posted by the `summary` job in
+`ci.yml`); treat it as authoritative, not raw job colors:
 
 - **Expected red — ignore as a blocker**: the `clippy (known-red debt)` job
   (continue-on-error; ~1300 pre-existing pedantic hits, issue #1). A PR must keep its
   increment at zero (template field), but a red clippy job alone never blocks a merge.
 - **Expected flaky — rerun once**: tests on the known-flaky list (§5) may fail once;
-  the sim/e2e steps auto-rerun once, and a second failure is a regression. A summary
-  line saying `expected-flaky: <test>` means: rerun, don't investigate.
+  the sim/e2e/fast-tier steps auto-rerun once, and a second failure is a regression.
+  A summary line reading `real red (already rerun once): <step>` means the failing step
+  already survived its built-in retry: rerun by hand, don't treat it as a flake.
 - **Real red**: anything else — investigate before merging.
 
 ### 6.4 Governance and releases
