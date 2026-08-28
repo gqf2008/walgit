@@ -1910,7 +1910,9 @@ fn install_git_shim() -> anyhow::Result<Option<tempfile::TempDir>> {
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     // git shim: slow only for multi-pack-index. On Windows the shim is a
     // rustc-built git.exe in front of PATH; see install_git_shim.
-    let Some(shim) = install_git_shim()? else { return Ok(()) };
+    let Some(shim) = install_git_shim()? else {
+        return Ok(());
+    };
     let old_path = std::env::var("PATH").unwrap_or_default();
     let sep = if cfg!(windows) { ";" } else { ":" };
     // SAFETY: test process, single-threaded runtime, set before any git spawn below.
