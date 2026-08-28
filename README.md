@@ -1,5 +1,8 @@
 # walgit — a git server that is one binary in front of an object store
 
+[![CI](https://github.com/gqf2008/walgit/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit/actions/workflows/ci.yml)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
+
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
 single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
 clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,

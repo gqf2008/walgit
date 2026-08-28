@@ -445,3 +445,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   under the full e2e suite: base published without `has_commit_graph`) and
   `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`). Both
   pass alone.
+- **Known-red until debt lands:** the workspace `clippy -D warnings` gate fails on pre-existing pedantic debt
+  (~1300 hits measured 2026-08-27; none from the windows port — tracked in the fork's issue). PRs must keep
+  their increment at zero; do not "fix" this by weakening the lint table, and do not treat red clippy CI as a
+  regression signal by itself.
