@@ -13,7 +13,12 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Upstream set cancel-in-progress for the PR-update flow; in this fork's
+  # maintenance mode runs are dispatched manually per commit, and cancelling
+  # the in-flight run repeatedly killed the ~40 min windows leg before it
+  # could report (its result is the scarce signal here). Runs may pile up on
+  # this branch; dispatch deliberately.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
