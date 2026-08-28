@@ -525,6 +525,9 @@ as authoritative, not raw job colors:
 - `main` is protected by a ruleset: PR required, required checks
   (`warnings + test`, `e2e`, `windows fast tier`; clippy excluded), linear history.
   Push to main directly is rejected.
+- Design decisions and Q&A live in **Discussions** (once enabled via
+  Settings → General — UI-only, no API); issues stay for work units, discussions
+  for "why".
 - Vulnerabilities: private reporting (SECURITY.md) + Dependabot security updates +
   CodeQL scanning on PRs (results in the Security tab).
 - Releases: tag `v*` triggers `release.yml` (builds ubuntu+windows artifacts,
