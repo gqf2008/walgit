@@ -59,13 +59,15 @@ jobs:
         run: just web-build
 
       - run: just warnings
-      - run: just test
-        # The 300 s timeout in the justfile can trip under CI load (measured
-        # exit 124 on 2026-08-28); a rerun after a timeout is a retry, not a
-        # regression signal.
+      # The 300 s timeout in the justfile can trip under CI load (measured
+      # exit 124 on 2026-08-28); a rerun after a timeout is a retry, not a
+      # regression signal. The retry lives inside this step, like sim/e2e: a
+      # separate `if: failure()` step would re-run after ANY earlier step
+      # failure (web-build, warnings) and, when the retry succeeded, would
+      # still leave the job red and get reported as a regression.
       - name: Fast tier (retry once on timeout)
-        if: failure()
-        run: just test
+        run: |
+          just test || { echo "test failed once (possibly a CI-load timeout); rerunning"; sleep 5; just test; }
       # Rerun once on failure: sim has known-flaky cases (~1 in 7 base_rebuild,
       # AGENTS.md §5); a second failure is a regression.
       - name: Simulation suite
@@ -195,9 +197,6 @@ jobs:
       - uses: actions/github-script@v7
         with:
           script: |
-            const run = await github.rest.actions.getWorkflowRun({
-              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
-            });
             const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
               owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
             });
@@ -212,7 +211,9 @@ jobs:
                 lines.push(`- ✅ **${j.name}** (${j.conclusion})`);
               } else if (j.name === 'clippy (known-red debt)') {
                 lines.push(`- ⚠️ **${j.name}** — expected-red (known debt, issue #1); not a merge blocker`);
-              } else if (failed.every(f => rerun_once.test(f))) {
+              } else if (j.conclusion === 'cancelled' || j.conclusion === 'neutral' || j.conclusion === 'timed_out') {
+                lines.push(`- ⏭️ **${j.name}** — ${j.conclusion}, not a failure`);
+              } else if (failed.length > 0 && failed.every(f => rerun_once.test(f))) {
                 lines.push(`- ❌ **${j.name}** — real red (already rerun once): ${failed.join(', ')}`);
               } else {
                 lines.push(`- ❌ **${j.name}** — real red: ${failed.join(', ') || j.conclusion}`);
@@ -224,6 +225,13 @@ jobs:
               : `**需处理**:${red} 个 job 真实失败`;
             const body = `## CI 摘要(agent 可读)\n${lines.join('\n')}\n\n${verdict}\n\n<!-- ci-summary -->`;
             const pr = context.payload.pull_request;
+            // PRs from forks get a read-only GITHUB_TOKEN: commenting would 403
+            // and turn this job red. The in-repo worktree flow is the norm; for
+            // fork PRs, just skip the comment.
+            if (pr.head.repo.full_name !== context.repo.full_name) {
+              console.log('PR from a fork; read-only token — skipping the summary comment');
+              return;
+            }
             const existing = await github.rest.issues.listComments({
               owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, per_page: 100,
             });
