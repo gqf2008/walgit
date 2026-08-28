@@ -24,6 +24,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `GOAL.md` | Everyone, first. What walgit is for, the acceptance table, what we do not optimise for. |
 | `AGENTS.md` (this) | Everyone. Constraints §1, WAL §2, principles §3, decisions §4, working rules §5. |
 | `README.md` | The introduction: why (the Cursor lineage), what it does, how it works briefly, running it, invariants. |
+| `.github/copilot-instructions.md` | AI coding agents working in this repository (GitHub web/IDE): pointers, workflow, CI reading. §6 is the fuller protocol. |
 | `docs/BUNDLE_URI_DESIGN.md` | Anyone touching bundles, the scheduler, base rebuilds, or big-repo clone/fetch UX. Design of record; normative config in §4. |
 | `docs/WINDOWS.md` | Developing on a Windows host: prerequisites, test surface, `dev-store` equivalent, NTFS symlink coverage. |
 | `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, bundles, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
