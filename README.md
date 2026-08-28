@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/gqf2008/walgit/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
+[![Agent-native](https://img.shields.io/badge/agent--native-work%20units%20%26%20protocol-purple)](AGENTS.md#6-agent-collaboration-protocol)
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
 single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
