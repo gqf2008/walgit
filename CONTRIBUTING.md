@@ -21,3 +21,10 @@
 
 Conventional Commits（`feat|fix|chore|docs|refactor|test|perf(scope): 描述`），一个提交一个逻辑变更，
 信息说"为什么"。
+
+## 发布
+
+- 版本语义化（semver）：`v<major>.<minor>.<patch>`，tag 触发 `release.yml`
+  （构建 linux/windows 产物、从 Conventional Commits 生成 changelog、挂到 GitHub Release）。
+- 发布本身是一个工作单元：开 `batch` issue 列发布清单（里程碑 `v0.1` 是首个目标）。
+- 里程碑与批次的关系：一个里程碑一个版本，issue 挂里程碑表示"进这个版本"。

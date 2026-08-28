@@ -1,0 +1,85 @@
+name: Release
+
+# Tag v* to publish: builds native binaries on linux and windows, generates
+# a changelog from Conventional Commits since the previous tag, and attaches
+# everything to a GitHub Release. Versioning is semantic; the v0.1 milestone
+# is the first target (AGENTS.md §6.4).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: walgit-linux-x86_64
+          - os: windows-latest
+            artifact: walgit-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then choco install protoc -y --no-progress; else sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi
+        shell: bash
+      - name: Install the pinned Rust toolchain
+        run: rustup show && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the SPA and the SDK (embedded into the binary)
+        run: just web-build
+        shell: bash
+      - name: Build release binary
+        run: cargo build --release --bin walgit --bin walgit-server
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/walgit${{ runner.os == 'Windows' && '.exe' || '' }}
+            target/release/walgit-server${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate changelog
+        id: changelog
+        run: |
+          prev=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -n "$prev" ]; then range="$prev..HEAD"; else range="HEAD"; fi
+          git log --pretty=format:'%s' "$range" | grep -E '^(feat|fix|docs|refactor|test|perf|chore)(\(|:)' > changelog.txt || true
+          echo "generated from ${range:-HEAD}"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          body="$(cat changelog.txt 2>/dev/null || echo '')"
+          gh release create "$tag" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "$body"
