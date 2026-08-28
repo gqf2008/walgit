@@ -65,7 +65,11 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          prev=$(git tag --sort=-version:refname | sed -n '2p')
+          # The tag being released is excluded: descending version sort can put
+          # the current tag (or a pre-release like v0.2.1-rc1, which sorts above
+          # its release) on the line `sed -n '2p'` would otherwise pick, making
+          # the range empty or start at a pre-release.
+          prev=$(git tag --sort=-version:refname | grep -v "^${GITHUB_REF#refs/tags/}$" | sed -n '1p')
           if [ -n "$prev" ]; then range="$prev..HEAD"; else range="HEAD"; fi
           git log --pretty=format:'%s' "$range" | grep -E '^(feat|fix|docs|refactor|test|perf|chore)(\(|:)' > changelog.txt || true
           echo "generated from ${range:-HEAD}"
