@@ -202,6 +202,9 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
             });
             const lines = [];
+            // Steps with a built-in rerun (sim/e2e/fast tier): a failure there
+            // already survived one retry, so it is a regression, not a flake.
+            const rerun_once = /Simulation suite|Smart-HTTP end-to-end|Fast tier/;
             for (const j of jobs) {
               if (j.name === 'CI summary') continue; // don't report on ourselves
               const failed = j.steps.filter(s => s.conclusion === 'failure').map(s => s.name);
@@ -209,6 +212,8 @@ jobs:
                 lines.push(`- ✅ **${j.name}** (${j.conclusion})`);
               } else if (j.name === 'clippy (known-red debt)') {
                 lines.push(`- ⚠️ **${j.name}** — expected-red (known debt, issue #1); not a merge blocker`);
+              } else if (failed.every(f => rerun_once.test(f))) {
+                lines.push(`- ❌ **${j.name}** — real red (already rerun once): ${failed.join(', ')}`);
               } else {
                 lines.push(`- ❌ **${j.name}** — real red: ${failed.join(', ') || j.conclusion}`);
               }
