@@ -1817,42 +1817,104 @@ async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
     Ok(())
 }
 
+/// Absolute path of the real `git` binary (the shim forwards to it).
+fn real_git_path() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()?;
+        return Ok(String::from_utf8(out.stdout)?.trim().to_string());
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "where", "git"])
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Prefer a real .exe; `where` may also list .bat/.cmd wrappers.
+        let exe = text
+            .lines()
+            .find(|l| l.trim().to_ascii_lowercase().ends_with(".exe"))
+            .or_else(|| text.lines().next());
+        return Ok(exe.unwrap_or_default().trim().to_string());
+    }
+}
+
+/// Install a `git` shim in front of PATH that sleeps 3 s on
+/// `multi-pack-index` and forwards everything else to the real git.
+///
+/// Unix: a shebang script with the executable bit set. Windows: a `git.exe`
+/// built on the fly with rustc — CreateProcess resolves only `.exe` for a
+/// bare name, so neither a script nor a `.bat` can shadow `git` there. The
+/// real git's path is embedded at compile time via `REAL_GIT`, resolved
+/// *before* the shim lands in PATH (so `where git` still finds the real one).
+///
+/// Returns `None` when the shim cannot be built (e.g. no rustc on PATH);
+/// the caller prints the reason and skips, per the detect-and-return rule.
+fn install_git_shim() -> anyhow::Result<Option<tempfile::TempDir>> {
+    let shim = tempfile::tempdir()?;
+    let real_git = real_git_path()?;
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            shim.path().join("git"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
+            ),
+        )?;
+        std::fs::set_permissions(
+            shim.path().join("git"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+    }
+    #[cfg(windows)]
+    {
+        let exe = shim.path().join("git.exe");
+        let src = shim.path().join("shim.rs");
+        std::fs::write(
+            &src,
+            "use std::process::Command;\n\
+             fn main() {\n\
+             \x20   let args: Vec<String> = std::env::args().skip(1).collect();\n\
+             \x20   if args.first().map(String::as_str) == Some(\"multi-pack-index\") {\n\
+             \x20       std::thread::sleep(std::time::Duration::from_secs(3));\n\
+             \x20   }\n\
+             \x20   let st = Command::new(env!(\"REAL_GIT\")).args(&args).status().unwrap();\n\
+             \x20   std::process::exit(st.code().unwrap_or(1));\n\
+             }\n",
+        )?;
+        let out = std::process::Command::new("rustc")
+            .arg(&src)
+            .args(["-o", &exe.to_string_lossy()])
+            .env("REAL_GIT", &real_git)
+            .output()?;
+        if !out.status.success() {
+            eprintln!(
+                "skipping history-pack stall test: rustc shim build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Ok(None);
+        }
+    }
+    Ok(Some(shim))
+}
+
 /// Installing a history pack runs `git multi-pack-index write` (minutes on
 /// a large repository) — it must run off the async runtime. This test runs the server on a
 /// **single** tokio worker with a `git` shim that sleeps 3 s on
 /// `multi-pack-index`, starts the install on a sibling, and asserts that an
 /// unrelated refs request answers in < 1 s meanwhile (prod: every request on
 /// the instance stalled for minutes, timers included).
-///
-/// Unix-only by mechanism, not by mood: the shim is a shebang script picked up
-/// from `PATH`, and there is no way to shadow a bare `git` name for arbitrary
-/// child processes on Windows (CreateProcess never resolves `.bat`).
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
-    // git shim: slow only for multi-pack-index.
-    let shim = tempfile::tempdir()?;
-    let real_git = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()?
-            .stdout,
-    )?
-    .trim()
-    .to_string();
-    std::fs::write(
-        shim.path().join("git"),
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
-        ),
-    )?;
-    std::fs::set_permissions(
-        shim.path().join("git"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )?;
+    // git shim: slow only for multi-pack-index. On Windows the shim is a
+    // rustc-built git.exe in front of PATH; see install_git_shim.
+    let Some(shim) = install_git_shim()? else { return Ok(()) };
     let old_path = std::env::var("PATH").unwrap_or_default();
+    let sep = if cfg!(windows) { ";" } else { ":" };
     // SAFETY: test process, single-threaded runtime, set before any git spawn below.
-    unsafe { std::env::set_var("PATH", format!("{}:{old_path}", shim.path().display())) };
+    unsafe { std::env::set_var("PATH", format!("{}{sep}{old_path}", shim.path().display())) };
 
     let big = Server::start().await?;
     big.put_repo("t", "hist").await?;
