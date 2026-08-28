@@ -452,3 +452,81 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   (~1300 hits measured 2026-08-27; none from the windows port — tracked in the fork's issue). PRs must keep
   their increment at zero; do not "fix" this by weakening the lint table, and do not treat red clippy CI as a
   regression signal by itself.
+
+## §6 Agent collaboration protocol
+
+How this repository works as an agent-native collaboration platform: GitHub is the
+coordination layer — work units (issues) carry a machine-readable lifecycle, CI reports
+its own expected-red noise, and every state change an agent makes is a label, a comment
+or a PR. **This section is the contract agents follow; humans use the same protocol.**
+
+### 6.1 Work-unit lifecycle
+
+An issue is a *work unit*. Its state is its labels (authoritative) mirrored onto the
+[walgit 工作单元 board](https://github.com/users/gqf2008/projects/5) (Status field):
+
+| State | Label | Project Status | Meaning |
+|---|---|---|---|
+| Backlog | *(none)* | Backlog | filed, not queued |
+| Ready | `ready` | Ready | queued, anyone may claim |
+| In Progress | `in-progress` | In Progress | claimed — a comment names the worktree |
+| In Review | `needs-review` | In Review | a PR exists, waiting for review/CI |
+| Done | *(closed)* | Done | merged/closed |
+| Blocked | `blocked` | (stays put) | waiting on a dependency or external input |
+
+Priority: `P0` (immediate) / `P1` (this batch) / `P2` (queued) / `P3` (spare).
+Kind: `batch` (checklist-driven), `bug`, `enhancement` (task). Batches own the
+`batch` label and a checklist; single units use the task/bug forms.
+
+### 6.2 Claim protocol (agents)
+
+1. **Claim**: pick a `ready` issue → add `in-progress`, remove `ready`, and comment
+   `🔄 [处理中][wt-<worktree>] <one-line plan>`. One issue, one worktree at a time.
+   Never start work on an issue another agent marked in-progress.
+2. **Work**: in a worktree off `main` (`.claude/worktrees/<name>`, branch
+   `worktree-<name>`), following §5 rules and CONTRIBUTING (batches ≥3 similar units,
+   Conventional Commits, one logical change per commit).
+3. **Ship**: open the PR (template: Closes/Relates, Verification, Model Used, reviewer),
+   add `needs-review` to the issue, remove `in-progress`.
+4. **Blocked**: add `blocked` + a comment saying what is missing.
+5. **Done**: the PR merge closes the issue (auto-merge enabled); remove `needs-review`.
+
+`gh` templates (copy-paste, `--repo gqf2008/walgit` implicit):
+
+```bash
+# claim
+gh issue edit <n> --add-label in-progress --remove-label ready
+gh issue comment <n> --body "🔄 [处理中][wt-<name>] <plan>"
+# move to review
+gh issue edit <n> --add-label needs-review --remove-label in-progress
+# check CI for a PR (conclusion per job + failing steps)
+gh pr checks <pr> --repo gqf2008/walgit
+gh run view <run> --repo gqf2008/walgit --json jobs --jq '.jobs[]|{n:.name,c:.conclusion,f:[.steps[]|select(.conclusion=="failure")|.name]}'
+# release (see 6.4)
+gh release create v0.1.0 --generate-notes
+```
+
+### 6.3 Reading CI signals
+
+The CI workflow posts a **summary comment** on every PR (see `ci-summary.yml`); treat it
+as authoritative, not raw job colors:
+
+- **Expected red — ignore as a blocker**: the `clippy (known-red debt)` job
+  (continue-on-error; ~1300 pre-existing pedantic hits, issue #1). A PR must keep its
+  increment at zero (template field), but a red clippy job alone never blocks a merge.
+- **Expected flaky — rerun once**: tests on the known-flaky list (§5) may fail once;
+  the sim/e2e steps auto-rerun once, and a second failure is a regression. A summary
+  line saying `expected-flaky: <test>` means: rerun, don't investigate.
+- **Real red**: anything else — investigate before merging.
+
+### 6.4 Governance and releases
+
+- `main` is protected by a ruleset: PR required, required checks
+  (`warnings + test`, `e2e`, `windows fast tier`; clippy excluded), linear history.
+  Push to main directly is rejected.
+- Vulnerabilities: private reporting (SECURITY.md) + Dependabot security updates +
+  CodeQL scanning on PRs (results in the Security tab).
+- Releases: tag `v*` triggers `release.yml` (builds ubuntu+windows artifacts,
+  changelog from Conventional Commits, attaches to `gh release`). Versioning is
+  semantic; milestone `v0.1` is the first release target. A release is also a work
+  unit: create a `batch` issue with the release checklist.

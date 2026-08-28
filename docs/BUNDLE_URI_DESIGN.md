@@ -9,7 +9,7 @@ decisions. Technical detail for `crates/walgit-bundle`, SSD-backed maintainers, 
 
 Status: **implemented design of record** (2026-08-21). Calendar slots, deterministic tokens, as-of-slot
 content, backfill, two-newest retention, self-contained incrementals, and the blobless family are live.
-Remaining work belongs in §8 and `AGENTS.md §6`. Reading order:
+Remaining work belongs in §8 and `AGENTS.md §2.6`. Reading order:
 AGENTS.md §2.6 (summary) → this file (detail) → `crates/walgit-bundle/` (code) → `web/API.md` (what the UI shows).
 
 ## 1. Why bundles exist here
