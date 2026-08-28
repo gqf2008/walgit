@@ -2733,7 +2733,24 @@ fn rename_atomic(src: &Path, dst: &Path) -> Result<(), GitError> {
             std::fs::remove_file(src).map_err(GitError::Io)?;
             Ok(())
         }
-        Err(e) => Err(GitError::Io(e)),
+        Err(e) => {
+            // Windows: overwriting a target that git for Windows marked
+            // READ_ONLY (every pack/idx/rev it writes) fails with
+            // ACCESS_DENIED; clear the attribute and retry once.
+            #[cfg(windows)]
+            {
+                if let Ok(md) = std::fs::metadata(dst) {
+                    let mut perm = md.permissions();
+                    if perm.readonly() {
+                        perm.set_readonly(false);
+                        if std::fs::set_permissions(dst, perm).is_ok() {
+                            return std::fs::rename(src, dst).map_err(GitError::Io);
+                        }
+                    }
+                }
+            }
+            Err(GitError::Io(e))
+        }
     }
 }
 /// Read the number of objects from a pack .idx file (v1 or v2) by reading the
