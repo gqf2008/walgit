@@ -5892,6 +5892,7 @@ dependencies = [
  "uuid",
  "walgit-config",
  "walgit-proto",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5967,6 +5968,7 @@ dependencies = [
  "walgit-proto",
  "walgit-store",
  "walgit-wal",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6039,6 +6041,7 @@ dependencies = [
  "walgit-git",
  "walgit-proto",
  "walgit-store",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

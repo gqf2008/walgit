@@ -992,7 +992,7 @@ pub fn verify_refs_in_packs(
     let objects = scratch.path().join("objects");
     std::fs::create_dir_all(objects.join("info"))?;
     std::fs::create_dir_all(scratch.path().join("refs"))?;
-    std::os::unix::fs::symlink(std::fs::canonicalize(pack_dir)?, objects.join("pack"))?;
+    walgit_wal::platform::symlink(&std::fs::canonicalize(pack_dir)?, &objects.join("pack"))?;
     std::fs::write(scratch.path().join("HEAD"), "ref: refs/heads/main\n")?;
     std::fs::write(
         scratch.path().join("config"),
@@ -1235,6 +1235,9 @@ mod tests {
     #[test]
     fn refs_ahead_of_the_pack_set_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
+        if !crate::testutil::symlinks_available(tmp.path()) {
+            return;
+        }
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         git(&src, &["init", "-q", "-b", "main"]);
@@ -1290,6 +1293,9 @@ mod tests {
     #[test]
     fn a_missing_blob_in_the_closure_is_found() {
         let tmp = tempfile::tempdir().unwrap();
+        if !crate::testutil::symlinks_available(tmp.path()) {
+            return;
+        }
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         git(&src, &["init", "-q", "-b", "main"]);

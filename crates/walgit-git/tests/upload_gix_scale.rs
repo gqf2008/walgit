@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Reproducer for AGENTS §6 "gix large-fetch object-id corruption and 178 GB OOM" (2026-08-21
 //! 05:4xZ: a remainder pack carried an entry under another object's id; 07:0xZ: the same shape
 //! replayed over a large repository was OOM-killed at 178 GB anon RSS after `Enumerating objects: 113683`).
@@ -28,9 +38,16 @@ mod cm {
     pub use super::common::*;
 }
 
+#[cfg(unix)]
 fn max_rss_kb() -> u64 {
+    #[allow(unsafe_code)] // a zeroed rusage the next call fills
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    // SAFETY: `ru` is a live rusage slot; getrusage fills it (its result is unused —
+    // a failed read yields the zeroed peak, which the caller's saturating_sub floors at 0).
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru)
+    };
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
     // fails a passing result (a 16 MB delta shown as "16832 MB").
@@ -39,6 +56,33 @@ fn max_rss_kb() -> u64 {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let kb = ru.ru_maxrss as u64;
     kb
+}
+
+/// Windows peak-RSS probe: `GetProcessMemoryInfo`'s `PeakWorkingSetSize` is the
+/// working-set analog of rusage's `ru_maxrss` (both are process-lifetime peaks, so
+/// the delta-of-peaks the bound below reads is meaningful the same way on both OSes).
+#[cfg(not(unix))]
+fn max_rss_kb() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    #[allow(unsafe_code)] // a zeroed counters struct we size and let the callee fill
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `GetCurrentProcess()` is the always-valid pseudo-handle; `counters` is a
+    // live out-struct whose `cb` we just set to its own size, as the API requires.
+    #[allow(unsafe_code)]
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            &mut counters,
+            counters.cb,
+        )
+    };
+    if ok == 0 {
+        return 0;
+    }
+    (counters.PeakWorkingSetSize as u64) / 1024
 }
 
 /// Deterministic source via `git fast-import`: `commits` commits, each rewriting `files_per_commit`

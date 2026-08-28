@@ -878,9 +878,12 @@ impl LocalRepo {
         // A ref-only push (`git push origin main:feature` with nothing new)
         // sends a 32-byte pack with zero objects. Nothing to publish.
         if object_count == 0 {
-            let _ = std::fs::remove_file(&pack_path);
-            let _ = std::fs::remove_file(&idx_path);
-            let _ = std::fs::remove_file(pack_path.with_extension("rev"));
+            // Best-effort (cleanup must not fail the push), but use the same
+            // bounded-window remover as supersede deletes: a just-written pack
+            // is exactly what a Windows real-time scanner holds briefly.
+            let _ = Self::remove_pack_file(&pack_path);
+            let _ = Self::remove_pack_file(&idx_path);
+            let _ = Self::remove_pack_file(&pack_path.with_extension("rev"));
             return Ok(None);
         }
         let pack_size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
@@ -945,22 +948,109 @@ impl LocalRepo {
     /// Delete `.pack/.idx/.rev/.bitmap` for `checksum`. Caller guarantees no
     /// readers.
     pub fn remove_pack(&self, checksum: &gix_hash::oid) -> Result<(), GitError> {
-        let hex = checksum.to_hex();
-        let pack_dir = self.objects_pack_dir();
-        let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
-        for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
-            let p = pack_dir.join(format!("pack-{hex}.{ext}"));
-            match std::fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(GitError::Io(e)),
+        self.remove_packs(&[checksum.to_owned()])
+    }
+
+    /// Delete the side-files of every `checksum` in one batch, with a single
+    /// Windows cold-handle swap for the whole set. Callers that supersede many
+    /// packs under one write lock (compaction's GC pass) must use this: the
+    /// swap drops this process's pre-warmed pack-index mmaps, and doing it once
+    /// per pack would invalidate *all* warm maps K times for K packs, then
+    /// re-parse the survivors from disk on every subsequent refresh.
+    /// Caller guarantees no readers.
+    pub fn remove_packs(&self, checksums: &[gix_hash::ObjectId]) -> Result<(), GitError> {
+        #[cfg(windows)]
+        {
+            // This process's own refresh() deliberately mmaps every pack index
+            // ("odb indices loaded") and keeps them behind the cached
+            // ThreadSafeRepository. On Unix those views vanish under an unlink;
+            // on Windows they are exactly what the deletes below must not
+            // fight — swap in a cold handle so this library releases its own
+            // maps first, then let remove_pack_file's bounded window absorb any
+            // reader clone that was mid-flight.
+            if let Ok(cold) = gix::ThreadSafeRepository::open(&self.inner.path) {
+                *self.inner.tsr.lock() = cold;
+            } else {
+                // Keep the retry window honest: if the reopen fails we still hold
+                // this process's own mmaps, so the delete below may hit
+                // ACCESS_DENIED even after remove_pack_file's bounded wait.
+                tracing::warn!(repo = %self.inner.path.display(), "remove_packs: cold reopen failed; deleting with live pack-index mappings");
             }
         }
-        if was_history {
-            // The midx must not name a pack that is gone.
-            self.write_history_midx_blocking()?;
+        let pack_dir = self.objects_pack_dir();
+        for checksum in checksums {
+            let hex = checksum.to_hex();
+            let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
+            for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
+                Self::remove_pack_file(&pack_dir.join(format!("pack-{hex}.{ext}")))?;
+            }
+            if was_history {
+                // The midx must not name a pack that is gone.
+                self.write_history_midx_blocking()?;
+            }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_pack_file(p: &std::path::Path) -> Result<(), GitError> {
+        match std::fs::remove_file(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(GitError::Io(e)),
+        }
+    }
+
+    /// Unix removes an open file without ceremony. Windows cannot: a just-written
+    /// side-file is briefly held by whatever real-time scanner or indexer noticed
+    /// it (`ERROR_ACCESS_DENIED`, os error 5), and a reader's transient lock means
+    /// the caller-guarantees-no-readers contract failed a moment ago, not forever.
+    /// Give such contention one small, bounded window instead of failing the push
+    /// that triggered a supersede.
+    ///
+    /// There is also a persistent cause that no wait fixes: git for Windows
+    /// creates `pack-*.idx`/`pack-*.pack` with the READ_ONLY attribute set
+    /// (its "don't touch finished packs" protection), and a supersede delete
+    /// fails with ERROR_ACCESS_DENIED until the attribute is cleared. So the
+    /// final attempt clears the read-only bit once before giving up.
+    #[cfg(windows)]
+    fn remove_pack_file(p: &std::path::Path) -> Result<(), GitError> {
+        let mut attempt: u64 = 0;
+        loop {
+            match std::fs::remove_file(p) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                // ACCESS_DENIED (5) is what a scanner's transient hold reports
+                // here; SHARING_VIOLATION (32) / LOCK_VIOLATION (33) are its
+                // cousins, and USER_MAPPED_FILE (1224) is what a reader's
+                // memory-mapped index reports until that reader drops it.
+                // Wait twice at most — a persistent 5 (read-only bit, real
+                // ACL) still fails honestly after the window.
+                Err(e)
+                    if e.raw_os_error()
+                        .is_some_and(|c| matches!(c, 5 | 32 | 33 | 1224))
+                        && attempt < 2 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                }
+                Err(e) => {
+                    // git's READ_ONLY pack attribute: clear it and retry once.
+                    if let Ok(md) = std::fs::metadata(p) {
+                        let mut perm = md.permissions();
+                        if perm.readonly() {
+                            perm.set_readonly(false);
+                            if std::fs::set_permissions(p, perm).is_ok()
+                                && std::fs::remove_file(p).is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Err(GitError::Io(e));
+                }
+            }
+        }
     }
 
     pub fn packs(&self) -> Result<Vec<PackInfo>, GitError> {
@@ -2643,7 +2733,24 @@ fn rename_atomic(src: &Path, dst: &Path) -> Result<(), GitError> {
             std::fs::remove_file(src).map_err(GitError::Io)?;
             Ok(())
         }
-        Err(e) => Err(GitError::Io(e)),
+        Err(e) => {
+            // Windows: overwriting a target that git for Windows marked
+            // READ_ONLY (every pack/idx/rev it writes) fails with
+            // ACCESS_DENIED; clear the attribute and retry once.
+            #[cfg(windows)]
+            {
+                if let Ok(md) = std::fs::metadata(dst) {
+                    let mut perm = md.permissions();
+                    if perm.readonly() {
+                        perm.set_readonly(false);
+                        if std::fs::set_permissions(dst, perm).is_ok() {
+                            return std::fs::rename(src, dst).map_err(GitError::Io);
+                        }
+                    }
+                }
+            }
+            Err(GitError::Io(e))
+        }
     }
 }
 /// Read the number of objects from a pack .idx file (v1 or v2) by reading the

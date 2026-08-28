@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 #![allow(dead_code)]
 //! Test harness: spin up walgit-server on a random port backed by the in-memory
 //! store + a tempdir cache, and drive real upstream `git` against it.
@@ -351,4 +361,51 @@ pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// `git <first> | git <second>` without a POSIX shell: the suite also runs on
+/// Windows, where spawning `/bin/sh` simply fails. Collects the first
+/// process's whole output, then feeds it to the second through its stdin — a
+/// buffered hop avoids the flaky instant-EOF a live child-to-child pipe shows
+/// on Windows (same shape as `crates/walgit-cli/src/testutil.rs`; each
+/// integration binary is its own world, so the helper is duplicated per crate).
+pub fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output {
+    use std::io::Write;
+
+    let up = Command::new("git")
+        .args(first)
+        .current_dir(cwd)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run upstream git");
+    if !up.status.success() {
+        panic!(
+            "git {first:?} failed: {} — stderr: {}",
+            up.status,
+            String::from_utf8_lossy(&up.stderr)
+        );
+    }
+
+    let mut down = Command::new("git")
+        .args(second)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn downstream git");
+    // The whole input is already in memory: write it, close stdin, then wait.
+    // A write error means the child died early — its status says how.
+    if let Some(mut stdin) = down.stdin.take() {
+        let _ = stdin.write_all(&up.stdout);
+    }
+    let out = down.wait_with_output().expect("wait downstream git");
+    if !out.status.success() {
+        panic!(
+            "git {second:?} failed: {} — stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out
 }

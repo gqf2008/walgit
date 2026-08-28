@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Simulation tests: safety mode → liveness mode (after TigerBeetle's VOPR,
 //! "Simulation Testing For Liveness", 2023).
 //!
@@ -2615,19 +2625,35 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
             .collect::<Vec<_>>()
     );
     // A late joiner attaches to the finished task and gets the replay + outcome.
-    let last_ok = materializes
-        .iter()
-        .find(|t| t.ok == Some(true))
-        .ok_or_else(|| anyhow!("no successful materialize: {materializes:?}"))?;
-    let state = tasks
-        .get(&last_ok.id)
-        .ok_or_else(|| anyhow!("task state gone"))?;
-    let (replay, _rx, outcome) = state.attach();
-    ensure!(!replay.is_empty(), "late joiner got no replay");
-    ensure!(
-        matches!(outcome, Some(Ok(_))),
-        "late joiner did not see the outcome: {outcome:?}"
-    );
+    // The callers are single-attempt syncs, so if the task creator hit an
+    // injected retryable error (or was the aborted victim) there may
+    // legitimately be no success at all — assert the failure propagated
+    // instead; the heal below still converges.
+    if let Some(last_ok) = materializes.iter().find(|t| t.ok == Some(true)) {
+        let state = tasks
+            .get(&last_ok.id)
+            .ok_or_else(|| anyhow!("task state gone"))?;
+        let (replay, _rx, outcome) = state.attach();
+        ensure!(!replay.is_empty(), "late joiner got no replay");
+        ensure!(
+            matches!(outcome, Some(Ok(_))),
+            "late joiner did not see the outcome: {outcome:?}"
+        );
+    } else {
+        ensure!(
+            materializes.iter().all(|t| t.ok == Some(false)),
+            "mixed task outcomes without a success: {materializes:?}"
+        );
+        let state = tasks
+            .get(&materializes[0].id)
+            .ok_or_else(|| anyhow!("task state gone"))?;
+        let (replay, _rx, outcome) = state.attach();
+        ensure!(!replay.is_empty(), "late joiner got no replay");
+        ensure!(
+            matches!(outcome, Some(Err(_))),
+            "late joiner did not see the failure outcome: {outcome:?}"
+        );
+    }
     // Downloads: every attempt downloads each pack at most once (+ idx); no N-fold traffic.
     let ops = c.instances[j].link.stats().ops.load(Ordering::Relaxed) as usize;
     let attempts = materializes.len();
@@ -2807,8 +2833,17 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
         let ho = front.registry.open(other).await?;
         drop(ho.sync_refs().await?);
         let took = t.elapsed();
+        // On Windows a just-evicted repo's refs read occasionally pays a
+        // real-time scanner opening the freshly written files (measured
+        // 2.5 s worst case vs ≈ 20 ms nominal); the 1 s bound is a
+        // regression guard for the refs-only path, not a latency SLA.
+        let limit = if cfg!(windows) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
         ensure!(
-            took < Duration::from_secs(1),
+            took < limit,
             "step {step}: refs read took {took:?} (eviction took {evict_took:?}; observed ≈ 20 ms)"
         );
         refs_latencies.push(took);

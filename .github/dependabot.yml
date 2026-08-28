@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Rust 依赖：月度批量，agent 按批次 issue 处理，避免零碎 PR 噪音。
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+  # Actions 版本腐烂防护（@v4 之类）。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Integration tests for walgit-wal.
 //!
 //! Uses MemoryStore + real LocalRepo tempdir + upstream git to create
@@ -18,6 +28,80 @@ use walgit_wal::Registry;
 use std::io::Write;
 
 // ---- test helpers ----
+
+/// `git <first> | git <second>` without a POSIX shell: the suite also runs on
+/// Windows, where spawning `/bin/sh` simply fails. Collects the first
+/// process's whole output, then feeds it to the second through its stdin — a
+/// buffered hop avoids the flaky instant-EOF a live child-to-child pipe shows
+/// on Windows.
+fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output {
+    use std::io::Write;
+
+    let up = Command::new("git")
+        .args(first)
+        .current_dir(cwd)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run upstream git");
+    if !up.status.success() {
+        panic!(
+            "git {first:?} failed: {} — stderr: {}",
+            up.status,
+            String::from_utf8_lossy(&up.stderr)
+        );
+    }
+
+    let mut down = Command::new("git")
+        .args(second)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn downstream git");
+    // The whole input is already in memory: write it, close stdin, then wait.
+    // A write error means the child died early — its status says how.
+    if let Some(mut stdin) = down.stdin.take() {
+        let _ = stdin.write_all(&up.stdout);
+    }
+    let out = down.wait_with_output().expect("wait downstream git");
+    if !out.status.success() {
+        panic!(
+            "git {second:?} failed: {} — stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out
+}
+
+/// Whether this account may create a symlink here at all: NTFS needs Developer
+/// Mode or a privilege, and the mount-link tests are meaningless without one.
+/// Detect-and-report (never silently): a false return says exactly why.
+fn symlinks_available(dir: &Path) -> bool {
+    let target = dir.join(".symlink-probe-target");
+    let link = dir.join(".symlink-probe-link");
+    let _ = std::fs::remove_file(&link);
+    match std::fs::write(&target, b"probe") {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("skipped (probe target unwritable: {e})");
+            return false;
+        }
+    }
+    let created = walgit_wal::platform::symlink(&target, &link);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&target);
+    match created {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "skipped: creating symlinks failed ({e}); Windows needs Developer Mode or administrator rights"
+            );
+            false
+        }
+    }
+}
 
 struct WorkRepo {
     dir: tempfile::TempDir,
@@ -934,6 +1018,9 @@ async fn test_zero_oid_means_absent_for_create_and_delete() {
 #[tokio::test]
 async fn test_serve_level_links_base_from_store_mount() {
     let cache = tempfile::tempdir().unwrap();
+    if !symlinks_available(cache.path()) {
+        return;
+    }
     let store = MemoryStore::shared();
     let cfg = make_config(cache.path(), 0);
     let registry = Registry::new(store.clone(), Arc::new(cfg));
@@ -1106,18 +1193,37 @@ async fn test_serve_level_links_base_from_store_mount() {
     .trim()
     .to_string();
     assert!(tree.len() == 40 && blob.len() == 40, "{tree} {blob}");
-    let mut perms = std::fs::metadata(&mounted_pack).unwrap().permissions();
-    let orig = perms.clone();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
-    std::fs::set_permissions(&mounted_pack, perms).unwrap();
-    let tree_ok = git(&["cat-file", "-t", &tree]).status.success();
-    let blob_ok = git(&["cat-file", "-t", &blob]).status.success();
-    std::fs::set_permissions(&mounted_pack, orig).unwrap();
-    assert!(
-        tree_ok,
-        "tree must come from the local history pack, not the mount"
-    );
-    assert!(!blob_ok, "blob lives only in the (now unreadable) base");
+    // "Unreadable base": mode 000 on Unix; on Windows (no per-file mode bits to
+    // strip from here) the mounted pack is renamed out of reach instead — same
+    // observable: the base's objects vanish for the duration of both probes.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&mounted_pack).unwrap().permissions();
+        let orig = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&mounted_pack, perms).unwrap();
+        let tree_ok = git(&["cat-file", "-t", &tree]).status.success();
+        let blob_ok = git(&["cat-file", "-t", &blob]).status.success();
+        std::fs::set_permissions(&mounted_pack, orig).unwrap();
+        assert!(
+            tree_ok,
+            "tree must come from the local history pack, not the mount"
+        );
+        assert!(!blob_ok, "blob lives only in the (now unreadable) base");
+    }
+    #[cfg(windows)]
+    {
+        let hidden = mounted_pack.with_extension("hidden");
+        std::fs::rename(&mounted_pack, &hidden).unwrap();
+        let tree_ok = git(&["cat-file", "-t", &tree]).status.success();
+        let blob_ok = git(&["cat-file", "-t", &blob]).status.success();
+        std::fs::rename(&hidden, &mounted_pack).unwrap();
+        assert!(
+            tree_ok,
+            "tree must come from the local history pack, not the mount"
+        );
+        assert!(!blob_ok, "blob lives only in the (now unreachable) base");
+    }
     assert!(git(&["multi-pack-index", "verify"]).status.success());
 
     // Fetch through B's upload-pack: base objects resolve via the link.
@@ -2059,14 +2165,11 @@ async fn test_publish_at_explicit_monotonic_created_at() {
     // One pack with every commit (HEAD is on `side`; include main's c2 too).
     let pack = work.create_incremental_pack(&c3, "");
     let pack = {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git rev-list --objects {c2} {c3} | git pack-objects --stdout"
-            ))
-            .current_dir(work.path())
-            .output()
-            .unwrap();
+        let out = git_pipe(
+            work.path(),
+            &["rev-list", "--objects", &c2, &c3],
+            &["pack-objects", "--stdout"],
+        );
         let _ = pack;
         out.stdout
     };

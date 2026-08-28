@@ -45,7 +45,12 @@ futures.workspace = true
 bytes.workspace = true
 toml.workspace = true
 reqwest.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+# `ring` is the runtime crypto provider installed in lib.rs (one per process).
+# Note aws-lc-rs stays in the dependency graph through other crates
+# (google-cloud-auth/quinn-proto/jsonwebtoken), so it does NOT disappear from
+# windows-msvc builds — the provider choice here is about which provider this
+# binary installs, not about what compiles.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 axum.workspace = true
 tempfile.workspace = true
 

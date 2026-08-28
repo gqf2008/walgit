@@ -282,7 +282,7 @@ pub(crate) async fn link_and_install_pack(
     idx_r?;
     let link = tmp_dir.join(format!("pack-{checksum}.pack"));
     let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(target, &link)?;
+    crate::platform::symlink(target, &link)?;
     local
         .install_pack(&link, &idx_path, &extra)
         .instrument(span.clone())
@@ -335,7 +335,6 @@ pub(crate) async fn download_object(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<(), WalError> {
     use futures::{StreamExt, TryStreamExt};
-    use std::os::unix::fs::FileExt;
     const CHUNK: u64 = 32 * 1024 * 1024;
     // 16 stripes in flight: one gRPC stream tops out around 10–20 MB/s from
     // a serverless host, the NIC well beyond 100 MB/s (a large repository's 2.1 GB idx took 217 s
@@ -412,9 +411,11 @@ pub(crate) async fn download_object(
                     )));
                 }
                 let n = bytes.len() as u64;
-                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
-                    .await
-                    .map_err(|e| WalError::Corrupt(format!("write task failed: {e}")))??;
+                tokio::task::spawn_blocking(move || {
+                    crate::platform::write_all_at(&file, start, &bytes)
+                })
+                .await
+                .map_err(|e| WalError::Corrupt(format!("write task failed: {e}")))??;
                 report(n);
                 Ok::<(), WalError>(())
             }
@@ -739,19 +740,23 @@ pub(crate) async fn reconcile_packs_inner(
         })
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
-        match handle.rw.try_write() {
-            Ok(_w) => {
-                for (_, oid) in &to_remove {
-                    if local.pack_path(oid).exists() {
-                        local.remove_pack(oid)?;
-                        removed += 1;
-                    }
-                }
+        if let Ok(_w) = handle.rw.try_write() {
+            // One call for the whole superseded set: on Windows the cold
+            // handle swap inside remove_packs releases this process's own
+            // pack-index mmaps once, not once per pack (K swaps would drop
+            // and re-parse every surviving index K times).
+            let existing: Vec<gix_hash::ObjectId> = to_remove
+                .iter()
+                .filter(|(_, oid)| local.pack_path(oid).exists())
+                .map(|(_, oid)| *oid)
+                .collect();
+            if !existing.is_empty() {
+                local.remove_packs(&existing)?;
             }
-            Err(_) => {
-                tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
-                still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
-            }
+            removed = existing.len();
+        } else {
+            tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
+            still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
         }
     }
     span.record("removed", removed);

@@ -21,8 +21,11 @@ target-dir = "target"
 # helper across four crates: no blast radius, ~40 lines of duplication, and every new test that
 # spawns git has to remember. One place won.
 #
-# `force` stays at its default (false), so a value already exported still wins. Unix-only
-# (/dev/null); a Windows host would need NUL.
+# `force` stays at its default (false), so a value already exported still wins.
+# `/dev/null` is POSIX: on Windows git treats a global-config path that cannot
+# be opened as absent, which reads as exactly the same empty config — and this
+# is exercised constantly, since every cargo-spawned git in the suite runs
+# under these very values.
 [env]
 GIT_CONFIG_GLOBAL = "/dev/null"
 GIT_CONFIG_SYSTEM = "/dev/null"

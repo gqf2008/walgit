@@ -177,7 +177,19 @@ impl RemotePacks {
                 let name = e.file_name().to_string_lossy().to_string();
                 if let Some(stem) = name.strip_suffix(".idx") {
                     if !live.contains(stem) {
-                        let _ = tokio::fs::remove_file(e.path()).await;
+                        if let Err(err) = tokio::fs::remove_file(e.path()).await {
+                            // On Windows a delete of a still-mapped index fails
+                            // (ACCESS_DENIED / USER_MAPPED_FILE) while the previous
+                            // RemotePacks or an in-flight request holds it; it is
+                            // pruned on the next refresh once every holder is gone.
+                            // Not an error: the manifest no longer names this pack,
+                            // so it can never serve bytes again.
+                            tracing::debug!(
+                                path = %e.path().display(),
+                                %err,
+                                "stale pack index kept: delete deferred to the next refresh"
+                            );
+                        }
                     }
                 }
             }

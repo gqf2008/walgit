@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! The gix upload-pack engine over a repository whose base pack is *not*
 //! local: history from the commit-graph chain, `have`s from the faulter's
 //! index, object enumeration by tree diff against parents, base objects
@@ -163,9 +173,11 @@ async fn diff_sized_fetch_without_base_pack_data() {
     set_main(&served, &base_tip, &c3);
     served.update_commit_graph(&[inc_cs], false).await.unwrap();
     assert!(!served.commit_graph_chain().unwrap().is_empty());
-    for ext in ["pack", "idx"] {
-        std::fs::remove_file(served.pack_path(&base_cs).with_extension(ext)).unwrap();
-    }
+    // Not a raw unlink: refresh() pre-warmed this process's mappings of the
+    // base index and Windows refuses to delete a mapped file. The library's
+    // own remover releases them first (and drops rev/bitmap beside pack+idx,
+    // which these scenarios want gone too).
+    served.remove_pack(&base_cs).unwrap();
     served.refresh().unwrap();
     let base_tip_oid = gix_hash::ObjectId::from_hex(base_tip.as_bytes()).unwrap();
     assert!(
@@ -374,9 +386,8 @@ async fn missing_base_without_faulter_is_an_error() {
     let inc_cs = ingest(&served, inc_pack).await;
     set_main(&served, &base_tip, &c1);
     served.update_commit_graph(&[inc_cs], false).await.unwrap();
-    for ext in ["pack", "idx"] {
-        std::fs::remove_file(served.pack_path(&base_cs).with_extension(ext)).unwrap();
-    }
+    // See the sibling test: remove via the library, never a raw unlink.
+    served.remove_pack(&base_cs).unwrap();
     served.refresh().unwrap();
     let want = gix_hash::ObjectId::from_hex(c1.as_bytes()).unwrap();
     let have = gix_hash::ObjectId::from_hex(base_tip.as_bytes()).unwrap();

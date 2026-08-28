@@ -1,5 +1,8 @@
 # walgit — a git server that is one binary in front of an object store
 
+[![CI](https://github.com/gqf2008/walgit/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit/actions/workflows/ci.yml)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
+
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
 single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
 clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
@@ -128,6 +131,13 @@ open https://walgit.localhost:8080/
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
+
+**Platforms.** Production targets Linux (containers, Nix). The code also builds and passes the fast test tier
+natively on Windows (`x86_64-pc-windows-msvc`): keep the repository on an **NTFS** volume and enable Developer
+Mode (or run elevated) — creating the store-mount symlinks needs the privilege *and* an NTFS filesystem;
+exFAT drives silently cannot host links. Pass `--config NUL` where docs say `/dev/null`. The developer
+`just dev-store` rig assumes podman on POSIX; on Windows bring your own S3-compatible store and point `[store]`
+at it.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
@@ -174,7 +184,7 @@ crates/
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
   walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo`; `walgit-server` = `walgit serve`
 web/              React SPA (Vite) + sdk/repos.ts, built into the binary; the wire contract is web/API.md
-docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, patches/
+docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, WINDOWS (dev runbook), patches/
 ```
 
 ## Invariants worth memorising

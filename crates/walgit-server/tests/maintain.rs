@@ -1,9 +1,19 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::dbg_macro
+)]
+// Tests may panic freely (the intent recorded in clippy.toml); helpers outside
+// #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! The `maintain` role's pass: checkpoint-if-due (refs-level, on an instance
 //! that cannot hold the packs), bundles-if-due, compaction, all as tasks.
 
 mod harness;
 
-use harness::{Server, git, git_in};
+use harness::{Server, git, git_in, git_pipe};
 
 /// Every await is bounded so a hang names the step instead of stalling CI.
 macro_rules! step {
@@ -1397,15 +1407,12 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
     let hour = std::time::Duration::from_secs(3600);
     // History with explicit times: c1 ten days ago (so a weekly slot with state
     // exists — a full with no state is cut from now), c2 six hours ago, nothing since.
+    // Revs arrive as one shell-flavored string ("<tip> ^<base>"); the pipe
+    // takes argv, so tokenize here like `sh` used to.
     let pack_of = |revs: &str| -> anyhow::Result<Vec<u8>> {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git rev-list --objects {revs} | git pack-objects --stdout"
-            ))
-            .current_dir(src.path())
-            .output()?;
-        Ok(out.stdout)
+        let mut first: Vec<&str> = vec!["rev-list", "--objects"];
+        first.extend(revs.split_whitespace());
+        Ok(git_pipe(src.path(), &first, &["pack-objects", "--stdout"]).stdout)
     };
     let txn = |name: &str, old: &str, new: &str| walgit_proto::v1::RefTransaction {
         updates: vec![walgit_proto::v1::RefUpdate {

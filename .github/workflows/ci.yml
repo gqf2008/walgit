@@ -13,7 +13,12 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Upstream set cancel-in-progress for the PR-update flow; in this fork's
+  # maintenance mode runs are dispatched manually per commit, and cancelling
+  # the in-flight run repeatedly killed the ~40 min windows leg before it
+  # could report (its result is the scarce signal here). Runs may pile up on
+  # this branch; dispatch deliberately.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,6 +61,7 @@ jobs:
       - run: just warnings
       - run: just clippy
       - run: just test
+      - run: just sim
 
   e2e:
     name: e2e
@@ -81,3 +87,58 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
       - run: just e2e
+
+  # Reachability for every cfg(windows) branch (issue #16): this leg compiles all
+  # targets and runs the fast hermetic tier on a real Windows host. Plain cargo +
+  # pnpm, not `just`: the recipes are bash-first and this job exists exactly so
+  # platform seams stop drifting unnoticed. Clippy joins once its gate is green
+  # workspace-wide (it currently trips pre-existing pedantic hits independent of OS).
+  windows:
+    name: windows fast tier
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
+      - shell: pwsh
+        run: rustup show; cargo --version; git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build the SPA and the SDK
+        run: just web-build
+        shell: bash
+      - name: Compile every target (lib/bins/tests)
+        run: cargo check --workspace --all-targets
+      - name: Fast hermetic tier
+        # bash, not the default pwsh: on Windows pwsh keeps going after a failing
+        # native command and the step's exit code is the LAST line's — a broken
+        # first tier would read green. bash stops at the first non-zero.
+        shell: bash
+        run: |
+          set -e
+          cargo test --workspace --lib --bins
+          cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+          cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+      - name: Simulation suite
+        # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
+        # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7
+        # (shared TEST_ABORT_AFTER; AGENTS.md) — rerun, not skip.
+        shell: bash
+        run: cargo test -p walgit-server --test sim
+      - name: Smart-HTTP end-to-end
+        # Real git against the server; the SPA build above is its only
+        # precondition (api_v1 asserts the built assets are served).
+        shell: bash
+        run: cargo test -p walgit-server --test e2e

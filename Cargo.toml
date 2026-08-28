@@ -21,7 +21,8 @@ rust-version = "1.90"
 # against this table (every crate opts in with `[lints] workspace = true`). Test code is
 # exempt from the panic-path restriction lints via clippy.toml (allow-unwrap-in-tests etc.).
 [workspace.lints.rust]
-# The two statvfs call sites must carry an explicit #[allow(unsafe_code)] — new unsafe
+# Every `unsafe` lives at the platform seam (crates/walgit-wal/src/platform.rs) and
+# carries an explicit #[allow(unsafe_code)] plus a // SAFETY: line there — new unsafe
 # should be a reviewed decision, not a habit.
 unsafe_code = "warn"
 
@@ -146,6 +147,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 base64 = "0.22"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 libc = "0.2"
+# Windows branch of the platform layer (crates/walgit-wal/src/platform.rs): the
+# GetDiskFreeSpaceExW probe behind `platform::capacity`, plus the peak-working-set
+# probe the `walgit-git` scale suite uses for its max-RSS bound. Feature set is
+# the minimum win32 facade for those two calls.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 # TLS (in-process termination)

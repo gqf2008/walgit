@@ -416,19 +416,14 @@ mod tests {
             run_git(work.path(), &["add", "."]);
             run_git(work.path(), &["commit", "-q", "-m", &format!("c{i}")]);
             let c = run_git(work.path(), &["rev-parse", "HEAD"]);
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "git rev-list --objects {c} {} | git pack-objects --stdout",
-                    if prev.is_empty() {
-                        String::new()
-                    } else {
-                        format!("^{prev}")
-                    }
-                ))
-                .current_dir(work.path())
-                .output()
-                .unwrap();
+            // `^prev` excludes the previous tip from the rev-list walk; with no
+            // previous tip the list is just the new head.
+            let mut revs: Vec<String> = vec!["rev-list".into(), "--objects".into(), c.clone()];
+            if !prev.is_empty() {
+                revs.push(format!("^{prev}"));
+            }
+            let revs: Vec<&str> = revs.iter().map(String::as_str).collect();
+            let out = crate::testutil::git_pipe(work.path(), &revs, &["pack-objects", "--stdout"]);
             let ingested = handle
                 .local()
                 .ingest_pack(

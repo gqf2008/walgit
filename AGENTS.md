@@ -25,6 +25,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `AGENTS.md` (this) | Everyone. Constraints §1, WAL §2, principles §3, decisions §4, working rules §5. |
 | `README.md` | The introduction: why (the Cursor lineage), what it does, how it works briefly, running it, invariants. |
 | `docs/BUNDLE_URI_DESIGN.md` | Anyone touching bundles, the scheduler, base rebuilds, or big-repo clone/fetch UX. Design of record; normative config in §4. |
+| `docs/WINDOWS.md` | Developing on a Windows host: prerequisites, test surface, `dev-store` equivalent, NTFS symlink coverage. |
 | `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, bundles, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
@@ -389,8 +390,9 @@ decision in §4 — or the PR is; never "fix later".
   nothing in front of it. (1) **TLS in-process** — `[server.tls] mode = off | self_signed | files`; self-signed
   certs are generated once under `<cache.dir>/tls/`, published at `/services/public/ca.pem`, pinned for git by the
   installer. (2) **Everything an upstream might take over is announced by the upstream, per request, in
-  `X-Walgit-Capabilities`** — never assumed. (3) `cache.dir` defaults to `/tmp/walgit`. (4) A missing `--config`
-  file is fatal (exit 2); `--config /dev/null` is the explicit defaults+env form. (5) The credential helper and
+  `X-Walgit-Capabilities`** — never assumed. (3) `cache.dir` defaults to `temp/walgit` (`/tmp` honouring TMPDIR,
+  `%TEMP%` elsewhere). (4) A missing `--config` file is fatal (exit 2); `--config /dev/null` is the explicit
+  defaults+env form (`NUL` plays that role on Windows). (5) The credential helper and
   token file are host-derived (`<host>-credential-helper`, `<host>-token`) so two walgit hosts coexist on one machine.
 - **D41** **Bundles: chained dailies, a clone list and a catch-up list, the chain through the weekly.** Dailies
   are cut on their predecessor (`chain = true`, default), hourlies on the newest daily (2 kept); at the tie between
@@ -434,13 +436,19 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   old readers within the retention window.
 - Web: pnpm + Vite, `pnpm run build` must pass oxlint/tsc. Config: `walgit.example.toml` documents every key;
   change it with the code.
-- Test tiers: `just test` (fast, < 1 min), `just e2e`, `just warnings`, `just clippy` (the
-  `[workspace.lints]` set, `-D warnings`), `just ci` = all four; the **simulation
+- Test tiers: `just test` (fast, < 1 min), `just e2e`, `just sim`, `just warnings`, `just clippy` (the
+  `[workspace.lints]` set, `-D warnings`), `just ci` = all five; the **simulation
   suite** `cargo test -p walgit-server --test sim` (fault links per instance over one truth store: crash,
   partition, stale, lost response, orphan scenarios + randomized seeds `WALGIT_SIM_SEEDS`/`WALGIT_SIM_SEED`);
+  CI runs sim on both ubuntu (build-test) and the windows leg, e2e on ubuntu and the windows leg;
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,
   `WALGIT_TOKEN`). Never `cargo test --workspace --no-fail-fast` in a session; wrap ad-hoc cargo in `timeout`.
 - Known flaky (find the cause, not the assertion): `fetch_from_front_that_serves_the_base_remotely` (~1 in 3
-  under the full e2e suite: base published without `has_commit_graph`) and
-  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`). Both
-  pass alone.
+  under the full e2e suite: base published without `has_commit_graph`),
+  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`) and
+  `reads_after_an_acknowledged_push_never_show_the_previous_tip` (high on ubuntu CI, 2/3 measured 2026-08-28;
+  candidate read-consistency bug, tracked in the fork's issue #4). All pass alone; rerun, not skip.
+- **Known-red until debt lands:** the workspace `clippy -D warnings` gate fails on pre-existing pedantic debt
+  (~1300 hits measured 2026-08-27; none from the windows port — tracked in the fork's issue). PRs must keep
+  their increment at zero; do not "fix" this by weakening the lint table, and do not treat red clippy CI as a
+  regression signal by itself.

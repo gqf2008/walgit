@@ -87,7 +87,10 @@ bulk_clients = 4                  # separate data channels for pack/idx/side-fil
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
 
 [cache]
-dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)
+dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate).
+                                  # DEFAULT (when this key is omitted): <temp-dir>/walgit (`/tmp` honoring TMPDIR,
+                                  # `%TEMP%` on Windows). This file pins an absolute path on purpose — a deployment
+                                  # cache must outlive the machine that created it.
 mode = "auto"                     # "budget" (max_bytes caps disk; too-large repos are served remotely) | "disk" (no budget,
                                   # full materialization, watermark eviction — a host with a real SSD) | "auto" = disk when
                                   # maintenance.disk = "ssd"

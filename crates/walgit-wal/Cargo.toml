@@ -18,7 +18,6 @@ tokio-util.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 metrics.workspace = true
-libc.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
@@ -34,6 +33,13 @@ serde_json.workspace = true
 moka = { workspace = true, features = ["future"] }
 flate2.workspace = true
 chrono.workspace = true
+
+# Per-OS: statvfs behind `platform::capacity` (unix), GetDiskFreeSpaceExW (windows).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
