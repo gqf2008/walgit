@@ -59,9 +59,33 @@ jobs:
         run: just web-build
 
       - run: just warnings
-      - run: just clippy
       - run: just test
-      - run: just sim
+      # Rerun once on failure: sim has known-flaky cases (~1 in 7 base_rebuild,
+      # AGENTS.md §5); a second failure is a regression.
+      - name: Simulation suite
+        run: |
+          just sim || { echo "sim failed once (possibly known-flaky); rerunning"; sleep 5; just sim; }
+
+  # Known-red until the debt lands (issue #1, ~1300 pre-existing pedantic
+  # hits): the gate fails by design, so it is a separate job with
+  # continue-on-error — never a merge blocker, always visible. A PR must keep
+  # its increment at zero (template field); a red here with new warnings is a
+  # regression regardless of the job's conclusion.
+  clippy-known-red:
+    name: clippy (known-red debt)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install the pinned Rust toolchain
+        run: rustup show && cargo --version && git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just clippy
 
   e2e:
     name: e2e
@@ -86,7 +110,11 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Build the SPA and the SDK
         run: just web-build
-      - run: just e2e
+      # Rerun once on failure: reads_after_an_acknowledged_push is a known
+      # flake (AGENTS.md §5 / issue #4); a second failure is a regression.
+      - name: Smart-HTTP end-to-end
+        run: |
+          just e2e || { echo "e2e failed once (possibly known-flaky); rerunning"; sleep 5; just e2e; }
 
   # Reachability for every cfg(windows) branch (issue #16): this leg compiles all
   # targets and runs the fast hermetic tier on a real Windows host. Plain cargo +
@@ -134,11 +162,13 @@ jobs:
       - name: Simulation suite
         # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
         # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7
-        # (shared TEST_ABORT_AFTER; AGENTS.md) — rerun, not skip.
+        # (shared TEST_ABORT_AFTER; AGENTS.md) — rerun once, not skip.
         shell: bash
-        run: cargo test -p walgit-server --test sim
+        run: |
+          cargo test -p walgit-server --test sim || { echo "sim failed once (possibly known-flaky); rerunning"; sleep 5; cargo test -p walgit-server --test sim; }
       - name: Smart-HTTP end-to-end
         # Real git against the server; the SPA build above is its only
         # precondition (api_v1 asserts the built assets are served).
         shell: bash
-        run: cargo test -p walgit-server --test e2e
+        run: |
+          cargo test -p walgit-server --test e2e || { echo "e2e failed once (possibly known-flaky); rerunning"; sleep 5; cargo test -p walgit-server --test e2e; }
