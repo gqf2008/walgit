@@ -115,7 +115,12 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings clippy test e2e
+ci: warnings clippy test e2e sim
+
+# Simulation suite: fault-injected cluster over one truth store
+# (seeds: WALGIT_SIM_SEEDS / WALGIT_SIM_SEED).
+sim:
+    {{t5}} cargo test -p walgit-server --test sim
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:

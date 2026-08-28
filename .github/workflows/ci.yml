@@ -61,6 +61,7 @@ jobs:
       - run: just warnings
       - run: just clippy
       - run: just test
+      - run: just sim
 
   e2e:
     name: e2e
@@ -130,3 +131,14 @@ jobs:
           cargo test --workspace --lib --bins
           cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
           cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+      - name: Simulation suite
+        # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
+        # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7
+        # (shared TEST_ABORT_AFTER; AGENTS.md) — rerun, not skip.
+        shell: bash
+        run: cargo test -p walgit-server --test sim
+      - name: Smart-HTTP end-to-end
+        # Real git against the server; the SPA build above is its only
+        # precondition (api_v1 asserts the built assets are served).
+        shell: bash
+        run: cargo test -p walgit-server --test e2e
