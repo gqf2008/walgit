@@ -1007,6 +1007,12 @@ impl LocalRepo {
     /// the caller-guarantees-no-readers contract failed a moment ago, not forever.
     /// Give such contention one small, bounded window instead of failing the push
     /// that triggered a supersede.
+    ///
+    /// There is also a persistent cause that no wait fixes: git for Windows
+    /// creates `pack-*.idx`/`pack-*.pack` with the READ_ONLY attribute set
+    /// (its "don't touch finished packs" protection), and a supersede delete
+    /// fails with ERROR_ACCESS_DENIED until the attribute is cleared. So the
+    /// final attempt clears the read-only bit once before giving up.
     #[cfg(windows)]
     fn remove_pack_file(p: &std::path::Path) -> Result<(), GitError> {
         let mut attempt: u64 = 0;
@@ -1028,7 +1034,21 @@ impl LocalRepo {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
                 }
-                Err(e) => return Err(GitError::Io(e)),
+                Err(e) => {
+                    // git's READ_ONLY pack attribute: clear it and retry once.
+                    if let Ok(md) = std::fs::metadata(p) {
+                        let mut perm = md.permissions();
+                        if perm.readonly() {
+                            perm.set_readonly(false);
+                            if std::fs::set_permissions(p, perm).is_ok()
+                                && std::fs::remove_file(p).is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Err(GitError::Io(e));
+                }
             }
         }
     }
