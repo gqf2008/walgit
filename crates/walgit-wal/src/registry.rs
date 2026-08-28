@@ -176,9 +176,33 @@ impl Registry {
         }
         let local_dir = id.local_dir(&self.cache_root);
         if local_dir.exists() {
-            tokio::fs::remove_dir_all(&local_dir)
-                .await
-                .map_err(WalError::Io)?;
+            #[cfg(windows)]
+            crate::platform::clear_readonly_recursive(&local_dir);
+            // Windows: git's READ_ONLY pack attribute was cleared above, but a
+            // still-open handle (this process's pack-index mmap, a real-time
+            // scanner) reports SHARING_VIOLATION (32) / ACCESS_DENIED (5) for
+            // a moment — give the teardown the same bounded window the
+            // supersede deletes get, and clear the attribute again in case the
+            // first pass raced a just-written file.
+            let mut attempt: u64 = 0;
+            loop {
+                match tokio::fs::remove_dir_all(&local_dir).await {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e)
+                        if cfg!(windows)
+                            && e.raw_os_error()
+                                .is_some_and(|c| matches!(c, 5 | 32 | 33 | 1224))
+                            && attempt < 3 =>
+                    {
+                        attempt += 1;
+                        #[cfg(windows)]
+                        crate::platform::clear_readonly_recursive(&local_dir);
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                    }
+                    Err(e) => return Err(WalError::Io(e)),
+                }
+            }
         }
         Ok(())
     }

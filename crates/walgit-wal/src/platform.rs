@@ -152,13 +152,38 @@ fn write_all_at_impl(file: &std::fs::File, offset: u64, buf: &[u8]) -> io::Resul
     Ok(())
 }
 
+/// Recursively clear the READ_ONLY attribute under `dir` (best effort).
+/// git for Windows marks finished pack files read-only, and both
+/// `remove_dir_all` and `remove_file` then fail with ERROR_ACCESS_DENIED
+/// (os error 5) — repo teardown must clear the bit first.
+#[cfg(windows)]
+pub(crate) fn clear_readonly_recursive(dir: &std::path::Path) {
+    use std::path::Path;
+    fn walk(p: &Path) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path);
+                } else if let Ok(md) = std::fs::metadata(&path) {
+                    let mut perm = md.permissions();
+                    if perm.readonly() {
+                        perm.set_readonly(false);
+                        let _ = std::fs::set_permissions(&path, perm);
+                    }
+                }
+            }
+        }
+    }
+    walk(dir);
+}
+
 /// Restrict `path` to the current user, the Windows shape of `chmod 0600`
 /// (POSIX mode bits don't exist; without this a file inherits the directory's
 /// ACL, typically readable by every local user — the private TLS key's whole
 /// point is that it is not). Replaces the DACL with exactly one entry: this
 /// process's user, `GENERIC_ALL`, no inheritance. Fails loudly: a key we cannot
 /// lock down is a key we refuse to write.
-///
 /// Built as an SDDL string — `D:P(A;;GA;;;<current-user-sid>)`, a protected
 /// DACL with one allow-all entry: windows-sys 0.61 generates the string
 /// round-trip APIs but not the `TRUSTEEW`/`EXPLICIT_ACCESSW` structs the
