@@ -1,0 +1,24 @@
+name: 任务
+description: 单个任务/改进：目标 / 验收 / 关联。同类同机制 ≥3 条请用批次模板。
+title: "[task] <目标>"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标
+      description: 完成后是什么样；越可机检越好
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 哪条命令红/绿证明完成（"违反时哪条命令会红"）
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: 关联
+      description: 相关 issue / PR / 文档
