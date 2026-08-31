@@ -32,6 +32,16 @@ const BLAME_BUDGET: usize = 3_000;
 /// Budget for a whole-tree archive fault (trees + blobs, deduped).
 const ARCHIVE_OBJECT_BUDGET: usize = 100_000;
 
+/// Test hook (same pattern as the `WALGIT_TEST_*` knobs in walgit-wal):
+/// shrink a budget from the environment so the 503 paths are exercisable in
+/// tests without building a 100 k-object fixture.
+fn test_budget(env: &str, default: usize) -> usize {
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
     pub local: walgit_git::LocalRepo,
@@ -335,6 +345,7 @@ impl Remote {
         let mut fb: VecDeque<ObjectId> = VecDeque::from([b]);
         let mut sa: HashSet<ObjectId> = HashSet::from([a]);
         let mut sb: HashSet<ObjectId> = HashSet::from([b]);
+        let budget = test_budget("WALGIT_TEST_MERGE_BASE_BUDGET", MERGE_BASE_BUDGET);
         let mut popped = 0usize;
         while !fa.is_empty() || !fb.is_empty() {
             // Expand the smaller frontier so the sides meet in the middle.
@@ -347,12 +358,11 @@ impl Remote {
                 continue;
             };
             popped += 1;
-            if popped > MERGE_BASE_BUDGET {
-                self.reporter.notice(format!(
-                    "merge-base: gave up after {MERGE_BASE_BUDGET} commits"
-                ));
+            if popped > budget {
+                self.reporter
+                    .notice(format!("merge-base: gave up after {budget} commits"));
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "merge-base walk exceeded {MERGE_BASE_BUDGET} commits; the histories are too far apart for the remote reader"
+                    "merge-base walk exceeded {budget} commits; the histories are too far apart for the remote reader"
                 )));
             }
             if popped.is_multiple_of(100) {
@@ -554,6 +564,7 @@ impl Remote {
         &self,
         mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)>,
     ) -> Result<(), ApiError> {
+        let budget = test_budget("WALGIT_TEST_DIFF_BUDGET", MAX_DIFF_OBJECTS);
         let mut count = 0usize;
         while !stack.is_empty() {
             let level = std::mem::take(&mut stack);
@@ -565,9 +576,9 @@ impl Remote {
             want.sort_unstable();
             want.dedup();
             count += want.len();
-            if count > MAX_DIFF_OBJECTS {
+            if count > budget {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
+                    "diff touches more than {budget} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&want).await?;
@@ -650,9 +661,9 @@ impl Remote {
             blobs.sort_unstable();
             blobs.dedup();
             count += blobs.len();
-            if count > MAX_DIFF_OBJECTS {
+            if count > budget {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
+                    "diff touches more than {budget} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&blobs).await?;
@@ -691,14 +702,15 @@ impl Remote {
         let start_meta = self.commit(&start).await?;
         heap.push(Item(start_meta.commit_time, seq, start));
         seen.insert(start);
+        let budget = test_budget("WALGIT_TEST_BLAME_BUDGET", BLAME_BUDGET);
         let mut visited = 0usize;
         while let Some(Item(_, _, oid)) = heap.pop() {
             visited += 1;
-            if visited > BLAME_BUDGET {
+            if visited > budget {
                 self.reporter
-                    .notice(format!("blame: gave up after {BLAME_BUDGET} commits"));
+                    .notice(format!("blame: gave up after {budget} commits"));
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "path '{path}' has more than {BLAME_BUDGET} commits of history; too large to blame from the remote pack set"
+                    "path '{path}' has more than {budget} commits of history; too large to blame from the remote pack set"
                 )));
             }
             if visited.is_multiple_of(100) {
@@ -721,10 +733,10 @@ impl Remote {
                 if seen.insert(par) {
                     // Fault the parent's path state now (idempotent with its own
                     // pop) so merge diffs have every parent's tree and blob.
-                    if let Ok((_, ptarget, pmode)) = self.fault_path(&par, path).await {
-                        if pmode.is_blob_or_symlink() {
-                            self.fault(&ptarget).await?;
-                        }
+                    if let Ok((_, ptarget, pmode)) = self.fault_path(&par, path).await
+                        && pmode.is_blob_or_symlink()
+                    {
+                        self.fault(&ptarget).await?;
                     }
                     seq += 1;
                     let pm = self.commit(&par).await?;
@@ -741,7 +753,7 @@ impl Remote {
 
     /// Fault every tree and blob reachable from `commit` into the loose store
     /// so an unmodified `git archive` can run against them — level-parallel,
-    /// deduped, bounded by ARCHIVE_OBJECT_BUDGET objects (503 past it: a tree
+    /// deduped, bounded by `ARCHIVE_OBJECT_BUDGET` objects (503 past it: a tree
     /// this large should be downloaded as a static bundle instead).
     pub async fn fault_tree_all(&self, commit_sha: &str) -> Result<(), ApiError> {
         let start = ObjectId::from_hex(commit_sha.as_bytes())
@@ -751,16 +763,17 @@ impl Remote {
         let mut frontier: Vec<ObjectId> = vec![c.tree];
         let mut seen: HashSet<ObjectId> = HashSet::new();
         seen.insert(c.tree);
+        let budget = test_budget("WALGIT_TEST_ARCHIVE_BUDGET", ARCHIVE_OBJECT_BUDGET);
         let mut count = 0usize;
-        let too_large = |count: usize| {
+        let too_large = || {
             ApiError::ServiceUnavailable(format!(
-                "tree at {commit_sha} has more than {ARCHIVE_OBJECT_BUDGET} objects; too large to archive from the remote pack set — clone via bundle-uri or use a host with the packs"
+                "tree at {commit_sha} has more than {budget} objects; too large to archive from the remote pack set — clone via bundle-uri or use a host with the packs"
             ))
         };
         while !frontier.is_empty() {
             count += frontier.len();
-            if count > ARCHIVE_OBJECT_BUDGET {
-                return Err(too_large(count));
+            if count > budget {
+                return Err(too_large());
             }
             self.fault_many(&frontier).await?;
             let mut next: Vec<ObjectId> = Vec::new();
@@ -777,8 +790,8 @@ impl Remote {
                 }
             }
             count += blobs.len();
-            if count > ARCHIVE_OBJECT_BUDGET {
-                return Err(too_large(count));
+            if count > budget {
+                return Err(too_large());
             }
             self.fault_many(&blobs).await?;
             frontier = next;
