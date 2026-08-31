@@ -34,10 +34,10 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # No toolchain version here on purpose: rust-toolchain.toml pins it (and its components).
-      # `rustup show` installs exactly that, so the pin has one home.
-      - name: Install the pinned Rust toolchain
-        run: rustup show && cargo --version && git --version
+      # No toolchain pin: build with stable (rust-toolchain.toml was removed). Install it
+      # explicitly so the runner does not silently drift with its image default.
+      - name: Install the stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup show && cargo --version && git --version
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -87,8 +87,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install the pinned Rust toolchain
-        run: rustup show && cargo --version && git --version
+      - name: Install the stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup show && cargo --version && git --version
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -102,8 +102,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install the pinned Rust toolchain
-        run: rustup show && cargo --version && git --version
+      - name: Install the stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup show && cargo --version && git --version
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -139,7 +139,7 @@ jobs:
       - name: Install protoc
         run: choco install protoc -y --no-progress
       - shell: pwsh
-        run: rustup show; cargo --version; git --version
+        run: rustup toolchain install stable --profile minimal; rustup default stable; rustup show; cargo --version; git --version
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:

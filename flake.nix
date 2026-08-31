@@ -29,7 +29,7 @@
           overlays = [ (import rust-overlay) ];
         };
         inherit (pkgs) lib;
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
         version = (lib.importTOML ./Cargo.toml).workspace.package.version;
 
@@ -39,7 +39,6 @@
             ./Cargo.toml
             ./Cargo.lock
             ./crates
-            ./rust-toolchain.toml
           ];
         };
 

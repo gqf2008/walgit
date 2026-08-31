@@ -21,5 +21,5 @@ node_modules/
 result
 result-*
 
-# macOS/ExFAT AppleDouble junk (LESSON_ExFAT卷…)
+# macOS/ExFAT AppleDouble junk (see LESSON_ExFAT卷同步文件生成点下划线AppleDouble需gitignore排除)
 ._*
