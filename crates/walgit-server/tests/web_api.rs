@@ -827,3 +827,74 @@ async fn remote_blame_of_renamed_file_is_a_defined_error() -> TestResult {
     assert_eq!(get(&small, "/o/r/api/blame/main/src/app.rs").await?.0, 404);
     Ok(())
 }
+
+/// Regression (PR #9 review C1): the remote merge-base walk must not busy-spin
+/// when one frontier exhausts before the other. Two unrelated roots on a
+/// 1-byte-cache sibling must answer `null`, not hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_merge_base_unrelated_histories_is_null() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "a"])?;
+    git_in(&dir, &["checkout", "-q", "--orphan", "other"])?;
+    std::fs::write(dir.join("b.txt"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "b"])?;
+    git_in(&dir, &["push", "-q", "--mirror", &big.repo_url("o", "r")])?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    let mb = json(&small, "/o/r/api/merge-base?from=main&to=other").await?;
+    assert_eq!(mb["merge_base"], Value::Null, "remote unrelated -> null");
+    Ok(())
+}
+
+/// Regression (PR #9 review C1): a feature forked from DEEP main — the walk
+/// must meet at the branch point even though one side's frontier empties
+/// first, and the remote answer must equal local git's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_merge_base_deep_fork() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "c1"])?;
+    for i in 2..=10 {
+        git_in(
+            &dir,
+            &["commit", "-q", "--allow-empty", "-m", &format!("m{i}")],
+        )?;
+    }
+    // Feature forks from main~2 (deep in main's history) and adds two commits.
+    git_in(&dir, &["checkout", "-q", "-b", "feature", "HEAD~2"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "f1"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "f2"])?;
+    git_in(&dir, &["checkout", "-q", "main"])?;
+    let expected = git_in(&dir, &["merge-base", "main", "feature"])?
+        .trim()
+        .to_string();
+    git_in(&dir, &["push", "-q", "--mirror", &big.repo_url("o", "r")])?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    let mb = json(&small, "/o/r/api/merge-base?from=main&to=feature").await?;
+    assert_eq!(
+        mb["merge_base"], expected,
+        "remote deep fork base matches git"
+    );
+    Ok(())
+}
