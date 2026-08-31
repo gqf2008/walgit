@@ -24,6 +24,7 @@ mod serve;
 #[cfg(test)]
 mod testutil;
 mod wal_cmd;
+mod collab_cmd;
 
 use std::path::PathBuf;
 
@@ -102,6 +103,11 @@ enum Command {
     Wal {
         #[command(subcommand)]
         action: WalAction,
+    },
+    /// D1 collaboration layer: deterministic aggregation over `refs/collab/*`.
+    Collab {
+        #[command(subcommand)]
+        action: collab_cmd::CollabAction,
     },
     /// Generate a deterministic synthetic repository via `git fast-import`.
     Synth {
@@ -510,6 +516,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         Command::Bundle { action } => bundle_cmd::run(action, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
+        Command::Collab { action } => collab_cmd::run(action),
         Command::Mirror {
             from,
             to,

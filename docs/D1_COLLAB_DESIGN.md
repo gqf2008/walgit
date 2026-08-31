@@ -71,6 +71,10 @@
 
 - **收件箱模型**：每人只写自己的 ref → 无跨参与者写冲突；同一收件箱内并发由 walgit 的
   manifest CAS（412 重试）保证。这与 walgit"多写者正确性由 CAS 保证"是同一哲学。
+- **收件箱一致性（聚合器不变量）**：条目 JSON 的 `actor` 必须与其收件箱 ref 路径上的
+  principal 一致，聚合器必须校验（`EntryRef::is_verified`：不一致 = 未验证）。policy 是
+  写入口的闸，聚合器是读侧的闸——两层缺一不可：无 policy 的仓库任何人可写任意收件箱，
+  签名本身只证明"actor 签了它"，不证明"它属于这个收件箱"。
 - **视图不存储**：issue 线程、PR 状态、评审统计都是**确定性纯函数**，输入 =
   (协议版本, 全部收件箱 refs 在某 manifest seq 的快照)。人人算出一致结果 → 不需要中心索引，
   没有中心服务可依赖/可单点故障。
@@ -224,7 +228,11 @@
    先裸 push——SDK `collab.*` 构造+签名条目并产出 `git hash-object` + `git push`
    指令（receive-pack 投递），由 CLI/agent 执行；"薄 API"（服务端把条目对象打进
    pack 并走 WAL publish，供浏览器直写）留待后续，是独立的服务端写路径改动。
-2. Web UI 先行还是 CLI 先行？（建议 CLI + 最小 Web 视图先跑通协议）
+2. Web UI 先行还是 CLI 先行？（建议 CLI + 最小 Web 视图先跑通协议）——**已定（issue #14）**：
+   CLI 先行，`walgit collab ls|thread|pr|entry|principal-register|principal-revoke`
+   已实现（读走本地 git 的 collab refs + 验签聚合；写走构造/签名 + 本地写 ref +
+   `--push` 经 receive-pack），并有真实 walgit 实例的 e2e（`crates/walgit-cli/tests/
+   collab_e2e.rs`：注册 → 建 issue → 链式评论 → approve → 新克隆聚合验签）。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
 5. 原型顺序建议：
