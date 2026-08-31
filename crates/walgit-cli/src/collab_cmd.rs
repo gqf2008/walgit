@@ -374,6 +374,58 @@ pub enum CollabAction {
         #[arg(long)]
         rules: Option<PathBuf>,
     },
+    /// Construct + sign + deliver a collab entry (§4.2). Writes the inbox ref
+    /// locally; `--push <remote>` additionally pushes it to a walgit server.
+    Entry {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote to push the ref to (omit for local-only writes).
+        #[arg(long)]
+        push: Option<String>,
+        #[arg(long)]
+        kind: String,
+        /// Thread id (shared by every entry of the thread).
+        #[arg(long)]
+        id: String,
+        /// Principal whose inbox receives the entry (refname-safe).
+        #[arg(long)]
+        actor: String,
+        /// Previous entry's oid in the thread, or empty for the root.
+        #[arg(long, default_value = "")]
+        parent: String,
+        /// Entry body as JSON.
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        head: Option<String>,
+        /// Ed25519 signing key: 32 raw bytes as hex.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// First-use registration of a principal's public key at
+    /// `refs/collab/meta/principals/<principal>` (D1 §5).
+    PrincipalRegister {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        principal: String,
+        /// The signing key seed; the public key is derived from it.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        push: Option<String>,
+    },
+    /// Revoke a principal's key: delete the registry ref (tombstone).
+    PrincipalRevoke {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        push: Option<String>,
+    },
 }
 
 pub fn run(action: CollabAction) -> Result<()> {
@@ -410,6 +462,29 @@ pub fn run(action: CollabAction) -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
+        CollabAction::Entry {
+            repo,
+            push,
+            kind,
+            id,
+            actor,
+            parent,
+            body,
+            base,
+            head,
+            key,
+        } => run_entry(&repo, push.as_deref(), &kind, &id, &actor, &parent, &body, base.as_deref(), head.as_deref(), &key)?,
+        CollabAction::PrincipalRegister {
+            repo,
+            principal,
+            key,
+            push,
+        } => run_principal_register(&repo, &principal, &key, push.as_deref())?,
+        CollabAction::PrincipalRevoke {
+            repo,
+            principal,
+            push,
+        } => run_principal_revoke(&repo, &principal, push.as_deref())?,
         CollabAction::Pr { id, repo, rules } => {
             let reader = CollabReader::new(&repo);
             let (entries, principals) = reader.load()?;
@@ -429,6 +504,186 @@ pub fn run(action: CollabAction) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn ref_segment(label: &str, s: &str) -> Result<()> {
+    let ok = !s.is_empty()
+        && s.len() <= 255
+        && s != "."
+        && s != ".."
+        && !s.ends_with(".lock")
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+        && s.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        bail!("collab.{label}: {s:?} is not a refname-safe segment ([A-Za-z0-9._@-]+)")
+    }
+}
+
+fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read key {}", path.display()))?;
+    let bytes = hex::decode(raw.trim())
+        .with_context(|| format!("key {} must be 32 raw bytes as hex", path.display()))?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("key {} must be 32 bytes", path.display()))?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn entry_uuid() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let mut b = [0u8; 16];
+    rng.fill(&mut b);
+    hex::encode(b)
+}
+
+/// Write a blob via `git hash-object -w --stdin`; returns the oid.
+fn git_write_blob(repo: &PathBuf, content: &str) -> Result<String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn git hash-object")?;
+    child
+        .stdin
+        .take()
+        .context("git hash-object stdin")?
+        .write_all(content.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_update_ref(repo: &PathBuf, name: &str, oid: Option<&str>) -> Result<()> {
+    let args: Vec<&str> = if let Some(oid) = oid {
+        vec!["update-ref", name, oid]
+    } else {
+        vec!["update-ref", "-d", name]
+    };
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(&args)
+        .output()
+        .context("git update-ref")?;
+    if !out.status.success() {
+        bail!(
+            "git update-ref {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn git_push(repo: &PathBuf, remote: &str, name: &str) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["push", remote, name])
+        .output()
+        .context("git push")?;
+    if !out.status.success() {
+        bail!(
+            "git push {remote} {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn run_entry(
+    repo: &PathBuf,
+    push: Option<&str>,
+    kind: &str,
+    id: &str,
+    actor: &str,
+    parent: &str,
+    body: &str,
+    base: Option<&str>,
+    head: Option<&str>,
+    key_path: &PathBuf,
+) -> Result<()> {
+    ref_segment("entry.actor", actor)?;
+    let body: serde_json::Value = serde_json::from_str(body)
+        .with_context(|| format!("--body must be JSON: {body}"))?;
+    let mut entry = Entry {
+        version: 1,
+        kind: kind.to_string(),
+        id: id.to_string(),
+        actor: actor.to_string(),
+        ts: chrono::Utc::now().timestamp(),
+        parent: parent.to_string(),
+        refs: match (base, head) {
+            (None, None) => None,
+            (b, h) => Some(EntryRefs {
+                base: b.map(str::to_string),
+                head: h.map(str::to_string),
+            }),
+        },
+        body,
+        sig: String::new(),
+    };
+    let key = read_signing_key(key_path)?;
+    entry.sig = sign_entry(&mut entry, &key);
+    let content = serde_json::to_string_pretty(&entry)?;
+    let oid = git_write_blob(repo, &content)?;
+    let ref_name = format!("refs/collab/inbox/{actor}/{}", entry_uuid());
+    git_update_ref(repo, &ref_name, Some(&oid))?;
+    if let Some(remote) = push {
+        git_push(repo, remote, &ref_name)?;
+    }
+    println!("{ref_name} {oid}");
+    Ok(())
+}
+
+fn run_principal_register(
+    repo: &PathBuf,
+    principal: &str,
+    key_path: &PathBuf,
+    push: Option<&str>,
+) -> Result<()> {
+    ref_segment("principal", principal)?;
+    let key = read_signing_key(key_path)?;
+    let public_key = base64::engine::general_purpose::STANDARD
+        .encode(key.verifying_key().to_bytes());
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "principal": principal,
+        "public_key": public_key,
+        "registered_at": chrono::Utc::now().timestamp(),
+    }))?;
+    let oid = git_write_blob(repo, &content)?;
+    let ref_name = format!("refs/collab/meta/principals/{principal}");
+    git_update_ref(repo, &ref_name, Some(&oid))?;
+    if let Some(remote) = push {
+        git_push(repo, remote, &ref_name)?;
+    }
+    println!("{ref_name} {oid}");
+    Ok(())
+}
+
+fn run_principal_revoke(repo: &PathBuf, principal: &str, push: Option<&str>) -> Result<()> {
+    ref_segment("principal", principal)?;
+    let ref_name = format!("refs/collab/meta/principals/{principal}");
+    git_update_ref(repo, &ref_name, None)?;
+    if let Some(remote) = push {
+        git_push(repo, remote, &ref_name)?;
+    }
+    println!("{ref_name} revoked");
     Ok(())
 }
 
