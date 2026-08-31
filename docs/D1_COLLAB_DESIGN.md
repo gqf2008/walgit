@@ -121,8 +121,10 @@
 - **token = 认证**：walgit 的静态 token / `wgt_` / OIDC，认证 git smart HTTP、API、协作写。
 - **principal = 身份**：token 解析为 principal（人 `alice@…` 或 agent `svc:reviewer-1`）。
 - **公钥 = 验签**：Ed25519 密钥对与 principal 绑定，注册进 `refs/collab/meta/principals`。
-  **建议**：token 签发时一并生成/注册密钥对（扩展 `wgt_` 签发流程为"principal 注册"一步），
-  这样"一个 token"同时覆盖认证与去中心化验签。
+  **落地（issue #10）**：首次使用自注册——`collab.principal({principal, publicKey})`
+  构造注册条目，经 receive-pack push 到 `refs/collab/meta/principals/<principal>`；
+  吊销 = 删该 ref（tombstone，`collab.revokePrincipal`）。"签发时自动注册"
+  （扩展 `wgt_` 签发流程为"principal 注册"一步）留待服务端薄 API（§11）。
 - **读可以直连桶（可选强化）**：bundle 走 presigned URL、静态对象走 S3 读——有凭据即可；
   **写永远走 walgit receive-pack**（manifest CAS 是唯一提交点，原则 II），
   所以"一个 S3 token"不意味着绕过 walgit 写。
@@ -184,6 +186,17 @@
 > `GET /{o}/{r}/api/archive/{rev}?format=tar.gz|zip` 已落地（二进制下载；
 > remote 预算化整树 fault，超限 503 指向 bundle-uri）。
 > 缺口 1、2 至此全部落地；第 8-10 项（契约文档、测试覆盖、本节进度）随批次收口。
+>
+> 缺口 3-5 由 [issue #10](https://github.com/gqf2008/walgit/issues/10) 批次落地：
+> 缺口 4（events 桥任意 ref）golden 测试已落地（`tests/events.rs`：
+> `refs/collab/*` 的 create/delete 事件与 heads 同一套 cursor/去重/回放契约）；
+> 缺口 5（SDK）`repos.js` 已加 collab lane：`refsAll`/`refsCollab`/`refByName`、
+> `mergeBase`/`diff`/`blame`/`archive`，以及 `collab.entry`/`collab.principal`/
+> `collab.revokePrincipal`（构造+签名条目并产出 git push 指令，经 receive-pack
+> 投递——SDK 跑不了 git，由 CLI/agent 执行）；
+> 缺口 3（token↔公钥）落地为**首次使用自注册**：用 `collab.principal()` 把公钥
+> push 到 `refs/collab/meta/principals/<principal>`，吊销 = 删该 ref（tombstone）。
+> "签发时自动注册"（auth.rs 挂接）留待薄 API（见 §11）。
 
 ## 10. 一致性、并发与安全
 
@@ -195,7 +208,10 @@
 
 ## 11. 开放问题 / 下一步
 
-1. 协作写走"裸 `git push` 收件箱"还是"薄 API 包装 push"？（倾向先裸 push，零新服务；API 包装后加）
+1. 协作写走"裸 `git push` 收件箱"还是"薄 API 包装 push"？**已定（issue #10）**：
+   先裸 push——SDK `collab.*` 构造+签名条目并产出 `git hash-object` + `git push`
+   指令（receive-pack 投递），由 CLI/agent 执行；"薄 API"（服务端把条目对象打进
+   pack 并走 WAL publish，供浏览器直写）留待后续，是独立的服务端写路径改动。
 2. Web UI 先行还是 CLI 先行？（建议 CLI + 最小 Web 视图先跑通协议）
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。

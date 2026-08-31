@@ -53,6 +53,60 @@ export interface RefListQuery {
   /** Page size (server default 100, max 1000). */
   n?: number;
 }
+// ---- D1 collaboration lane (docs/D1_COLLAB_DESIGN.md) ------------------------
+/** Full-name ref pages: `refs/all` (every ref) and `refs/collab/*` (inbox/meta). */
+export interface MergeBaseResult {
+  from: string;
+  to: string;
+  /** The merge base commit, or null when the histories are unrelated. */
+  merge_base: string | null;
+}
+export type DiffFormat = "patch" | "stat" | "name-status";
+export interface DiffQuery {
+  from: string;
+  to: string;
+  format?: DiffFormat;
+}
+export interface DiffNameStatus {
+  status: string;
+  path: string;
+  old_path?: string;
+}
+export interface DiffStat {
+  path: string;
+  additions: number;
+  deletions: number;
+}
+export interface DiffResult {
+  from: string;
+  to: string;
+  format: DiffFormat;
+  patch?: string;
+  stats?: DiffStat[];
+  changes?: DiffNameStatus[];
+}
+export interface BlameLine {
+  line: number;
+  commit: string;
+  author: string;
+  author_email: string;
+  time: number;
+  summary: string;
+  text: string;
+}
+export interface BlameResult {
+  sha: string;
+  path: string;
+  blame: BlameLine[];
+}
+/** A constructed collab write: the ref, the content, and the shell commands
+    (run by a CLI/agent) that deliver it through receive-pack. */
+export interface CollabPush {
+  ref: string;
+  /** Entry JSON to write, or null for a deletion (tombstone). */
+  content: string | null;
+  commands: string[];
+}
 export interface Resolved {
   ref: string;
   sha: string;
@@ -289,6 +343,27 @@ function scriptOrigin(): string | undefined {
 export const DEFAULT_BASE = typeof location !== "undefined" ? location.origin : "http://127.0.0.1:8080";
 
 /** One walgit host. */
+/** Deterministic key-sorted JSON (D1 §4.2: the signed canonical form). */
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .toSorted()
+      .map((k) => `${JSON.stringify(k)}:${canonicalize(o[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function pushFor(ref: string, content: string | null): CollabPush {
+  if (content === null) {
+    return { ref, content: null, commands: [`git push origin :${ref}`] };
+  }
+  const cmd = `sha=$(git hash-object -w --stdin <<'WALGIT_ENTRY'\n${content}\nWALGIT_ENTRY\n)\ngit push origin "$sha:${ref}"`;
+  return { ref, content, commands: [cmd] };
+}
+
 export class ReposClient {
   readonly base: string;
   private opts: ClientOptions;
@@ -620,8 +695,96 @@ export class RepoClient {
   tags(q: RefListQuery = {}, opts?: CallOptions) {
     return this.client.json<RefPage>(`${this.p}/refs/tags${qs(q)}`, opts, JSON_ONLY);
   }
+  /** Every ref as full names (`refs/…`), byte-sorted, paged (D1). */
+  refsAll(q: RefListQuery = {}, opts?: CallOptions) {
+    return this.client.json<RefPage>(`${this.p}/refs/all${qs(q)}`, opts, JSON_ONLY);
+  }
+  /** The `refs/collab/*` namespace (inbox/meta refs), full names, paged (D1). */
+  refsCollab(q: RefListQuery = {}, opts?: CallOptions) {
+    return this.client.json<RefPage>(`${this.p}/refs/collab${qs(q)}`, opts, JSON_ONLY);
+  }
+  /** Exact full-ref lookup (a collab inbox tip, a notes ref, …); 404 → ReposError. */
+  refByName(name: string, opts?: CallOptions) {
+    return this.client.json<RefInfo>(`${this.p}/refs/name/${enc(name)}`, opts);
+  }
+  /** Merge base of two revisions — the 3-dot diff base (D1 review primitive). */
+  mergeBase(from: string, to: string, opts?: CallOptions) {
+    return this.client.json<MergeBaseResult>(`${this.p}/merge-base?from=${enc(from)}&to=${enc(to)}`, opts);
+  }
+  /** Tree diff between two revisions (D1 review primitive). */
+  diff(q: DiffQuery, opts?: CallOptions) {
+    return this.client.json<DiffResult>(
+      `${this.p}/diff?from=${enc(q.from)}&to=${enc(q.to)}${q.format ? `&format=${q.format}` : ""}`,
+      opts,
+    );
+  }
+  /** Line attribution for one file (D1 review primitive). */
+  blame(rev: string, path: string, opts?: CallOptions) {
+    return this.client.json<BlameResult>(`${this.p}/blame/${enc(rev)}/${enc(path)}`, opts);
+  }
+  /** Download a tree archive as bytes (D1 review primitive). */
+  async archive(rev: string, format: "tar.gz" | "zip" = "tar.gz", opts?: CallOptions): Promise<ArrayBuffer> {
+    const url = this.client.url(`${this.p}/archive/${enc(rev)}${format === "zip" ? "?format=zip" : ""}`);
+    const r = await this.client.fetch(url, {
+      headers: { Accept: "application/gzip, application/zip", ...opts?.headers },
+      signal: opts?.signal,
+    });
+    if (!r.ok) throw new ReposError(r.status, (await r.text()).trim() || r.statusText, url);
+    return r.arrayBuffer();
+  }
+
+  /** D1 collaboration lane: build signed entries and the git push commands that
+      deliver them through receive-pack. The SDK cannot run git; a CLI or agent
+      executes `commands` (docs/D1_COLLAB_DESIGN.md §4/§7). */
+  readonly collab = {
+    /**
+     * Build a signed entry for `refs/collab/inbox/<principal>/<uuid>`.
+     * `sign(canonical)` must return the Ed25519 signature over the canonical
+     * JSON (WebCrypto: `crypto.subtle.sign("Ed25519", key, TextEncoder().encode(canonical))`,
+     * then base64).
+     */
+    entry: async (input: {
+      principal: string;
+      kind: "issue" | "comment" | "patch" | "review" | "status" | "merge_result" | "agent_action";
+      id: string;
+      actor: string;
+      parent: string;
+      refs?: { base?: string; head?: string };
+      body: Record<string, unknown>;
+      sign: (canonical: string) => Promise<string>;
+    }): Promise<CollabPush> => {
+      const entry: Record<string, unknown> = {
+        version: 1,
+        kind: input.kind,
+        id: input.id,
+        actor: input.actor,
+        ts: Math.floor(Date.now() / 1000),
+        parent: input.parent,
+      };
+      if (input.refs) entry.refs = input.refs;
+      entry.body = input.body;
+      const canonical = canonicalize(entry);
+      const sig = await input.sign(canonical);
+      const content = JSON.stringify({ ...entry, sig }, null, 2);
+      return pushFor(`refs/collab/inbox/${input.principal}/${input.id}`, content);
+    },
+    /** First-use registration of a principal's Ed25519 public key at
+        `refs/collab/meta/principals/<principal>` (D1 §5: the token binds the
+        principal; this ref binds the key). Content is stored as-is. */
+    principal: (input: { principal: string; publicKey: string }): CollabPush => {
+      const content = JSON.stringify(
+        { version: 1, principal: input.principal, public_key: input.publicKey, registered_at: Math.floor(Date.now() / 1000) },
+        null,
+        2,
+      );
+      return pushFor(`refs/collab/meta/principals/${input.principal}`, content);
+    },
+    /** Revoke a principal's key: delete the registry ref (tombstone, D1 §10). */
+    revokePrincipal: (principal: string): CollabPush => pushFor(`refs/collab/meta/principals/${principal}`, null),
+  };
+
   /** Streaming ref page: `onRef` per match as the server finds it; resolves `{more}`. */
-  async refStream(kind: "branches" | "tags", q: RefListQuery, onRef: (r: RefInfo) => void, opts?: CallOptions): Promise<{ more: boolean }> {
+  async refStream(kind: "branches" | "tags" | "all" | "collab", q: RefListQuery, onRef: (r: RefInfo) => void, opts?: CallOptions): Promise<{ more: boolean }> {
     let more = false;
     await this.client.sse(
       `${this.p}/refs/${kind}${qs(q)}`,

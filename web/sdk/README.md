@@ -52,7 +52,16 @@ r.delete()                                   → admin permission
 r.refs()                                     → { head: {name, sha} | null }
 r.branches({ prefix, q, after, n })          → { refs: [{name, sha}], more }      (one page; tags likewise)
 r.tags({ … })
-r.refStream("branches", q, onRef)            → streams matches as found; resolves { more }
+r.refStream("branches"|"tags"|"all"|"collab", q, onRef) → streams matches as found; resolves { more }
+r.refsAll({ prefix, q, after, n })           → every ref as full names (one page; D1)
+r.refsCollab({ … })                          → the refs/collab/* namespace (full names; D1)
+r.refByName("refs/collab/inbox/alice/1")     → { name, sha }                        (exact lookup; D1)
+r.mergeBase(from, to)                        → { from, to, merge_base | null }      (D1 review primitive)
+r.diff({ from, to, format })                 → { from, to, format, patch|stats|changes } (D1)
+r.blame(rev, path)                           → { sha, path, blame: [{line, commit, author, …}] } (D1)
+r.archive(rev, "tar.gz"|"zip")               → ArrayBuffer                          (D1)
+r.collab.entry({…}) / .principal({…}) / .revokePrincipal(p)
+                                             → { ref, content, commands }  (signed entry + git push via receive-pack; SDK cannot run git — CLI/agent executes `commands`)
 r.resolve("feature/x/src/main.go")           → { ref, sha, path, kind }           (server splits ref/path, API.md §3)
 r.tree(rev, path?)                           → { ref, sha, path, entries, commit?, readme? }
 r.blob(rev, path)                            → { …, contents | binary | too_large }
