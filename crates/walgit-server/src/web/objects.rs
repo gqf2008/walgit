@@ -26,7 +26,9 @@ const NEWEST_BUDGET: usize = 3_000;
 /// Budget for a history page walk (skip + n commits, plus skipped TREESAME ones).
 const WALK_BUDGET: usize = 50_000;
 /// Budget for a merge-base bidirectional walk (one commit popped per side).
-const MERGE_BASE_BUDGET: usize = WALK_BUDGET;
+/// Each pop is a serial range read on the remote reader; 50k could stall a
+/// request for minutes, so deep/unrelated histories fail fast instead.
+const MERGE_BASE_BUDGET: usize = 5_000;
 /// Budget for a blame history walk (commits visited before git blame runs).
 const BLAME_BUDGET: usize = 3_000;
 /// Budget for a whole-tree archive fault (trees + blobs, deduped).
@@ -348,8 +350,18 @@ impl Remote {
         let budget = test_budget("WALGIT_TEST_MERGE_BASE_BUDGET", MERGE_BASE_BUDGET);
         let mut popped = 0usize;
         while !fa.is_empty() || !fb.is_empty() {
-            // Expand the smaller frontier so the sides meet in the middle.
-            let (front, seen_self, seen_other) = if fa.len() <= fb.len() {
+            // Expand the smaller frontier so the sides meet in the middle; a
+            // side whose frontier is exhausted must not be re-picked (otherwise
+            // `0 <= n` selects the empty side forever and the loop busy-spins
+            // on the async runtime without consuming budget).
+            let pick_a = if fa.is_empty() {
+                false
+            } else if fb.is_empty() {
+                true
+            } else {
+                fa.len() <= fb.len()
+            };
+            let (front, seen_self, seen_other) = if pick_a {
                 (&mut fa, &mut sa, &sb)
             } else {
                 (&mut fb, &mut sb, &sa)
@@ -733,10 +745,17 @@ impl Remote {
                 if seen.insert(par) {
                     // Fault the parent's path state now (idempotent with its own
                     // pop) so merge diffs have every parent's tree and blob.
-                    if let Ok((_, ptarget, pmode)) = self.fault_path(&par, path).await
-                        && pmode.is_blob_or_symlink()
-                    {
-                        self.fault(&ptarget).await?;
+                    match self.fault_path(&par, path).await {
+                        Ok((_, ptarget, pmode)) => {
+                            if pmode.is_blob_or_symlink() {
+                                self.fault(&ptarget).await?;
+                            }
+                        }
+                        // Path absent in this parent: a boundary, not an error.
+                        Err(ApiError::NotFound(_)) => {}
+                        // Real failures must surface, or the later `git blame`
+                        // fails with an unreproducible local error.
+                        Err(e) => return Err(e),
                     }
                     seq += 1;
                     let pm = self.commit(&par).await?;
