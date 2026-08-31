@@ -238,6 +238,7 @@
    拉取 `refs/collab/*`，状态文件（`<gitdir>/collab-watch.json`）对比增量，每条
    新条目通过 `--exec` 回调（stdin 传条目 JSON，env 给 kind/thread/actor/verified）；
    agent 的“大脑”是外部命令，walgit 只做 notify+sync。
+    ④ dashboard（issue #19）：`walgit collab report --format text|markdown|html` 已实现——只读观测渲染端（无状态、无写权限），全局聚合线程/PR/验签健康/agent 活动，html 为自包含单文件。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
 5. 原型顺序建议：

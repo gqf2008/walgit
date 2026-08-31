@@ -155,6 +155,18 @@ async fn cli_full_collab_flow_against_a_real_server() -> TestResult {
     let pv: serde_json::Value = serde_json::from_str(&pr_out)?;
     assert_eq!(pv["pr"]["human_approvals"][0]["actor"], "alice");
     assert_eq!(pv["merge"]["allowed"], serde_json::Value::Bool(true));
+
+    // Read-only observability dashboard over the same refs.
+    let text = run(&["collab", "report", "--repo", repo_b])?;
+    assert!(text.contains("collab report"), "{text}");
+    assert!(text.contains("pr1"), "{text}");
+    assert!(text.contains("verified"), "{text}");
+    let md = run(&["collab", "report", "--repo", repo_b, "--format", "markdown"])?;
+    assert!(md.contains("## PRs"), "{md}");
+    let html = run(&["collab", "report", "--repo", repo_b, "--format", "html"])?;
+    assert!(html.contains("<!doctype html>"), "{html}");
+    assert!(html.contains("</html>"), "{html}");
+    assert!(html.contains("pr1"), "{html}");
     Ok(())
 }
 

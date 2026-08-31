@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use std::fmt::Write as _;
+use std::io::Write as _;
 
 // ---- §4.2 entry schema -------------------------------------------------------
 
@@ -439,6 +441,18 @@ pub enum CollabAction {
         #[arg(long)]
         push: Option<String>,
     },
+    /// Read-only observability dashboard (D1 §8): aggregate all collab state
+    /// into a summary — threads, PR status, verification health, activity.
+    Report {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Output format: text (default), markdown, html.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Merge-rules JSON file (same shape as `pr --rules`).
+        #[arg(long)]
+        rules: Option<PathBuf>,
+    },
     /// Resident watcher: fetch `refs/collab/*` from a remote, report new or
     /// changed refs, and invoke `--exec` for each with the entry JSON on
     /// stdin (the agent's decision logic; walgit only does notify+sync).
@@ -529,6 +543,7 @@ pub fn run(action: CollabAction) -> Result<()> {
             principal,
             push,
         } => run_principal_revoke(&repo, &principal, push.as_deref())?,
+        CollabAction::Report { repo, format, rules } => run_report(&repo, &format, rules.as_deref())?,
         CollabAction::Watch {
             repo,
             remote,
@@ -595,7 +610,6 @@ fn entry_uuid() -> String {
 
 /// Write a blob via `git hash-object -w --stdin`; returns the oid.
 fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
-    use std::io::Write;
     let mut child = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -741,6 +755,238 @@ fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Res
     Ok(())
 }
 
+// ---- report: read-only observability dashboard (D1 §8) -------------------------
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ReportThread {
+    pub id: String,
+    pub entries: usize,
+    pub verified: usize,
+    pub last_ts: i64,
+    pub kinds: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ReportPr {
+    pub id: String,
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub status: String,
+    pub approvals: usize,
+    pub merge_allowed: bool,
+    pub merge_reason: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct Report {
+    pub threads: Vec<ReportThread>,
+    pub prs: Vec<ReportPr>,
+    pub total_entries: usize,
+    pub verified_entries: usize,
+    pub unverified_entries: usize,
+    pub missing_principals: usize,
+    pub by_actor: Vec<(String, usize)>,
+    pub by_kind: Vec<(String, usize)>,
+}
+
+pub fn build_report(
+    entries: &[&EntryRef],
+    principals: &std::collections::HashMap<String, String>,
+    rules: &MergeRules,
+) -> Report {
+    let mut by_thread: std::collections::BTreeMap<&str, Vec<&EntryRef>> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        by_thread.entry(e.entry.id.as_str()).or_default().push(e);
+    }
+    let mut report = Report::default();
+    for (id, group) in &by_thread {
+        let ordered = thread(group);
+        let verified = ordered
+            .iter()
+            .filter(|r| r.is_verified(principals))
+            .count();
+        let mut kinds: Vec<String> = group
+            .iter()
+            .map(|r| r.entry.kind.clone())
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        report.threads.push(ReportThread {
+            id: (*id).to_string(),
+            entries: group.len(),
+            verified,
+            last_ts: group.iter().map(|r| r.entry.ts).max().unwrap_or(0),
+            kinds,
+        });
+    }
+    for (id, group) in &by_thread {
+        if group.iter().any(|r| r.entry.kind == "patch") {
+            let pr = pr_view(group, principals);
+            let eval = merge_rule_eval(rules, &pr);
+            report.prs.push(ReportPr {
+                id: (*id).to_string(),
+                base: pr.base.clone(),
+                head: pr.head.clone(),
+                status: pr.status.clone(),
+                approvals: pr.human_approvals.len(),
+                merge_allowed: eval.allowed,
+                merge_reason: eval.reason.clone(),
+            });
+        }
+    }
+    report.total_entries = entries.len();
+    for r in entries {
+        let verified = r.is_verified(principals);
+        if verified {
+            report.verified_entries += 1;
+        } else {
+            report.unverified_entries += 1;
+            if !principals.contains_key(&r.entry.actor) {
+                report.missing_principals += 1;
+            }
+        }
+    }
+    let mut by_actor: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for r in entries {
+        *by_actor.entry(&r.entry.actor).or_default() += 1;
+        *by_kind.entry(&r.entry.kind).or_default() += 1;
+    }
+    report.by_actor = by_actor.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    report.by_kind = by_kind.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    report
+}
+
+fn render_report_text(r: &Report) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "collab report: {} threads, {} PRs, {}/{} entries verified\n",
+        r.threads.len(),
+        r.prs.len(),
+        r.verified_entries,
+        r.total_entries
+    );
+    let _ = writeln!(out, "threads");
+    for t in &r.threads {
+        let _ = writeln!(
+            out,
+            "  {}: {} entries ({} verified), kinds {}, last {}",
+            t.id,
+            t.entries,
+            t.verified,
+            t.kinds.join("/"),
+            t.last_ts
+        );
+    }
+    let _ = writeln!(out, "\nprs");
+    for p in &r.prs {
+        let _ = writeln!(
+            out,
+            "  {} [{}] approvals={} merge_allowed={} ({})",
+            p.id, p.status, p.approvals, p.merge_allowed, p.merge_reason
+        );
+    }
+    let _ = writeln!(out, "\nactivity");
+    for (a, n) in &r.by_actor {
+        let _ = writeln!(out, "  {a}: {n}");
+    }
+    out
+}
+
+fn render_report_markdown(r: &Report) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# collab report\n\n{} threads, {} PRs, **{}/{}** entries verified.\n",
+        r.threads.len(),
+        r.prs.len(),
+        r.verified_entries,
+        r.total_entries
+    );
+    let _ = writeln!(out, "## threads\n\n| id | entries | verified | kinds | last |\n|---|---|---|---|---|");
+    for t in &r.threads {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            t.id, t.entries, t.verified, t.kinds.join("/"), t.last_ts
+        );
+    }
+    let _ = writeln!(out, "\n## PRs\n\n| id | status | approvals | merge |\n|---|---|---|---|");
+    for p in &r.prs {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            p.id, p.status, p.approvals, p.merge_allowed
+        );
+    }
+    out
+}
+
+fn render_report_html(r: &Report) -> String {
+    let mut rows = String::new();
+    for t in &r.threads {
+        let _ = writeln!(
+            rows,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            esc(&t.id),
+            t.entries,
+            t.verified,
+            esc(&t.kinds.join("/")),
+            t.last_ts
+        );
+    }
+    let mut prs = String::new();
+    for p in &r.prs {
+        let _ = writeln!(
+            prs,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            esc(&p.id),
+            esc(&p.status),
+            p.approvals,
+            p.merge_allowed
+        );
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=utf-8><title>walgit collab</title>\
+<style>body{{font-family:system-ui;margin:2rem;color:#111}}table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:.3rem .6rem;text-align:left}}</style>\
+</head><body><h1>collab report</h1>\
+<p>{} threads, {} PRs, {}/{} entries verified</p>\
+<h2>threads</h2><table><tr><th>id</th><th>entries</th><th>verified</th><th>kinds</th><th>last</th></tr>{}</table>\
+<h2>PRs</h2><table><tr><th>id</th><th>status</th><th>approvals</th><th>merge</th></tr>{}</table>\
+</body></html>",
+        r.threads.len(),
+        r.prs.len(),
+        r.verified_entries,
+        r.total_entries,
+        rows,
+        prs
+    )
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()> {
+    let reader = CollabReader::new(repo);
+    let (entries, principals) = reader.load()?;
+    let refs: Vec<&EntryRef> = entries.iter().collect();
+    let rules: MergeRules = match rules_path {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+        None => MergeRules::default(),
+    };
+    let report = build_report(&refs, &principals, &rules);
+    match format {
+        "text" => print!("{}", render_report_text(&report)),
+        "markdown" => print!("{}", render_report_markdown(&report)),
+        "html" => print!("{}", render_report_html(&report)),
+        other => bail!("unknown report format {other} (text|markdown|html)"),
+    }
+    Ok(())
+}
+
 // ---- watch: resident change detection + callback ------------------------------
 
 /// Refs that are new or whose oid changed between two snapshots.
@@ -775,9 +1021,8 @@ fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn read_state(path: &Path) -> Result<std::collections::HashMap<String, String>> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(_) => return Ok(std::collections::HashMap::new()),
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(std::collections::HashMap::new());
     };
     let v: serde_json::Value = serde_json::from_str(&raw)?;
     let mut map = std::collections::HashMap::new();
@@ -902,7 +1147,6 @@ fn run_exec(cmd: &str, stdin: &str, env: &[(&str, &str)]) -> Result<()> {
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .context("spawn --exec")?;
-    use std::io::Write;
     out.stdin
         .take()
         .context("--exec stdin")?
@@ -1169,6 +1413,52 @@ mod tests {
             !merge_rule_eval(&rules, &agent_only).allowed,
             "agent approval does not count"
         );
+    }
+
+    #[test]
+    fn report_is_deterministic_and_counts_verification() {
+        let (sk, pk) = keypair();
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pk);
+
+        let mut issue = entry("pr1", "issue", "alice", "", "a", 1, serde_json::json!({"title": "t"}));
+        issue.entry.sig = sign_entry(&mut issue.entry, &sk);
+        let unsigned = entry("pr1", "comment", "bob", "a", "b", 2, serde_json::json!({}));
+        let mut patch = entry("pr1", "patch", "alice", "b", "c", 3, serde_json::json!({}));
+        patch.entry.refs = Some(EntryRefs {
+            base: Some("refs/heads/main".into()),
+            head: Some("refs/heads/topic".into()),
+        });
+        patch.entry.sig = sign_entry(&mut patch.entry, &sk);
+        let mut review = entry("pr1", "review", "alice", "c", "d", 4, serde_json::json!({"decision": "approve"}));
+        review.entry.sig = sign_entry(&mut review.entry, &sk);
+
+        let refs = vec![&issue, &unsigned, &patch, &review];
+        let rules = MergeRules {
+            protect: vec!["refs/heads/main".into()],
+            require_human_approvals: 1,
+        };
+        let r1 = build_report(&refs, &principals, &rules);
+        assert_eq!(r1.threads.len(), 1);
+        assert_eq!(r1.threads[0].id, "pr1");
+        assert_eq!(r1.threads[0].entries, 4);
+        assert_eq!(r1.threads[0].verified, 3, "bob's unsigned entry not verified");
+        assert_eq!(r1.total_entries, 4);
+        assert_eq!(r1.verified_entries, 3);
+        assert_eq!(r1.unverified_entries, 1);
+        assert_eq!(r1.missing_principals, 1, "bob has no key");
+        assert_eq!(r1.prs.len(), 1);
+        assert_eq!(r1.prs[0].approvals, 1);
+        assert!(r1.prs[0].merge_allowed);
+        assert_eq!(r1.by_actor, vec![("alice".to_string(), 3), ("bob".to_string(), 1)]);
+
+        // Determinism: identical input -> identical text render.
+        let r2 = build_report(&refs, &principals, &rules);
+        assert_eq!(render_report_text(&r1), render_report_text(&r2));
+        assert_eq!(render_report_markdown(&r1), render_report_markdown(&r2));
+        assert_eq!(render_report_html(&r1), render_report_html(&r2));
+        assert!(render_report_html(&r1).contains("<!doctype html>"));
+        assert!(render_report_html(&r1).contains("</html>"));
     }
 
     #[test]
