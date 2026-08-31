@@ -587,24 +587,24 @@ async fn ref_list(
             .filter(|s| !s.is_empty())
             .map(str::to_ascii_lowercase);
     let after = q.after.as_deref().unwrap_or("");
-    // Byte-sorted: skip straight to the first candidate (> after, >= prefix).
+    // Byte-sorted: skip straight to the first candidate (> after, >= prefix,
+    // >= namespace start). The namespace folds into `lower` so the collab view
+    // is O(log n + page), not a linear skip past refs/heads and refs/tags.
+    let ns_start = ns.unwrap_or("");
     let lower = match &prefix {
         Some(p) if p.as_str() > after => p.as_str(),
         _ => after,
     };
+    let lower = if lower < ns_start { ns_start } else { lower };
     let start = slice.at_or_after(lower).max(slice.after(after));
     let mut refs = Vec::with_capacity(n.min(256));
     let mut more = false;
     let mut i = start;
     while let Some((name, sha)) = slice.at(i) {
-        if let Some(ns) = ns {
-            if name < ns {
-                i += 1;
-                continue; // sorted: still before the namespace
-            }
-            if !name.starts_with(ns) {
-                break; // sorted: past the namespace
-            }
+        if let Some(ns) = ns
+            && !name.starts_with(ns)
+        {
+            break; // sorted: past the namespace (start already >= ns)
         }
         if let Some(p) = &prefix
             && !name.starts_with(p.as_str())
@@ -719,14 +719,17 @@ async fn merge_base(
                 } else if out.status.code() == Some(1) {
                     None // git: exit 1 = no common ancestor
                 } else {
-                    return Err(not_found(
+                    // Any other failure (corrupt objects, IO) is a server-side
+                    // condition, not a missing revision.
+                    return Err(internal(
                         String::from_utf8_lossy(&out.stderr).trim().to_string(),
                     ));
                 }
             };
+            let etag = etag_for(&format!("{a}:{b}:{}", base.as_deref().unwrap_or("")));
             Ok(json_swr(
                 &serde_json::json!({ "from": a, "to": b, "merge_base": base }),
-                None,
+                Some(&etag),
             ))
         },
     )
@@ -1064,7 +1067,7 @@ async fn archive(
                 body: bytes::Bytes::from(bytes),
                 content_type,
                 cache_control: SWR,
-                etag: Some(etag_for(&res.sha)),
+                etag: Some(etag_for(&format!("{}:{format}", res.sha))),
             })
         },
     )
