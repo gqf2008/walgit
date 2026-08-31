@@ -145,6 +145,21 @@ pub fn sign_entry(entry: &mut Entry, key: &SigningKey) -> String {
     )
 }
 
+impl EntryRef {
+    /// Whether the entry counts as verified: the signature checks against the
+    /// actor's registered key **and** the inbox it was found in names the
+    /// entry's own principal. The inbox model (D1 §4.1) shards write access by
+    /// principal; a policy that lets anyone write any inbox must not smuggle
+    /// an entry across principals — the signature alone only proves the actor
+    /// signed it, not that it belongs in this inbox.
+    pub fn is_verified(&self, principals: &HashMap<String, String>) -> bool {
+        self.principal == self.entry.actor
+            && principals
+                .get(&self.entry.actor)
+                .is_some_and(|k| verify_entry(&self.entry, k).is_ok())
+    }
+}
+
 // ---- §4.3 deterministic aggregation ------------------------------------------
 
 /// One issue/thread: entries referencing the same `id`, topologically ordered
@@ -227,9 +242,7 @@ pub fn pr_view(
             base = rs.base.clone().or(base);
             head = rs.head.clone().or(head);
         }
-        let verified = principals
-            .get(&e.actor)
-            .is_some_and(|k| verify_entry(e, k).is_ok());
+        let verified = r.is_verified(principals);
         if !verified {
             unverified.push(format!("{}@{}", e.actor, r.oid));
         }
@@ -454,9 +467,7 @@ pub fn run(action: CollabAction) -> Result<()> {
             let out: Vec<serde_json::Value> = ordered
                 .iter()
                 .map(|r| {
-                    let verified = principals
-                        .get(&r.entry.actor)
-                        .is_some_and(|k| verify_entry(&r.entry, k).is_ok());
+                    let verified = r.is_verified(&principals);
                     serde_json::json!({ "oid": r.oid, "principal": r.principal, "verified": verified, "entry": r.entry })
                 })
                 .collect();
@@ -944,5 +955,42 @@ mod tests {
         let pr = pr_view(&refs, &principals);
         assert_eq!(pr.human_approvals.len(), 1, "only the verified approve counts");
         assert_eq!(pr.unverified.len(), 1, "tampered entry listed unverified");
+    }
+
+    #[test]
+    fn an_entry_in_the_wrong_inbox_is_not_verified() {
+        let (sk, pk) = keypair();
+        let mut e = entry(
+            "pr1",
+            "review",
+            "alice", // the JSON names alice
+            "",
+            "r1",
+            1,
+            serde_json::json!({"decision": "approve"}),
+        );
+        e.entry.sig = sign_entry(&mut e.entry, &sk);
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pk);
+
+        // Same actor, own inbox: verified.
+        let mut own = e.clone();
+        own.principal = "alice".into();
+        assert!(own.is_verified(&principals));
+
+        // The same signed bytes found in someone else's inbox: the signature is
+        // alice's, but the inbox model (D1 §4.1) shards by principal — an entry
+        // in bob's inbox naming alice as actor does not count.
+        let mut smuggled = e.clone();
+        smuggled.principal = "bob".into();
+        assert!(!smuggled.is_verified(&principals));
+
+        let refs = vec![&smuggled];
+        let pr = pr_view(&refs, &principals);
+        assert!(
+            pr.human_approvals.is_empty(),
+            "an approval smuggled into another inbox does not count"
+        );
+        assert_eq!(pr.unverified.len(), 1);
     }
 }
