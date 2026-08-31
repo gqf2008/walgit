@@ -367,6 +367,15 @@ function refSegment(label: string, s: string): void {
   }
 }
 
+/** A refname-safe per-entry segment (D1 §4.1: inbox refs are per-entry, so a
+    thread can hold many entries by one principal without overwriting). */
+function entrySegment(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function pushFor(ref: string, content: string | null): CollabPush {
   if (content === null) {
     return { ref, content: null, commands: [`set -e\ngit push origin ":${ref}"`] };
@@ -767,7 +776,6 @@ export class RepoClient {
       sign: (canonical: string) => Promise<string>;
     }): Promise<CollabPush> => {
       refSegment("entry.principal", input.principal);
-      refSegment("entry.id", input.id);
       const entry: Record<string, unknown> = {
         version: 1,
         kind: input.kind,
@@ -781,7 +789,9 @@ export class RepoClient {
       const canonical = canonicalize(entry);
       const sig = `ed25519:${await input.sign(canonical)}`;
       const content = JSON.stringify({ ...entry, sig }, null, 2);
-      return pushFor(`refs/collab/inbox/${input.principal}/${input.id}`, content);
+      // Per-entry ref: a thread with many entries by one principal must not
+      // overwrite a single inbox ref (D1 §4.1).
+      return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, content);
     },
     /** First-use registration of a principal's Ed25519 public key at
         `refs/collab/meta/principals/<principal>` (D1 §5: the token binds the
