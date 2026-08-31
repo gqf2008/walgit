@@ -145,6 +145,7 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 base64 = "0.22"
+ed25519-dalek = "2"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 libc = "0.2"
 # Windows branch of the platform layer (crates/walgit-wal/src/platform.rs): the
