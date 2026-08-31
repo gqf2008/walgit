@@ -23,11 +23,11 @@ COPY web/ ./
 RUN pnpm run build && test -f dist/index.html && test -f dist/repos.js
 
 # ---- 2. rust build ------------------------------------------------------------------------
-FROM docker.io/library/rust:1.97-bookworm AS build
+FROM docker.io/library/rust:stable AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config cmake perl python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY --from=web /src/web/dist ./web/dist
 ARG WALGIT_BUILD_SHA=dev

@@ -4,7 +4,7 @@
 
 ## 环境
 
-- Rust 工具链由 `rust-toolchain.toml` 锁定；还需 `protoc`、`git ≥ 2.46`；web UI 需要 `node 24 + pnpm`。
+- 需要 stable Rust 工具链（`rustup` 默认即可，不再锁定版本）；还需 `protoc`、`git ≥ 2.46`；web UI 需要 `node 24 + pnpm`。
 - 一键环境：`nix develop`（flake.nix），或按 README 的 Platforms 段落自备。
 - Windows 原生可编译可测（NTFS 卷 + Developer Mode）；容器仍是推荐部署形态。
 

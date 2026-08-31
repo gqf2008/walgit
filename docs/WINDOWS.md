@@ -7,7 +7,7 @@ same surface a contributor gets.
 
 ## 1. Prerequisites
 
-- **Rust**: `rustup` (the pinned toolchain in `rust-toolchain.toml` installs on
+- **Rust**: `rustup` (the stable toolchain installs on
   first `cargo` use; `rustup show` in the repo root).
 - **protoc**: `choco install protoc -y` (prost-build does not vendor it).
 - **git for Windows**: required — the server shells out to real `git`

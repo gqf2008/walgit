@@ -119,7 +119,7 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 ## Running it
 
 ```sh
-# build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
+# build (needs a recent stable Rust toolchain, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli
 # or: nix build .#walgit        or: podman build -t walgit -f Containerfile .
 

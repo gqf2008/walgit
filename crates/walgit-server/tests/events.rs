@@ -267,3 +267,73 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
     Ok(())
 }
+
+/// D1 (`docs/D1_COLLAB_DESIGN.md` §7/§9): collab refs (`refs/collab/*`) are
+/// ordinary refs to the bridge — their create/delete events travel the same
+/// durable cursor with the same `(repo, seq, ref_name)` dedup key, so the
+/// collaboration layer can rebuild thread state from the WAL exactly like
+/// branch events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_ref_events_flow_through_the_bridge() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    server.put_repo("t", "r").await?;
+    let id = walgit_git::RepoId::new("t", "r")?;
+
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "base"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+
+    // The D1 inbox model is just refs under refs/collab/: write an entry as a
+    // plain ref, push it, then erase it (tombstone) — all through receive-pack.
+    let collab_sha = git_in(&src, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(
+        &src,
+        &["update-ref", "refs/collab/inbox/alice/1", &collab_sha],
+    )?;
+    git_in(&src, &["push", "origin", "refs/collab/inbox/alice/1"])?;
+    git_in(&src, &["push", "origin", ":refs/collab/inbox/alice/1"])?;
+
+    // seq 1 create main, 2 create collab inbox, 3 delete collab inbox.
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!((r.from_seq, r.head_seq, r.emitted, r.gap), (0, 3, 3, None));
+    let got = wait_for(&captured, 3).await;
+    let create = got
+        .iter()
+        .find(|e| e["action"] == "create" && e["ref_name"] == "refs/collab/inbox/alice/1")
+        .expect("collab create event");
+    assert_eq!(create["old"], ZERO_OID, "create carries the zero OID");
+    assert_eq!(create["new"], collab_sha);
+    assert_eq!(create["ref_type"], "", "not a branch or tag");
+    assert_eq!(create["repo"], "t/r");
+    assert_eq!(create["_walgit"]["entry_kind"], "push");
+    let delete = got
+        .iter()
+        .find(|e| e["action"] == "delete" && e["ref_name"] == "refs/collab/inbox/alice/1")
+        .expect("collab delete event");
+    assert_eq!(delete["new"], ZERO_OID, "delete carries the zero OID");
+    assert_eq!(delete["_walgit"]["seq"], "3");
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(3));
+
+    // Dedup: a second catch-up emits nothing and the cursor is untouched
+    // (same `(repo, seq, ref_name)` contract as heads — no duplicate events).
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!((r.from_seq, r.head_seq, r.emitted), (3, 3, 0));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        3,
+        "no duplicates for collab refs"
+    );
+
+    // Replay contract: the WAL log holds exactly these three entries, so a
+    // consumer backfills the same events after a gap (docs/EVENTS.md).
+    assert_eq!(server.read_log("t", "r").await?.len(), 3);
+    Ok(())
+}
