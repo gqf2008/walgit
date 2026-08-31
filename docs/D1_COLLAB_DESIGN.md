@@ -179,11 +179,15 @@
 > `GET /{o}/{r}/api/diff?from=&to=&format=patch|stat|name-status` 已落地
 > （remote 先 level-parallel fault 两树差异对象再跑同一 `git diff`，与本地字节一致）；
 > `GET /{o}/{r}/api/blame/{rev}/{path}` 已落地（porcelain 解析为 JSON；remote 有界
-> fault 路径历史后跑同一 `git blame`）；`patch`（格式 patch 语义）已由
+> fault 祖先链后跑同一 `git blame`）；`patch`（格式 patch 语义）已由
 > `diff?format=patch` 覆盖；
 > `GET /{o}/{r}/api/archive/{rev}?format=tar.gz|zip` 已落地（二进制下载；
 > remote 预算化整树 fault，超限 503 指向 bundle-uri）。
-> 缺口 1、2 至此全部落地；第 8-10 项（契约文档、测试覆盖、本节进度）随批次收口。
+> 缺口 1、2 至此落地（第 8-10 项契约/测试/进度随批次收口）。**blame 已知限制**
+> （评审期明确，见 web/API.md）：remote 上**不跟随 rename**（git blame 无开关可关，
+> 且需读未 fault 的旧路径树 → 定义 404，本地正常），深祖先文件超预算 503——
+> 两者均需本地 packs/bundle，后续批次再补 rename 跟随。
+> merge-base 的"无关历史 → null"在深仓库可能先撞预算表现为 503（文案已注明）。
 
 ## 10. 一致性、并发与安全
 

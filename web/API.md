@@ -349,8 +349,9 @@ a convenience equivalent to `all?prefix=refs/collab`).
   `event: done`), SWR cache.
 - **Names are full ref names** (unlike `branches`/`tags`, which trim their
   namespace): `prefix` therefore matches against `refs/…` (e.g.
-  `prefix=refs/collab/inbox` on `all`). `[]` when the namespace is empty.
-  Unknown namespace (anything other than `branches|tags|all|collab`) → `404`.
+  `prefix=refs/collab/inbox` on `all` — a bare `prefix=inbox` matches
+  nothing). `[]` when the namespace is empty. Unknown namespace (anything
+  other than `branches|tags|all|collab`) → `404`.
 
 ### `GET /{owner}/{repo}/api/refs/name/{rest...}`
 
@@ -381,7 +382,13 @@ review primitive).
   branch-from-trunk shape returns the branch point — criss-cross histories may
   differ from git's preferred base. The walk is narrated (SSE) and gives up
   with a clear error past the budget (paths too far apart for a remote reader).
-- `merge_base` is `null` when the histories are unrelated. Unknown revision →
+- **Remote revision resolution** (applies to `merge-base`/`diff`/`blame`):
+  on a remote-served base `from`/`to` resolve by branch, tag or full/unique
+  hex sha — revision expressions like `HEAD~1` or `main^` need local packs
+  and are `404` on remote.
+- `merge_base` is `null` when the histories are unrelated. In a deep
+  repository two unrelated histories can exhaust the walk budget first and
+  surface as a `503` ("too far apart (or unrelated)"). Unknown revision →
   `404`. Cache: SWR (depends on ref state, not immutable).
 
 ### `GET /{owner}/{repo}/api/diff?from=&to=&format=`
@@ -424,7 +431,13 @@ context and agent lookups. `rev` resolves like `resolve`; `path` is the file.
   remote-served base faults the path history first (`Remote::fault_blame`,
   bounded by `BLAME_BUDGET` commits, narrated on SSE, path boundaries and
   merge parents covered) and then runs the same git — same objects, same
-  answer. Paths with longer history than the budget → `503` with the fix.
+  answer.
+- **Remote limits**: a file whose *ancestry* is deeper than the budget → `503`
+  (deep-history files need a host with the packs or a bundle — the budget
+  counts every ancestor the walk must fault, not just lines that changed).
+  Renames are **not followed on remote** (git blame has no switch to turn
+  rename-following off and reads the never-faulted parent tree) → a defined
+  `404`; local packs follow renames natively. Tracked in the D1 issue.
 - `blame` of a directory or a missing path → `404`. Cache: SWR.
 
 ### `GET /{owner}/{repo}/api/archive/{rev}?format=`
