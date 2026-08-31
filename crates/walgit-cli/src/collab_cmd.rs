@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -473,7 +473,18 @@ pub fn run(action: CollabAction) -> Result<()> {
             base,
             head,
             key,
-        } => run_entry(&repo, push.as_deref(), &kind, &id, &actor, &parent, &body, base.as_deref(), head.as_deref(), &key)?,
+        } => run_entry(&EntryArgs {
+            repo,
+            push,
+            kind,
+            id,
+            actor,
+            parent,
+            body,
+            base,
+            head,
+            key,
+        })?,
         CollabAction::PrincipalRegister {
             repo,
             principal,
@@ -512,9 +523,9 @@ fn ref_segment(label: &str, s: &str) -> Result<()> {
         && s.len() <= 255
         && s != "."
         && s != ".."
-        && !s.ends_with(".lock")
+        && !s.to_ascii_lowercase().ends_with(".lock")
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
-        && s.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false);
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
     if ok {
         Ok(())
     } else {
@@ -535,14 +546,14 @@ fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
 
 fn entry_uuid() -> String {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut b = [0u8; 16];
     rng.fill(&mut b);
     hex::encode(b)
 }
 
 /// Write a blob via `git hash-object -w --stdin`; returns the oid.
-fn git_write_blob(repo: &PathBuf, content: &str) -> Result<String> {
+fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
     use std::io::Write;
     let mut child = std::process::Command::new("git")
         .args(["-C"])
@@ -567,7 +578,7 @@ fn git_write_blob(repo: &PathBuf, content: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_update_ref(repo: &PathBuf, name: &str, oid: Option<&str>) -> Result<()> {
+fn git_update_ref(repo: &std::path::Path, name: &str, oid: Option<&str>) -> Result<()> {
     let args: Vec<&str> = if let Some(oid) = oid {
         vec!["update-ref", name, oid]
     } else {
@@ -589,7 +600,7 @@ fn git_update_ref(repo: &PathBuf, name: &str, oid: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn git_push(repo: &PathBuf, remote: &str, name: &str) -> Result<()> {
+fn git_push(repo: &std::path::Path, remote: &str, name: &str) -> Result<()> {
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -605,55 +616,57 @@ fn git_push(repo: &PathBuf, remote: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_entry(
-    repo: &PathBuf,
-    push: Option<&str>,
-    kind: &str,
-    id: &str,
-    actor: &str,
-    parent: &str,
-    body: &str,
-    base: Option<&str>,
-    head: Option<&str>,
-    key_path: &PathBuf,
-) -> Result<()> {
-    ref_segment("entry.actor", actor)?;
-    let body: serde_json::Value = serde_json::from_str(body)
-        .with_context(|| format!("--body must be JSON: {body}"))?;
+struct EntryArgs {
+    repo: std::path::PathBuf,
+    push: Option<String>,
+    kind: String,
+    id: String,
+    actor: String,
+    parent: String,
+    body: String,
+    base: Option<String>,
+    head: Option<String>,
+    key: std::path::PathBuf,
+}
+
+fn run_entry(args: &EntryArgs) -> Result<()> {
+    ref_segment("entry.actor", &args.actor)?;
+    let body: serde_json::Value = serde_json::from_str(&args.body)
+        .with_context(|| format!("--body must be JSON: {}", args.body))?;
     let mut entry = Entry {
         version: 1,
-        kind: kind.to_string(),
-        id: id.to_string(),
-        actor: actor.to_string(),
+        kind: args.kind.clone(),
+        id: args.id.clone(),
+        actor: args.actor.clone(),
         ts: chrono::Utc::now().timestamp(),
-        parent: parent.to_string(),
-        refs: match (base, head) {
+        parent: args.parent.clone(),
+        refs: match (&args.base, &args.head) {
             (None, None) => None,
             (b, h) => Some(EntryRefs {
-                base: b.map(str::to_string),
-                head: h.map(str::to_string),
+                base: b.clone(),
+                head: h.clone(),
             }),
         },
         body,
         sig: String::new(),
     };
-    let key = read_signing_key(key_path)?;
+    let key = read_signing_key(&args.key)?;
     entry.sig = sign_entry(&mut entry, &key);
     let content = serde_json::to_string_pretty(&entry)?;
-    let oid = git_write_blob(repo, &content)?;
-    let ref_name = format!("refs/collab/inbox/{actor}/{}", entry_uuid());
-    git_update_ref(repo, &ref_name, Some(&oid))?;
-    if let Some(remote) = push {
-        git_push(repo, remote, &ref_name)?;
+    let oid = git_write_blob(&args.repo, &content)?;
+    let ref_name = format!("refs/collab/inbox/{}/{}", args.actor, entry_uuid());
+    git_update_ref(&args.repo, &ref_name, Some(&oid))?;
+    if let Some(remote) = &args.push {
+        git_push(&args.repo, remote, &ref_name)?;
     }
     println!("{ref_name} {oid}");
     Ok(())
 }
 
 fn run_principal_register(
-    repo: &PathBuf,
+    repo: &Path,
     principal: &str,
-    key_path: &PathBuf,
+    key_path: &Path,
     push: Option<&str>,
 ) -> Result<()> {
     ref_segment("principal", principal)?;
@@ -676,7 +689,7 @@ fn run_principal_register(
     Ok(())
 }
 
-fn run_principal_revoke(repo: &PathBuf, principal: &str, push: Option<&str>) -> Result<()> {
+fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Result<()> {
     ref_segment("principal", principal)?;
     let ref_name = format!("refs/collab/meta/principals/{principal}");
     git_update_ref(repo, &ref_name, None)?;
