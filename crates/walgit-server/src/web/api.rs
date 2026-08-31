@@ -1,7 +1,8 @@
 //! Read-only JSON API for the web UI (`web/API.md`, v2 contract).
 //!
-//! Two URL classes: ref-dependent (`refs`, `refs/{branches,tags}`,
-//! `resolve`, name-addressed tree/blob/commits/commit) answered from a
+//! Two URL classes: ref-dependent (`refs`, `refs/{branches,tags,all,collab}`,
+//! `refs/name/{rest}`, `resolve`, name-addressed tree/blob/commits/commit)
+//! answered from a
 //! per-manifest-version [`RefIndex`] with `stale-while-revalidate` + `ETag`,
 //! and sha-addressed immutable ones (`tree/<sha>`, `blob/<sha>`,
 //! `commits?ref=<sha>`, `commit/<sha>`) rendered once and cached in memory
@@ -201,6 +202,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         r = r
             .route(&format!("{base}/refs"), get(refs))
             .route(&format!("{base}/refs/{{kind}}"), get(ref_list))
+            .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
+            .route(&format!("{base}/merge-base"), get(merge_base))
+            .route(&format!("{base}/diff"), get(diff))
+            .route(&format!("{base}/blame/{{*rest}}"), get(blame))
+            .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -518,6 +524,37 @@ async fn refs(
     .await
 }
 
+/// A byte-sorted ref namespace: short-name pairs (`branches`/`tags`) or
+/// full-name triples (`all`, `refs/collab/*`). Index-based access keeps a
+/// 466 k-ref repository paged in O(page) without copying the namespace.
+enum RefSlice<'a> {
+    Pairs(&'a [(String, String)]),
+    All(&'a [(String, String)]),
+}
+
+impl RefSlice<'_> {
+    fn at(&self, i: usize) -> Option<(&str, &str)> {
+        match self {
+            RefSlice::Pairs(v) => v.get(i).map(|(n, s)| (n.as_str(), s.as_str())),
+            RefSlice::All(v) => v.get(i).map(|(n, s)| (n.as_str(), s.as_str())),
+        }
+    }
+    /// First index whose name sorts strictly after `x` (names byte-sorted).
+    fn after(&self, x: &str) -> usize {
+        match self {
+            RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() <= x),
+            RefSlice::All(v) => v.partition_point(|(n, _)| n.as_str() <= x),
+        }
+    }
+    /// First index whose name sorts at-or-after `x`.
+    fn at_or_after(&self, x: &str) -> usize {
+        match self {
+            RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() < x),
+            RefSlice::All(v) => v.partition_point(|(n, _)| n.as_str() < x),
+        }
+    }
+}
+
 async fn ref_list(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -527,9 +564,15 @@ async fn ref_list(
     let wants_sse = crate::sse::wants_sse(&headers);
     let handle = open(&st, &headers, &owner, &repo_name).await?;
     let r = view(&st, handle, Need::Refs, Reporter::none()).await?;
-    let list = match kind.as_str() {
-        "branches" => &r.index.branches,
-        "tags" => &r.index.tags,
+    // `branches`/`tags` are short-name namespaces; `all` is every ref as its
+    // full name; `collab` is the D1 collaboration namespace (`refs/collab/*`),
+    // also full names. All are byte-sorted, so pagination is index arithmetic
+    // over the cached index, never a copy.
+    let (slice, ns) = match kind.as_str() {
+        "branches" => (RefSlice::Pairs(&r.index.branches), None),
+        "tags" => (RefSlice::Pairs(&r.index.tags), None),
+        "all" => (RefSlice::All(&r.index.all), None),
+        "collab" => (RefSlice::All(&r.index.all), Some("refs/collab/")),
         _ => return Err(not_found("ref namespace")),
     };
     let n = q.n.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
@@ -542,37 +585,47 @@ async fn ref_list(
     let needle =
         q.q.as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
     let after = q.after.as_deref().unwrap_or("");
-    // Byte-sorted: skip straight to the first candidate (> after, >= prefix).
+    // Byte-sorted: skip straight to the first candidate (> after, >= prefix,
+    // >= namespace start). The namespace folds into `lower` so the collab view
+    // is O(log n + page), not a linear skip past refs/heads and refs/tags.
+    let ns_start = ns.unwrap_or("");
     let lower = match &prefix {
         Some(p) if p.as_str() > after => p.as_str(),
         _ => after,
     };
-    let start = list
-        .partition_point(|(name, _)| name.as_str() <= lower && name.as_str() != lower)
-        .max(list.partition_point(|(name, _)| name.as_str() <= after));
+    let lower = if lower < ns_start { ns_start } else { lower };
+    let start = slice.at_or_after(lower).max(slice.after(after));
     let mut refs = Vec::with_capacity(n.min(256));
     let mut more = false;
-    for (name, sha) in &list[start..] {
-        if let Some(p) = &prefix {
-            if !name.starts_with(p.as_str()) {
-                break; // sorted: no further names share the prefix
-            }
+    let mut i = start;
+    while let Some((name, sha)) = slice.at(i) {
+        if let Some(ns) = ns
+            && !name.starts_with(ns)
+        {
+            break; // sorted: past the namespace (start already >= ns)
         }
-        if let Some(nd) = &needle {
-            if !name.to_ascii_lowercase().contains(nd.as_str()) {
-                continue;
-            }
+        if let Some(p) = &prefix
+            && !name.starts_with(p.as_str())
+        {
+            break; // sorted: no further names share the prefix
+        }
+        if let Some(nd) = &needle
+            && !name.to_ascii_lowercase().contains(nd.as_str())
+        {
+            i += 1;
+            continue;
         }
         if refs.len() == n {
             more = true;
             break;
         }
         refs.push(RefInfo {
-            name: name.clone(),
-            sha: sha.clone(),
+            name: name.to_string(),
+            sha: sha.to_string(),
         });
+        i += 1;
     }
     if wants_sse {
         // Streamed form: one `ref` packet per ref, then `done` (web/API.md).
@@ -591,6 +644,434 @@ async fn ref_list(
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))
+}
+
+/// Exact full-ref lookup (`refs/name/{rest}`), e.g. the tip of a D1 collab
+/// inbox. The sha is the raw oid (no peeling); 404 when the ref does not exist.
+async fn ref_by_name(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, name)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Refs,
+        None,
+        |r| async move {
+            match r.index.by_name.get(&name) {
+                Some((sha, _)) => {
+                    let etag = etag_for(sha.as_str());
+                    Ok(json_swr(
+                        &RefInfo {
+                            name,
+                            sha: sha.clone(),
+                        },
+                        Some(&etag),
+                    ))
+                }
+                None => Err(not_found("ref")),
+            }
+        },
+    )
+    .await
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MergeBaseQuery {
+    from: String,
+    to: String,
+}
+
+/// The merge base of two revisions (`?from=&to=`) — the diff base for 3-dot
+/// PR comparisons. Local packs use `git merge-base`; remote-served bases use a
+/// bounded bidirectional walk over the pack set (`Remote::merge_base`).
+/// `merge_base` is `null` when the histories are unrelated.
+async fn merge_base(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(q): Query<MergeBaseQuery>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        |r| async move {
+            let a = resolve_name(&r, &q.from).await?.sha;
+            let b = resolve_name(&r, &q.to).await?.sha;
+            let base = if let Some(remote) = r.remote() {
+                remote.merge_base(&a, &b).await?.map(|oid| oid.to_string())
+            } else {
+                let out = r
+                    .local
+                    .git(&["merge-base", a.as_str(), b.as_str()])
+                    .await
+                    .map_err(internal)?;
+                if out.status.success() {
+                    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    (!sha.is_empty()).then_some(sha)
+                } else if out.status.code() == Some(1) {
+                    None // git: exit 1 = no common ancestor
+                } else {
+                    // Any other failure (corrupt objects, IO) is a server-side
+                    // condition, not a missing revision.
+                    return Err(internal(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ));
+                }
+            };
+            let etag = etag_for(&format!("{a}:{b}:{}", base.as_deref().unwrap_or("")));
+            Ok(json_swr(
+                &serde_json::json!({ "from": a, "to": b, "merge_base": base }),
+                Some(&etag),
+            ))
+        },
+    )
+    .await
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiffQuery {
+    from: String,
+    to: String,
+    #[serde(default = "default_diff_format")]
+    format: String,
+}
+
+fn default_diff_format() -> String {
+    "patch".to_string()
+}
+
+#[derive(Serialize)]
+struct NameStatus {
+    status: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DiffResult {
+    from: String,
+    to: String,
+    format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<Vec<Stat>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<Vec<NameStatus>>,
+}
+
+/// The tree diff between two revisions (`?from=&to=&format=patch|stat|
+/// name-status`), default `patch`. Local packs run `git diff` directly;
+/// remote-served bases fault exactly the trees/blobs the diff touches into
+/// the loose store first (`Remote::fault_diff`) and then run the same git.
+async fn diff(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(q): Query<DiffQuery>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let a = resolve_name(&r, &q.from).await?.sha;
+            let b = resolve_name(&r, &q.to).await?.sha;
+            match q.format.as_str() {
+                "patch" | "stat" | "name-status" => {}
+                other => return Err(not_found(format!("unknown diff format {other}"))),
+            }
+            if let Some(remote) = r.remote() {
+                remote.fault_diff(&a, &b).await?;
+            }
+            Ok(json_swr(
+                &git_diff(&r.local, &a, &b, &q.format).await?,
+                None,
+            ))
+        },
+    )
+    .await
+}
+
+/// Run `git diff <a> <b>` and shape the output for the requested format.
+async fn git_diff(
+    local: &walgit_git::LocalRepo,
+    a: &str,
+    b: &str,
+    format: &str,
+) -> Result<DiffResult, ApiError> {
+    let mut out = DiffResult {
+        from: a.to_string(),
+        to: b.to_string(),
+        format: format.to_string(),
+        patch: None,
+        stats: None,
+        changes: None,
+    };
+    match format {
+        "patch" => {
+            let patch = String::from_utf8_lossy(
+                &git(
+                    local,
+                    vec![
+                        "diff".into(),
+                        "--no-color".into(),
+                        "--no-ext-diff".into(),
+                        "-M".into(),
+                        a.into(),
+                        b.into(),
+                    ],
+                )
+                .await?,
+            )
+            .into_owned();
+            out.patch = Some(patch);
+        }
+        "stat" => {
+            let stats = parse_stats(
+                &git(
+                    local,
+                    vec![
+                        "diff".into(),
+                        "--numstat".into(),
+                        "-M".into(),
+                        a.into(),
+                        b.into(),
+                    ],
+                )
+                .await?,
+            );
+            out.stats = Some(stats);
+        }
+        "name-status" => {
+            let raw = git(
+                local,
+                vec![
+                    "diff".into(),
+                    "--name-status".into(),
+                    "-M".into(),
+                    a.into(),
+                    b.into(),
+                ],
+            )
+            .await?;
+            out.changes = Some(parse_name_status(&raw));
+        }
+        _ => return Err(not_found("unknown diff format")),
+    }
+    Ok(out)
+}
+
+/// `git diff --name-status -M`: `STATUS\tpath` or `R<score>\told\tnew`.
+fn parse_name_status(bytes: &[u8]) -> Vec<NameStatus> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (status, path, old_path) = match f.as_slice() {
+                [s, p] => (s, p, None),
+                [s, old, p] => (s, p, Some(*old)),
+                _ => return None,
+            };
+            Some(NameStatus {
+                status: status.get(..1).unwrap_or("?").to_string(),
+                path: (*path).to_string(),
+                old_path: old_path.map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct BlameLine {
+    line: u32,
+    commit: String,
+    author: String,
+    author_email: String,
+    time: i64,
+    summary: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct BlameResult {
+    sha: String,
+    path: String,
+    blame: Vec<BlameLine>,
+}
+
+/// Line attribution for one file (`blame/{rev}/{path}`): `git blame
+/// --porcelain` parsed to JSON. Local packs run git directly; remote-served
+/// bases fault the path history first (`Remote::fault_blame`, bounded) and
+/// then run the same git — same objects, same answer.
+async fn blame(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, rest)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        |r| async move {
+            let res = resolve_rest(&r, &rest).await?;
+            if res.path.is_empty() {
+                return Err(not_found("blame needs a file path"));
+            }
+            if let Some(remote) = r.remote() {
+                remote.fault_blame(&res.sha, &res.path).await?;
+            }
+            let raw = git(
+                &r.local,
+                vec![
+                    "blame".into(),
+                    "--porcelain".into(),
+                    res.sha.clone(),
+                    "--".into(),
+                    res.path.clone(),
+                ],
+            )
+            .await?;
+            let blame = parse_porcelain_blame(&raw);
+            Ok(json_swr(
+                &BlameResult {
+                    sha: res.sha,
+                    path: res.path,
+                    blame,
+                },
+                None,
+            ))
+        },
+    )
+    .await
+}
+
+/// `git blame --porcelain`: per line a `<sha> <orig> <final> <count>` header,
+/// key-value fields (author / author-mail / author-time / summary …), then
+/// `\t<text>`; groups are separated by blank lines.
+fn parse_porcelain_blame(bytes: &[u8]) -> Vec<BlameLine> {
+    let mut out = Vec::new();
+    let mut cur: Option<BlameLine> = None;
+    for raw in String::from_utf8_lossy(bytes).lines() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(text) = raw.strip_prefix('\t') {
+            if let Some(mut c) = cur.take() {
+                c.text = text.to_string();
+                out.push(c);
+            }
+            continue;
+        }
+        let parts: Vec<&str> = raw.splitn(4, ' ').collect();
+        let sha = parts.first().copied().filter(|s| is_full_sha(s));
+        let line = parts.get(2).and_then(|s| s.parse::<u32>().ok());
+        if let (Some(sha), Some(line)) = (sha, line) {
+            cur = Some(BlameLine {
+                line,
+                commit: sha.to_string(),
+                author: String::new(),
+                author_email: String::new(),
+                time: 0,
+                summary: String::new(),
+                text: String::new(),
+            });
+            continue;
+        }
+        if let Some(c) = &mut cur {
+            if let Some(v) = raw.strip_prefix("author ") {
+                c.author = v.to_string();
+            } else if let Some(v) = raw.strip_prefix("author-mail ") {
+                c.author_email = v.trim_matches(['<', '>']).to_string();
+            } else if let Some(v) = raw.strip_prefix("author-time ") {
+                c.time = v.parse().unwrap_or(0);
+            } else if let Some(v) = raw.strip_prefix("summary ") {
+                c.summary = v.to_string();
+            }
+        }
+    }
+    out
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ArchiveQuery {
+    #[serde(default = "default_archive_format")]
+    format: String,
+}
+
+fn default_archive_format() -> String {
+    "tar.gz".to_string()
+}
+
+/// A tree archive (`archive/{rev}?format=tar.gz|zip`, default `tar.gz`) as a
+/// binary download — the whole tree at one revision. Local packs run `git
+/// archive` directly; remote-served bases fault the whole tree first
+/// (`Remote::fault_tree_all`, bounded — larger trees get a 503 pointing at
+/// bundle-uri, where big-repo downloads belong anyway).
+async fn archive(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, rest)): Path<(String, String, String)>,
+    Query(q): Query<ArchiveQuery>,
+) -> Result<Response, ApiError> {
+    // Binary download: never the SSE envelope.
+    let mut plain_headers = headers.clone();
+    plain_headers.remove(header::ACCEPT);
+    run(
+        &st,
+        &plain_headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let rev = rest.trim_matches('/');
+            let res = resolve_name(&r, rev).await?;
+            let format = match q.format.as_str() {
+                "tar.gz" | "zip" => q.format,
+                other => return Err(not_found(format!("unknown archive format {other}"))),
+            };
+            if let Some(remote) = r.remote() {
+                remote.fault_tree_all(&res.sha).await?;
+            }
+            let bytes = git(
+                &r.local,
+                vec![
+                    "archive".into(),
+                    format!("--format={format}"),
+                    res.sha.clone(),
+                ],
+            )
+            .await?;
+            let content_type: &'static str = if format == "zip" {
+                "application/zip"
+            } else {
+                "application/gzip"
+            };
+            Ok(Rendered {
+                body: bytes::Bytes::from(bytes),
+                content_type,
+                cache_control: SWR,
+                etag: Some(etag_for(&format!("{}:{format}", res.sha))),
+            })
+        },
+    )
+    .await
 }
 
 // ---- resolve -----------------------------------------------------------------

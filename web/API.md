@@ -333,6 +333,126 @@ One **name-sorted page** of one namespace, for the branch/tag picker.
   ref-state version; the picker's typical traffic is the same handful of
   queries repeated.
 
+### `GET /{owner}/{repo}/api/refs/{all|collab}?prefix=&q=&after=&n=`
+
+Full-name pages for the collaboration layer (D1) and any other tooling that
+namespaces refs: `all` is every ref in the repository, `collab` is the
+`refs/collab/*` namespace (the decentralized-collaboration inbox/meta refs;
+a convenience equivalent to `all?prefix=refs/collab`).
+
+```json
+{ "refs": [ { "name": "refs/collab/inbox/alice@example.com/1", "sha": "807d45a6…" }, … ], "more": true }
+```
+
+- Same pagination contract as `refs/{branches|tags}`: `prefix`, `q`,
+  `after`, `n`, byte-sorted ascending, `more`, SSE option (`event: ref` /
+  `event: done`), SWR cache.
+- **Names are full ref names** (unlike `branches`/`tags`, which trim their
+  namespace): `prefix` therefore matches against `refs/…` (e.g.
+  `prefix=refs/collab/inbox` on `all` — a bare `prefix=inbox` matches
+  nothing). `[]` when the namespace is empty. Unknown namespace (anything
+  other than `branches|tags|all|collab`) → `404`.
+
+### `GET /{owner}/{repo}/api/refs/name/{rest...}`
+
+Exact full-ref lookup by name — the tip of one D1 inbox, a notes ref, any
+ref. `rest` is the full name with slashes (`refs/collab/inbox/alice@example.com/1`).
+
+```json
+{ "name": "refs/collab/inbox/alice@example.com/1", "sha": "807d45a6…" }
+```
+
+- `sha` is the raw oid the ref points at (no peeling). `404` when the ref
+  does not exist. Cache: SWR + `ETag: "<sha>"` → `304` (the ref's oid is a
+  strong version for its value).
+
+### `GET /{owner}/{repo}/api/merge-base?from=&to=`
+
+The merge base of two revisions — the diff base for 3-dot PR comparisons (D1
+review primitive).
+
+```json
+{ "from": "807d45a6…", "to": "5ed435d9…", "merge_base": "46b7fd29…" }
+```
+
+- `from` / `to`: branch name, tag name, or commit-ish (same resolution as
+  `resolve`). The response echoes the **resolved commit shas**.
+- Local packs run `git merge-base`; a remote-served base uses a **bounded
+  bidirectional walk** over the pack set (`Remote::merge_base`), which for the
+  branch-from-trunk shape returns the branch point — criss-cross histories may
+  differ from git's preferred base. The walk is narrated (SSE) and gives up
+  with a clear error past the budget (paths too far apart for a remote reader).
+- **Remote revision resolution** (applies to `merge-base`/`diff`/`blame`):
+  on a remote-served base `from`/`to` resolve by branch, tag or full/unique
+  hex sha — revision expressions like `HEAD~1` or `main^` need local packs
+  and are `404` on remote.
+- `merge_base` is `null` when the histories are unrelated. In a deep
+  repository two unrelated histories can exhaust the walk budget first and
+  surface as a `503` ("too far apart (or unrelated)"). Unknown revision →
+  `404`. Cache: SWR (depends on ref state, not immutable).
+
+### `GET /{owner}/{repo}/api/diff?from=&to=&format=`
+
+The tree diff between two revisions — the file list / stat / patch a PR
+review (human or agent) renders. `format` is `patch` (default), `stat` or
+`name-status`.
+
+```json
+{ "from": "807d45a6…", "to": "5ed435d9…", "format": "name-status",
+  "changes": [ { "status": "M", "path": "src/inner/x.txt" },
+               { "status": "R", "path": "src/app.rs", "old_path": "src/main.rs" } ] }
+```
+
+- `from` / `to` resolve like `resolve` (branch, tag, commit-ish); the response
+  echoes the resolved shas. `stat` returns the `stats` array of the `commit`
+  endpoint (`--numstat -M`, renames as new path); `patch` returns the raw
+  unified diff text.
+- Local packs run `git diff` directly; a remote-served base faults exactly the
+  trees/blobs the diff touches into the loose store first (`Remote::fault_diff`,
+  level-parallel, narrated on SSE, bounded by `MAX_DIFF_OBJECTS`) and then
+  runs the same `git diff` — the two paths are byte-identical.
+- Unknown format → `404`; `from == to` → empty changes / empty patch. Cache:
+  SWR (ref-state dependent, not immutable).
+
+### `GET /{owner}/{repo}/api/blame/{rev}/{path}`
+
+Line attribution for one file — who last changed each line — for review
+context and agent lookups. `rev` resolves like `resolve`; `path` is the file.
+
+```json
+{ "sha": "807d45a6…", "path": "src/app.rs",
+  "blame": [ { "line": 1, "commit": "5ed435d9…", "author": "alice",
+               "author_email": "alice@example.com", "time": 1710000000,
+               "summary": "move main into app", "text": "fn main() {}" } ] }
+```
+
+- The line order matches the file; `text` is the line content (self-contained,
+  no separate blob fetch). Local packs run `git blame --porcelain`; a
+  remote-served base faults the path history first (`Remote::fault_blame`,
+  bounded by `BLAME_BUDGET` commits, narrated on SSE, path boundaries and
+  merge parents covered) and then runs the same git — same objects, same
+  answer.
+- **Remote limits**: a file whose *ancestry* is deeper than the budget → `503`
+  (deep-history files need a host with the packs or a bundle — the budget
+  counts every ancestor the walk must fault, not just lines that changed).
+  Renames are **not followed on remote** (git blame has no switch to turn
+  rename-following off and reads the never-faulted parent tree) → a defined
+  `404`; local packs follow renames natively. Tracked in the D1 issue.
+- `blame` of a directory or a missing path → `404`. Cache: SWR.
+
+### `GET /{owner}/{repo}/api/archive/{rev}?format=`
+
+A tree archive at one revision as a binary download — `format=tar.gz`
+(default) or `zip`. The "download this repo" button; small/medium repos get a
+real archive, large ones a clear 503 pointing at bundle-uri (where big-repo
+bytes belong anyway).
+
+- Local packs run `git archive` directly; a remote-served base faults the
+  whole tree first (`Remote::fault_tree_all`, level-parallel, deduped, bounded
+  by `ARCHIVE_OBJECT_BUDGET` objects → `503` past it).
+- `Content-Type`: `application/gzip` / `application/zip`; `ETag: "<sha>"` +
+  SWR. Unknown format or revision → `404`. Never the SSE envelope (binary).
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json

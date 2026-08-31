@@ -113,6 +113,9 @@ fn fixture(server: &Server) -> anyhow::Result<std::path::PathBuf> {
     for _ in 0..40 {
         git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "filler"])?;
     }
+    // D1 collaboration namespace: arbitrary refs under refs/collab/* must be
+    // hostable (the design's inbox model) and listable via the new endpoints.
+    git_in(&dir, &["update-ref", "refs/collab/inbox/alice/1", "HEAD"])?;
     git_in(
         &dir,
         &["push", "-q", "--mirror", &server.repo_url("o", "r")],
@@ -178,6 +181,187 @@ async fn conformance(
     assert_eq!(st, 200);
     assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
     assert!(body.contains("event: ref\n") && body.contains("event: done\ndata: {\"more\":false}"));
+
+    // any-namespace refs (D1 collab): full-name listing, namespace filter,
+    // exact lookup, pagination, SSE
+    let p = json(server, "/o/r/api/refs/all").await?;
+    let names: Vec<String> = p["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
+    for expect in [
+        "refs/heads/main",
+        "refs/heads/feature/x",
+        "refs/tags/v1.0",
+        "refs/collab/inbox/alice/1",
+    ] {
+        assert!(
+            names.contains(&expect.to_string()),
+            "refs/all missing {expect}: {names:?}"
+        );
+    }
+    assert!(
+        names.windows(2).all(|w| w[0] < w[1]),
+        "refs/all must be byte-sorted: {names:?}"
+    );
+    let p = json(server, "/o/r/api/refs/all?prefix=refs/collab").await?;
+    assert_eq!(p["refs"].as_array().unwrap().len(), 1);
+    let p = json(server, "/o/r/api/refs/all?n=2").await?;
+    assert_eq!(p["refs"].as_array().unwrap().len(), 2);
+    assert_eq!(p["more"], true);
+    let p = json(server, "/o/r/api/refs/collab").await?;
+    assert_eq!(p["refs"][0]["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(p["refs"][0]["sha"], head);
+    assert_eq!(
+        json(server, "/o/r/api/refs/collab?q=INBOX").await?["refs"][0]["name"],
+        "refs/collab/inbox/alice/1"
+    );
+    let r = json(server, "/o/r/api/refs/name/refs/collab/inbox/alice/1").await?;
+    assert_eq!(r["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(r["sha"], head);
+    let r = json(server, "/o/r/api/refs/name/refs/heads/main").await?;
+    assert_eq!(r["sha"], head);
+    assert_eq!(get(server, "/o/r/api/refs/name/refs/nope").await?.0, 404);
+    let (st, body, h) = get_h(
+        server,
+        "/o/r/api/refs/collab",
+        &[("Accept", "text/event-stream")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
+    assert!(body.contains("event: ref\n") && body.contains("event: done\n"));
+
+    // merge-base (D1 review primitive): local git and remote reader agree
+    let expected_base = git_in(src, &["merge-base", "main", "feature/x"])?
+        .trim()
+        .to_string();
+    let mb = json(server, "/o/r/api/merge-base?from=main&to=feature/x").await?;
+    assert_eq!(
+        mb["from"].as_str().unwrap().len(),
+        40,
+        "from resolved to a sha"
+    );
+    assert_eq!(mb["to"].as_str().unwrap().len(), 40, "to resolved to a sha");
+    assert_eq!(mb["merge_base"], expected_base);
+    let mb = json(server, "/o/r/api/merge-base?from=main&to=main").await?;
+    assert_eq!(mb["merge_base"], mb["from"], "same revision -> itself");
+    assert_eq!(
+        get(server, "/o/r/api/merge-base?from=nope&to=main")
+            .await?
+            .0,
+        404
+    );
+
+    // diff (D1 review primitive): name-status / stat / patch, local + remote
+    let d = json(
+        server,
+        "/o/r/api/diff?from=feature/x&to=main&format=name-status",
+    )
+    .await?;
+    assert_eq!(d["format"], "name-status");
+    assert_eq!(d["from"].as_str().unwrap().len(), 40);
+    assert_eq!(d["to"].as_str().unwrap().len(), 40);
+    let ch = d["changes"].as_array().unwrap();
+    assert!(
+        ch.iter()
+            .any(|c| c["status"] == "M" && c["path"] == "src/inner/x.txt"),
+        "second on main modified x.txt: {ch:?}"
+    );
+    let st = json(server, "/o/r/api/diff?from=feature/x&to=main&format=stat").await?;
+    assert_eq!(st["format"], "stat");
+    assert!(
+        st["stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["path"] == "src/inner/x.txt"),
+        "stat lists x.txt"
+    );
+    let p = json(server, "/o/r/api/diff?from=feature/x&to=main").await?;
+    assert_eq!(p["format"], "patch", "default format is patch");
+    assert!(p["patch"].as_str().unwrap().contains("diff --git"));
+    let same = json(server, "/o/r/api/diff?from=main&to=main&format=name-status").await?;
+    assert_eq!(same["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        get(server, "/o/r/api/diff?from=main&to=main&format=bogus")
+            .await?
+            .0,
+        404
+    );
+    assert_eq!(get(server, "/o/r/api/diff?from=nope&to=main").await?.0, 404);
+
+    // blame (D1 review primitive): porcelain parsed, local + remote agree
+    let b = json(server, "/o/r/api/blame/main/src/inner/x.txt").await?;
+    assert_eq!(b["path"], "src/inner/x.txt");
+    assert_eq!(b["sha"].as_str().unwrap().len(), 40);
+    let lines = b["blame"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["line"], 1);
+    assert_eq!(lines[0]["text"], "xx", "main's x.txt content");
+    assert!(
+        !lines[0]["author"].as_str().unwrap().is_empty(),
+        "author present"
+    );
+    assert!(
+        lines[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("second on main"),
+        "main's line attributed to second on main: {lines:?}"
+    );
+    let b2 = json(server, "/o/r/api/blame/feature/x/src/inner/x.txt").await?;
+    let l2 = &b2["blame"][0];
+    assert!(
+        l2["summary"].as_str().unwrap().contains("initial"),
+        "feature/x's x.txt came from initial: {l2:?}"
+    );
+    assert_eq!(get(server, "/o/r/api/blame/main/nope.txt").await?.0, 404);
+
+    // archive (D1 review primitive): binary download, gzip/zip magic
+    let resp = reqwest::Client::new()
+        .get(format!("{}/o/r/api/archive/main", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("application/gzip"), "ct: {ct}");
+    let bytes = resp.bytes().await?;
+    assert!(bytes.len() > 100, "archive is non-trivial: {}", bytes.len());
+    assert!(
+        bytes.starts_with(b"\x1f\x8b"),
+        "gzip magic: {:02x?}",
+        &bytes[..2]
+    );
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/o/r/api/archive/main?format=zip",
+            server.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("application/zip"), "ct: {ct}");
+    let bytes = resp.bytes().await?;
+    assert!(bytes.starts_with(b"PK"), "zip magic: {:02x?}", &bytes[..2]);
+    assert_eq!(
+        get(server, "/o/r/api/archive/main?format=bogus").await?.0,
+        404
+    );
+    assert_eq!(get(server, "/o/r/api/archive/nope").await?.0, 404);
 
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
@@ -590,5 +774,127 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
         .send()
         .await?;
     assert_ne!(git.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_base_unrelated_histories() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "r2").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "a"])?;
+    git_in(&dir, &["checkout", "-q", "--orphan", "other"])?;
+    std::fs::write(dir.join("b.txt"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "b"])?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "r2")],
+    )?;
+    let mb = json(&server, "/o/r2/api/merge-base?from=main&to=other").await?;
+    assert_eq!(mb["merge_base"], Value::Null, "unrelated histories -> null");
+    Ok(())
+}
+
+/// D1 blame known limitation (web/API.md + docs/D1_COLLAB_DESIGN.md §9): git
+/// blame has no switch to turn rename-following off, so a remote-served base
+/// cannot follow a rename (the parent tree that holds the old path is never
+/// faulted). Local blame follows it; remote must fail with a defined 404, not
+/// a silent wrong answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_blame_of_renamed_file_is_a_defined_error() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    fixture(&big)?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    // Local blame follows the rename (src/main.rs -> src/app.rs) and works.
+    let b = json(&big, "/o/r/api/blame/main/src/app.rs").await?;
+    assert_eq!(b["path"], "src/app.rs");
+    assert!(
+        !b["blame"].as_array().unwrap().is_empty(),
+        "local blame works"
+    );
+    // Remote cannot follow the rename: defined 404, not a wrong answer.
+    assert_eq!(get(&small, "/o/r/api/blame/main/src/app.rs").await?.0, 404);
+    Ok(())
+}
+
+/// Regression (PR #9 review C1): the remote merge-base walk must not busy-spin
+/// when one frontier exhausts before the other. Two unrelated roots on a
+/// 1-byte-cache sibling must answer `null`, not hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_merge_base_unrelated_histories_is_null() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "a"])?;
+    git_in(&dir, &["checkout", "-q", "--orphan", "other"])?;
+    std::fs::write(dir.join("b.txt"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "b"])?;
+    git_in(&dir, &["push", "-q", "--mirror", &big.repo_url("o", "r")])?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    let mb = json(&small, "/o/r/api/merge-base?from=main&to=other").await?;
+    assert_eq!(mb["merge_base"], Value::Null, "remote unrelated -> null");
+    Ok(())
+}
+
+/// Regression (PR #9 review C1): a feature forked from DEEP main — the walk
+/// must meet at the branch point even though one side's frontier empties
+/// first, and the remote answer must equal local git's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_merge_base_deep_fork() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "c1"])?;
+    for i in 2..=10 {
+        git_in(
+            &dir,
+            &["commit", "-q", "--allow-empty", "-m", &format!("m{i}")],
+        )?;
+    }
+    // Feature forks from main~2 (deep in main's history) and adds two commits.
+    git_in(&dir, &["checkout", "-q", "-b", "feature", "HEAD~2"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "f1"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "f2"])?;
+    git_in(&dir, &["checkout", "-q", "main"])?;
+    let expected = git_in(&dir, &["merge-base", "main", "feature"])?
+        .trim()
+        .to_string();
+    git_in(&dir, &["push", "-q", "--mirror", &big.repo_url("o", "r")])?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    let mb = json(&small, "/o/r/api/merge-base?from=main&to=feature").await?;
+    assert_eq!(
+        mb["merge_base"], expected,
+        "remote deep fork base matches git"
+    );
     Ok(())
 }

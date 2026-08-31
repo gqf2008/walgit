@@ -8,7 +8,7 @@
 //! Everything reports what it is doing through a [`Reporter`] so the SSE
 //! envelope can narrate ("Reading tree areas/core…", "Walked 300 commits…").
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use gix_hash::ObjectId;
@@ -25,6 +25,24 @@ const MAX_DIFF_OBJECTS: usize = 20_000;
 const NEWEST_BUDGET: usize = 3_000;
 /// Budget for a history page walk (skip + n commits, plus skipped TREESAME ones).
 const WALK_BUDGET: usize = 50_000;
+/// Budget for a merge-base bidirectional walk (one commit popped per side).
+/// Each pop is a serial range read on the remote reader; 50k could stall a
+/// request for minutes, so deep/unrelated histories fail fast instead.
+const MERGE_BASE_BUDGET: usize = 5_000;
+/// Budget for a blame history walk (commits visited before git blame runs).
+const BLAME_BUDGET: usize = 3_000;
+/// Budget for a whole-tree archive fault (trees + blobs, deduped).
+const ARCHIVE_OBJECT_BUDGET: usize = 100_000;
+
+/// Test hook (same pattern as the `WALGIT_TEST_*` knobs in walgit-wal):
+/// shrink a budget from the environment so the 503 paths are exercisable in
+/// tests without building a 100 k-object fixture.
+fn test_budget(env: &str, default: usize) -> usize {
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
@@ -311,6 +329,78 @@ impl Remote {
         Ok(res.pop())
     }
 
+    /// A merge base of `a` and `b` (hex shas), by bounded bidirectional walk
+    /// over the pack set — no objects on disk needed. Returns the first common
+    /// ancestor found: for the branch-from-trunk shape this is the branch
+    /// point; criss-cross histories may differ from `git merge-base`'s
+    /// preferred one. `None` when the histories are unrelated; 503 when the
+    /// walk budget is exhausted (paths too far apart for a remote reader).
+    pub async fn merge_base(&self, a: &str, b: &str) -> Result<Option<ObjectId>, ApiError> {
+        let a = ObjectId::from_hex(a.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {a}")))?;
+        let b = ObjectId::from_hex(b.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {b}")))?;
+        if a == b {
+            return Ok(Some(a));
+        }
+        let mut fa: VecDeque<ObjectId> = VecDeque::from([a]);
+        let mut fb: VecDeque<ObjectId> = VecDeque::from([b]);
+        let mut sa: HashSet<ObjectId> = HashSet::from([a]);
+        let mut sb: HashSet<ObjectId> = HashSet::from([b]);
+        let budget = test_budget("WALGIT_TEST_MERGE_BASE_BUDGET", MERGE_BASE_BUDGET);
+        let mut popped = 0usize;
+        while !fa.is_empty() || !fb.is_empty() {
+            // Expand the smaller frontier so the sides meet in the middle; a
+            // side whose frontier is exhausted must not be re-picked (otherwise
+            // `0 <= n` selects the empty side forever and the loop busy-spins
+            // on the async runtime without consuming budget).
+            let pick_a = if fa.is_empty() {
+                false
+            } else if fb.is_empty() {
+                true
+            } else {
+                fa.len() <= fb.len()
+            };
+            let (front, seen_self, seen_other) = if pick_a {
+                (&mut fa, &mut sa, &sb)
+            } else {
+                (&mut fb, &mut sb, &sa)
+            };
+            let Some(oid) = front.pop_front() else {
+                continue;
+            };
+            popped += 1;
+            if popped > budget {
+                self.reporter
+                    .notice(format!("merge-base: gave up after {budget} commits"));
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "merge-base walk exceeded {budget} commits; the histories are too far apart (or unrelated) for the remote reader"
+                )));
+            }
+            if popped.is_multiple_of(100) {
+                self.reporter.bar(
+                    "Finding merge base".to_string(),
+                    popped as u64,
+                    None,
+                    "commits",
+                );
+            }
+            if seen_other.contains(&oid) {
+                return Ok(Some(oid));
+            }
+            let meta = self.commit(&oid).await?;
+            for par in meta.parents {
+                if seen_other.contains(&par) {
+                    return Ok(Some(par));
+                }
+                if seen_self.insert(par) {
+                    front.push_back(par);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn walk_bounded(
         &self,
         start: ObjectId,
@@ -439,10 +529,54 @@ impl Remote {
             "Reading the trees and blobs changed by {}",
             &c.id.to_hex().to_string()[..12]
         ));
-        // Level-parallel: every tree pair of the current level is faulted in
-        // one concurrent batch (range reads ~50 ms each; serially a large repository
-        // commit took 300 round trips = 15 s), then merge-walked; the blobs
-        // it references are faulted in a second batch. Rounds ≈ path depth.
+        self.fault_tree_pairs(stack).await?;
+        Ok(c)
+    }
+
+    /// Fault every tree and blob the diff between `a` and `b` (hex shas)
+    /// touches into the local loose store, so an unmodified `git diff` can run
+    /// against them. `a == b` faults nothing.
+    pub async fn fault_diff(&self, a: &str, b: &str) -> Result<(), ApiError> {
+        let a = ObjectId::from_hex(a.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {a}")))?;
+        let b = ObjectId::from_hex(b.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {b}")))?;
+        if a == b {
+            return Ok(());
+        }
+        let ca = self.commit(&a).await?;
+        self.fault(&a).await?;
+        let cb = self.commit(&b).await?;
+        self.fault(&b).await?;
+        let (sa, sb) = (
+            a.to_hex()
+                .to_string()
+                .get(..12)
+                .unwrap_or_default()
+                .to_string(),
+            b.to_hex()
+                .to_string()
+                .get(..12)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        self.reporter
+            .notice(format!("Reading the diff between {sa} and {sb}"));
+        self.fault_tree_pairs(vec![(Some(ca.tree), Some(cb.tree))])
+            .await
+    }
+
+    /// Level-parallel faulting of a set of tree pairs (`None` = empty tree):
+    /// every tree of the current level is faulted in one concurrent batch
+    /// (range reads ~50 ms each; serially a large repository commit took 300
+    /// round trips = 15 s), then merge-walked; the blobs it references are
+    /// faulted in a second batch. Rounds ≈ path depth. Bounded by
+    /// MAX_DIFF_OBJECTS.
+    async fn fault_tree_pairs(
+        &self,
+        mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)>,
+    ) -> Result<(), ApiError> {
+        let budget = test_budget("WALGIT_TEST_DIFF_BUDGET", MAX_DIFF_OBJECTS);
         let mut count = 0usize;
         while !stack.is_empty() {
             let level = std::mem::take(&mut stack);
@@ -454,10 +588,9 @@ impl Remote {
             want.sort_unstable();
             want.dedup();
             count += want.len();
-            if count > MAX_DIFF_OBJECTS {
+            if count > budget {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "diff touches more than {budget} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&want).await?;
@@ -540,10 +673,9 @@ impl Remote {
             blobs.sort_unstable();
             blobs.dedup();
             count += blobs.len();
-            if count > MAX_DIFF_OBJECTS {
+            if count > budget {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "diff touches more than {budget} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&blobs).await?;
@@ -552,7 +684,142 @@ impl Remote {
             .refresh_async()
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(c)
+        Ok(())
+    }
+
+    /// Fault everything `git blame --porcelain <rev> -- <path>` reads into the
+    /// loose store: each commit of the path history, its path trees and every
+    /// version of the file blob — bounded by BLAME_BUDGET commits. Paths that
+    /// did not yet exist are boundaries (their ancestors are not followed);
+    /// merge commits get every parent's path state faulted because blame diffs
+    /// against all of them.
+    pub async fn fault_blame(&self, commit_sha: &str, path: &str) -> Result<(), ApiError> {
+        let start = ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {commit_sha}")))?;
+        #[derive(PartialEq, Eq)]
+        struct Item(i64, u64, ObjectId);
+        impl Ord for Item {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.0.cmp(&o.0).then_with(|| o.1.cmp(&self.1))
+            }
+        }
+        impl PartialOrd for Item {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        let mut heap = BinaryHeap::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut seq = 0u64;
+        let start_meta = self.commit(&start).await?;
+        heap.push(Item(start_meta.commit_time, seq, start));
+        seen.insert(start);
+        let budget = test_budget("WALGIT_TEST_BLAME_BUDGET", BLAME_BUDGET);
+        let mut visited = 0usize;
+        while let Some(Item(_, _, oid)) = heap.pop() {
+            visited += 1;
+            if visited > budget {
+                self.reporter
+                    .notice(format!("blame: gave up after {budget} commits"));
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "path '{path}' has more than {budget} commits of ancestry; too deep to blame from the remote pack set — use a host with the packs or a bundle"
+                )));
+            }
+            if visited.is_multiple_of(100) {
+                self.reporter.bar(
+                    "Reading blame history".to_string(),
+                    visited as u64,
+                    None,
+                    "commits",
+                );
+            }
+            let (meta, target, mode) = match self.fault_path(&oid, path).await {
+                Ok(x) => x,
+                Err(ApiError::NotFound(_)) => continue, // path absent: boundary
+                Err(e) => return Err(e),
+            };
+            if mode.is_blob_or_symlink() {
+                self.fault(&target).await?;
+            }
+            for par in meta.parents {
+                if seen.insert(par) {
+                    // Fault the parent's path state now (idempotent with its own
+                    // pop) so merge diffs have every parent's tree and blob.
+                    match self.fault_path(&par, path).await {
+                        Ok((_, ptarget, pmode)) => {
+                            if pmode.is_blob_or_symlink() {
+                                self.fault(&ptarget).await?;
+                            }
+                        }
+                        // Path absent in this parent: a boundary, not an error.
+                        Err(ApiError::NotFound(_)) => {}
+                        // Real failures must surface, or the later `git blame`
+                        // fails with an unreproducible local error.
+                        Err(e) => return Err(e),
+                    }
+                    seq += 1;
+                    let pm = self.commit(&par).await?;
+                    heap.push(Item(pm.commit_time, seq, par));
+                }
+            }
+        }
+        self.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Fault every tree and blob reachable from `commit` into the loose store
+    /// so an unmodified `git archive` can run against them — level-parallel,
+    /// deduped, bounded by `ARCHIVE_OBJECT_BUDGET` objects (503 past it: a tree
+    /// this large should be downloaded as a static bundle instead).
+    pub async fn fault_tree_all(&self, commit_sha: &str) -> Result<(), ApiError> {
+        let start = ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {commit_sha}")))?;
+        let c = self.commit(&start).await?;
+        self.fault(&start).await?;
+        let mut frontier: Vec<ObjectId> = vec![c.tree];
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        seen.insert(c.tree);
+        let budget = test_budget("WALGIT_TEST_ARCHIVE_BUDGET", ARCHIVE_OBJECT_BUDGET);
+        let mut count = 0usize;
+        let too_large = || {
+            ApiError::ServiceUnavailable(format!(
+                "tree at {commit_sha} has more than {budget} objects; too large to archive from the remote pack set — clone via bundle-uri or use a host with the packs"
+            ))
+        };
+        while !frontier.is_empty() {
+            count += frontier.len();
+            if count > budget {
+                return Err(too_large());
+            }
+            self.fault_many(&frontier).await?;
+            let mut next: Vec<ObjectId> = Vec::new();
+            let mut blobs: Vec<ObjectId> = Vec::new();
+            for tree in &frontier {
+                for e in self.tree_entries(tree).await? {
+                    if e.mode.is_tree() {
+                        if seen.insert(e.oid) {
+                            next.push(e.oid);
+                        }
+                    } else if e.mode.is_blob_or_symlink() && seen.insert(e.oid) {
+                        blobs.push(e.oid);
+                    }
+                }
+            }
+            count += blobs.len();
+            if count > budget {
+                return Err(too_large());
+            }
+            self.fault_many(&blobs).await?;
+            frontier = next;
+        }
+        self.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(())
     }
 }
 
