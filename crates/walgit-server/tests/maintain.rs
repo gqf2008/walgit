@@ -793,6 +793,9 @@ async fn bundle_list_shows_a_bundle_right_after_this_host_builds_it() -> anyhow:
 /// a daily is final an hour after 23:00, not at the next 23:00):
 /// `next_unit` settles them at plan time (refs-level; verdicts recorded in the
 /// list), and the live slot with real objects is built in the SAME pass.
+/// One pass may additionally cut a weekly whose fire passed since the
+/// fixture's cut; the new base re-opens the recorded questions, so the test
+/// loops passes until the plan is stable and then asserts the invariant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     let server = step!(
@@ -893,23 +896,14 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         "only the newest slots are planned: {rows:?}"
     );
 
-    // ONE pass.
-    let report = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
-    let list = walgit_bundle::ops::read_list(h.store())
-        .await?
-        .expect("list");
-    let hourlies: Vec<_> = list
-        .bundles
-        .iter()
-        .filter(|b| b.strategy == "hourly")
-        .collect();
-    assert!(
-        !list.skipped.is_empty(),
-        "closed empty slots recorded in the list: {report:?}"
-    );
-    // Every CLOSED missing slot is settled in that one pass. The open (current)
-    // slot may stay missing: the commit above was pushed after its fire time, so
-    // as of the slot there is nothing new — it belongs to the next hour (D22).
+    // One pass settles every closed empty slot at plan time (one CAS for all
+    // verdicts). The pass may ALSO cut the weekly whose fire has passed since
+    // the fixture's cut (self-healing, D22): a new weekly re-opens the
+    // recorded questions — skip records match on their base, so the hourlies
+    // it now anchors show `missing` again until one more pass re-settles them
+    // with the same verdicts (issue #17: the real clock put every
+    // Monday-morning run inside exactly that window). Loop until the plan is
+    // stable; the first pass still proves the batch settle below.
     let hourly = server
         .state
         .cfg
@@ -919,30 +913,53 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .find(|s| s.name == "hourly")
         .unwrap()
         .clone();
-    let rows = server
-        .state
-        .bundles
-        .plan(&id, std::time::SystemTime::now(), ctx)
-        .await?;
-    let still_missing_closed: Vec<u64> = rows
-        .iter()
-        .filter(|r| {
-            r.strategy == "hourly"
-                && r.status == walgit_bundle::slots::SlotStatus::Missing
-                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
-        })
-        .map(|r| r.slot)
-        .collect();
+    let mut still_missing_closed = Vec::new();
+    let mut first_pass_skipped = 0usize;
+    for round in 0..4 {
+        let report = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
+        let list = walgit_bundle::ops::read_list(h.store())
+            .await?
+            .expect("list");
+        let rows = server
+            .state
+            .bundles
+            .plan(&id, std::time::SystemTime::now(), ctx)
+            .await?;
+        still_missing_closed = rows
+            .iter()
+            .filter(|r| {
+                r.strategy == "hourly"
+                    && r.status == walgit_bundle::slots::SlotStatus::Missing
+                    && walgit_bundle::slots::slot_closed(
+                        &hourly,
+                        r.slot,
+                        std::time::SystemTime::now(),
+                    )
+            })
+            .map(|r| r.slot)
+            .collect();
+        if round == 0 {
+            // The open (current) slot may stay missing: the commit above was
+            // pushed after its fire time, so as of the slot there is nothing
+            // new — it belongs to the next hour (D22).
+            assert!(
+                !list.skipped.is_empty(),
+                "closed empty slots recorded in the list: {report:?}"
+            );
+            assert!(
+                list.skipped.len() >= missing_before - 1,
+                "settled at plan time, not one per pass: skipped={} missing_before={missing_before}",
+                list.skipped.len()
+            );
+            first_pass_skipped = list.skipped.len();
+        }
+        if still_missing_closed.is_empty() {
+            break;
+        }
+    }
     assert!(
         still_missing_closed.is_empty(),
-        "after one pass no closed slot stays missing: {still_missing_closed:?}\nskipped={} built={}",
-        list.skipped.len(),
-        hourlies.len()
-    );
-    assert!(
-        list.skipped.len() >= missing_before - 1,
-        "settled at plan time, not one per pass: skipped={} missing_before={missing_before}",
-        list.skipped.len()
+        "passes do not settle every closed empty slot: {still_missing_closed:?} (skipped after the first pass: {first_pass_skipped})"
     );
     Ok(())
 }
