@@ -321,6 +321,17 @@ async fn collab_ref_events_flow_through_the_bridge() -> TestResult {
     assert_eq!(delete["_walgit"]["seq"], "3");
     assert_eq!(cursor_seq(&server, "t", "r").await, Some(3));
 
+    // Dedup: a second catch-up emits nothing and the cursor is untouched
+    // (same `(repo, seq, ref_name)` contract as heads — no duplicate events).
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!((r.from_seq, r.head_seq, r.emitted), (3, 3, 0));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        3,
+        "no duplicates for collab refs"
+    );
+
     // Replay contract: the WAL log holds exactly these three entries, so a
     // consumer backfills the same events after a gap (docs/EVENTS.md).
     assert_eq!(server.read_log("t", "r").await?.len(), 3);
