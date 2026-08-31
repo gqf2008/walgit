@@ -147,6 +147,21 @@ pub fn sign_entry(entry: &mut Entry, key: &SigningKey) -> String {
     )
 }
 
+impl EntryRef {
+    /// Whether the entry counts as verified: the signature checks against the
+    /// actor's registered key **and** the inbox it was found in names the
+    /// entry's own principal. The inbox model (D1 §4.1) shards write access by
+    /// principal; a policy that lets anyone write any inbox must not smuggle
+    /// an entry across principals — the signature alone only proves the actor
+    /// signed it, not that it belongs in this inbox.
+    pub fn is_verified(&self, principals: &HashMap<String, String>) -> bool {
+        self.principal == self.entry.actor
+            && principals
+                .get(&self.entry.actor)
+                .is_some_and(|k| verify_entry(&self.entry, k).is_ok())
+    }
+}
+
 // ---- §4.3 deterministic aggregation ------------------------------------------
 
 /// One issue/thread: entries referencing the same `id`, topologically ordered
@@ -229,9 +244,7 @@ pub fn pr_view(
             base = rs.base.clone().or(base);
             head = rs.head.clone().or(head);
         }
-        let verified = principals
-            .get(&e.actor)
-            .is_some_and(|k| verify_entry(e, k).is_ok());
+        let verified = r.is_verified(principals);
         if !verified {
             unverified.push(format!("{}@{}", e.actor, r.oid));
         }
@@ -490,9 +503,7 @@ pub fn run(action: CollabAction) -> Result<()> {
             let out: Vec<serde_json::Value> = ordered
                 .iter()
                 .map(|r| {
-                    let verified = principals
-                        .get(&r.entry.actor)
-                        .is_some_and(|k| verify_entry(&r.entry, k).is_ok());
+                    let verified = r.is_verified(&principals);
                     serde_json::json!({ "oid": r.oid, "principal": r.principal, "verified": verified, "entry": r.entry })
                 })
                 .collect();
@@ -1074,15 +1085,31 @@ fn refs_map(repo: &Path) -> Result<std::collections::HashMap<String, String>> {
     Ok(map)
 }
 
-/// Describe one new/changed ref for the callback and stdout.
-fn describe_ref(repo: &Path, name: &str, oid: &str) -> Result<String> {
+/// One new/changed collab ref, described for the callback. The fields are
+/// taken from the **parsed entry** — never re-parsed out of rendered text: the
+/// blob is remote content, and a body containing a literal `\nkind=` line
+/// must not be able to forge the signals an agent's `--exec` keys on.
+struct RefEvent {
+    kind: String,
+    actor: String,
+    thread: String,
+    verified: bool,
+    /// The raw blob text (the entry JSON on stdin).
+    text: String,
+}
+
+fn describe_ref(repo: &Path, name: &str, oid: &str) -> Result<RefEvent> {
     let blob = CollabReader::new(repo).git(&["cat-file", "blob", oid])?;
     let principals = CollabReader::new(repo).principals()?;
     let text = String::from_utf8_lossy(&blob).to_string();
     if let Some(principal) = name.strip_prefix("refs/collab/meta/principals/") {
-        return Ok(format!(
-            "ref={name}\nkind=principal\nactor={principal}\nthread=\nverified=true\n\n{text}"
-        ));
+        return Ok(RefEvent {
+            kind: "principal".into(),
+            actor: principal.into(),
+            thread: String::new(),
+            verified: true,
+            text,
+        });
     }
     let entry: Entry = serde_json::from_str(&text).unwrap_or_else(|_| Entry {
         version: 0,
@@ -1095,13 +1122,25 @@ fn describe_ref(repo: &Path, name: &str, oid: &str) -> Result<String> {
         body: serde_json::Value::Null,
         sig: String::new(),
     });
-    let verified = principals
-        .get(&entry.actor)
-        .is_some_and(|k| verify_entry(&entry, k).is_ok());
-    Ok(format!(
-        "ref={name}\nkind={}\nactor={}\nthread={}\nverified={}\n\n{text}",
-        entry.kind, entry.actor, entry.id, verified
-    ))
+    // The inbox path names the principal; verification includes the
+    // inbox-consistency invariant (D1 §4.1, `EntryRef::is_verified`).
+    let principal = name
+        .strip_prefix("refs/collab/inbox/")
+        .and_then(|p| p.rsplit_once('/'))
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let er = EntryRef {
+        oid: oid.to_string(),
+        principal,
+        entry,
+    };
+    Ok(RefEvent {
+        kind: er.entry.kind.clone(),
+        actor: er.entry.actor.clone(),
+        thread: er.entry.id.clone(),
+        verified: er.is_verified(&principals),
+        text,
+    })
 }
 
 fn run_exec(cmd: &str, stdin: &str, env: &[(&str, &str)]) -> Result<()> {
@@ -1140,17 +1179,16 @@ fn run_watch(
         let prev = read_state(&state_file)?;
         let changed = changed_refs(&prev, &cur);
         for (name, oid) in &changed {
-            let desc = describe_ref(repo, name, oid)?;
+            let ev = describe_ref(repo, name, oid)?;
             if let Some(cmd) = exec {
                 let env: Vec<(&str, &str)> = vec![
                     ("WALGIT_COLLAB_REF", name.as_str()),
-                    ("WALGIT_COLLAB_KIND", desc.split("\nkind=").nth(1).and_then(|s| s.split('\n').next()).unwrap_or("")),
-                    ("WALGIT_COLLAB_THREAD", desc.split("\nthread=").nth(1).and_then(|s| s.split('\n').next()).unwrap_or("")),
-                    ("WALGIT_COLLAB_ACTOR", desc.split("\nactor=").nth(1).and_then(|s| s.split('\n').next()).unwrap_or("")),
-                    ("WALGIT_COLLAB_VERIFIED", desc.split("\nverified=").nth(1).and_then(|s| s.split('\n').next()).unwrap_or("false")),
+                    ("WALGIT_COLLAB_KIND", ev.kind.as_str()),
+                    ("WALGIT_COLLAB_THREAD", ev.thread.as_str()),
+                    ("WALGIT_COLLAB_ACTOR", ev.actor.as_str()),
+                    ("WALGIT_COLLAB_VERIFIED", if ev.verified { "true" } else { "false" }),
                 ];
-                let stdin = desc.split("\n\n").nth(1).unwrap_or("").to_string();
-                run_exec(cmd, &stdin, &env)?;
+                run_exec(cmd, &ev.text, &env)?;
             }
             println!("{name} {oid}");
         }
@@ -1471,5 +1509,42 @@ mod tests {
         let pr = pr_view(&refs, &principals);
         assert_eq!(pr.human_approvals.len(), 1, "only the verified approve counts");
         assert_eq!(pr.unverified.len(), 1, "tampered entry listed unverified");
+    }
+
+    #[test]
+    fn an_entry_in_the_wrong_inbox_is_not_verified() {
+        let (sk, pk) = keypair();
+        let mut e = entry(
+            "pr1",
+            "review",
+            "alice", // the JSON names alice
+            "",
+            "r1",
+            1,
+            serde_json::json!({"decision": "approve"}),
+        );
+        e.entry.sig = sign_entry(&mut e.entry, &sk);
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pk);
+
+        // Same actor, own inbox: verified.
+        let mut own = e.clone();
+        own.principal = "alice".into();
+        assert!(own.is_verified(&principals));
+
+        // The same signed bytes found in someone else's inbox: the signature is
+        // alice's, but the inbox model (D1 §4.1) shards by principal — an entry
+        // in bob's inbox naming alice as actor does not count.
+        let mut smuggled = e.clone();
+        smuggled.principal = "bob".into();
+        assert!(!smuggled.is_verified(&principals));
+
+        let refs = vec![&smuggled];
+        let pr = pr_view(&refs, &principals);
+        assert!(
+            pr.human_approvals.is_empty(),
+            "an approval smuggled into another inbox does not count"
+        );
+        assert_eq!(pr.unverified.len(), 1);
     }
 }
