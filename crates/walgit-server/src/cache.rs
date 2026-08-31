@@ -232,10 +232,12 @@ pub struct RefIndex {
     pub branches: Vec<(String, String)>,
     /// Short tag names, byte-sorted, with the peeled commit sha.
     pub tags: Vec<(String, String)>,
-    /// Every ref as (full name, oid, peeled), byte-sorted by full name. Built
-    /// once per manifest version like the namespaces above; listing endpoints
-    /// page over it in O(page) without copying.
-    pub all: Vec<(String, String, String)>,
+    /// Every ref as (full name, oid), byte-sorted by full name. Built once
+    /// per manifest version like the namespaces above; listing endpoints page
+    /// over it in O(page) without copying. Peeled tags are not needed for a
+    /// full-name listing, so they are not carried here (saves a String per ref
+    /// on a 466 k-ref monorepo).
+    pub all: Vec<(String, String)>,
     /// HEAD symref target (full name) or "".
     pub head_target: String,
 }
@@ -257,7 +259,7 @@ impl RefIndex {
                 };
                 tags.push((n.to_string(), sha));
             }
-            all.push((r.name.clone(), r.oid.clone(), r.peeled.clone()));
+            all.push((r.name.clone(), r.oid.clone()));
             by_name.insert(r.name.clone(), (r.oid.clone(), r.peeled.clone()));
         }
         branches.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
