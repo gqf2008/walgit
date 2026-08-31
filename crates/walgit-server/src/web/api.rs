@@ -206,6 +206,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
+            .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -1002,6 +1003,72 @@ fn parse_porcelain_blame(bytes: &[u8]) -> Vec<BlameLine> {
         }
     }
     out
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ArchiveQuery {
+    #[serde(default = "default_archive_format")]
+    format: String,
+}
+
+fn default_archive_format() -> String {
+    "tar.gz".to_string()
+}
+
+/// A tree archive (`archive/{rev}?format=tar.gz|zip`, default `tar.gz`) as a
+/// binary download — the whole tree at one revision. Local packs run `git
+/// archive` directly; remote-served bases fault the whole tree first
+/// (`Remote::fault_tree_all`, bounded — larger trees get a 503 pointing at
+/// bundle-uri, where big-repo downloads belong anyway).
+async fn archive(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, rest)): Path<(String, String, String)>,
+    Query(q): Query<ArchiveQuery>,
+) -> Result<Response, ApiError> {
+    // Binary download: never the SSE envelope.
+    let mut plain_headers = headers.clone();
+    plain_headers.remove(header::ACCEPT);
+    run(
+        &st,
+        &plain_headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let rev = rest.trim_matches('/');
+            let res = resolve_name(&r, rev).await?;
+            let format = match q.format.as_str() {
+                "tar.gz" | "zip" => q.format,
+                other => return Err(not_found(format!("unknown archive format {other}"))),
+            };
+            if let Some(remote) = r.remote() {
+                remote.fault_tree_all(&res.sha).await?;
+            }
+            let bytes = git(
+                &r.local,
+                vec![
+                    "archive".into(),
+                    format!("--format={format}"),
+                    res.sha.clone(),
+                ],
+            )
+            .await?;
+            let content_type: &'static str = if format == "zip" {
+                "application/zip"
+            } else {
+                "application/gzip"
+            };
+            Ok(Rendered {
+                body: bytes::Bytes::from(bytes),
+                content_type,
+                cache_control: SWR,
+                etag: Some(etag_for(&res.sha)),
+            })
+        },
+    )
+    .await
 }
 
 // ---- resolve -----------------------------------------------------------------

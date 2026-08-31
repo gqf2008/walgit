@@ -320,6 +320,49 @@ async fn conformance(
     );
     assert_eq!(get(server, "/o/r/api/blame/main/nope.txt").await?.0, 404);
 
+    // archive (D1 review primitive): binary download, gzip/zip magic
+    let resp = reqwest::Client::new()
+        .get(format!("{}/o/r/api/archive/main", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("application/gzip"), "ct: {ct}");
+    let bytes = resp.bytes().await?;
+    assert!(bytes.len() > 100, "archive is non-trivial: {}", bytes.len());
+    assert!(
+        bytes.starts_with(b"\x1f\x8b"),
+        "gzip magic: {:02x?}",
+        &bytes[..2]
+    );
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/o/r/api/archive/main?format=zip",
+            server.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("application/zip"), "ct: {ct}");
+    let bytes = resp.bytes().await?;
+    assert!(bytes.starts_with(b"PK"), "zip magic: {:02x?}", &bytes[..2]);
+    assert_eq!(
+        get(server, "/o/r/api/archive/main?format=bogus").await?.0,
+        404
+    );
+    assert_eq!(get(server, "/o/r/api/archive/nope").await?.0, 404);
+
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
     assert_eq!(st, 200);

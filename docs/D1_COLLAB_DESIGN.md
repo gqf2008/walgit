@@ -180,7 +180,10 @@
 > （remote 先 level-parallel fault 两树差异对象再跑同一 `git diff`，与本地字节一致）；
 > `GET /{o}/{r}/api/blame/{rev}/{path}` 已落地（porcelain 解析为 JSON；remote 有界
 > fault 路径历史后跑同一 `git blame`）；`patch`（格式 patch 语义）已由
-> `diff?format=patch` 覆盖；archive 待办。
+> `diff?format=patch` 覆盖；
+> `GET /{o}/{r}/api/archive/{rev}?format=tar.gz|zip` 已落地（二进制下载；
+> remote 预算化整树 fault，超限 503 指向 bundle-uri）。
+> 缺口 1、2 至此全部落地；第 8-10 项（契约文档、测试覆盖、本节进度）随批次收口。
 
 ## 10. 一致性、并发与安全
 

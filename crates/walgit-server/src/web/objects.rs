@@ -29,6 +29,8 @@ const WALK_BUDGET: usize = 50_000;
 const MERGE_BASE_BUDGET: usize = WALK_BUDGET;
 /// Budget for a blame history walk (commits visited before git blame runs).
 const BLAME_BUDGET: usize = 3_000;
+/// Budget for a whole-tree archive fault (trees + blobs, deduped).
+const ARCHIVE_OBJECT_BUDGET: usize = 100_000;
 
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
@@ -729,6 +731,57 @@ impl Remote {
                     heap.push(Item(pm.commit_time, seq, par));
                 }
             }
+        }
+        self.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Fault every tree and blob reachable from `commit` into the loose store
+    /// so an unmodified `git archive` can run against them — level-parallel,
+    /// deduped, bounded by ARCHIVE_OBJECT_BUDGET objects (503 past it: a tree
+    /// this large should be downloaded as a static bundle instead).
+    pub async fn fault_tree_all(&self, commit_sha: &str) -> Result<(), ApiError> {
+        let start = ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {commit_sha}")))?;
+        let c = self.commit(&start).await?;
+        self.fault(&start).await?;
+        let mut frontier: Vec<ObjectId> = vec![c.tree];
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        seen.insert(c.tree);
+        let mut count = 0usize;
+        let too_large = |count: usize| {
+            ApiError::ServiceUnavailable(format!(
+                "tree at {commit_sha} has more than {ARCHIVE_OBJECT_BUDGET} objects; too large to archive from the remote pack set — clone via bundle-uri or use a host with the packs"
+            ))
+        };
+        while !frontier.is_empty() {
+            count += frontier.len();
+            if count > ARCHIVE_OBJECT_BUDGET {
+                return Err(too_large(count));
+            }
+            self.fault_many(&frontier).await?;
+            let mut next: Vec<ObjectId> = Vec::new();
+            let mut blobs: Vec<ObjectId> = Vec::new();
+            for tree in &frontier {
+                for e in self.tree_entries(tree).await? {
+                    if e.mode.is_tree() {
+                        if seen.insert(e.oid) {
+                            next.push(e.oid);
+                        }
+                    } else if e.mode.is_blob_or_symlink() && seen.insert(e.oid) {
+                        blobs.push(e.oid);
+                    }
+                }
+            }
+            count += blobs.len();
+            if count > ARCHIVE_OBJECT_BUDGET {
+                return Err(too_large(count));
+            }
+            self.fault_many(&blobs).await?;
+            frontier = next;
         }
         self.local
             .refresh_async()

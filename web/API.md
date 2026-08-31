@@ -427,6 +427,19 @@ context and agent lookups. `rev` resolves like `resolve`; `path` is the file.
   answer. Paths with longer history than the budget → `503` with the fix.
 - `blame` of a directory or a missing path → `404`. Cache: SWR.
 
+### `GET /{owner}/{repo}/api/archive/{rev}?format=`
+
+A tree archive at one revision as a binary download — `format=tar.gz`
+(default) or `zip`. The "download this repo" button; small/medium repos get a
+real archive, large ones a clear 503 pointing at bundle-uri (where big-repo
+bytes belong anyway).
+
+- Local packs run `git archive` directly; a remote-served base faults the
+  whole tree first (`Remote::fault_tree_all`, level-parallel, deduped, bounded
+  by `ARCHIVE_OBJECT_BUDGET` objects → `503` past it).
+- `Content-Type`: `application/gzip` / `application/zip`; `ETag: "<sha>"` +
+  SWR. Unknown format or revision → `404`. Never the SSE envelope (binary).
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json
