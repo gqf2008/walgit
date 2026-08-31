@@ -439,6 +439,28 @@ pub enum CollabAction {
         #[arg(long)]
         push: Option<String>,
     },
+    /// Resident watcher: fetch `refs/collab/*` from a remote, report new or
+    /// changed refs, and invoke `--exec` for each with the entry JSON on
+    /// stdin (the agent's decision logic; walgit only does notify+sync).
+    Watch {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote to fetch collab refs from.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Seconds between passes (default 10).
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
+        /// Run a single pass and exit (tests/CI).
+        #[arg(long)]
+        once: bool,
+        /// Command run for each new/changed ref (`sh -c`); entry JSON on stdin.
+        #[arg(long)]
+        exec: Option<String>,
+        /// State file override (default `<gitdir>/collab-watch.json`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
 }
 
 pub fn run(action: CollabAction) -> Result<()> {
@@ -507,6 +529,14 @@ pub fn run(action: CollabAction) -> Result<()> {
             principal,
             push,
         } => run_principal_revoke(&repo, &principal, push.as_deref())?,
+        CollabAction::Watch {
+            repo,
+            remote,
+            interval,
+            once,
+            exec,
+            state,
+        } => run_watch(&repo, &remote, interval, once, exec.as_deref(), state.as_deref())?,
         CollabAction::Pr { id, repo, rules } => {
             let reader = CollabReader::new(&repo);
             let (entries, principals) = reader.load()?;
@@ -709,6 +739,215 @@ fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Res
     }
     println!("{ref_name} revoked");
     Ok(())
+}
+
+// ---- watch: resident change detection + callback ------------------------------
+
+/// Refs that are new or whose oid changed between two snapshots.
+fn changed_refs(
+    prev: &std::collections::HashMap<String, String>,
+    cur: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = cur
+        .iter()
+        .filter(|(name, oid)| prev.get(*name) != Some(*oid))
+        .map(|(n, o)| (n.clone(), o.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+    let git_dir = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .context("git rev-parse --absolute-git-dir")?;
+    if !git_dir.status.success() {
+        bail!("{} is not a git checkout", repo.display());
+    }
+    let dir = String::from_utf8_lossy(&git_dir.stdout).trim().to_string();
+    Ok(PathBuf::from(dir).join("collab-watch.json"))
+}
+
+fn read_state(path: &Path) -> Result<std::collections::HashMap<String, String>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return Ok(std::collections::HashMap::new()),
+    };
+    let v: serde_json::Value = serde_json::from_str(&raw)?;
+    let mut map = std::collections::HashMap::new();
+    if let Some(o) = v.as_object() {
+        for (k, val) in o {
+            if let Some(oid) = val.as_str() {
+                map.insert(k.clone(), oid.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn write_state(path: &Path, map: &std::collections::HashMap<String, String>) -> Result<()> {
+    let mut obj = serde_json::Map::new();
+    for (k, v) in map {
+        obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&serde_json::Value::Object(obj))?)
+        .with_context(|| format!("write state {}", path.display()))?;
+    Ok(())
+}
+
+fn git_fetch_collab(repo: &Path, remote: &str) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["fetch", "-q", remote, "+refs/collab/*:refs/collab/*"])
+        .output()
+        .context("git fetch collab refs")?;
+    if !out.status.success() {
+        bail!(
+            "git fetch {remote} refs/collab/* failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn refs_map(repo: &Path) -> Result<std::collections::HashMap<String, String>> {
+    let reader = CollabReader::new(repo);
+    let out = reader.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/collab",
+    ])?;
+    let mut map = std::collections::HashMap::new();
+    for l in String::from_utf8_lossy(&out).lines() {
+        let mut it = l.split_whitespace();
+        if let (Some(n), Some(o)) = (it.next(), it.next()) {
+            map.insert(n.to_string(), o.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// One new/changed collab ref, described for the callback. The fields are
+/// taken from the **parsed entry** — never re-parsed out of rendered text: the
+/// blob is remote content, and a body containing a literal `\nkind=` line
+/// must not be able to forge the signals an agent's `--exec` keys on.
+struct RefEvent {
+    kind: String,
+    actor: String,
+    thread: String,
+    verified: bool,
+    /// The raw blob text (the entry JSON on stdin).
+    text: String,
+}
+
+fn describe_ref(repo: &Path, name: &str, oid: &str) -> Result<RefEvent> {
+    let blob = CollabReader::new(repo).git(&["cat-file", "blob", oid])?;
+    let principals = CollabReader::new(repo).principals()?;
+    let text = String::from_utf8_lossy(&blob).to_string();
+    if let Some(principal) = name.strip_prefix("refs/collab/meta/principals/") {
+        return Ok(RefEvent {
+            kind: "principal".into(),
+            actor: principal.into(),
+            thread: String::new(),
+            verified: true,
+            text,
+        });
+    }
+    let entry: Entry = serde_json::from_str(&text).unwrap_or_else(|_| Entry {
+        version: 0,
+        kind: "unknown".into(),
+        id: String::new(),
+        actor: String::new(),
+        ts: 0,
+        parent: String::new(),
+        refs: None,
+        body: serde_json::Value::Null,
+        sig: String::new(),
+    });
+    // The inbox path names the principal; verification includes the
+    // inbox-consistency invariant (D1 §4.1, `EntryRef::is_verified`).
+    let principal = name
+        .strip_prefix("refs/collab/inbox/")
+        .and_then(|p| p.rsplit_once('/'))
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let er = EntryRef {
+        oid: oid.to_string(),
+        principal,
+        entry,
+    };
+    Ok(RefEvent {
+        kind: er.entry.kind.clone(),
+        actor: er.entry.actor.clone(),
+        thread: er.entry.id.clone(),
+        verified: er.is_verified(&principals),
+        text,
+    })
+}
+
+fn run_exec(cmd: &str, stdin: &str, env: &[(&str, &str)]) -> Result<()> {
+    let mut out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("spawn --exec")?;
+    use std::io::Write;
+    out.stdin
+        .take()
+        .context("--exec stdin")?
+        .write_all(stdin.as_bytes())?;
+    let status = out.wait_with_output().context("--exec")?.status;
+    if !status.success() {
+        bail!("--exec failed with {status}");
+    }
+    Ok(())
+}
+
+fn run_watch(
+    repo: &Path,
+    remote: &str,
+    interval: u64,
+    once: bool,
+    exec: Option<&str>,
+    state_override: Option<&Path>,
+) -> Result<()> {
+    let state_file = state_path(repo, state_override)?;
+    loop {
+        git_fetch_collab(repo, remote)?;
+        let cur = refs_map(repo)?;
+        let prev = read_state(&state_file)?;
+        let changed = changed_refs(&prev, &cur);
+        for (name, oid) in &changed {
+            let ev = describe_ref(repo, name, oid)?;
+            if let Some(cmd) = exec {
+                let env: Vec<(&str, &str)> = vec![
+                    ("WALGIT_COLLAB_REF", name.as_str()),
+                    ("WALGIT_COLLAB_KIND", ev.kind.as_str()),
+                    ("WALGIT_COLLAB_THREAD", ev.thread.as_str()),
+                    ("WALGIT_COLLAB_ACTOR", ev.actor.as_str()),
+                    ("WALGIT_COLLAB_VERIFIED", if ev.verified { "true" } else { "false" }),
+                ];
+                run_exec(cmd, &ev.text, &env)?;
+            }
+            println!("{name} {oid}");
+        }
+        write_state(&state_file, &cur)?;
+        if once {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 // ---- reading from a local git checkout --------------------------------------
@@ -929,6 +1168,25 @@ mod tests {
         assert!(
             !merge_rule_eval(&rules, &agent_only).allowed,
             "agent approval does not count"
+        );
+    }
+
+    #[test]
+    fn changed_refs_reports_new_and_updated_only() {
+        let mut prev = std::collections::HashMap::new();
+        prev.insert("refs/collab/inbox/a/1".to_string(), "aaa".to_string());
+        prev.insert("refs/collab/inbox/a/2".to_string(), "bbb".to_string());
+        let mut cur = std::collections::HashMap::new();
+        cur.insert("refs/collab/inbox/a/1".to_string(), "aaa".to_string()); // unchanged
+        cur.insert("refs/collab/inbox/a/2".to_string(), "ccc".to_string()); // updated
+        cur.insert("refs/collab/inbox/b/3".to_string(), "ddd".to_string()); // new
+        let changed = changed_refs(&prev, &cur);
+        assert_eq!(
+            changed,
+            vec![
+                ("refs/collab/inbox/a/2".to_string(), "ccc".to_string()),
+                ("refs/collab/inbox/b/3".to_string(), "ddd".to_string()),
+            ]
         );
     }
 

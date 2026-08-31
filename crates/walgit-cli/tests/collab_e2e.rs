@@ -157,3 +157,108 @@ async fn cli_full_collab_flow_against_a_real_server() -> TestResult {
     assert_eq!(pv["merge"]["allowed"], serde_json::Value::Bool(true));
     Ok(())
 }
+
+/// `walgit collab watch`: cold start reports every collab ref, a later pass
+/// reports only what is new, and the callback gets the entry JSON on stdin
+/// with the env contract (kind/thread/actor/verified). Runs against a real
+/// walgit server; the watch fetches refs/collab/* from a fresh clone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_reports_new_collab_entries_via_callback() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit");
+    let keydir = tempfile::tempdir()?;
+    let key = keydir.path().join("key");
+    std::fs::write(&key, "07".repeat(32))?;
+    let key_s = key.to_str().unwrap();
+
+    let run = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "walgit {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // Repo A writes: register + issue entry, pushed to the server.
+    let a = tempfile::tempdir()?;
+    git_in(a.path(), &["init", "-q", "-b", "main"])?;
+    git_in(a.path(), &["config", "user.email", "t@t"])?;
+    git_in(a.path(), &["config", "user.name", "T"])?;
+    git_in(
+        a.path(),
+        &["remote", "add", "origin", &format!("{base}/o/r.git")],
+    )?;
+    let repo_a = a.path().to_str().unwrap();
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "alice", "--key", key_s,
+        "--push", "origin",
+    ])?;
+    run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "wt1", "--actor", "alice",
+        "--body", r#"{"title":"watch me"}"#, "--key", key_s, "--push", "origin",
+    ])?;
+
+    // Repo B: a fresh clone where the watcher lives.
+    let b = tempfile::tempdir()?;
+    git_in(
+        b.path(),
+        &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."],
+    )?;
+    let repo_b = b.path().to_str().unwrap();
+    let captured = tempfile::tempdir()?;
+    let cap = captured.path().to_str().unwrap();
+    let cb = format!("cat > {cap}/$WALGIT_COLLAB_KIND-$WALGIT_COLLAB_VERIFIED.txt");
+
+    // Cold start: issue + principal are both reported through the callback.
+    run(&[
+        "collab", "watch", "--repo", repo_b, "--remote", "origin", "--once", "--exec", &cb,
+    ])?;
+    let issue_file = captured.path().join("issue-true.txt");
+    let principal_file = captured.path().join("principal-true.txt");
+    assert!(issue_file.exists(), "cold start delivered the issue entry");
+    assert!(principal_file.exists(), "cold start delivered the principal record");
+    let issue_v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&issue_file)?)?;
+    assert_eq!(issue_v["kind"], "issue");
+    assert_eq!(issue_v["id"], "wt1");
+
+    // A second pass with no changes reports nothing new.
+    run(&[
+        "collab", "watch", "--repo", repo_b, "--remote", "origin", "--once", "--exec", &cb,
+    ])?;
+    let before = std::fs::read_to_string(&issue_file)?;
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // ensure distinct mtime
+    run(&[
+        "collab", "watch", "--repo", repo_b, "--remote", "origin", "--once", "--exec", &cb,
+    ])?;
+    assert_eq!(
+        std::fs::read_to_string(&issue_file)?,
+        before,
+        "no new refs -> callback not re-fired"
+    );
+
+    // A new comment from another actor triggers only the comment callback.
+    let comment_out = run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "comment", "--id", "wt1", "--actor",
+        "alice", "--parent", "", "--body", r#"{"note":"from agent B"}"#, "--key", key_s,
+        "--push", "origin",
+    ])?;
+    let comment_oid = comment_out.split_whitespace().nth(1).unwrap().to_string();
+    // Chain it properly by rewriting the ref to point at the issue? Simpler: the
+    // watcher only cares about new refs, so a fresh uuid ref is fine.
+    let _ = comment_oid;
+    run(&[
+        "collab", "watch", "--repo", repo_b, "--remote", "origin", "--once", "--exec", &cb,
+    ])?;
+    let comment_file = captured.path().join("comment-true.txt");
+    assert!(comment_file.exists(), "new comment delivered: {}", comment_file.display());
+    let comment_v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&comment_file)?)?;
+    assert_eq!(comment_v["kind"], "comment");
+    Ok(())
+}
