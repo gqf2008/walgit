@@ -962,8 +962,14 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
     cfg.bundles.min_commits = 1000; // everything is too small
     let cfg = Arc::new(cfg);
     let bundler = Bundler::new_with_source(Arc::new(source), cfg.clone());
-    // A closed daily slot (yesterday 23:00) on a weekly cut at the Sunday before it.
-    let now = std::time::SystemTime::now();
+    // A closed daily slot on a weekly cut at the Sunday before it. The clock is
+    // a fixed Wednesday (2026-08-26 12:00 UTC, issue #17): with the real clock
+    // the scenario breaks whenever "yesterday" lands on the weekly's own slot —
+    // every Monday (UTC), the daily chain then anchors AT that slot and `plan`
+    // omits it (see the tie test below). A fixed past instant keeps the slot
+    // math deterministic on any run day; `build_slot_unit` still closes slots
+    // against the real clock, which stays true forever for a 2026 date.
+    let now = walgit_bundle::slots::from_epoch(1_787_745_600); // Wed 2026-08-26 12:00 UTC
     let daily_strat = cfg
         .bundles
         .strategy
@@ -1079,6 +1085,134 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
         row.status,
         walgit_bundle::slots::SlotStatus::Missing,
         "{row:?}"
+    );
+}
+
+/// The Monday tie, locked as intended semantics (issue #17): when the newest
+/// closed daily slot IS the weekly's slot (`@weekly` Sunday 00:00 — the real
+/// clock produced this every Monday), the daily chain anchors AT that slot and
+/// `plan` omits it: the weekly covers the same content point, and the next
+/// daily chains on the weekly (D41 "the chain continues through its own
+/// link"). The recorded skip stays in the list and the slot is never
+/// re-measured.
+#[tokio::test]
+async fn the_daily_slot_tying_with_the_weekly_anchor_is_omitted_and_not_remeasured() {
+    let tr = TestRepo::new("test", "tie").await;
+    tr.commit("initial").await;
+    tr.push().await;
+    tr.advance_seq();
+    let id = RepoId::new("test", "tie").unwrap();
+    let mut source = TestSource::new();
+    source.add(&tr, id.clone());
+    let mut cfg = cfg_weekly_daily(4, 7);
+    cfg.bundles.min_commits = 1000; // everything is too small
+    let cfg = Arc::new(cfg);
+    let bundler = Bundler::new_with_source(Arc::new(source), cfg.clone());
+    // Fixed Monday 2026-08-31 09:00 UTC: yesterday (Sun Aug 30 00:00) is the
+    // weekly's own slot — the tie the real clock produced every Monday.
+    let now = walgit_bundle::slots::from_epoch(1_788_166_800);
+    let daily_strat = cfg
+        .bundles
+        .strategy
+        .iter()
+        .find(|s| s.name == "daily")
+        .unwrap();
+    let latest = walgit_bundle::slots::last_slot_at_or_before(daily_strat, now)
+        .unwrap()
+        .unwrap();
+    let yesterday = walgit_bundle::slots::last_slot_at_or_before(
+        daily_strat,
+        walgit_bundle::slots::from_epoch(latest - 1),
+    )
+    .unwrap()
+    .unwrap();
+    let weekly_strat = cfg
+        .bundles
+        .strategy
+        .iter()
+        .find(|s| s.name == "weekly")
+        .unwrap();
+    let sunday = walgit_bundle::slots::last_slot_at_or_before(
+        weekly_strat,
+        walgit_bundle::slots::from_epoch(yesterday),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        sunday, yesterday,
+        "the Monday tie: yesterday is the weekly's own slot"
+    );
+    let weekly = bundler
+        .build_slot_unit(&id, "weekly", sunday)
+        .await
+        .unwrap()
+        .expect("weekly cut from the earliest state");
+    assert!(
+        bundler
+            .build_slot_unit(&id, "daily", yesterday)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let list = ops::read_list(&tr.store).await.unwrap().unwrap();
+    assert_eq!(list.skipped.len(), 1, "{:?}", list.skipped);
+    assert_eq!(
+        (
+            list.skipped[0].strategy.as_str(),
+            list.skipped[0].slot,
+            list.skipped[0].base_id.as_str()
+        ),
+        ("daily", yesterday, weekly.id.as_str())
+    );
+    // The plan omits the tie slot (the weekly covers it) while today's closed
+    // daily slot is still planned; the record survives the plan untouched.
+    let ctx = walgit_bundle::slots::PlanContext {
+        first_state: None,
+        can_full: true,
+        can_incremental: true,
+        wrong_host_reason: None,
+    };
+    let rows = bundler.plan(&id, now, ctx).await.unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.strategy != "daily" || r.slot != yesterday),
+        "the tie slot must be omitted from the plan: {rows:?}"
+    );
+    let live = rows
+        .iter()
+        .find(|r| r.strategy == "daily")
+        .expect("today's daily slot is planned");
+    assert_eq!(live.slot, latest);
+    assert!(
+        matches!(live.status, walgit_bundle::slots::SlotStatus::Missing),
+        "{live:?}"
+    );
+    assert_eq!(
+        ops::read_list(&tr.store)
+            .await
+            .unwrap()
+            .unwrap()
+            .skipped
+            .len(),
+        1
+    );
+    // Never re-measured: the build attempt stays None and the record is
+    // idempotent.
+    assert!(
+        bundler
+            .build_slot_unit(&id, "daily", yesterday)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ops::read_list(&tr.store)
+            .await
+            .unwrap()
+            .unwrap()
+            .skipped
+            .len(),
+        1
     );
 }
 
