@@ -407,6 +407,26 @@ review (human or agent) renders. `format` is `patch` (default), `stat` or
 - Unknown format → `404`; `from == to` → empty changes / empty patch. Cache:
   SWR (ref-state dependent, not immutable).
 
+### `GET /{owner}/{repo}/api/blame/{rev}/{path}`
+
+Line attribution for one file — who last changed each line — for review
+context and agent lookups. `rev` resolves like `resolve`; `path` is the file.
+
+```json
+{ "sha": "807d45a6…", "path": "src/app.rs",
+  "blame": [ { "line": 1, "commit": "5ed435d9…", "author": "alice",
+               "author_email": "alice@example.com", "time": 1710000000,
+               "summary": "move main into app", "text": "fn main() {}" } ] }
+```
+
+- The line order matches the file; `text` is the line content (self-contained,
+  no separate blob fetch). Local packs run `git blame --porcelain`; a
+  remote-served base faults the path history first (`Remote::fault_blame`,
+  bounded by `BLAME_BUDGET` commits, narrated on SSE, path boundaries and
+  merge parents covered) and then runs the same git — same objects, same
+  answer. Paths with longer history than the budget → `503` with the fix.
+- `blame` of a directory or a missing path → `404`. Cache: SWR.
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json

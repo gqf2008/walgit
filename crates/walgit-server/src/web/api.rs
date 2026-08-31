@@ -205,6 +205,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
+            .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -887,6 +888,120 @@ fn parse_name_status(bytes: &[u8]) -> Vec<NameStatus> {
             })
         })
         .collect()
+}
+
+#[derive(Serialize)]
+struct BlameLine {
+    line: u32,
+    commit: String,
+    author: String,
+    author_email: String,
+    time: i64,
+    summary: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct BlameResult {
+    sha: String,
+    path: String,
+    blame: Vec<BlameLine>,
+}
+
+/// Line attribution for one file (`blame/{rev}/{path}`): `git blame
+/// --porcelain` parsed to JSON. Local packs run git directly; remote-served
+/// bases fault the path history first (`Remote::fault_blame`, bounded) and
+/// then run the same git — same objects, same answer.
+async fn blame(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, rest)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        |r| async move {
+            let res = resolve_rest(&r, &rest).await?;
+            if res.path.is_empty() {
+                return Err(not_found("blame needs a file path"));
+            }
+            if let Some(remote) = r.remote() {
+                remote.fault_blame(&res.sha, &res.path).await?;
+            }
+            let raw = git(
+                &r.local,
+                vec![
+                    "blame".into(),
+                    "--porcelain".into(),
+                    res.sha.clone(),
+                    "--".into(),
+                    res.path.clone(),
+                ],
+            )
+            .await?;
+            let blame = parse_porcelain_blame(&raw);
+            Ok(json_swr(
+                &BlameResult {
+                    sha: res.sha,
+                    path: res.path,
+                    blame,
+                },
+                None,
+            ))
+        },
+    )
+    .await
+}
+
+/// `git blame --porcelain`: per line a `<sha> <orig> <final> <count>` header,
+/// key-value fields (author / author-mail / author-time / summary …), then
+/// `\t<text>`; groups are separated by blank lines.
+fn parse_porcelain_blame(bytes: &[u8]) -> Vec<BlameLine> {
+    let mut out = Vec::new();
+    let mut cur: Option<BlameLine> = None;
+    for raw in String::from_utf8_lossy(bytes).lines() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(text) = raw.strip_prefix('\t') {
+            if let Some(mut c) = cur.take() {
+                c.text = text.to_string();
+                out.push(c);
+            }
+            continue;
+        }
+        let parts: Vec<&str> = raw.splitn(4, ' ').collect();
+        let sha = parts.first().copied().filter(|s| is_full_sha(s));
+        let line = parts.get(2).and_then(|s| s.parse::<u32>().ok());
+        if let (Some(sha), Some(line)) = (sha, line) {
+            cur = Some(BlameLine {
+                line,
+                commit: sha.to_string(),
+                author: String::new(),
+                author_email: String::new(),
+                time: 0,
+                summary: String::new(),
+                text: String::new(),
+            });
+            continue;
+        }
+        if let Some(c) = &mut cur {
+            if let Some(v) = raw.strip_prefix("author ") {
+                c.author = v.to_string();
+            } else if let Some(v) = raw.strip_prefix("author-mail ") {
+                c.author_email = v.trim_matches(['<', '>']).to_string();
+            } else if let Some(v) = raw.strip_prefix("author-time ") {
+                c.time = v.parse().unwrap_or(0);
+            } else if let Some(v) = raw.strip_prefix("summary ") {
+                c.summary = v.to_string();
+            }
+        }
+    }
+    out
 }
 
 // ---- resolve -----------------------------------------------------------------

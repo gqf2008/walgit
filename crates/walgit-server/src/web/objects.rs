@@ -27,6 +27,8 @@ const NEWEST_BUDGET: usize = 3_000;
 const WALK_BUDGET: usize = 50_000;
 /// Budget for a merge-base bidirectional walk (one commit popped per side).
 const MERGE_BASE_BUDGET: usize = WALK_BUDGET;
+/// Budget for a blame history walk (commits visited before git blame runs).
+const BLAME_BUDGET: usize = 3_000;
 
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
@@ -652,6 +654,81 @@ impl Remote {
                 )));
             }
             self.fault_many(&blobs).await?;
+        }
+        self.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Fault everything `git blame --porcelain <rev> -- <path>` reads into the
+    /// loose store: each commit of the path history, its path trees and every
+    /// version of the file blob — bounded by BLAME_BUDGET commits. Paths that
+    /// did not yet exist are boundaries (their ancestors are not followed);
+    /// merge commits get every parent's path state faulted because blame diffs
+    /// against all of them.
+    pub async fn fault_blame(&self, commit_sha: &str, path: &str) -> Result<(), ApiError> {
+        let start = ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {commit_sha}")))?;
+        #[derive(PartialEq, Eq)]
+        struct Item(i64, u64, ObjectId);
+        impl Ord for Item {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.0.cmp(&o.0).then_with(|| o.1.cmp(&self.1))
+            }
+        }
+        impl PartialOrd for Item {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        let mut heap = BinaryHeap::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut seq = 0u64;
+        let start_meta = self.commit(&start).await?;
+        heap.push(Item(start_meta.commit_time, seq, start));
+        seen.insert(start);
+        let mut visited = 0usize;
+        while let Some(Item(_, _, oid)) = heap.pop() {
+            visited += 1;
+            if visited > BLAME_BUDGET {
+                self.reporter
+                    .notice(format!("blame: gave up after {BLAME_BUDGET} commits"));
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "path '{path}' has more than {BLAME_BUDGET} commits of history; too large to blame from the remote pack set"
+                )));
+            }
+            if visited.is_multiple_of(100) {
+                self.reporter.bar(
+                    "Reading blame history".to_string(),
+                    visited as u64,
+                    None,
+                    "commits",
+                );
+            }
+            let (meta, target, mode) = match self.fault_path(&oid, path).await {
+                Ok(x) => x,
+                Err(ApiError::NotFound(_)) => continue, // path absent: boundary
+                Err(e) => return Err(e),
+            };
+            if mode.is_blob_or_symlink() {
+                self.fault(&target).await?;
+            }
+            for par in meta.parents {
+                if seen.insert(par) {
+                    // Fault the parent's path state now (idempotent with its own
+                    // pop) so merge diffs have every parent's tree and blob.
+                    if let Ok((_, ptarget, pmode)) = self.fault_path(&par, path).await {
+                        if pmode.is_blob_or_symlink() {
+                            self.fault(&ptarget).await?;
+                        }
+                    }
+                    seq += 1;
+                    let pm = self.commit(&par).await?;
+                    heap.push(Item(pm.commit_time, seq, par));
+                }
+            }
         }
         self.local
             .refresh_async()

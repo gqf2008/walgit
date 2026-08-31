@@ -293,6 +293,33 @@ async fn conformance(
     );
     assert_eq!(get(server, "/o/r/api/diff?from=nope&to=main").await?.0, 404);
 
+    // blame (D1 review primitive): porcelain parsed, local + remote agree
+    let b = json(server, "/o/r/api/blame/main/src/inner/x.txt").await?;
+    assert_eq!(b["path"], "src/inner/x.txt");
+    assert_eq!(b["sha"].as_str().unwrap().len(), 40);
+    let lines = b["blame"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["line"], 1);
+    assert_eq!(lines[0]["text"], "xx", "main's x.txt content");
+    assert!(
+        !lines[0]["author"].as_str().unwrap().is_empty(),
+        "author present"
+    );
+    assert!(
+        lines[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("second on main"),
+        "main's line attributed to second on main: {lines:?}"
+    );
+    let b2 = json(server, "/o/r/api/blame/feature/x/src/inner/x.txt").await?;
+    let l2 = &b2["blame"][0];
+    assert!(
+        l2["summary"].as_str().unwrap().contains("initial"),
+        "feature/x's x.txt came from initial: {l2:?}"
+    );
+    assert_eq!(get(server, "/o/r/api/blame/main/nope.txt").await?.0, 404);
+
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
     assert_eq!(st, 200);

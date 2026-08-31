@@ -178,7 +178,9 @@
 > remote 走有界双向 walk，含 SSE 叙述与预算保护）；
 > `GET /{o}/{r}/api/diff?from=&to=&format=patch|stat|name-status` 已落地
 > （remote 先 level-parallel fault 两树差异对象再跑同一 `git diff`，与本地字节一致）；
-> patch（format=patch 即完整 unified diff）/blame/archive 待办。
+> `GET /{o}/{r}/api/blame/{rev}/{path}` 已落地（porcelain 解析为 JSON；remote 有界
+> fault 路径历史后跑同一 `git blame`）；`patch`（格式 patch 语义）已由
+> `diff?format=patch` 覆盖；archive 待办。
 
 ## 10. 一致性、并发与安全
 
