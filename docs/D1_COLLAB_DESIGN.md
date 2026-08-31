@@ -175,7 +175,10 @@
 > `GET /{o}/{r}/api/refs/collab`（`refs/collab/*` 命名空间）与
 > `GET /{o}/{r}/api/refs/name/{rest}`（精确单 ref 读取，SWR+ETag）。
 > 缺口 2 进展：`GET /{o}/{r}/api/merge-base?from=&to=` 已落地（本地 `git merge-base`；
-> remote 走有界双向 walk，含 SSE 叙述与预算保护）；diff/patch/blame/archive 进行中。
+> remote 走有界双向 walk，含 SSE 叙述与预算保护）；
+> `GET /{o}/{r}/api/diff?from=&to=&format=patch|stat|name-status` 已落地
+> （remote 先 level-parallel fault 两树差异对象再跑同一 `git diff`，与本地字节一致）；
+> patch（format=patch 即完整 unified diff）/blame/archive 待办。
 
 ## 10. 一致性、并发与安全
 

@@ -204,6 +204,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/refs/{{kind}}"), get(ref_list))
             .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
             .route(&format!("{base}/merge-base"), get(merge_base))
+            .route(&format!("{base}/diff"), get(diff))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -728,6 +729,164 @@ async fn merge_base(
         },
     )
     .await
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiffQuery {
+    from: String,
+    to: String,
+    #[serde(default = "default_diff_format")]
+    format: String,
+}
+
+fn default_diff_format() -> String {
+    "patch".to_string()
+}
+
+#[derive(Serialize)]
+struct NameStatus {
+    status: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DiffResult {
+    from: String,
+    to: String,
+    format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<Vec<Stat>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<Vec<NameStatus>>,
+}
+
+/// The tree diff between two revisions (`?from=&to=&format=patch|stat|
+/// name-status`), default `patch`. Local packs run `git diff` directly;
+/// remote-served bases fault exactly the trees/blobs the diff touches into
+/// the loose store first (`Remote::fault_diff`) and then run the same git.
+async fn diff(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(q): Query<DiffQuery>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let a = resolve_name(&r, &q.from).await?.sha;
+            let b = resolve_name(&r, &q.to).await?.sha;
+            match q.format.as_str() {
+                "patch" | "stat" | "name-status" => {}
+                other => return Err(not_found(format!("unknown diff format {other}"))),
+            }
+            if let Some(remote) = r.remote() {
+                remote.fault_diff(&a, &b).await?;
+            }
+            Ok(json_swr(
+                &git_diff(&r.local, &a, &b, &q.format).await?,
+                None,
+            ))
+        },
+    )
+    .await
+}
+
+/// Run `git diff <a> <b>` and shape the output for the requested format.
+async fn git_diff(
+    local: &walgit_git::LocalRepo,
+    a: &str,
+    b: &str,
+    format: &str,
+) -> Result<DiffResult, ApiError> {
+    let mut out = DiffResult {
+        from: a.to_string(),
+        to: b.to_string(),
+        format: format.to_string(),
+        patch: None,
+        stats: None,
+        changes: None,
+    };
+    match format {
+        "patch" => {
+            let patch = String::from_utf8_lossy(
+                &git(
+                    local,
+                    vec![
+                        "diff".into(),
+                        "--no-color".into(),
+                        "--no-ext-diff".into(),
+                        "-M".into(),
+                        a.into(),
+                        b.into(),
+                    ],
+                )
+                .await?,
+            )
+            .into_owned();
+            out.patch = Some(patch);
+        }
+        "stat" => {
+            let stats = parse_stats(
+                &git(
+                    local,
+                    vec![
+                        "diff".into(),
+                        "--numstat".into(),
+                        "-M".into(),
+                        a.into(),
+                        b.into(),
+                    ],
+                )
+                .await?,
+            );
+            out.stats = Some(stats);
+        }
+        "name-status" => {
+            let raw = git(
+                local,
+                vec![
+                    "diff".into(),
+                    "--name-status".into(),
+                    "-M".into(),
+                    a.into(),
+                    b.into(),
+                ],
+            )
+            .await?;
+            out.changes = Some(parse_name_status(&raw));
+        }
+        _ => return Err(not_found("unknown diff format")),
+    }
+    Ok(out)
+}
+
+/// `git diff --name-status -M`: `STATUS\tpath` or `R<score>\told\tnew`.
+fn parse_name_status(bytes: &[u8]) -> Vec<NameStatus> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (status, path, old_path) = match f.as_slice() {
+                [s, p] => (s, p, None),
+                [s, old, p] => (s, p, Some(*old)),
+                _ => return None,
+            };
+            Some(NameStatus {
+                status: status.get(..1).unwrap_or("?").to_string(),
+                path: (*path).to_string(),
+                old_path: old_path.map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 // ---- resolve -----------------------------------------------------------------

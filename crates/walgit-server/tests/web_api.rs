@@ -255,6 +255,44 @@ async fn conformance(
         404
     );
 
+    // diff (D1 review primitive): name-status / stat / patch, local + remote
+    let d = json(
+        server,
+        "/o/r/api/diff?from=feature/x&to=main&format=name-status",
+    )
+    .await?;
+    assert_eq!(d["format"], "name-status");
+    assert_eq!(d["from"].as_str().unwrap().len(), 40);
+    assert_eq!(d["to"].as_str().unwrap().len(), 40);
+    let ch = d["changes"].as_array().unwrap();
+    assert!(
+        ch.iter()
+            .any(|c| c["status"] == "M" && c["path"] == "src/inner/x.txt"),
+        "second on main modified x.txt: {ch:?}"
+    );
+    let st = json(server, "/o/r/api/diff?from=feature/x&to=main&format=stat").await?;
+    assert_eq!(st["format"], "stat");
+    assert!(
+        st["stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["path"] == "src/inner/x.txt"),
+        "stat lists x.txt"
+    );
+    let p = json(server, "/o/r/api/diff?from=feature/x&to=main").await?;
+    assert_eq!(p["format"], "patch", "default format is patch");
+    assert!(p["patch"].as_str().unwrap().contains("diff --git"));
+    let same = json(server, "/o/r/api/diff?from=main&to=main&format=name-status").await?;
+    assert_eq!(same["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        get(server, "/o/r/api/diff?from=main&to=main&format=bogus")
+            .await?
+            .0,
+        404
+    );
+    assert_eq!(get(server, "/o/r/api/diff?from=nope&to=main").await?.0, 404);
+
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
     assert_eq!(st, 200);

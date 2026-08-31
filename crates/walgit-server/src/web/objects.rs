@@ -503,10 +503,53 @@ impl Remote {
             "Reading the trees and blobs changed by {}",
             &c.id.to_hex().to_string()[..12]
         ));
-        // Level-parallel: every tree pair of the current level is faulted in
-        // one concurrent batch (range reads ~50 ms each; serially a large repository
-        // commit took 300 round trips = 15 s), then merge-walked; the blobs
-        // it references are faulted in a second batch. Rounds ≈ path depth.
+        self.fault_tree_pairs(stack).await?;
+        Ok(c)
+    }
+
+    /// Fault every tree and blob the diff between `a` and `b` (hex shas)
+    /// touches into the local loose store, so an unmodified `git diff` can run
+    /// against them. `a == b` faults nothing.
+    pub async fn fault_diff(&self, a: &str, b: &str) -> Result<(), ApiError> {
+        let a = ObjectId::from_hex(a.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {a}")))?;
+        let b = ObjectId::from_hex(b.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {b}")))?;
+        if a == b {
+            return Ok(());
+        }
+        let ca = self.commit(&a).await?;
+        self.fault(&a).await?;
+        let cb = self.commit(&b).await?;
+        self.fault(&b).await?;
+        let (sa, sb) = (
+            a.to_hex()
+                .to_string()
+                .get(..12)
+                .unwrap_or_default()
+                .to_string(),
+            b.to_hex()
+                .to_string()
+                .get(..12)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        self.reporter
+            .notice(format!("Reading the diff between {sa} and {sb}"));
+        self.fault_tree_pairs(vec![(Some(ca.tree), Some(cb.tree))])
+            .await
+    }
+
+    /// Level-parallel faulting of a set of tree pairs (`None` = empty tree):
+    /// every tree of the current level is faulted in one concurrent batch
+    /// (range reads ~50 ms each; serially a large repository commit took 300
+    /// round trips = 15 s), then merge-walked; the blobs it references are
+    /// faulted in a second batch. Rounds ≈ path depth. Bounded by
+    /// MAX_DIFF_OBJECTS.
+    async fn fault_tree_pairs(
+        &self,
+        mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)>,
+    ) -> Result<(), ApiError> {
         let mut count = 0usize;
         while !stack.is_empty() {
             let level = std::mem::take(&mut stack);
@@ -520,8 +563,7 @@ impl Remote {
             count += want.len();
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&want).await?;
@@ -606,8 +648,7 @@ impl Remote {
             count += blobs.len();
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&blobs).await?;
@@ -616,7 +657,7 @@ impl Remote {
             .refresh_async()
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(c)
+        Ok(())
     }
 }
 

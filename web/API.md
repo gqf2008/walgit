@@ -384,6 +384,29 @@ review primitive).
 - `merge_base` is `null` when the histories are unrelated. Unknown revision →
   `404`. Cache: SWR (depends on ref state, not immutable).
 
+### `GET /{owner}/{repo}/api/diff?from=&to=&format=`
+
+The tree diff between two revisions — the file list / stat / patch a PR
+review (human or agent) renders. `format` is `patch` (default), `stat` or
+`name-status`.
+
+```json
+{ "from": "807d45a6…", "to": "5ed435d9…", "format": "name-status",
+  "changes": [ { "status": "M", "path": "src/inner/x.txt" },
+               { "status": "R", "path": "src/app.rs", "old_path": "src/main.rs" } ] }
+```
+
+- `from` / `to` resolve like `resolve` (branch, tag, commit-ish); the response
+  echoes the resolved shas. `stat` returns the `stats` array of the `commit`
+  endpoint (`--numstat -M`, renames as new path); `patch` returns the raw
+  unified diff text.
+- Local packs run `git diff` directly; a remote-served base faults exactly the
+  trees/blobs the diff touches into the loose store first (`Remote::fault_diff`,
+  level-parallel, narrated on SSE, bounded by `MAX_DIFF_OBJECTS`) and then
+  runs the same `git diff` — the two paths are byte-identical.
+- Unknown format → `404`; `from == to` → empty changes / empty patch. Cache:
+  SWR (ref-state dependent, not immutable).
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json
