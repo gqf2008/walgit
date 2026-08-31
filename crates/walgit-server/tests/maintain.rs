@@ -877,23 +877,42 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     )?;
 
     // Plan before: only the two newest hourly slots are wanted (D21, 2026-08-22) — the older ones
-    // are not work even though they are missing; the closed one of the two is empty (the weekly
-    // holds everything up to now-ish).
+    // are not work even though they are missing; the closed ones of the two are empty (the weekly
+    // holds everything up to now-ish). An hour boundary can leave the newest slot still inside
+    // SLOT_CLOSE_GRACE (Pending): then only one of the two is closed-Missing — both phases are
+    // legal, so the plan-shape invariant and the closed count are asserted separately.
     let ctx = walgit_bundle::slots::PlanContext {
         first_state: h.first_state_time(),
         can_full: true,
         can_incremental: true,
         wrong_host_reason: None,
     };
-    let rows = server.state.bundles.plan(&id, now, ctx).await?;
-    let missing_before = rows
+    let hourly = server
+        .state
+        .cfg
+        .bundles
+        .strategy
         .iter()
-        .filter(|r| r.strategy == "hourly" && r.status == walgit_bundle::slots::SlotStatus::Missing)
-        .count();
+        .find(|s| s.name == "hourly")
+        .unwrap()
+        .clone();
+    let rows = server.state.bundles.plan(&id, now, ctx).await?;
+    let hourly_rows: Vec<_> = rows.iter().filter(|r| r.strategy == "hourly").collect();
     assert_eq!(
-        missing_before,
+        hourly_rows.len(),
         walgit_bundle::slots::INCREMENTALS_KEPT,
         "only the newest slots are planned: {rows:?}"
+    );
+    let missing_before = hourly_rows
+        .iter()
+        .filter(|r| {
+            r.status == walgit_bundle::slots::SlotStatus::Missing
+                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
+        })
+        .count();
+    assert!(
+        missing_before >= 1,
+        "at least the newest closed hour must be missing: {rows:?}"
     );
 
     // One pass settles every closed empty slot at plan time (one CAS for all
@@ -904,15 +923,6 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     // with the same verdicts (issue #17: the real clock put every
     // Monday-morning run inside exactly that window). Loop until the plan is
     // stable; the first pass still proves the batch settle below.
-    let hourly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "hourly")
-        .unwrap()
-        .clone();
     let mut still_missing_closed = Vec::new();
     let mut first_pass_skipped = 0usize;
     for round in 0..4 {
