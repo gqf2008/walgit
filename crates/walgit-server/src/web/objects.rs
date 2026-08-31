@@ -362,7 +362,7 @@ impl Remote {
                 self.reporter
                     .notice(format!("merge-base: gave up after {budget} commits"));
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "merge-base walk exceeded {budget} commits; the histories are too far apart for the remote reader"
+                    "merge-base walk exceeded {budget} commits; the histories are too far apart (or unrelated) for the remote reader"
                 )));
             }
             if popped.is_multiple_of(100) {
@@ -710,7 +710,7 @@ impl Remote {
                 self.reporter
                     .notice(format!("blame: gave up after {budget} commits"));
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "path '{path}' has more than {budget} commits of history; too large to blame from the remote pack set"
+                    "path '{path}' has more than {budget} commits of ancestry; too deep to blame from the remote pack set — use a host with the packs or a bundle"
                 )));
             }
             if visited.is_multiple_of(100) {

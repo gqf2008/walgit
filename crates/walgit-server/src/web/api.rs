@@ -529,28 +529,28 @@ async fn refs(
 /// 466 k-ref repository paged in O(page) without copying the namespace.
 enum RefSlice<'a> {
     Pairs(&'a [(String, String)]),
-    All(&'a [(String, String, String)]),
+    All(&'a [(String, String)]),
 }
 
 impl RefSlice<'_> {
     fn at(&self, i: usize) -> Option<(&str, &str)> {
         match self {
             RefSlice::Pairs(v) => v.get(i).map(|(n, s)| (n.as_str(), s.as_str())),
-            RefSlice::All(v) => v.get(i).map(|(n, s, _)| (n.as_str(), s.as_str())),
+            RefSlice::All(v) => v.get(i).map(|(n, s)| (n.as_str(), s.as_str())),
         }
     }
     /// First index whose name sorts strictly after `x` (names byte-sorted).
     fn after(&self, x: &str) -> usize {
         match self {
             RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() <= x),
-            RefSlice::All(v) => v.partition_point(|(n, _, _)| n.as_str() <= x),
+            RefSlice::All(v) => v.partition_point(|(n, _)| n.as_str() <= x),
         }
     }
     /// First index whose name sorts at-or-after `x`.
     fn at_or_after(&self, x: &str) -> usize {
         match self {
             RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() < x),
-            RefSlice::All(v) => v.partition_point(|(n, _, _)| n.as_str() < x),
+            RefSlice::All(v) => v.partition_point(|(n, _)| n.as_str() < x),
         }
     }
 }
