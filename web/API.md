@@ -365,6 +365,25 @@ ref. `rest` is the full name with slashes (`refs/collab/inbox/alice@example.com/
   does not exist. Cache: SWR + `ETag: "<sha>"` → `304` (the ref's oid is a
   strong version for its value).
 
+### `GET /{owner}/{repo}/api/merge-base?from=&to=`
+
+The merge base of two revisions — the diff base for 3-dot PR comparisons (D1
+review primitive).
+
+```json
+{ "from": "807d45a6…", "to": "5ed435d9…", "merge_base": "46b7fd29…" }
+```
+
+- `from` / `to`: branch name, tag name, or commit-ish (same resolution as
+  `resolve`). The response echoes the **resolved commit shas**.
+- Local packs run `git merge-base`; a remote-served base uses a **bounded
+  bidirectional walk** over the pack set (`Remote::merge_base`), which for the
+  branch-from-trunk shape returns the branch point — criss-cross histories may
+  differ from git's preferred base. The walk is narrated (SSE) and gives up
+  with a clear error past the budget (paths too far apart for a remote reader).
+- `merge_base` is `null` when the histories are unrelated. Unknown revision →
+  `404`. Cache: SWR (depends on ref state, not immutable).
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json

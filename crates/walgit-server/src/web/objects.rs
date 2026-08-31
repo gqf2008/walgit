@@ -8,7 +8,7 @@
 //! Everything reports what it is doing through a [`Reporter`] so the SSE
 //! envelope can narrate ("Reading tree areas/core…", "Walked 300 commits…").
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use gix_hash::ObjectId;
@@ -25,6 +25,8 @@ const MAX_DIFF_OBJECTS: usize = 20_000;
 const NEWEST_BUDGET: usize = 3_000;
 /// Budget for a history page walk (skip + n commits, plus skipped TREESAME ones).
 const WALK_BUDGET: usize = 50_000;
+/// Budget for a merge-base bidirectional walk (one commit popped per side).
+const MERGE_BASE_BUDGET: usize = WALK_BUDGET;
 
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
@@ -309,6 +311,68 @@ impl Remote {
             .walk_bounded(start, Some(path), 1, &label, NEWEST_BUDGET)
             .await?;
         Ok(res.pop())
+    }
+
+    /// A merge base of `a` and `b` (hex shas), by bounded bidirectional walk
+    /// over the pack set — no objects on disk needed. Returns the first common
+    /// ancestor found: for the branch-from-trunk shape this is the branch
+    /// point; criss-cross histories may differ from `git merge-base`'s
+    /// preferred one. `None` when the histories are unrelated; 503 when the
+    /// walk budget is exhausted (paths too far apart for a remote reader).
+    pub async fn merge_base(&self, a: &str, b: &str) -> Result<Option<ObjectId>, ApiError> {
+        let a = ObjectId::from_hex(a.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {a}")))?;
+        let b = ObjectId::from_hex(b.as_bytes())
+            .map_err(|_| not_found(format!("invalid commit sha {b}")))?;
+        if a == b {
+            return Ok(Some(a));
+        }
+        let mut fa: VecDeque<ObjectId> = VecDeque::from([a]);
+        let mut fb: VecDeque<ObjectId> = VecDeque::from([b]);
+        let mut sa: HashSet<ObjectId> = HashSet::from([a]);
+        let mut sb: HashSet<ObjectId> = HashSet::from([b]);
+        let mut popped = 0usize;
+        while !fa.is_empty() || !fb.is_empty() {
+            // Expand the smaller frontier so the sides meet in the middle.
+            let (front, seen_self, seen_other) = if fa.len() <= fb.len() {
+                (&mut fa, &mut sa, &sb)
+            } else {
+                (&mut fb, &mut sb, &sa)
+            };
+            let Some(oid) = front.pop_front() else {
+                continue;
+            };
+            popped += 1;
+            if popped > MERGE_BASE_BUDGET {
+                self.reporter.notice(format!(
+                    "merge-base: gave up after {MERGE_BASE_BUDGET} commits"
+                ));
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "merge-base walk exceeded {MERGE_BASE_BUDGET} commits; the histories are too far apart for the remote reader"
+                )));
+            }
+            if popped.is_multiple_of(100) {
+                self.reporter.bar(
+                    "Finding merge base".to_string(),
+                    popped as u64,
+                    None,
+                    "commits",
+                );
+            }
+            if seen_other.contains(&oid) {
+                return Ok(Some(oid));
+            }
+            let meta = self.commit(&oid).await?;
+            for par in meta.parents {
+                if seen_other.contains(&par) {
+                    return Ok(Some(par));
+                }
+                if seen_self.insert(par) {
+                    front.push_back(par);
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn walk_bounded(

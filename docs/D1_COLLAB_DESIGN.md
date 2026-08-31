@@ -173,8 +173,9 @@
 > 进度：缺口 1 由 [issue #8](https://github.com/gqf2008/walgit/issues/8) 批次落地——
 > 已实现 `GET /{o}/{r}/api/refs/all`（全量 ref，全名、字节序分页、SSE）、
 > `GET /{o}/{r}/api/refs/collab`（`refs/collab/*` 命名空间）与
-> `GET /{o}/{r}/api/refs/name/{rest}`（精确单 ref 读取，SWR+ETag）。缺口 2（评审原语）
-> 为同批次的下一项。
+> `GET /{o}/{r}/api/refs/name/{rest}`（精确单 ref 读取，SWR+ETag）。
+> 缺口 2 进展：`GET /{o}/{r}/api/merge-base?from=&to=` 已落地（本地 `git merge-base`；
+> remote 走有界双向 walk，含 SSE 叙述与预算保护）；diff/patch/blame/archive 进行中。
 
 ## 10. 一致性、并发与安全
 

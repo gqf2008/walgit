@@ -203,6 +203,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/refs"), get(refs))
             .route(&format!("{base}/refs/{{kind}}"), get(ref_list))
             .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
+            .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -670,6 +671,60 @@ async fn ref_by_name(
                 }
                 None => Err(not_found("ref")),
             }
+        },
+    )
+    .await
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MergeBaseQuery {
+    from: String,
+    to: String,
+}
+
+/// The merge base of two revisions (`?from=&to=`) — the diff base for 3-dot
+/// PR comparisons. Local packs use `git merge-base`; remote-served bases use a
+/// bounded bidirectional walk over the pack set (`Remote::merge_base`).
+/// `merge_base` is `null` when the histories are unrelated.
+async fn merge_base(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(q): Query<MergeBaseQuery>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        |r| async move {
+            let a = resolve_name(&r, &q.from).await?.sha;
+            let b = resolve_name(&r, &q.to).await?.sha;
+            let base = if let Some(remote) = r.remote() {
+                remote.merge_base(&a, &b).await?.map(|oid| oid.to_string())
+            } else {
+                let out = r
+                    .local
+                    .git(&["merge-base", a.as_str(), b.as_str()])
+                    .await
+                    .map_err(internal)?;
+                if out.status.success() {
+                    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    (!sha.is_empty()).then_some(sha)
+                } else if out.status.code() == Some(1) {
+                    None // git: exit 1 = no common ancestor
+                } else {
+                    return Err(not_found(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ));
+                }
+            };
+            Ok(json_swr(
+                &serde_json::json!({ "from": a, "to": b, "merge_base": base }),
+                None,
+            ))
         },
     )
     .await

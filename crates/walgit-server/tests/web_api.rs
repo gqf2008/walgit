@@ -234,6 +234,27 @@ async fn conformance(
     assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
     assert!(body.contains("event: ref\n") && body.contains("event: done\n"));
 
+    // merge-base (D1 review primitive): local git and remote reader agree
+    let expected_base = git_in(src, &["merge-base", "main", "feature/x"])?
+        .trim()
+        .to_string();
+    let mb = json(server, "/o/r/api/merge-base?from=main&to=feature/x").await?;
+    assert_eq!(
+        mb["from"].as_str().unwrap().len(),
+        40,
+        "from resolved to a sha"
+    );
+    assert_eq!(mb["to"].as_str().unwrap().len(), 40, "to resolved to a sha");
+    assert_eq!(mb["merge_base"], expected_base);
+    let mb = json(server, "/o/r/api/merge-base?from=main&to=main").await?;
+    assert_eq!(mb["merge_base"], mb["from"], "same revision -> itself");
+    assert_eq!(
+        get(server, "/o/r/api/merge-base?from=nope&to=main")
+            .await?
+            .0,
+        404
+    );
+
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
     assert_eq!(st, 200);
@@ -645,5 +666,29 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
         .send()
         .await?;
     assert_ne!(git.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_base_unrelated_histories() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "r2").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "a"])?;
+    git_in(&dir, &["checkout", "-q", "--orphan", "other"])?;
+    std::fs::write(dir.join("b.txt"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "b"])?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "r2")],
+    )?;
+    let mb = json(&server, "/o/r2/api/merge-base?from=main&to=other").await?;
+    assert_eq!(mb["merge_base"], Value::Null, "unrelated histories -> null");
     Ok(())
 }
