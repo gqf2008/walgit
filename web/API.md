@@ -333,6 +333,38 @@ One **name-sorted page** of one namespace, for the branch/tag picker.
   ref-state version; the picker's typical traffic is the same handful of
   queries repeated.
 
+### `GET /{owner}/{repo}/api/refs/{all|collab}?prefix=&q=&after=&n=`
+
+Full-name pages for the collaboration layer (D1) and any other tooling that
+namespaces refs: `all` is every ref in the repository, `collab` is the
+`refs/collab/*` namespace (the decentralized-collaboration inbox/meta refs;
+a convenience equivalent to `all?prefix=refs/collab`).
+
+```json
+{ "refs": [ { "name": "refs/collab/inbox/alice@example.com/1", "sha": "807d45a6…" }, … ], "more": true }
+```
+
+- Same pagination contract as `refs/{branches|tags}`: `prefix`, `q`,
+  `after`, `n`, byte-sorted ascending, `more`, SSE option (`event: ref` /
+  `event: done`), SWR cache.
+- **Names are full ref names** (unlike `branches`/`tags`, which trim their
+  namespace): `prefix` therefore matches against `refs/…` (e.g.
+  `prefix=refs/collab/inbox` on `all`). `[]` when the namespace is empty.
+  Unknown namespace (anything other than `branches|tags|all|collab`) → `404`.
+
+### `GET /{owner}/{repo}/api/refs/name/{rest...}`
+
+Exact full-ref lookup by name — the tip of one D1 inbox, a notes ref, any
+ref. `rest` is the full name with slashes (`refs/collab/inbox/alice@example.com/1`).
+
+```json
+{ "name": "refs/collab/inbox/alice@example.com/1", "sha": "807d45a6…" }
+```
+
+- `sha` is the raw oid the ref points at (no peeling). `404` when the ref
+  does not exist. Cache: SWR + `ETag: "<sha>"` → `304` (the ref's oid is a
+  strong version for its value).
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json

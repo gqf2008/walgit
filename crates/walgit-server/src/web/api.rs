@@ -1,7 +1,8 @@
 //! Read-only JSON API for the web UI (`web/API.md`, v2 contract).
 //!
-//! Two URL classes: ref-dependent (`refs`, `refs/{branches,tags}`,
-//! `resolve`, name-addressed tree/blob/commits/commit) answered from a
+//! Two URL classes: ref-dependent (`refs`, `refs/{branches,tags,all,collab}`,
+//! `refs/name/{rest}`, `resolve`, name-addressed tree/blob/commits/commit)
+//! answered from a
 //! per-manifest-version [`RefIndex`] with `stale-while-revalidate` + `ETag`,
 //! and sha-addressed immutable ones (`tree/<sha>`, `blob/<sha>`,
 //! `commits?ref=<sha>`, `commit/<sha>`) rendered once and cached in memory
@@ -201,6 +202,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         r = r
             .route(&format!("{base}/refs"), get(refs))
             .route(&format!("{base}/refs/{{kind}}"), get(ref_list))
+            .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -518,6 +520,37 @@ async fn refs(
     .await
 }
 
+/// A byte-sorted ref namespace: short-name pairs (`branches`/`tags`) or
+/// full-name triples (`all`, `refs/collab/*`). Index-based access keeps a
+/// 466 k-ref repository paged in O(page) without copying the namespace.
+enum RefSlice<'a> {
+    Pairs(&'a [(String, String)]),
+    All(&'a [(String, String, String)]),
+}
+
+impl RefSlice<'_> {
+    fn at(&self, i: usize) -> Option<(&str, &str)> {
+        match self {
+            RefSlice::Pairs(v) => v.get(i).map(|(n, s)| (n.as_str(), s.as_str())),
+            RefSlice::All(v) => v.get(i).map(|(n, s, _)| (n.as_str(), s.as_str())),
+        }
+    }
+    /// First index whose name sorts strictly after `x` (names byte-sorted).
+    fn after(&self, x: &str) -> usize {
+        match self {
+            RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() <= x),
+            RefSlice::All(v) => v.partition_point(|(n, _, _)| n.as_str() <= x),
+        }
+    }
+    /// First index whose name sorts at-or-after `x`.
+    fn at_or_after(&self, x: &str) -> usize {
+        match self {
+            RefSlice::Pairs(v) => v.partition_point(|(n, _)| n.as_str() < x),
+            RefSlice::All(v) => v.partition_point(|(n, _, _)| n.as_str() < x),
+        }
+    }
+}
+
 async fn ref_list(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -527,9 +560,15 @@ async fn ref_list(
     let wants_sse = crate::sse::wants_sse(&headers);
     let handle = open(&st, &headers, &owner, &repo_name).await?;
     let r = view(&st, handle, Need::Refs, Reporter::none()).await?;
-    let list = match kind.as_str() {
-        "branches" => &r.index.branches,
-        "tags" => &r.index.tags,
+    // `branches`/`tags` are short-name namespaces; `all` is every ref as its
+    // full name; `collab` is the D1 collaboration namespace (`refs/collab/*`),
+    // also full names. All are byte-sorted, so pagination is index arithmetic
+    // over the cached index, never a copy.
+    let (slice, ns) = match kind.as_str() {
+        "branches" => (RefSlice::Pairs(&r.index.branches), None),
+        "tags" => (RefSlice::Pairs(&r.index.tags), None),
+        "all" => (RefSlice::All(&r.index.all), None),
+        "collab" => (RefSlice::All(&r.index.all), Some("refs/collab/")),
         _ => return Err(not_found("ref namespace")),
     };
     let n = q.n.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
@@ -542,37 +581,47 @@ async fn ref_list(
     let needle =
         q.q.as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
     let after = q.after.as_deref().unwrap_or("");
     // Byte-sorted: skip straight to the first candidate (> after, >= prefix).
     let lower = match &prefix {
         Some(p) if p.as_str() > after => p.as_str(),
         _ => after,
     };
-    let start = list
-        .partition_point(|(name, _)| name.as_str() <= lower && name.as_str() != lower)
-        .max(list.partition_point(|(name, _)| name.as_str() <= after));
+    let start = slice.at_or_after(lower).max(slice.after(after));
     let mut refs = Vec::with_capacity(n.min(256));
     let mut more = false;
-    for (name, sha) in &list[start..] {
-        if let Some(p) = &prefix {
-            if !name.starts_with(p.as_str()) {
-                break; // sorted: no further names share the prefix
+    let mut i = start;
+    while let Some((name, sha)) = slice.at(i) {
+        if let Some(ns) = ns {
+            if name < ns {
+                i += 1;
+                continue; // sorted: still before the namespace
+            }
+            if !name.starts_with(ns) {
+                break; // sorted: past the namespace
             }
         }
-        if let Some(nd) = &needle {
-            if !name.to_ascii_lowercase().contains(nd.as_str()) {
-                continue;
-            }
+        if let Some(p) = &prefix
+            && !name.starts_with(p.as_str())
+        {
+            break; // sorted: no further names share the prefix
+        }
+        if let Some(nd) = &needle
+            && !name.to_ascii_lowercase().contains(nd.as_str())
+        {
+            i += 1;
+            continue;
         }
         if refs.len() == n {
             more = true;
             break;
         }
         refs.push(RefInfo {
-            name: name.clone(),
-            sha: sha.clone(),
+            name: name.to_string(),
+            sha: sha.to_string(),
         });
+        i += 1;
     }
     if wants_sse {
         // Streamed form: one `ref` packet per ref, then `done` (web/API.md).
@@ -591,6 +640,39 @@ async fn ref_list(
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))
+}
+
+/// Exact full-ref lookup (`refs/name/{rest}`), e.g. the tip of a D1 collab
+/// inbox. The sha is the raw oid (no peeling); 404 when the ref does not exist.
+async fn ref_by_name(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, name)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Refs,
+        None,
+        |r| async move {
+            match r.index.by_name.get(&name) {
+                Some((sha, _)) => {
+                    let etag = etag_for(sha.as_str());
+                    Ok(json_swr(
+                        &RefInfo {
+                            name,
+                            sha: sha.clone(),
+                        },
+                        Some(&etag),
+                    ))
+                }
+                None => Err(not_found("ref")),
+            }
+        },
+    )
+    .await
 }
 
 // ---- resolve -----------------------------------------------------------------

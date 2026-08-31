@@ -232,6 +232,10 @@ pub struct RefIndex {
     pub branches: Vec<(String, String)>,
     /// Short tag names, byte-sorted, with the peeled commit sha.
     pub tags: Vec<(String, String)>,
+    /// Every ref as (full name, oid, peeled), byte-sorted by full name. Built
+    /// once per manifest version like the namespaces above; listing endpoints
+    /// page over it in O(page) without copying.
+    pub all: Vec<(String, String, String)>,
     /// HEAD symref target (full name) or "".
     pub head_target: String,
 }
@@ -241,6 +245,7 @@ impl RefIndex {
         let mut by_name = std::collections::HashMap::with_capacity(snap.refs.len());
         let mut branches = Vec::new();
         let mut tags = Vec::new();
+        let mut all = Vec::with_capacity(snap.refs.len());
         for r in &snap.refs {
             if let Some(n) = r.name.strip_prefix("refs/heads/") {
                 branches.push((n.to_string(), r.oid.clone()));
@@ -252,14 +257,17 @@ impl RefIndex {
                 };
                 tags.push((n.to_string(), sha));
             }
+            all.push((r.name.clone(), r.oid.clone(), r.peeled.clone()));
             by_name.insert(r.name.clone(), (r.oid.clone(), r.peeled.clone()));
         }
         branches.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         tags.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        all.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         Self {
             by_name,
             branches,
             tags,
+            all,
             head_target: snap.head_target.clone(),
         }
     }

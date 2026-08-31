@@ -113,6 +113,9 @@ fn fixture(server: &Server) -> anyhow::Result<std::path::PathBuf> {
     for _ in 0..40 {
         git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "filler"])?;
     }
+    // D1 collaboration namespace: arbitrary refs under refs/collab/* must be
+    // hostable (the design's inbox model) and listable via the new endpoints.
+    git_in(&dir, &["update-ref", "refs/collab/inbox/alice/1", "HEAD"])?;
     git_in(
         &dir,
         &["push", "-q", "--mirror", &server.repo_url("o", "r")],
@@ -178,6 +181,58 @@ async fn conformance(
     assert_eq!(st, 200);
     assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
     assert!(body.contains("event: ref\n") && body.contains("event: done\ndata: {\"more\":false}"));
+
+    // any-namespace refs (D1 collab): full-name listing, namespace filter,
+    // exact lookup, pagination, SSE
+    let p = json(server, "/o/r/api/refs/all").await?;
+    let names: Vec<String> = p["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
+    for expect in [
+        "refs/heads/main",
+        "refs/heads/feature/x",
+        "refs/tags/v1.0",
+        "refs/collab/inbox/alice/1",
+    ] {
+        assert!(
+            names.contains(&expect.to_string()),
+            "refs/all missing {expect}: {names:?}"
+        );
+    }
+    assert!(
+        names.windows(2).all(|w| w[0] < w[1]),
+        "refs/all must be byte-sorted: {names:?}"
+    );
+    let p = json(server, "/o/r/api/refs/all?prefix=refs/collab").await?;
+    assert_eq!(p["refs"].as_array().unwrap().len(), 1);
+    let p = json(server, "/o/r/api/refs/all?n=2").await?;
+    assert_eq!(p["refs"].as_array().unwrap().len(), 2);
+    assert_eq!(p["more"], true);
+    let p = json(server, "/o/r/api/refs/collab").await?;
+    assert_eq!(p["refs"][0]["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(p["refs"][0]["sha"], head);
+    assert_eq!(
+        json(server, "/o/r/api/refs/collab?q=INBOX").await?["refs"][0]["name"],
+        "refs/collab/inbox/alice/1"
+    );
+    let r = json(server, "/o/r/api/refs/name/refs/collab/inbox/alice/1").await?;
+    assert_eq!(r["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(r["sha"], head);
+    let r = json(server, "/o/r/api/refs/name/refs/heads/main").await?;
+    assert_eq!(r["sha"], head);
+    assert_eq!(get(server, "/o/r/api/refs/name/refs/nope").await?.0, 404);
+    let (st, body, h) = get_h(
+        server,
+        "/o/r/api/refs/collab",
+        &[("Accept", "text/event-stream")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
+    assert!(body.contains("event: ref\n") && body.contains("event: done\n"));
 
     // resolve
     let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
