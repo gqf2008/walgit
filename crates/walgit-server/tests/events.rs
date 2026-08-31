@@ -268,7 +268,7 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
     Ok(())
 }
 
-/// D1 (docs/D1_COLLAB_DESIGN.md §7/§9): collab refs (`refs/collab/*`) are
+/// D1 (`docs/D1_COLLAB_DESIGN.md` §7/§9): collab refs (`refs/collab/*`) are
 /// ordinary refs to the bridge — their create/delete events travel the same
 /// durable cursor with the same `(repo, seq, ref_name)` dedup key, so the
 /// collaboration layer can rebuild thread state from the WAL exactly like
