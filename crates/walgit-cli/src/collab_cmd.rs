@@ -804,11 +804,7 @@ pub fn build_report(
         let ordered = thread(group);
         let verified = ordered
             .iter()
-            .filter(|r| {
-                principals
-                    .get(&r.entry.actor)
-                    .is_some_and(|k| verify_entry(&r.entry, k).is_ok())
-            })
+            .filter(|r| r.is_verified(principals))
             .count();
         let mut kinds: Vec<String> = group
             .iter()
@@ -841,9 +837,7 @@ pub fn build_report(
     }
     report.total_entries = entries.len();
     for r in entries {
-        let verified = principals
-            .get(&r.entry.actor)
-            .is_some_and(|k| verify_entry(&r.entry, k).is_ok());
+        let verified = r.is_verified(principals);
         if verified {
             report.verified_entries += 1;
         } else {
