@@ -86,6 +86,10 @@ Every call takes a trailing `{ signal, onProgress, headers }`. Errors are
 `ReposError { status, message, url }` (`.notFound`, `.unauthorized`). Arrays
 are never `null`.
 
+The collab lane uses ES2023 (`Array#toSorted`) and WebCrypto Ed25519
+(`crypto.subtle.sign`): needs Chrome 110+/Safari 16+/Firefox 115+/Node 20+.
+
+
 ### Addressing: resolve once, then by sha
 
 Everything addressed by a **full sha** (`tree`, `blob`, `commits({ref: sha})`,

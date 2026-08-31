@@ -348,19 +348,32 @@ function canonicalize(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const o = value as Record<string, unknown>;
-    return `{${Object.keys(o)
+    // Keys are byte-sorted; `undefined` values are dropped (JSON.stringify also
+    // drops them when the entry is stored), so the signed form matches the
+    // stored content.
+    const keys = Object.keys(o)
       .toSorted()
-      .map((k) => `${JSON.stringify(k)}:${canonicalize(o[k])}`)
-      .join(",")}}`;
+      .filter((k) => o[k] !== undefined);
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(o[k])}`).join(",")}}`;
   }
   return JSON.stringify(value);
 }
 
+/** Refname-safe segment for collab refs (D1 §5): no `:`, `/`, `..`, `.lock`. */
+const REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/;
+function refSegment(label: string, s: string): void {
+  if (!REF_SEGMENT.test(s) || s === "." || s === ".." || s.endsWith(".lock")) {
+    throw new ReposError(400, `collab.${label}: ${JSON.stringify(s)} is not a refname-safe segment ([A-Za-z0-9._@-]+)`);
+  }
+}
+
 function pushFor(ref: string, content: string | null): CollabPush {
   if (content === null) {
-    return { ref, content: null, commands: [`git push origin :${ref}`] };
+    return { ref, content: null, commands: [`set -e\ngit push origin ":${ref}"`] };
   }
-  const cmd = `sha=$(git hash-object -w --stdin <<'WALGIT_ENTRY'\n${content}\nWALGIT_ENTRY\n)\ngit push origin "$sha:${ref}"`;
+  // A random delimiter so an entry body cannot truncate the heredoc early.
+  const delim = `WALGIT_ENTRY_${Math.random().toString(36).slice(2)}`;
+  const cmd = `set -e\nsha=$(git hash-object -w --stdin <<'${delim}'\n${content}\n${delim}\n)\ngit push origin "$sha:${ref}"`;
   return { ref, content, commands: [cmd] };
 }
 
@@ -753,6 +766,8 @@ export class RepoClient {
       body: Record<string, unknown>;
       sign: (canonical: string) => Promise<string>;
     }): Promise<CollabPush> => {
+      refSegment("entry.principal", input.principal);
+      refSegment("entry.id", input.id);
       const entry: Record<string, unknown> = {
         version: 1,
         kind: input.kind,
@@ -764,7 +779,7 @@ export class RepoClient {
       if (input.refs) entry.refs = input.refs;
       entry.body = input.body;
       const canonical = canonicalize(entry);
-      const sig = await input.sign(canonical);
+      const sig = `ed25519:${await input.sign(canonical)}`;
       const content = JSON.stringify({ ...entry, sig }, null, 2);
       return pushFor(`refs/collab/inbox/${input.principal}/${input.id}`, content);
     },
@@ -772,6 +787,7 @@ export class RepoClient {
         `refs/collab/meta/principals/<principal>` (D1 §5: the token binds the
         principal; this ref binds the key). Content is stored as-is. */
     principal: (input: { principal: string; publicKey: string }): CollabPush => {
+      refSegment("principal", input.principal);
       const content = JSON.stringify(
         { version: 1, principal: input.principal, public_key: input.publicKey, registered_at: Math.floor(Date.now() / 1000) },
         null,
@@ -780,7 +796,10 @@ export class RepoClient {
       return pushFor(`refs/collab/meta/principals/${input.principal}`, content);
     },
     /** Revoke a principal's key: delete the registry ref (tombstone, D1 §10). */
-    revokePrincipal: (principal: string): CollabPush => pushFor(`refs/collab/meta/principals/${principal}`, null),
+    revokePrincipal: (principal: string): CollabPush => {
+      refSegment("revokePrincipal", principal);
+      return pushFor(`refs/collab/meta/principals/${principal}`, null);
+    },
   };
 
   /** Streaming ref page: `onRef` per match as the server finds it; resolves `{more}`. */
