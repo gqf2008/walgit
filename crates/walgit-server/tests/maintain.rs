@@ -846,11 +846,13 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .find(|s| s.name == "weekly")
         .unwrap()
         .clone();
-    let sunday = walgit_bundle::slots::last_slot_at_or_before(
-        &weekly,
-        now - std::time::Duration::from_secs(36 * 3600),
-    )?
-    .unwrap();
+    // The most recent weekly slot (not `now - 36h`): if an OLDER weekly were
+    // cut, the maintainer pass would first build the NEWER due weekly and
+    // re-base the hourlies, leaving the hourly skips stale (they were recorded
+    // against the old base) and the plan re-reporting them Missing. With the
+    // last weekly as the base, no newer weekly is due during the pass and the
+    // hourly verdicts stay stable (issue #17).
+    let sunday = walgit_bundle::slots::last_slot_at_or_before(&weekly, now)?.unwrap();
     let mut params = std::collections::HashMap::new();
     params.insert("strategy".to_string(), "weekly".to_string());
     params.insert("slot".to_string(), sunday.to_string());
@@ -919,17 +921,16 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .find(|s| s.name == "hourly")
         .unwrap()
         .clone();
-    let rows = server
-        .state
-        .bundles
-        .plan(&id, std::time::SystemTime::now(), ctx)
-        .await?;
+    let rows = server.state.bundles.plan(&id, now, ctx).await?;
+    {
+        let hb1 = walgit_bundle::slots::base_for_incremental(&server.state.cfg.bundles, &list, &hourly, 1788181200).map(|b| b.id.clone());
+        }
     let still_missing_closed: Vec<u64> = rows
         .iter()
         .filter(|r| {
             r.strategy == "hourly"
                 && r.status == walgit_bundle::slots::SlotStatus::Missing
-                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
+                && walgit_bundle::slots::slot_closed(&hourly, r.slot, now)
         })
         .map(|r| r.slot)
         .collect();

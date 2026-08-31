@@ -963,7 +963,10 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
     let cfg = Arc::new(cfg);
     let bundler = Bundler::new_with_source(Arc::new(source), cfg.clone());
     // A closed daily slot (yesterday 23:00) on a weekly cut at the Sunday before it.
-    let now = std::time::SystemTime::now();
+    // Freeze `now` on a Wednesday (2026-07-15T12:00:00Z): yesterday is Tuesday,
+    // never the Sunday weekly cut, so the test is deterministic instead of
+    // failing every Monday (issue #17).
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_116_800);
     let daily_strat = cfg
         .bundles
         .strategy
