@@ -63,7 +63,7 @@
 | ref | 内容 | 写权限 |
 |---|---|---|
 | `refs/collab/inbox/<principal>/<uuid>` | 某参与者的一条追加式条目链（签名字节） | 仅该 principal（policy 锁） |
-| `refs/collab/meta/principals` | 注册表：principal → Ed25519 公钥（含吊销标记） | 仅 token 签发方 / 首次注册 |
+| `refs/collab/meta/principals/<principal>` | 每 principal 一个注册 ref（内容 = 公钥 JSON）；吊销 = 删该 ref（tombstone） | 仅本人（首次注册）/ 本人 |
 | `refs/collab/meta/rules` | 合并规则对象（协作层语义，见 §6） | 仅 admin |
 | `refs/collab/meta/protocol` | 协议版本号 | 仅 admin |
 
@@ -95,7 +95,12 @@
 }
 ```
 
-- **验签**：本地用 `refs/collab/meta/principals` 里该 actor 的公钥验 `sig`；
+- **签名 canonical 形式（契约，跨语言验签者据此复现）**：对不含 `sig` 的条目做
+  **递归键排序** JSON：对象键按字节序升序；数组保持顺序；字符串/数字/布尔按
+  JSON 标准转义；值为 `undefined` 的键**丢弃**（与存储时 `JSON.stringify` 丢键一致）；
+  无空白、无尾随逗号。`sig = "ed25519:" + base64(Ed25519 对 canonical 字节的签名)`。
+  SDK 的 `collab.entry` 即按此实现；任何语言的验签端以本定义为准。
+- **验签**：本地用 `refs/collab/meta/principals/<principal>` 里该 actor 的公钥验 `sig`；
   链式 `parent` 保证追加顺序不可篡改（防重排、防丢）。
 - **条目类型语义**：
   - `issue`：开 issue。
@@ -119,7 +124,9 @@
 目标：人类和 agent 只需要一个凭据即可无缝协作（git + 协作 + dashboard）。
 
 - **token = 认证**：walgit 的静态 token / `wgt_` / OIDC，认证 git smart HTTP、API、协作写。
-- **principal = 身份**：token 解析为 principal（人 `alice@…` 或 agent `svc:reviewer-1`）。
+- **principal = 身份**：token 解析为 principal（人 `alice@…` 或 agent `svc-reviewer-1`）。
+  **principal 语法**：`[A-Za-z0-9][A-Za-z0-9._@-]*`（refname-safe，不含 `:`/`/`/`..`；SDK
+  在 `collab.*` 里校验，非法即抛 `ReposError(400)`）。
 - **公钥 = 验签**：Ed25519 密钥对与 principal 绑定，注册进 `refs/collab/meta/principals`。
   **落地（issue #10）**：首次使用自注册——`collab.principal({principal, publicKey})`
   构造注册条目，经 receive-pack push 到 `refs/collab/meta/principals/<principal>`；
@@ -202,7 +209,8 @@
 
 - **写并发**：收件箱按 principal 分片 → 无跨参与者竞争；同收件箱内 CAS 重试。
 - **读一致性**：以单次 manifest CAS 为同步点读取全部 collab refs。
-- **防滥用**：条目大小上限、频率配额（policy/代理层）、公钥吊销（principals 注册表支持 revoke 条目）。
+- **防滥用**：条目大小上限、频率配额（policy/代理层）、公钥吊销（删
+  `refs/collab/meta/principals/<principal>` tombstone，SDK `collab.revokePrincipal`）。
 - **隐私**：collab refs 与仓库同权限域——匿名/私有仓库的协作数据随之同权限（walgit 认证已覆盖）；
   独立的可见性控制（如 issue 对组织外可见）留作后续，本设计不引入。
 
