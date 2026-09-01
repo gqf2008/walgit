@@ -1108,7 +1108,10 @@ fn ref_segment_ok(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
 }
 
-async fn git_hash_object(local: &walgit_git::LocalRepo, content: &[u8]) -> Result<String, ApiError> {
+async fn git_hash_object(
+    local: &walgit_git::LocalRepo,
+    content: &[u8],
+) -> Result<String, ApiError> {
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new("git")
         .current_dir(local.path())
@@ -1196,7 +1199,8 @@ async fn collab_entries(
     }
     let content = serde_json::to_vec(&entry).map_err(internal)?;
     let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
-    let (oid, seq) = publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
+    let (oid, seq) =
+        publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
     Ok(json_swr(
         &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
         None,
@@ -1294,7 +1298,9 @@ async fn publish_collab_ref(
     let oid = git_hash_object(&r.local, &content).await?;
     let pack_bytes = git_pack_object(&r.local, &oid).await?;
     let tmp = std::env::temp_dir().join(format!("walgit-collab-{}.pack", uuid::Uuid::new_v4()));
-    tokio::fs::write(&tmp, &pack_bytes).await.map_err(internal)?;
+    tokio::fs::write(&tmp, &pack_bytes)
+        .await
+        .map_err(internal)?;
     let f = tokio::fs::File::open(&tmp).await.map_err(internal)?;
     let pack = r
         .local
@@ -1341,10 +1347,7 @@ async fn publish_collab_ref(
     if policy.has_protect() {
         for u in &txn.updates {
             if crate::policy::classify(&u.old_oid, &u.new_oid) == crate::policy::RefOp::Update
-                && !matches!(
-                    r.local.is_ancestor(&u.old_oid, &u.new_oid).await,
-                    Ok(true)
-                )
+                && !matches!(r.local.is_ancestor(&u.old_oid, &u.new_oid).await, Ok(true))
             {
                 forces.insert(u.name.clone());
             }
@@ -1401,7 +1404,8 @@ async fn collab_principal(
     }))
     .map_err(internal)?;
     let ref_name = format!("refs/collab/meta/principals/{}", body.principal);
-    let (oid, seq) = publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
+    let (oid, seq) =
+        publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
     Ok(json_swr(
         &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
         None,
@@ -1546,11 +1550,8 @@ async fn collab_thread(
         None,
         move |r| async move {
             let state = collab_load(&r).await?;
-            let filtered: Vec<&EntryRef> = state
-                .entries
-                .iter()
-                .filter(|e| e.entry.id == id)
-                .collect();
+            let filtered: Vec<&EntryRef> =
+                state.entries.iter().filter(|e| e.entry.id == id).collect();
             if filtered.is_empty() {
                 return Err(not_found(format!("no collab thread {id}")));
             }

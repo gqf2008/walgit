@@ -940,7 +940,10 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     assert_eq!(resp.status(), 200, "post signed entry");
     let body: serde_json::Value = resp.json().await?;
     let ref_name = body["ref"].as_str().expect("ref").to_string();
-    assert!(ref_name.starts_with("refs/collab/inbox/alice/"), "{ref_name}");
+    assert!(
+        ref_name.starts_with("refs/collab/inbox/alice/"),
+        "{ref_name}"
+    );
     assert_eq!(body["oid"].as_str().unwrap().len(), 40);
 
     // Visible in the collab namespace listing (authenticated read).
@@ -982,7 +985,11 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
         .json(&serde_json::json!({ "entry": entry }))
         .send()
         .await?;
-    assert_eq!(resp.status(), 403, "unauthenticated refused (token mode, no credential)");
+    assert_eq!(
+        resp.status(),
+        403,
+        "unauthenticated refused (token mode, no credential)"
+    );
     Ok(())
 }
 
@@ -1076,7 +1083,9 @@ async fn collab_report_and_thread_aggregate_entries() -> TestResult {
         .map(|e| e["entry"]["kind"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, vec!["issue", "patch", "review"], "parent-ordered");
-    let pr = thread["pr"].as_object().expect("thread has a patch -> pr view");
+    let pr = thread["pr"]
+        .as_object()
+        .expect("thread has a patch -> pr view");
     assert_eq!(pr["pr"]["base"], "refs/heads/main");
     assert_eq!(pr["pr"]["head"], "refs/heads/topic");
     assert_eq!(pr["pr"]["reviews"].as_array().unwrap().len(), 1);
@@ -1124,7 +1133,8 @@ async fn collab_principal_registration_and_verified_entries() -> TestResult {
     assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
 
     let sk = SigningKey::from_bytes(&[7u8; 32]);
-    let public_key = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
 
     // Register alice's key through the thin API.
     let resp = client
@@ -1178,7 +1188,10 @@ async fn collab_principal_registration_and_verified_entries() -> TestResult {
     assert_eq!(st, 200);
     let report: serde_json::Value = serde_json::from_str(&text)?;
     assert_eq!(report["total_entries"], 1);
-    assert_eq!(report["verified_entries"], 1, "signed entry with registered key verifies");
+    assert_eq!(
+        report["verified_entries"], 1,
+        "signed entry with registered key verifies"
+    );
     assert_eq!(report["unverified_entries"], 0);
     assert_eq!(report["missing_principals"], 0);
     assert_eq!(report["threads"][0]["verified"], 1);
@@ -1246,7 +1259,12 @@ async fn collab_thin_api_honors_repo_policy() -> TestResult {
         .body(policy)
         .send()
         .await?;
-    assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap_or_default());
+    assert_eq!(
+        resp.status(),
+        204,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
 
     let entry = serde_json::json!({
         "version": 1, "kind": "issue", "id": "t9", "actor": "alice",
@@ -1258,7 +1276,11 @@ async fn collab_thin_api_honors_repo_policy() -> TestResult {
         .json(&serde_json::json!({ "entry": entry }))
         .send()
         .await?;
-    assert_eq!(resp.status(), 403, "policy denies the collab create on the thin path");
+    assert_eq!(
+        resp.status(),
+        403,
+        "policy denies the collab create on the thin path"
+    );
 
     // Lift the freeze: the same write now lands.
     let del = client

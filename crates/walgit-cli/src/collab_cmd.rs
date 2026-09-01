@@ -16,8 +16,8 @@ use ed25519_dalek::SigningKey;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use walgit_wal::collab::{
-    Entry, EntryRefs, EntryRef, MergeRules, Report, build_report,
-    merge_rule_eval, pr_view, sign_entry, thread,
+    Entry, EntryRef, EntryRefs, MergeRules, Report, build_report, merge_rule_eval, pr_view,
+    sign_entry, thread,
 };
 
 // ---- CLI commands --------------------------------------------------------------
@@ -148,10 +148,7 @@ pub fn run(action: CollabAction) -> Result<()> {
         CollabAction::Thread { id, repo } => {
             let reader = CollabReader::new(&repo);
             let (entries, principals) = reader.load()?;
-            let filtered: Vec<&EntryRef> = entries
-                .iter()
-                .filter(|e| e.entry.id == id)
-                .collect();
+            let filtered: Vec<&EntryRef> = entries.iter().filter(|e| e.entry.id == id).collect();
             if filtered.is_empty() {
                 bail!("no entries for thread {id}");
             }
@@ -199,7 +196,11 @@ pub fn run(action: CollabAction) -> Result<()> {
             principal,
             push,
         } => run_principal_revoke(&repo, &principal, push.as_deref())?,
-        CollabAction::Report { repo, format, rules } => run_report(&repo, &format, rules.as_deref())?,
+        CollabAction::Report {
+            repo,
+            format,
+            rules,
+        } => run_report(&repo, &format, rules.as_deref())?,
         CollabAction::Watch {
             repo,
             remote,
@@ -207,14 +208,18 @@ pub fn run(action: CollabAction) -> Result<()> {
             once,
             exec,
             state,
-        } => run_watch(&repo, &remote, interval, once, exec.as_deref(), state.as_deref())?,
+        } => run_watch(
+            &repo,
+            &remote,
+            interval,
+            once,
+            exec.as_deref(),
+            state.as_deref(),
+        )?,
         CollabAction::Pr { id, repo, rules } => {
             let reader = CollabReader::new(&repo);
             let (entries, principals) = reader.load()?;
-            let filtered: Vec<&EntryRef> = entries
-                .iter()
-                .filter(|e| e.entry.id == id)
-                .collect();
+            let filtered: Vec<&EntryRef> = entries.iter().filter(|e| e.entry.id == id).collect();
             let pr = pr_view(&filtered, &principals);
             let rules: MergeRules = match rules {
                 Some(p) => serde_json::from_str(&std::fs::read_to_string(&p)?)?,
@@ -247,8 +252,8 @@ fn ref_segment(label: &str, s: &str) -> Result<()> {
 }
 
 fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read key {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read key {}", path.display()))?;
     let bytes = hex::decode(raw.trim())
         .with_context(|| format!("key {} must be 32 raw bytes as hex", path.display()))?;
     let bytes: [u8; 32] = bytes
@@ -383,8 +388,8 @@ fn run_principal_register(
 ) -> Result<()> {
     ref_segment("principal", principal)?;
     let key = read_signing_key(key_path)?;
-    let public_key = base64::engine::general_purpose::STANDARD
-        .encode(key.verifying_key().to_bytes());
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
     let content = serde_json::to_string_pretty(&serde_json::json!({
         "version": 1,
         "principal": principal,
@@ -459,15 +464,25 @@ fn render_report_markdown(r: &Report) -> String {
         r.verified_entries,
         r.total_entries
     );
-    let _ = writeln!(out, "## threads\n\n| id | entries | verified | kinds | last |\n|---|---|---|---|---|");
+    let _ = writeln!(
+        out,
+        "## threads\n\n| id | entries | verified | kinds | last |\n|---|---|---|---|---|"
+    );
     for t in &r.threads {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} | {} |",
-            t.id, t.entries, t.verified, t.kinds.join("/"), t.last_ts
+            t.id,
+            t.entries,
+            t.verified,
+            t.kinds.join("/"),
+            t.last_ts
         );
     }
-    let _ = writeln!(out, "\n## PRs\n\n| id | status | approvals | merge |\n|---|---|---|---|");
+    let _ = writeln!(
+        out,
+        "\n## PRs\n\n| id | status | approvals | merge |\n|---|---|---|---|"
+    );
     for p in &r.prs {
         let _ = writeln!(
             out,
@@ -520,7 +535,9 @@ fn render_report_html(r: &Report) -> String {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()> {
@@ -595,8 +612,11 @@ fn write_state(path: &Path, map: &std::collections::HashMap<String, String>) -> 
     for (k, v) in map {
         obj.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
-    std::fs::write(path, serde_json::to_string_pretty(&serde_json::Value::Object(obj))?)
-        .with_context(|| format!("write state {}", path.display()))?;
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(obj))?,
+    )
+    .with_context(|| format!("write state {}", path.display()))?;
     Ok(())
 }
 
@@ -734,7 +754,10 @@ fn run_watch(
                     ("WALGIT_COLLAB_KIND", ev.kind.as_str()),
                     ("WALGIT_COLLAB_THREAD", ev.thread.as_str()),
                     ("WALGIT_COLLAB_ACTOR", ev.actor.as_str()),
-                    ("WALGIT_COLLAB_VERIFIED", if ev.verified { "true" } else { "false" }),
+                    (
+                        "WALGIT_COLLAB_VERIFIED",
+                        if ev.verified { "true" } else { "false" },
+                    ),
                 ];
                 run_exec(cmd, &ev.text, &env)?;
             }
@@ -834,9 +857,8 @@ impl CollabReader {
                 continue;
             };
             let blob = self.git(&["cat-file", "blob", &oid])?;
-            let entry: Entry = serde_json::from_slice(&blob).with_context(|| {
-                format!("parse entry at {name} ({oid})")
-            })?;
+            let entry: Entry = serde_json::from_slice(&blob)
+                .with_context(|| format!("parse entry at {name} ({oid})"))?;
             entries.push(EntryRef {
                 oid,
                 principal,
@@ -850,17 +872,14 @@ impl CollabReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use walgit_wal::collab::{canonicalize, verify_entry, Review};
+    use walgit_wal::collab::{Review, canonicalize, verify_entry};
 
     fn keypair() -> (ed25519_dalek::SigningKey, String) {
         // Deterministic test key (the CLI's write path takes the key from a
         // user file; generation is not part of the aggregation core).
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let pk = sk.verifying_key().to_bytes();
-        (
-            sk,
-            base64::engine::general_purpose::STANDARD.encode(pk),
-        )
+        (sk, base64::engine::general_purpose::STANDARD.encode(pk))
     }
 
     fn entry(
@@ -891,8 +910,7 @@ mod tests {
 
     #[test]
     fn canonicalize_is_sorted_and_compact() {
-        let v: serde_json::Value =
-            serde_json::json!({"b": 1, "a": {"d": [1, 2], "c": "x"}});
+        let v: serde_json::Value = serde_json::json!({"b": 1, "a": {"d": [1, 2], "c": "x"}});
         assert_eq!(canonicalize(&v), r#"{"a":{"c":"x","d":[1,2]},"b":1}"#);
     }
 
@@ -928,7 +946,15 @@ mod tests {
 
     #[test]
     fn thread_deterministic_with_dangling_parent() {
-        let e1 = entry("t", "comment", "alice", "missing", "a", 1, serde_json::json!({}));
+        let e1 = entry(
+            "t",
+            "comment",
+            "alice",
+            "missing",
+            "a",
+            1,
+            serde_json::json!({}),
+        );
         let e2 = entry("t", "comment", "bob", "", "b", 2, serde_json::json!({}));
         let refs = vec![&e1, &e2];
         let ordered = thread(&refs);
@@ -976,7 +1002,15 @@ mod tests {
         let mut principals = HashMap::new();
         principals.insert("alice".to_string(), pk);
 
-        let mut issue = entry("pr1", "issue", "alice", "", "a", 1, serde_json::json!({"title": "t"}));
+        let mut issue = entry(
+            "pr1",
+            "issue",
+            "alice",
+            "",
+            "a",
+            1,
+            serde_json::json!({"title": "t"}),
+        );
         issue.entry.sig = sign_entry(&mut issue.entry, &sk);
         let unsigned = entry("pr1", "comment", "bob", "a", "b", 2, serde_json::json!({}));
         let mut patch = entry("pr1", "patch", "alice", "b", "c", 3, serde_json::json!({}));
@@ -985,7 +1019,15 @@ mod tests {
             head: Some("refs/heads/topic".into()),
         });
         patch.entry.sig = sign_entry(&mut patch.entry, &sk);
-        let mut review = entry("pr1", "review", "alice", "c", "d", 4, serde_json::json!({"decision": "approve"}));
+        let mut review = entry(
+            "pr1",
+            "review",
+            "alice",
+            "c",
+            "d",
+            4,
+            serde_json::json!({"decision": "approve"}),
+        );
         review.entry.sig = sign_entry(&mut review.entry, &sk);
 
         let refs = vec![&issue, &unsigned, &patch, &review];
@@ -997,7 +1039,10 @@ mod tests {
         assert_eq!(r1.threads.len(), 1);
         assert_eq!(r1.threads[0].id, "pr1");
         assert_eq!(r1.threads[0].entries, 4);
-        assert_eq!(r1.threads[0].verified, 3, "bob's unsigned entry not verified");
+        assert_eq!(
+            r1.threads[0].verified, 3,
+            "bob's unsigned entry not verified"
+        );
         assert_eq!(r1.total_entries, 4);
         assert_eq!(r1.verified_entries, 3);
         assert_eq!(r1.unverified_entries, 1);
@@ -1005,7 +1050,10 @@ mod tests {
         assert_eq!(r1.prs.len(), 1);
         assert_eq!(r1.prs[0].approvals, 1);
         assert!(r1.prs[0].merge_allowed);
-        assert_eq!(r1.by_actor, vec![("alice".to_string(), 3), ("bob".to_string(), 1)]);
+        assert_eq!(
+            r1.by_actor,
+            vec![("alice".to_string(), 3), ("bob".to_string(), 1)]
+        );
 
         // Determinism: identical input -> identical text render.
         let r2 = build_report(&refs, &principals, &rules);
@@ -1056,7 +1104,11 @@ mod tests {
         principals.insert("alice".to_string(), pk);
         let refs = vec![&good, &tampered];
         let pr = pr_view(&refs, &principals);
-        assert_eq!(pr.human_approvals.len(), 1, "only the verified approve counts");
+        assert_eq!(
+            pr.human_approvals.len(),
+            1,
+            "only the verified approve counts"
+        );
         assert_eq!(pr.unverified.len(), 1, "tampered entry listed unverified");
     }
 
