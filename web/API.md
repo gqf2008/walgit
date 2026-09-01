@@ -580,6 +580,80 @@ list by `commit_date` day and shows `subject` + `author`.
   walgit passes `--diff-merges=first-parent`). Do not return a combined
   (`diff --cc`) patch or an empty patch with non-empty `stats`.
 
+### D1 collaboration lane (`/{owner}/{repo}/api/collab/…`) — walgit-specific
+
+The decentralized collaboration layer (`docs/D1_COLLAB_DESIGN.md`) writes to
+`refs/collab/*` (inbox entries + principals registry) and aggregates them
+deterministically; these endpoints back the Collab tab and mirror what the
+`walgit collab` CLI computes locally. Auth: same as every repo-scoped write
+(write tokens / signed-in principal; `actor == principal` is enforced).
+
+#### `POST /{owner}/{repo}/api/collab/entries`
+
+```json
+{ "entry": { "version": 1, "kind": "comment", "id": "t1", "actor": "alice", "ts": 1786500000, "parent": "…", "body": {}, "sig": "ed25519:…" } }
+```
+
+Materializes the entry as a one-object bucket pack and publishes
+`refs/collab/inbox/<actor>/<uuid>` through the WAL — the browser write path
+(no git). `200` → `{ "ref", "oid", "seq" }`. The server does **not** verify
+the signature (client-side); it enforces `actor == authenticated principal`
+(`403` otherwise) and that the actor is a refname-safe segment. No credential
+→ `401`/`403` per lane. Signature verification happens in the aggregation.
+
+#### `POST /{owner}/{repo}/api/collab/principal`
+
+```json
+{ "principal": "alice", "public_key": "base64(Ed25519 pub)" }
+```
+
+First-use self-registration: publishes the public key at
+`refs/collab/meta/principals/<principal>` (D1 §5; re-registering overwrites
+with the new key, the tombstone is a git deletion). `principal ==
+authenticated principal` is enforced. `200` → `{ "ref", "oid", "seq" }`.
+
+#### `GET /{owner}/{repo}/api/collab/report`
+
+The full observability report (D1 §8) — thread summaries, PR status + merge
+rule evaluation, verification health, per-actor/per-kind activity. Shape is
+`walgit-wal::collab::Report`:
+
+```json
+{
+  "threads": [ { "id": "t1", "entries": 4, "verified": 3, "last_ts": 1786500000, "kinds": ["comment","issue","patch","review"] } ],
+  "prs": [ { "id": "t1", "base": "refs/heads/main", "head": "refs/heads/topic", "status": "open", "approvals": 1, "merge_allowed": true, "merge_reason": "…" } ],
+  "total_entries": 4,
+  "verified_entries": 3,
+  "unverified_entries": 1,
+  "missing_principals": 1,
+  "by_actor": [["alice", 3], ["bob", 1]],
+  "by_kind": [["comment", 1], ["issue", 1], ["patch", 1], ["review", 1]]
+}
+```
+
+`verified` requires a registered key for the actor **and** that the entry sits
+in the actor's own inbox (the D1 inbox model). Merge rules come from
+`refs/collab/meta/rules` when present, else defaults (nothing protected).
+
+#### `GET /{owner}/{repo}/api/collab/threads/{id}`
+
+One thread: parent-ordered entries with per-entry verification, plus the PR
+view + merge evaluation when the thread has a `patch`. `404` for an unknown
+thread id.
+
+```json
+{
+  "id": "t1",
+  "entries": [ { "oid": "…", "principal": "alice", "verified": true, "entry": { "kind": "issue", "actor": "alice", "ts": 1786500000, "parent": "", "refs": null, "body": {}, "sig": "ed25519:…" } } ],
+  "pr": { "pr": { "id": "t1", "base": "refs/heads/main", "head": "refs/heads/topic", "status": "open", "reviews": [], "human_approvals": [], "unverified": [] }, "merge": { "allowed": true, "reason": "base is not protected", "satisfied_by": [] } }
+}
+```
+
+Both read endpoints answer from the synced WAL view (`Need::Objects`): entry
+blobs are read locally when packs fit, faulted through the remote reader
+otherwise. SWR caching (stale-while-revalidate=60), never immutable — collab
+state changes with every push.
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a
@@ -656,6 +730,10 @@ GET /o/r/api/commits?ref=<sha>&path=&skip=0     → 200 {ref,sha,commits,more}; 
 GET /o/r/api/commit/<sha>                       → 200 {commit,stats,patch}; immutable
 GET /o/r/api/commit/<sha[:8]>                   → 200; SWR + ETag "<full sha>"
 GET /o/r/api/commit/deadbeef                    → 404 text/plain
+POST /o/r/api/collab/entries                    → 200 {ref,oid,seq} | 403 (actor≠principal) | 401 (no credential)
+POST /o/r/api/collab/principal                  → 200 {ref,oid,seq} | 403 (registering another principal)
+GET /o/r/api/collab/report                      → 200 CollabReport; SWR (threads, prs, totals, by_actor, by_kind)
+GET /o/r/api/collab/threads/t1                  → 200 {id,entries,pr?} | 404 unknown thread
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)
 ```
