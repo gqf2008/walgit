@@ -3138,11 +3138,13 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
         }
         // The concurrent reader may see base or winner, never base again after
         // winner (the original bug's signature: old refs cached under the new
-        // version). A value that is neither is impossible server-side — the
-        // WAL refs are only ever base or the single winner (manifest CAS +
-        // refs-first local commit) — so it is collected as a diagnostic, not a
-        // hard failure (PR #28 forensics: one CI run saw a 'foreign tip' that
-        // every other run and the isolated read-after-ack probe cannot produce).
+        // version). A foreign value (neither base nor winner) is evidence the
+        // server advertised a contender's commit as refs/heads/main — main's
+        // 2026-09-01 05:40Z windows run saw one foreign sha for ~40 consecutive
+        // samples (~1 s of sustained advertisement), so this is a real signal,
+        // not noise. A single stray sample could be a client artifact, so a
+        // sustained run of >=3 identical foreign values is a hard failure; 1-2
+        // samples are reported as a diagnostic for forensics.
         let mut saw_winner = false;
         let mut foreign: Vec<String> = Vec::new();
         for h in &seen {
@@ -3158,7 +3160,21 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
                 foreign.push(h.clone());
             }
         }
-        if !stale.is_empty() || !foreign.is_empty() {
+        if !foreign.is_empty() {
+            let mut runs: Vec<(String, usize)> = Vec::new();
+            for h in &foreign {
+                match runs.last_mut() {
+                    Some((last, n)) if last == h => *n += 1,
+                    _ => runs.push((h.clone(), 1)),
+                }
+            }
+            for (h, n) in &runs {
+                if *n >= 3 {
+                    stale.push(format!(
+                        "round {round}: reader saw a sustained foreign tip {h} ({n} consecutive samples)"
+                    ));
+                }
+            }
             eprintln!("DIAG round {round}: contenders={contender_shas:?}");
             eprintln!("DIAG prev_winner={prev_winner:?} base={base:?} winner={winner:?}");
             eprintln!("DIAG after={after:?}");
@@ -3180,6 +3196,7 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
 #[allow(unsafe_code)] // SAFETY: test-only env hooks, same pattern as the sibling test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn read_after_ack_probe_isolated() -> TestResult {
+    // SAFETY: test-only env hook, read by the publish path of this process.
     unsafe { std::env::set_var("WALGIT_TEST_PUBLISH_GAP_MS", "150") };
     let server = Server::start().await?;
     server.put_repo("t", "probe").await?;
@@ -3190,18 +3207,6 @@ async fn read_after_ack_probe_isolated() -> TestResult {
     )?;
     git_in(&src, &["push", "-q", "origin", "main"])?;
     let url = server.repo_url("t", "probe");
-    let tip = |dir: &std::path::Path| -> String {
-        let out = std::process::Command::new("git")
-            .args(["ls-remote", &url, "refs/heads/main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string()
-    };
     let mut stale = 0usize;
     for i in 0..20 {
         std::fs::write(src.join(format!("f{i}.txt")), format!("{i}\n"))?;
@@ -3214,13 +3219,25 @@ async fn read_after_ack_probe_isolated() -> TestResult {
             .output()?;
         assert!(out.status.success(), "push {i} failed");
         for _ in 0..10 {
-            let t = tip(&src);
+            let out = std::process::Command::new("git")
+                .args(["ls-remote", &url, "refs/heads/main"])
+                .current_dir(&*src)
+                .output()?;
+            // A failed ls-remote (empty stdout) is a transport failure, not a
+            // stale read — never count it as a read-your-writes violation.
+            assert!(out.status.success(), "ls-remote {i} failed");
+            let t = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
             if t != sha {
                 stale += 1;
                 eprintln!("STALE after ack {i}: got {t} want {sha}");
             }
         }
     }
+    // SAFETY: see above.
     unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
     if stale > 0 {
         eprintln!("read-after-ack probe stale reads: {stale}/200");

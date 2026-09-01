@@ -943,15 +943,6 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     // slot may stay missing: the commit above was pushed after its fire time, so
     // as of the slot there is nothing new — it belongs to the next hour (D22).
     let rows = server.state.bundles.plan(&id, now, ctx).await?;
-    {
-        let hb1 = walgit_bundle::slots::base_for_incremental(
-            &server.state.cfg.bundles,
-            &list,
-            &hourly,
-            1788181200,
-        )
-        .map(|b| b.id.clone());
-    }
     let still_missing_closed: Vec<u64> = rows
         .iter()
         .filter(|r| {

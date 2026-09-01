@@ -428,3 +428,45 @@ fn start_scratch(
     abort_after(handle.id(), Phase::Copied)?;
     Ok(m)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::copy_tree;
+
+    /// The scratch copy must never inherit git's transient `.lock` files: a
+    /// concurrent `git commit-graph write` on the serving copy leaves
+    /// `commit-graph-chain.lock` mid-flight, and a copy would break the
+    /// rebuild's own write ("Unable to create ...lock: File exists", CI
+    /// 2026-09-01). Ordinary files must still be copied.
+    #[test]
+    fn copy_tree_skips_lock_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("objects/info/commit-graphs")).unwrap();
+        std::fs::write(
+            src.path()
+                .join("objects/info/commit-graphs/commit-graph-chain.lock"),
+            "stale",
+        )
+        .unwrap();
+        std::fs::write(src.path().join("objects/info/commit-graph-chain"), "hash\n").unwrap();
+        std::fs::write(src.path().join("packed-refs"), "ref: x\n").unwrap();
+
+        copy_tree(src.path(), dst.path()).unwrap();
+
+        assert!(
+            !dst.path()
+                .join("objects/info/commit-graphs/commit-graph-chain.lock")
+                .exists(),
+            "the stale lock must not be copied into the scratch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("objects/info/commit-graph-chain")).unwrap(),
+            "hash\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("packed-refs")).unwrap(),
+            "ref: x\n"
+        );
+    }
+}
