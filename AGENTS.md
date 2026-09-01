@@ -32,6 +32,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
+| `docs/D1_CI_PROTOCOL.md` | Anyone touching the decentralized CI protocol: the `walgit ci` runner, `ci_claim`/`ci_result` entries, or the CI aggregation (`walgit-wal/src/ci.rs`). Normative rule language. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
 | `docs/patches/README.md` | Git client patches (bundle filter matching) and the gate for advertising filtered bundle families together. |

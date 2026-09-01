@@ -15,6 +15,8 @@ mod settings_cmd;
 mod synth;
 
 mod bundle_cmd;
+mod ci_cmd;
+mod collab_cmd;
 mod compact;
 mod import;
 mod import_direct;
@@ -24,7 +26,6 @@ mod serve;
 #[cfg(test)]
 mod testutil;
 mod wal_cmd;
-mod collab_cmd;
 
 use std::path::PathBuf;
 
@@ -108,6 +109,14 @@ enum Command {
     Collab {
         #[command(subcommand)]
         action: collab_cmd::CollabAction,
+    },
+    /// Decentralized CI (`docs/D1_CI_PROTOCOL.md`): a client-side runner that
+    /// subscribes to ref updates, claims runs with signed entries, executes the
+    /// tested commit's `.walgit/ci.toml` and publishes signed results. The
+    /// server holds no CI logic.
+    Ci {
+        #[command(subcommand)]
+        action: ci_cmd::CiAction,
     },
     /// Generate a deterministic synthetic repository via `git fast-import`.
     Synth {
@@ -517,6 +526,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
         Command::Collab { action } => collab_cmd::run(action),
+        Command::Ci { action } => ci_cmd::run(action),
         Command::Mirror {
             from,
             to,

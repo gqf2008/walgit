@@ -99,18 +99,44 @@ function parsePatchFilesSafe(patch: string, sha: string) {
   }
 }
 
+/** CI conclusions get the only colors on this page: green/red/amber (D1-CI §8.3). */
+function ciColor(conclusion: string): string {
+  return conclusion === "success" ? "var(--ok, #2ea043)"
+    : conclusion === "error" ? "var(--warning, #d29922)"
+    : "var(--danger, #f85149)";
+}
+
 function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
   const kind = e.entry.kind;
+  const body = e.entry.body as Record<string, unknown>;
+  const ciConclusion = kind === "ci_result" ? String(body.conclusion ?? "") : "";
   const title =
-    kind === "issue" ? String((e.entry.body as { title?: unknown }).title ?? "(issue)")
-    : kind === "review" ? String((e.entry.body as { decision?: unknown }).decision ?? "comment")
-    : kind === "status" ? String((e.entry.body as { status?: unknown }).status ?? "status")
+    kind === "issue" ? String(body.title ?? "(issue)")
+    : kind === "review" ? String(body.decision ?? "comment")
+    : kind === "status" ? String(body.status ?? "status")
+    : kind === "ci_claim" ? `claim ${String(body.task ?? "?")} · attempt ${String(body.attempt ?? "?")}`
+    : kind === "ci_result" ? `result ${String(body.task ?? "?")} · attempt ${String(body.attempt ?? "?")}`
     : kind;
   return (
     <Box title={<span>#{n} <strong>{kind}</strong> · {e.entry.actor} · {fmtTime(e.entry.ts)} · {e.verified ? "✓ verified" : "✗ unverified"}</span>}>
       <div className="pad">
-        <div className="strong">{title}</div>
-        <pre className="collab-pre">{JSON.stringify(e.entry.body, null, 2)}</pre>
+        <div className="strong">
+          {title}
+          {ciConclusion && (
+            <span style={{ marginLeft: 8, color: ciColor(ciConclusion) }}>● {ciConclusion}</span>
+          )}
+        </div>
+        {kind === "ci_result" && (
+          <div className="mono muted">
+            {String(body.ref ?? "")} @ {String(body.commit ?? "").slice(0, 8)} · exit{" "}
+            {body.exit_code === null || body.exit_code === undefined ? "—" : String(body.exit_code)} · {String(body.duration_ms ?? "?")} ms · log
+            sha {String(body.log_sha256 ?? "").slice(0, 12)}
+          </div>
+        )}
+        {ciConclusion && typeof body.log_summary === "string" && body.log_summary !== "" && (
+          <pre className="collab-pre">{body.log_summary}</pre>
+        )}
+        {!ciConclusion && <pre className="collab-pre">{JSON.stringify(e.entry.body, null, 2)}</pre>}
         {(e.entry.refs?.base || e.entry.refs?.head) && (
           <div className="mono muted">
             {e.entry.refs?.base ?? "?"} → {e.entry.refs?.head ?? "?"}
