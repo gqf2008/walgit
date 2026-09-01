@@ -78,7 +78,7 @@ server entirely (**bundle-uri**: fresh clones and catch-ups are static files the
 | **bundle-uri** | Bundles cut on calendar slots (weekly full, chained dailies, hourlies) as a pure function of the WAL: a fresh clone downloads the newest full plus the chain above it from the bucket and asks the server only for the remainder; a catch-up downloads exactly the slots it missed. Two lists per repo: `bundles/list` for clones, `bundles/catchup` for fetches. Blobless families for `--filter=blob:none`. |
 | **LFS** | Batch API + basic transfer, objects in the bucket, optional read-through from an upstream LFS server for imported repositories. |
 | **web UI + API** | A React UI (tree, blob, commits, diffs, the WAL's own health page) on a read-mostly JSON API under `/{owner}/{repo}/api/*`; sha-addressed answers are immutable and cached everywhere; long answers stream progress as SSE. `repos.js` is a dependency-free SDK for pages, agents and scripts. |
-| **collab** | A decentralized collaboration layer on `refs/collab/*`: signed issue/comment/review/status/patch entries, per-principal Ed25519 keys self-registered via the thin API, and a deterministic aggregation (threads, PR merge rules, verification health, and a work-unit board projected from declarative column rules in `.walgit/board.toml` — moving a card is just a signed `status` entry) shared by the `walgit collab` CLI, the JSON API and the web UI's Collab tab — one S3 token per participant, no server-side collaboration state. `docs/D1_COLLAB_DESIGN.md`. |
+| **collab** | A decentralized collaboration layer on `refs/collab/*`: signed issue/comment/review/status/patch entries, per-principal Ed25519 keys self-registered via the thin API, and a deterministic aggregation (threads, PR merge rules, verification health, and a work-unit board projected from declarative column rules in `.walgit/board.toml` — moving a card is just a signed `status` entry) shared by the `walgit collab` CLI, the JSON API and the web UI's Collab tab — one S3 token per participant, no server-side collaboration state. `docs/D1_COLLAB_DESIGN.md`. **CI** rides the same refs: `.walgit/ci.toml` in the tested commit declares tasks; `walgit ci run` clients subscribe to ref tips, claim runs with signed `ci_claim` entries (deterministic earliest-claimant convergence, TTL re-claim), execute the command under an env allowlist and publish signed `ci_result` entries — a scheduler-free CI with zero server-side logic. `docs/D1_CI_PROTOCOL.md`. |
 | **policy** | Per-repository push rules (`policy.json`): protected refs, groups, fast-forward only, bypass lists. `docs/POLICY.md`. |
 | **settings** | Per-repository config (bundle schedules, compaction, upstream follow) published into the WAL with history. |
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
@@ -187,9 +187,9 @@ crates/
   walgit-server   axum: smart HTTP, LFS, bundles, auth (none/token/oidc), the maintainer loop, upstream follow,
                   web/ (API, UI, SDK routes, SSE), setup.rs (installer + recipes), events bridge
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
-  walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo|collab`; `walgit-server` = `walgit serve`
+  walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo|collab|ci`; `walgit-server` = `walgit serve`
 web/              React SPA (Vite) + sdk/repos.ts, built into the binary; the wire contract is web/API.md
-docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, WINDOWS (dev runbook), patches/
+docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, D1_COLLAB_DESIGN, D1_CI_PROTOCOL, CONTRACT, WINDOWS (dev runbook), patches/
 ```
 
 ## Invariants worth memorising
