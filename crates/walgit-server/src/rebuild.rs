@@ -114,6 +114,15 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
         if ft.is_dir() {
             bytes += copy_tree(&from, &to)?;
         } else if ft.is_file() {
+            // Skip git's transient lock files: a concurrent `git commit-graph
+            // write` on the serving copy (maintain_commit_graph, spawned after
+            // every publish) leaves `*.lock` mid-flight; the scratch copy would
+            // inherit it and the rebuild's own `commit-graph write` would fail
+            // with "Unable to create ...lock: File exists" (CI 2026-09-01,
+            // fetch_from_front_that_serves_the_base_remotely).
+            if ent.file_name().to_string_lossy().ends_with(".lock") {
+                continue;
+            }
             bytes += std::fs::copy(&from, &to)?;
         } else if ft.is_symlink() {
             // A mount-linked base (`pack-<sha>.pack` → store mount) is never rebuilt here:
