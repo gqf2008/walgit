@@ -745,6 +745,13 @@ impl Runner {
             }
         };
         let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
+        // §4: the tip is recorded as processed only once **every** task of the
+        // tip reached a terminal state — a later task standing down (someone
+        // else holds the run, or this pass gave up) keeps the tip unrecorded,
+        // so the next pass revisits it. A settled task re-decides on revisit
+        // (its result already answers the claim) and never re-executes.
+        let mut all_terminal = true;
+        let mut any_failed = false;
         for t in cfg.matching(ref_name) {
             if self.task_filter.as_deref().is_some_and(|n| n != t.name) {
                 continue;
@@ -757,14 +764,14 @@ impl Runner {
                         t.name,
                         other.as_str()
                     );
-                    // A non-success verdict is still terminal (§4): the tip is
-                    // recorded and the pass exits non-zero.
-                    return Ok((true, true));
+                    // A non-success verdict is still terminal (§4); the pass
+                    // exits non-zero.
+                    any_failed = true;
                 }
-                TaskOutcome::Deferred => return Ok((false, false)),
+                TaskOutcome::Deferred => all_terminal = false,
             }
         }
-        Ok((true, false))
+        Ok((all_terminal, any_failed))
     }
 
     /// One task of one ref tip: decide, claim, execute, publish — repeat until
