@@ -54,7 +54,7 @@ impl EntryRef {
     /// principal; a policy that lets anyone write any inbox must not smuggle
     /// an entry across principals — the signature alone only proves the actor
     /// signed it, not that it belongs in this inbox.
-    pub fn is_verified(&self, principals: &HashMap<String, String>) -> bool {
+    pub fn is_verified(&self, principals: &HashMap<String, String, impl std::hash::BuildHasher>) -> bool {
         self.principal == self.entry.actor
             && principals
                 .get(&self.entry.actor)
@@ -219,7 +219,7 @@ fn is_agent(actor: &str) -> bool {
 
 pub fn pr_view(
     entries: &[&EntryRef],
-    principals: &HashMap<String, String>,
+    principals: &HashMap<String, String, impl std::hash::BuildHasher>,
 ) -> PrView {
     let ordered = thread(entries);
     let mut base = None;
@@ -389,7 +389,7 @@ pub struct Report {
 
 pub fn build_report(
     entries: &[&EntryRef],
-    principals: &HashMap<String, String>,
+    principals: &HashMap<String, String, impl std::hash::BuildHasher>,
     rules: &MergeRules,
 ) -> Report {
     let mut by_thread: BTreeMap<&str, Vec<&EntryRef>> = BTreeMap::new();

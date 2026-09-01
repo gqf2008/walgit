@@ -928,7 +928,7 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
 
     let entry = serde_json::json!({
         "version": 1, "kind": "issue", "id": "t1", "actor": "alice",
-        "ts": 1786500000, "parent": "", "body": {"title": "hi"},
+        "ts": 1_786_500_000, "parent": "", "body": {"title": "hi"},
         "sig": "ed25519:AAAA"
     });
     let resp = client
@@ -1014,18 +1014,18 @@ async fn collab_report_and_thread_aggregate_entries() -> TestResult {
 
     let issue = serde_json::json!({
         "version": 1, "kind": "issue", "id": "t1", "actor": "alice",
-        "ts": 1786500000, "parent": "", "body": {"title": "hi"},
+        "ts": 1_786_500_000, "parent": "", "body": {"title": "hi"},
         "sig": "ed25519:AAAA"
     });
     let patch = serde_json::json!({
         "version": 1, "kind": "patch", "id": "t1", "actor": "alice",
-        "ts": 1786500001, "parent": "", "body": {},
+        "ts": 1_786_500_001, "parent": "", "body": {},
         "refs": {"base": "refs/heads/main", "head": "refs/heads/topic"},
         "sig": "ed25519:BBBB"
     });
     let review = serde_json::json!({
         "version": 1, "kind": "review", "id": "t1", "actor": "alice",
-        "ts": 1786500002, "parent": "", "body": {"decision": "approve"},
+        "ts": 1_786_500_002, "parent": "", "body": {"decision": "approve"},
         "sig": "ed25519:CCCC"
     });
     let mut oids = Vec::new();
@@ -1153,7 +1153,7 @@ async fn collab_principal_registration_and_verified_entries() -> TestResult {
         kind: "issue".into(),
         id: "t2".into(),
         actor: "alice".into(),
-        ts: 1786500010,
+        ts: 1_786_500_010,
         parent: String::new(),
         refs: None,
         body: serde_json::json!({ "title": "signed" }),
