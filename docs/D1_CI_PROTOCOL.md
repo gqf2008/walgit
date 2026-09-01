@@ -180,7 +180,8 @@ settled）。协议不做时钟同步；偏斜大的部署把 `claim_ttl` 调大
 ```text
 run_view(entries, principals, now) -> RunView      // 按 id 分组后的单 run 视图
 collect_runs(entries, principals, now) -> BTreeMap<run_id, RunView>
-decide(run, actor, max_attempts, now) -> Decision  // §6.2 步骤 2 的规范实现
+decide(run, actor, max_attempts) -> Decision      // §6.2 步骤 2 的规范实现
+                                                  //（评估时刻已由 run_view(.., now) 携带）
 ```
 
 只计入**已验证**条目（`EntryRef::is_verified`：验签通过 **且** 收件箱归属正确，D1 §4.1）；
@@ -222,7 +223,7 @@ done    : effective 存在                               → Settled(conclusion)
           conclusion == "error" 时 effective 仍展示，但其 claim 已作废 ⇒ 状态实为 stale（§6.3）
 ```
 
-`decide(run, actor, max_attempts, now)`：
+`decide(run, actor, max_attempts)`：
 
 ```text
 最新 attempt n* = run 内出现过的最大 attempt（无则 0）

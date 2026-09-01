@@ -8,10 +8,19 @@
 //! this module writes, the aggregation core (`walgit-wal/src/ci.rs`) can
 //! re-derive and verify offline — the protocol has no server-side logic.
 
+use anyhow::bail;
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::Subcommand;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use walgit_wal::ci::{CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id};
+use walgit_wal::collab::{Entry, EntryRef, sign_entry};
 
 // ---- schema limits (docs/D1_CI_PROTOCOL.md §3.1, normative bounds) -------------
 
@@ -51,6 +60,38 @@ pub enum CiAction {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Subscribe to ref tips, claim runs, execute the declared tasks and
+    /// publish signed results (`docs/D1_CI_PROTOCOL.md` §4–§9).
+    Run {
+        /// The checkout to watch: its remote is polled, its collab refs read.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote to poll for tips and to push entries to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Principal the entries are signed as (conventionally `ci-…`).
+        #[arg(long)]
+        actor: String,
+        /// Ed25519 signing key: 32 raw bytes as hex.
+        #[arg(long)]
+        key: PathBuf,
+        /// One pass over the remote's tips and exit (cron / agent friendly).
+        #[arg(long)]
+        once: bool,
+        /// Seconds between passes in watch mode.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
+        /// Override every task's claim TTL in seconds (ci.toml `claim_ttl`
+        /// otherwise; tests shrink it to re-claim quickly).
+        #[arg(long)]
+        claim_ttl: Option<u64>,
+        /// Only run this named task.
+        #[arg(long)]
+        task: Option<String>,
+        /// State file (default `<gitdir>/ci-run.json`, §4).
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
 }
 
 pub fn run(action: CiAction) -> Result<()> {
@@ -78,6 +119,52 @@ pub fn run(action: CiAction) -> Result<()> {
                 );
             }
             Ok(())
+        }
+        CiAction::Run {
+            repo,
+            remote,
+            actor,
+            key,
+            once,
+            interval,
+            claim_ttl,
+            task,
+            state,
+        } => {
+            crate::collab_cmd::ref_segment("ci.actor", &actor)?;
+            let signing = crate::collab_cmd::read_signing_key(&key)?;
+            let state_file = match state {
+                Some(p) => p,
+                None => crate::collab_cmd::absolute_git_dir(&repo)?.join("ci-run.json"),
+            };
+            let runner = Runner {
+                repo,
+                remote,
+                actor,
+                key: signing,
+                state_file,
+                task_filter: task,
+            };
+            runner.register()?;
+            println!(
+                "ci: watching {} via {} as {} (interval {}s, state {})",
+                runner.repo.display(),
+                runner.remote,
+                runner.actor,
+                interval,
+                runner.state_file.display()
+            );
+            if once {
+                let code = runner.run_pass(claim_ttl)?;
+                if code != 0 {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            loop {
+                let _ = runner.run_pass(claim_ttl)?;
+                std::thread::sleep(Duration::from_secs(interval.max(1)));
+            }
         }
     }
 }
@@ -135,9 +222,6 @@ pub struct CiResolved {
 
 impl CiResolved {
     /// The tasks whose `refs` patterns match `ref_name`, in declaration order.
-    // `#[allow(dead_code)]`: consumed by the runner (`ci run`, batch #31 unit 3);
-    // it lives with the schema so the trigger-matching contract is tested here.
-    #[allow(dead_code)]
     pub fn matching(&self, ref_name: &str) -> Vec<&CiResolvedTask> {
         self.tasks
             .iter()
@@ -337,9 +421,6 @@ fn valid_env_name(name: &str) -> bool {
 /// Glob over ref names (§3.2): `*` matches any run of characters **including
 /// `/`**, `?` one character, everything else literal; the whole name must
 /// match. Iterative greedy backtracking, no allocations per candidate.
-// `#[allow(dead_code)]`: consumed by the runner (`ci run`, batch #31 unit 3);
-// it lives with the schema so the glob contract is tested here.
-#[allow(dead_code)]
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
@@ -367,6 +448,730 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+// ---- runner (`walgit ci run`, docs/D1_CI_PROTOCOL.md §4–§9) ---------------------
+
+/// Platform basics every task process gets after `env_clear` (§8.1) — enough
+/// for tools to find themselves and temp files to work, nothing else. The
+/// runner's own environment (secrets included) stays behind unless the task's
+/// `env_allow` names it.
+const BASE_ENV_ALLOW: [&str; 10] = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+];
+/// Captured output kept in memory: the tail of the merged stdout+stderr (§8.2).
+const LOG_CAPTURE_MAX: usize = 64 * 1024;
+/// The `log_summary` bound a result entry carries (§8.2).
+const LOG_SUMMARY_MAX: usize = 4096;
+/// An `error` conclusion voids its claim (§6.3), so the same attempt is
+/// re-claimable at once; cap the per-pass loop so a permanently broken
+/// environment defers to the next pass instead of spinning.
+const ERROR_RECLAIMS_MAX: u32 = 3;
+
+/// The runner: one checkout, one principal, one state file. A plain git
+/// client — everything it writes is a signed collab entry in its own inbox,
+/// verifiable by any other client offline (§1).
+struct Runner {
+    repo: PathBuf,
+    remote: String,
+    actor: String,
+    key: ed25519_dalek::SigningKey,
+    state_file: PathBuf,
+    task_filter: Option<String>,
+}
+
+/// One command execution (§8.1).
+struct ExecOutcome {
+    conclusion: Conclusion,
+    exit_code: Option<i64>,
+    duration_ms: u64,
+    /// Merged stdout+stderr tail, at most `LOG_CAPTURE_MAX` bytes.
+    log: Vec<u8>,
+}
+
+/// Per-task terminal state within one pass (§4: a ref tip is recorded as
+/// processed only once **every** task of that tip reached a terminal state).
+enum TaskOutcome {
+    /// A verdict exists (possibly after retries) — terminal.
+    Settled(Conclusion),
+    /// Someone else holds the run, or this pass gave up — revisit later.
+    Deferred,
+}
+
+impl Runner {
+    /// First-use self-registration (§2/§11): `refs/collab/meta/principals/
+    /// <actor>`, the same shape `walgit collab principal register` writes.
+    /// Idempotent — re-registering republishes the same key.
+    fn register(&self) -> Result<()> {
+        let public_key =
+            base64::engine::general_purpose::STANDARD.encode(self.key.verifying_key().to_bytes());
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "principal": self.actor,
+            "public_key": public_key,
+            "registered_at": chrono::Utc::now().timestamp(),
+        }))?;
+        let oid = crate::collab_cmd::git_write_blob(&self.repo, &content)?;
+        let ref_name = format!("refs/collab/meta/principals/{}", self.actor);
+        crate::collab_cmd::git_update_ref(&self.repo, &ref_name, Some(&oid))?;
+        crate::collab_cmd::git_push(&self.repo, &self.remote, &ref_name)
+    }
+
+    /// One subscription pass (§4): fetch collab refs, diff the remote's tips
+    /// against the state file, work every changed ref to a terminal state.
+    /// Returns a process exit code: 0, or 1 when something settled non-success.
+    fn run_pass(&self, ttl_override: Option<u64>) -> Result<i32> {
+        if let Err(e) = crate::collab_cmd::git_fetch_collab(&self.repo, &self.remote) {
+            eprintln!("ci: fetching collab refs failed ({e:#}); continuing with local state");
+        }
+        let mut processed = read_processed(&self.state_file)?;
+        let mut exit = 0i32;
+        let mut dirty = false;
+        for (ref_name, tip) in self.ls_tips()? {
+            if processed.get(&ref_name).is_some_and(|seen| seen == &tip) {
+                continue;
+            }
+            match self.process_ref(&ref_name, ttl_override) {
+                Ok((terminal, failed)) => {
+                    if terminal {
+                        processed.insert(ref_name, tip);
+                        dirty = true;
+                    }
+                    if failed {
+                        exit = 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ci: {ref_name}: {e:#}");
+                    exit = 1;
+                }
+            }
+        }
+        if dirty {
+            write_processed(&self.state_file, &processed)?;
+        }
+        Ok(exit)
+    }
+
+    /// The trigger surface (§3.2): `refs/heads/*` and `refs/tags/*` of the
+    /// remote, sorted. Peeled-tag lines (`<oid>\trefs/tags/x^{}`) are skipped.
+    fn ls_tips(&self) -> Result<Vec<(String, String)>> {
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["ls-remote", "--heads", "--tags"])
+            .arg(&self.remote)
+            .output()
+            .context("git ls-remote")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-remote {} failed: {}",
+                self.remote,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let mut tips = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut it = line.split_whitespace();
+            let (Some(oid), Some(name)) = (it.next(), it.next()) else {
+                continue;
+            };
+            if name.ends_with("^{}") {
+                continue;
+            }
+            tips.push((name.to_string(), oid.to_string()));
+        }
+        tips.sort();
+        Ok(tips)
+    }
+
+    /// All tasks of one ref tip (§3.2/§4). Returns (all-terminal, any-failed).
+    /// The tip itself is the caller's (`run_pass`) processed-state key.
+    fn process_ref(&self, ref_name: &str, ttl_override: Option<u64>) -> Result<(bool, bool)> {
+        let commit = self.fetch_commit(ref_name)?;
+        let short: String = commit.chars().take(8).collect();
+        let Some(raw) = self.read_ci_toml(&commit)? else {
+            println!("ci: {ref_name} @ {short}: no .walgit/ci.toml");
+            return Ok((true, false));
+        };
+        let cfg = match parse_and_validate(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ci: {ref_name} @ {short}: invalid .walgit/ci.toml, skipping: {e}");
+                return Ok((true, true));
+            }
+        };
+        let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
+        for t in cfg.matching(ref_name) {
+            if self.task_filter.as_deref().is_some_and(|n| n != t.name) {
+                continue;
+            }
+            match self.process_task(t, ref_name, &commit, ttl)? {
+                TaskOutcome::Settled(Conclusion::Success) => {}
+                TaskOutcome::Settled(other) => {
+                    println!(
+                        "ci: {ref_name} @ {short} task {}: settled {}",
+                        t.name,
+                        other.as_str()
+                    );
+                    // A non-success verdict is still terminal (§4): the tip is
+                    // recorded and the pass exits non-zero.
+                    return Ok((true, true));
+                }
+                TaskOutcome::Deferred => return Ok((false, false)),
+            }
+        }
+        Ok((true, false))
+    }
+
+    /// One task of one ref tip: decide, claim, execute, publish — repeat until
+    /// a terminal state or a hand-off (§6.2). Bounded: attempts ≤ `max_attempts`
+    /// (V7, enforced by `decide`) and error re-claims ≤ `ERROR_RECLAIMS_MAX`.
+    fn process_task(
+        &self,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        ttl: u64,
+    ) -> Result<TaskOutcome> {
+        let id = run_id(&task.name, ref_name, commit);
+        let mut error_reclaims = 0u32;
+        loop {
+            let decision = match self.run_view(&id)? {
+                Some(view) => walgit_wal::ci::decide(&view, &self.actor, task.max_attempts),
+                None => Decision::Claim { attempt: 1 },
+            };
+            match decision {
+                Decision::Settled { conclusion, .. } => {
+                    return Ok(TaskOutcome::Settled(conclusion));
+                }
+                Decision::StandDown { holder } => {
+                    println!(
+                        "ci: run {id} task {}: held by {holder}, standing down",
+                        task.name
+                    );
+                    return Ok(TaskOutcome::Deferred);
+                }
+                Decision::Resume { claim_oid, attempt } => {
+                    if !self.run_once(
+                        task,
+                        ref_name,
+                        commit,
+                        &id,
+                        attempt,
+                        &claim_oid,
+                        &mut error_reclaims,
+                    )? {
+                        return Ok(TaskOutcome::Deferred);
+                    }
+                }
+                Decision::Claim { attempt } => {
+                    let claim_oid =
+                        self.publish_claim(&id, task, ref_name, commit, ttl, attempt)?;
+                    // The convergence point (§6.2 step 3): re-read the log;
+                    // only the deterministic winner executes.
+                    let recheck = match self.run_view(&id)? {
+                        Some(v) => walgit_wal::ci::decide(&v, &self.actor, task.max_attempts),
+                        None => Decision::Claim { attempt: 1 },
+                    };
+                    match recheck {
+                        Decision::Resume {
+                            claim_oid: mine,
+                            attempt,
+                        } if mine == claim_oid => {
+                            if !self.run_once(
+                                task,
+                                ref_name,
+                                commit,
+                                &id,
+                                attempt,
+                                &claim_oid,
+                                &mut error_reclaims,
+                            )? {
+                                return Ok(TaskOutcome::Deferred);
+                            }
+                        }
+                        Decision::StandDown { holder } => {
+                            println!(
+                                "ci: run {id} task {}: lost the claim race, held by {holder}",
+                                task.name
+                            );
+                            return Ok(TaskOutcome::Deferred);
+                        }
+                        // Settled between our push and the re-read, or our
+                        // claim died already: leave the run to the next pass.
+                        _ => return Ok(TaskOutcome::Deferred),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute once under our claim and publish the result. Returns `false`
+    /// when this pass should stop working the run (error re-claim cap, §6.3).
+    #[allow(clippy::too_many_arguments)]
+    fn run_once(
+        &self,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        id: &str,
+        attempt: u32,
+        claim_oid: &str,
+        error_reclaims: &mut u32,
+    ) -> Result<bool> {
+        let outcome = self.execute(task, ref_name, commit, id, attempt);
+        self.publish_result(id, task, ref_name, commit, attempt, claim_oid, &outcome)?;
+        if outcome.conclusion != Conclusion::Error {
+            return Ok(true);
+        }
+        *error_reclaims += 1;
+        if *error_reclaims >= ERROR_RECLAIMS_MAX {
+            eprintln!("ci: run {id}: infrastructure keeps failing; deferring to the next pass");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The run's view over freshly fetched collab refs (§6.2 step 1).
+    fn run_view(&self, id: &str) -> Result<Option<RunView>> {
+        if let Err(e) = crate::collab_cmd::git_fetch_collab(&self.repo, &self.remote) {
+            eprintln!("ci: fetch collab refs failed ({e:#}); reading local state");
+        }
+        let (entries, principals) = crate::collab_cmd::CollabReader::new(&self.repo).load()?;
+        let ci: Vec<&EntryRef> = entries.iter().filter(|e| e.entry.id == id).collect();
+        let now = chrono::Utc::now().timestamp();
+        Ok(walgit_wal::ci::run_view(id, &ci, &principals, now))
+    }
+
+    /// Bring the ref's tip into this checkout and resolve it to a commit oid.
+    fn fetch_commit(&self, ref_name: &str) -> Result<String> {
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["fetch", "-q", "--no-tags"])
+            .arg(&self.remote)
+            .arg(ref_name)
+            .output()
+            .with_context(|| format!("git fetch {ref_name}"))?;
+        if !out.status.success() {
+            bail!(
+                "git fetch {} {ref_name} failed: {}",
+                self.remote,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}"])
+            .output()
+            .context("git rev-parse FETCH_HEAD")?;
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || oid.is_empty() {
+            bail!("{ref_name}: tip does not resolve to a commit");
+        }
+        Ok(oid)
+    }
+
+    /// `.walgit/ci.toml` from the tested commit's tree (§3): `None` if absent.
+    fn read_ci_toml(&self, commit: &str) -> Result<Option<Vec<u8>>> {
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["ls-tree", commit, "--", ".walgit/ci.toml"])
+            .output()
+            .context("git ls-tree")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-tree {commit} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let Some(meta) = line.split('\t').next() else {
+            return Ok(None);
+        };
+        // `100644 blob <oid>`; a non-blob entry (submodule) is no declaration.
+        let Some(oid) = meta
+            .split_whitespace()
+            .nth(1)
+            .filter(|_| meta.contains(" blob "))
+        else {
+            return Ok(None);
+        };
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["cat-file", "blob", oid])
+            .output()
+            .context("git cat-file")?;
+        if !out.status.success() {
+            bail!(
+                "git cat-file {oid} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Some(out.stdout))
+    }
+
+    /// Sign an entry into the runner's inbox and push it (D1 §4.2 write path).
+    fn publish(
+        &self,
+        kind: &str,
+        id: &str,
+        parent: &str,
+        body: serde_json::Value,
+    ) -> Result<String> {
+        let mut entry = Entry {
+            version: 1,
+            kind: kind.to_string(),
+            id: id.to_string(),
+            actor: self.actor.clone(),
+            ts: chrono::Utc::now().timestamp(),
+            parent: parent.to_string(),
+            refs: None,
+            body,
+            sig: String::new(),
+        };
+        entry.sig = sign_entry(&mut entry, &self.key);
+        let content = serde_json::to_string_pretty(&entry)?;
+        let oid = crate::collab_cmd::git_write_blob(&self.repo, &content)?;
+        let ref_name = format!(
+            "refs/collab/inbox/{}/{}",
+            self.actor,
+            crate::collab_cmd::entry_uuid()
+        );
+        crate::collab_cmd::git_update_ref(&self.repo, &ref_name, Some(&oid))?;
+        crate::collab_cmd::git_push(&self.repo, &self.remote, &ref_name)?;
+        Ok(oid)
+    }
+
+    fn publish_claim(
+        &self,
+        id: &str,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        ttl: u64,
+        attempt: u32,
+    ) -> Result<String> {
+        let oid = self.publish(
+            CI_CLAIM_KIND,
+            id,
+            "",
+            serde_json::json!({
+                "task": task.name,
+                "ref": ref_name,
+                "commit": commit,
+                "ttl": ttl,
+                "attempt": attempt,
+                "runner": format!("walgit ci/{}", env!("CARGO_PKG_VERSION")),
+            }),
+        )?;
+        println!(
+            "ci: run {id} task {} attempt {attempt}: claimed (ttl {ttl}s)",
+            task.name
+        );
+        Ok(oid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_result(
+        &self,
+        id: &str,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        attempt: u32,
+        claim_oid: &str,
+        outcome: &ExecOutcome,
+    ) -> Result<()> {
+        let oid = self.publish(
+            CI_RESULT_KIND,
+            id,
+            claim_oid,
+            serde_json::json!({
+                "task": task.name,
+                "ref": ref_name,
+                "commit": commit,
+                "attempt": attempt,
+                "claim": claim_oid,
+                "conclusion": outcome.conclusion.as_str(),
+                "exit_code": outcome.exit_code,
+                "duration_ms": outcome.duration_ms,
+                "log_summary": tail_string(&outcome.log, LOG_SUMMARY_MAX),
+                "log_sha256": sha256_hex(&outcome.log),
+            }),
+        )?;
+        println!(
+            "ci: run {id} task {} attempt {attempt}: {} (exit {}, {} ms) as {oid}",
+            task.name,
+            outcome.conclusion.as_str(),
+            outcome
+                .exit_code
+                .map_or("signal".to_string(), |c| c.to_string()),
+            outcome.duration_ms
+        );
+        Ok(())
+    }
+
+    /// §8.1: a detached worktree of the tested commit, the command inside it,
+    /// cleanup whatever happens. Infrastructure failures (temp dir, worktree,
+    /// spawn) map to `Conclusion::Error` (§8.2): no task verdict, the claim it
+    /// voids, the run re-claimable at once (§6.3).
+    fn execute(
+        &self,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        id: &str,
+        attempt: u32,
+    ) -> ExecOutcome {
+        let started = Instant::now();
+        let fail = |msg: String| ExecOutcome {
+            conclusion: Conclusion::Error,
+            exit_code: None,
+            duration_ms: millis_since(started),
+            log: msg.into_bytes(),
+        };
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => return fail(format!("create temp dir: {e}")),
+        };
+        let added = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["worktree", "add", "--detach"])
+            .arg(dir.path())
+            .arg(commit)
+            .output();
+        let added = match added {
+            Ok(o) => o,
+            Err(e) => return fail(format!("git worktree add: {e}")),
+        };
+        if !added.status.success() {
+            return fail(format!(
+                "git worktree add {commit}: {}",
+                String::from_utf8_lossy(&added.stderr).trim()
+            ));
+        }
+        let outcome = self.run_command(dir.path(), task, ref_name, commit, id, attempt);
+        // Best-effort cleanup: a failed removal never blocks the result (§8.1).
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["worktree", "prune"])
+            .output();
+        outcome
+    }
+
+    /// Spawn the command (§8.1): `sh -c` (POSIX) / `cmd /C` (Windows), cwd =
+    /// worktree, cleared environment with the platform basics + `env_allow` +
+    /// `WALGIT_CI_*`, capped capture of the merged output, hard timeout. Never
+    /// returns `Err`: spawn failures are `Conclusion::Error`.
+    fn run_command(
+        &self,
+        dir: &Path,
+        task: &CiResolvedTask,
+        ref_name: &str,
+        commit: &str,
+        id: &str,
+        attempt: u32,
+    ) -> ExecOutcome {
+        let started = Instant::now();
+        let fail = |msg: String| ExecOutcome {
+            conclusion: Conclusion::Error,
+            exit_code: None,
+            duration_ms: millis_since(started),
+            log: msg.into_bytes(),
+        };
+        let (program, prefix): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C"])
+        } else {
+            ("sh", &["-c"])
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(prefix)
+            .arg(&task.command)
+            .current_dir(dir)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in BASE_ENV_ALLOW {
+            if let Some(v) = std::env::var_os(name) {
+                cmd.env(name, v);
+            }
+        }
+        for name in &task.env_allow {
+            if let Some(v) = std::env::var_os(name) {
+                cmd.env(name, v);
+            }
+        }
+        cmd.env("WALGIT_CI_TASK", &task.name)
+            .env("WALGIT_CI_REF", ref_name)
+            .env("WALGIT_CI_COMMIT", commit)
+            .env("WALGIT_CI_RUN_ID", id)
+            .env("WALGIT_CI_ATTEMPT", attempt.to_string())
+            .env("WALGIT_CI_ACTOR", &self.actor);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return fail(format!("spawn `{}`: {e}", task.command)),
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let readers = [
+            drain(child.stdout.take(), Arc::clone(&log)),
+            drain(child.stderr.take(), Arc::clone(&log)),
+        ];
+        let deadline = started + Duration::from_secs(task.timeout_secs);
+        let mut status = child.try_wait().ok().flatten();
+        while status.is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                for r in readers {
+                    let _ = r.join();
+                }
+                return ExecOutcome {
+                    conclusion: Conclusion::Timeout,
+                    exit_code: None,
+                    duration_ms: millis_since(started),
+                    log: take_log(&log),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            status = child.try_wait().ok().flatten();
+        }
+        for r in readers {
+            let _ = r.join();
+        }
+        let code = status.and_then(|s| s.code());
+        let conclusion = if code == Some(0) {
+            Conclusion::Success
+        } else {
+            Conclusion::Failure
+        };
+        ExecOutcome {
+            conclusion,
+            exit_code: code.map(i64::from),
+            duration_ms: millis_since(started),
+            log: take_log(&log),
+        }
+    }
+}
+
+/// Milliseconds elapsed since `started`, saturating (§8.2 `duration_ms`).
+fn millis_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The captured tail out of the shared buffer (poison-tolerant: a panicking
+/// reader thread must not lose the task's output).
+fn take_log(log: &Mutex<Vec<u8>>) -> Vec<u8> {
+    let mut guard = log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *guard)
+}
+
+/// Pipe one child stream into the shared, capped log tail (§8.2).
+fn drain<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    log: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(reader) = pipe else {
+            return;
+        };
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut tail = log
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if tail.len() + n > LOG_CAPTURE_MAX {
+                        let cut = (tail.len() + n - LOG_CAPTURE_MAX).min(tail.len());
+                        tail.drain(..cut);
+                    }
+                    if let Some(chunk) = buf.get(..n) {
+                        tail.extend_from_slice(chunk);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// §8.2 `log_summary`: the last ≤ `max` bytes, snapped forward to a UTF-8
+/// char boundary so the writer never truncates mid-codepoint.
+fn tail_string(bytes: &[u8], max: usize) -> String {
+    let mut start = bytes.len().saturating_sub(max);
+    // A UTF-8 continuation byte (0b10xxxxxx) is never a boundary.
+    while bytes.get(start).is_some_and(|b| b & 0xC0 == 0x80) {
+        start += 1;
+    }
+    match bytes.get(start..) {
+        Some(b) => String::from_utf8_lossy(b).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// §8.2 `log_sha256`: integrity of the full captured output.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+/// `<gitdir>/ci-run.json` (§4): `{"processed": {"<ref>": "<tip oid>"}}`.
+/// Missing file = nothing processed yet.
+fn read_processed(path: &Path) -> Result<HashMap<String, String>> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(HashMap::new());
+    };
+    let v: serde_json::Value = serde_json::from_str(&raw)?;
+    let mut map = HashMap::new();
+    if let Some(obj) = v.get("processed").and_then(serde_json::Value::as_object) {
+        for (k, val) in obj {
+            if let Some(oid) = val.as_str() {
+                map.insert(k.clone(), oid.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn write_processed(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+    let processed: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::json!({ "processed": processed }))?,
+    )
+    .with_context(|| format!("write state {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -560,5 +1365,232 @@ max_attempts = 2
         let raw = vec![b'#'; FILE_MAX_BYTES + 1];
         let e = parse_and_validate(&raw).expect_err("must reject");
         assert!(e.contains("V9"), "{e}");
+    }
+
+    #[test]
+    fn tail_string_takes_the_last_bytes_at_a_char_boundary() {
+        let full = "αβγδεζηθικ";
+        let tail = tail_string(full.as_bytes(), 4);
+        assert!(full.ends_with(&tail), "{tail:?} must be a suffix");
+        assert!(tail.len() <= 4, "{tail:?}");
+        assert!(
+            tail.chars().count() >= 1,
+            "never empty when there is content"
+        );
+        // A multibyte tail is not cut mid-codepoint: the result is valid UTF-8.
+        let noisy = "aé中".repeat(4_000);
+        let t = tail_string(noisy.as_bytes(), 100);
+        assert!(noisy.ends_with(&t));
+        assert!(t.len() <= 100 + 3, "{}", t.len());
+        assert_eq!(tail_string(b"hello", 3), "llo");
+        assert_eq!(tail_string(b"", 10), "");
+    }
+
+    #[test]
+    fn processed_state_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("ci-run.json");
+        assert!(
+            read_processed(&p).expect("read").is_empty(),
+            "missing = empty"
+        );
+        let mut m = HashMap::new();
+        m.insert("refs/heads/main".to_string(), "abc".to_string());
+        m.insert("refs/tags/v1".to_string(), "def".to_string());
+        write_processed(&p, &m).expect("write");
+        assert_eq!(read_processed(&p).expect("read"), m);
+    }
+
+    // ---- the executor (§8.1): where the runtime hazards live --------------------
+    // These tests shell out to git and run real commands, so they need a real
+    // checkout fixture; the shell paths are POSIX-only (the Windows leg of the
+    // runner is covered by e2e, where walgit-cli tests do not run at all).
+
+    #[cfg(unix)]
+    mod exec {
+        use super::*;
+        use std::process::Command as SysCommand;
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            repo: PathBuf,
+            commit: String,
+        }
+
+        fn fixture_repo() -> Fixture {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let git = |args: &[&str]| {
+                let out = SysCommand::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .output()
+                    .expect("spawn git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let init = SysCommand::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(dir.path())
+                .output()
+                .expect("spawn git init");
+            assert!(
+                init.status.success(),
+                "git init: {}",
+                String::from_utf8_lossy(&init.stderr)
+            );
+            std::fs::write(dir.path().join("f.txt"), "hello\n").expect("write file");
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "one",
+            ]);
+            let out = SysCommand::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse");
+            Fixture {
+                repo: dir.path().to_path_buf(),
+                commit: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                _dir: dir,
+            }
+        }
+
+        fn runner(repo: &Path) -> Runner {
+            Runner {
+                repo: repo.to_path_buf(),
+                remote: "origin".to_string(),
+                actor: "ci-test".to_string(),
+                key: ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+                state_file: PathBuf::from("/nonexistent/ci-run.json"),
+                task_filter: None,
+            }
+        }
+
+        fn task(command: &str, timeout_secs: u64, env_allow: &[&str]) -> CiResolvedTask {
+            CiResolvedTask {
+                name: "test".to_string(),
+                refs: vec!["refs/heads/*".to_string()],
+                command: command.to_string(),
+                timeout_secs,
+                max_attempts: 1,
+                env_allow: env_allow.iter().map(|s| (*s).to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn success_captures_log_and_exit_code() {
+            let f = fixture_repo();
+            let r = runner(&f.repo);
+            let out = r.execute(
+                &task("printf hello", 10, &[]),
+                "refs/heads/main",
+                &f.commit,
+                "ci-x",
+                1,
+            );
+            assert_eq!(out.conclusion, Conclusion::Success);
+            assert_eq!(out.exit_code, Some(0));
+            assert_eq!(tail_string(&out.log, LOG_SUMMARY_MAX), "hello");
+            assert!(out.duration_ms < 60_000, "{} ms", out.duration_ms);
+        }
+
+        #[test]
+        fn failure_maps_nonzero_exit() {
+            let f = fixture_repo();
+            let r = runner(&f.repo);
+            let out = r.execute(
+                &task("echo boom >&2; exit 3", 10, &[]),
+                "refs/heads/main",
+                &f.commit,
+                "ci-x",
+                1,
+            );
+            assert_eq!(out.conclusion, Conclusion::Failure);
+            assert_eq!(out.exit_code, Some(3));
+            assert!(
+                String::from_utf8_lossy(&out.log).contains("boom"),
+                "stderr merged"
+            );
+        }
+
+        #[test]
+        fn timeout_kills_the_command() {
+            let f = fixture_repo();
+            let r = runner(&f.repo);
+            let out = r.execute(
+                &task("sleep 30", 1, &[]),
+                "refs/heads/main",
+                &f.commit,
+                "ci-x",
+                1,
+            );
+            assert_eq!(out.conclusion, Conclusion::Timeout);
+            assert_eq!(out.exit_code, None);
+            assert!(
+                out.duration_ms < 5_000,
+                "the command must be killed, not waited out: {} ms",
+                out.duration_ms
+            );
+        }
+
+        #[test]
+        fn env_is_allowlist_only_with_injected_task_vars() {
+            // §8.1/§9: after env_clear the task sees the platform basics, the
+            // allow-listed names and the injected WALGIT_CI_* — nothing else.
+            // The guard that has seen red: this session runs with
+            // RUSTUP_TOOLCHAIN and CARGO_TARGET_DIR in the environment; were
+            // the allowlist leaky (or env_clear missing), `test -z` would fail.
+            let f = fixture_repo();
+            let r = runner(&f.repo);
+            let cmd = "test -n \"$PATH\" \
+                && test -z \"$RUSTUP_TOOLCHAIN\" && test -z \"$CARGO_TARGET_DIR\" \
+                && test \"$CARGO_PKG_NAME\" = walgit-cli \
+                && test \"$WALGIT_CI_TASK\" = test && test \"$WALGIT_CI_REF\" = refs/heads/main \
+                && test \"$WALGIT_CI_ATTEMPT\" = 1 && test \"$WALGIT_CI_RUN_ID\" = ci-x \
+                && test \"$WALGIT_CI_ACTOR\" = ci-test && test -n \"$WALGIT_CI_COMMIT\"";
+            let out = r.execute(
+                &task(cmd, 10, &["CARGO_PKG_NAME"]),
+                "refs/heads/main",
+                &f.commit,
+                "ci-x",
+                1,
+            );
+            assert_eq!(
+                out.conclusion,
+                Conclusion::Success,
+                "log: {}",
+                String::from_utf8_lossy(&out.log)
+            );
+        }
+
+        #[test]
+        fn infra_failure_maps_to_error_conclusion() {
+            // A commit that does not exist locally cannot be worktree'd — the
+            // runner reports Conclusion::Error, not a task verdict (§8.2).
+            let f = fixture_repo();
+            let r = runner(&f.repo);
+            let out = r.execute(
+                &task("true", 10, &[]),
+                "refs/heads/main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "ci-x",
+                1,
+            );
+            assert_eq!(out.conclusion, Conclusion::Error);
+            assert_eq!(out.exit_code, None);
+            assert!(!out.log.is_empty(), "the reason is captured");
+        }
     }
 }

@@ -4,6 +4,7 @@
 mod checkpoint;
 mod error;
 mod handle;
+pub mod ci;
 pub mod collab;
 pub mod lockwait;
 mod log_reader;

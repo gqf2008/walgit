@@ -259,7 +259,7 @@ pub fn run(action: CollabAction) -> Result<()> {
     Ok(())
 }
 
-fn ref_segment(label: &str, s: &str) -> Result<()> {
+pub(crate) fn ref_segment(label: &str, s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 255
         && !s.contains("..") // git forbids `..` inside a component
@@ -275,7 +275,7 @@ fn ref_segment(label: &str, s: &str) -> Result<()> {
     }
 }
 
-fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
+pub(crate) fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("read key {}", path.display()))?;
     let bytes = hex::decode(raw.trim())
@@ -286,7 +286,7 @@ fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
-fn entry_uuid() -> String {
+pub(crate) fn entry_uuid() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
     let mut b = [0u8; 16];
@@ -295,7 +295,7 @@ fn entry_uuid() -> String {
 }
 
 /// Write a blob via `git hash-object -w --stdin`; returns the oid.
-fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
+pub(crate) fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
     let mut child = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -319,7 +319,7 @@ fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_update_ref(repo: &std::path::Path, name: &str, oid: Option<&str>) -> Result<()> {
+pub(crate) fn git_update_ref(repo: &std::path::Path, name: &str, oid: Option<&str>) -> Result<()> {
     let args: Vec<&str> = if let Some(oid) = oid {
         vec!["update-ref", name, oid]
     } else {
@@ -341,7 +341,7 @@ fn git_update_ref(repo: &std::path::Path, name: &str, oid: Option<&str>) -> Resu
     Ok(())
 }
 
-fn git_push(repo: &std::path::Path, remote: &str, name: &str) -> Result<()> {
+pub(crate) fn git_push(repo: &std::path::Path, remote: &str, name: &str) -> Result<()> {
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -700,10 +700,9 @@ fn changed_refs(
     out
 }
 
-fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
-    if let Some(p) = override_path {
-        return Ok(p.to_path_buf());
-    }
+/// The checkout's git directory (absolute) — where per-checkout client state
+/// lives (`collab-watch.json`, `ci-run.json`).
+pub(crate) fn absolute_git_dir(repo: &Path) -> Result<PathBuf> {
     let git_dir = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -713,8 +712,14 @@ fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
     if !git_dir.status.success() {
         bail!("{} is not a git checkout", repo.display());
     }
-    let dir = String::from_utf8_lossy(&git_dir.stdout).trim().to_string();
-    Ok(PathBuf::from(dir).join("collab-watch.json"))
+    Ok(PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim()))
+}
+
+pub(crate) fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+    Ok(absolute_git_dir(repo)?.join("collab-watch.json"))
 }
 
 fn read_state(path: &Path) -> Result<std::collections::HashMap<String, String>> {
@@ -746,7 +751,7 @@ fn write_state(path: &Path, map: &std::collections::HashMap<String, String>) -> 
     Ok(())
 }
 
-fn git_fetch_collab(repo: &Path, remote: &str) -> Result<()> {
+pub(crate) fn git_fetch_collab(repo: &Path, remote: &str) -> Result<()> {
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
