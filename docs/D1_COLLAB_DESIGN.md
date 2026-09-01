@@ -293,6 +293,11 @@
    拒绝 = 403，理由记日志）、`wal.fsck_objects` 同源、principal 更新为真实 old 值 CAS；
    聚合读单请求预算 20k refs，超限 503 指向 CLI 离线聚合（条目对象一次
    `cat-file --batch` 读完，无逐条目子进程）。
+    ⑤ CI 外挂协议（issue #31）：`docs/D1_CI_PROTOCOL.md`（规范）——触发 = ref 事实
+   （refs 级轮询，events 桥为 push 形态扩展点）、`ci_claim`/`ci_result` 签名条目、
+   确定性竞争收敛 + TTL 重认领、产物引用 + 哈希、秘密只在客户端 env；落地为
+   `walgit-wal/src/ci.rs`（聚合核心）与 `walgit ci validate|run|status`。服务端零 CI
+   逻辑（原则 X）。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
    **不复用（issue #30 决定）**。render cache 的契约是"答案按内容寻址、不可变"
    （键 = 答案自身的哈希：可无限重放、谁先算好谁受益）；而协作聚合的输入是活的
