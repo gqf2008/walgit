@@ -444,11 +444,13 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   CI runs sim on both ubuntu (build-test) and the windows leg, e2e on ubuntu and the windows leg;
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,
   `WALGIT_TOKEN`). Never `cargo test --workspace --no-fail-fast` in a session; wrap ad-hoc cargo in `timeout`.
-- Known flaky (find the cause, not the assertion): `fetch_from_front_that_serves_the_base_remotely` (~1 in 3
-  under the full e2e suite: base published without `has_commit_graph`),
-  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`) and
-  `reads_after_an_acknowledged_push_never_show_the_previous_tip` (high on ubuntu CI, 2/3 measured 2026-08-28;
-  candidate read-consistency bug, tracked in the fork's issue #4). All pass alone; rerun, not skip.
+- Known flaky (find the cause, not the assertion):
+  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`;
+  passes alone; rerun, not skip). `reads_after_an_acknowledged_push_never_show_the_previous_tip` is
+  hardened (PR #28): a sustained run of ≥3 consecutive identical foreign tips is a hard failure with a
+  full DIAG dump (contenders/prev_winner/base/winner/after/seen) — a red means the read-side race of
+  issue #4 re-fired; attach the dump to issue #4, never rerun-and-forget. 1–2 stray foreign samples
+  print the same dump without failing.
 - **Known-red until debt lands:** the workspace `clippy -D warnings` gate fails on pre-existing pedantic debt
   (~1300 hits measured 2026-08-27; none from the windows port — tracked in the fork's issue). PRs must keep
   their increment at zero; do not "fix" this by weakening the lint table, and do not treat red clippy CI as a
