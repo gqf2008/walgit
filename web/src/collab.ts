@@ -13,11 +13,16 @@ function b64(bytes: ArrayBuffer | Uint8Array): string {
   return btoa(Array.from(u, (c) => String.fromCharCode(c)).join(""));
 }
 
-/** WebCrypto Ed25519 exists in current Chromium/Safari/Firefox; older
-    browsers throw on generateKey — the UI shows a clear message instead. */
-export function ed25519Supported(): boolean {
+/** WebCrypto Ed25519 exists in current Chromium/Safari/Firefox. Feature
+    detection must ATTEMPT the operation: `SubtleCrypto` exposes no
+    algorithm-named properties, so `"Ed25519" in crypto.subtle` is always
+    false and a property check silently disables the whole browser path.
+    Older browsers reject generateKey — we surface that as the message. */
+export async function ed25519Supported(): Promise<boolean> {
   try {
-    return typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined" && "Ed25519" in (crypto.subtle as unknown as Record<string, unknown>);
+    if (typeof crypto === "undefined" || typeof crypto.subtle === "undefined") return false;
+    await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
+    return true;
   } catch {
     return false;
   }

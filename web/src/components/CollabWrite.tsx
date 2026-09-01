@@ -36,7 +36,7 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
     setBusy(true);
     setError(null);
     try {
-      if (!ed25519Supported()) {
+      if (!(await ed25519Supported())) {
         setError("This browser has no WebCrypto Ed25519 support — use the walgit collab CLI to sign entries.");
         return null;
       }
