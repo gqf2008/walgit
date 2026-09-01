@@ -793,6 +793,20 @@ export class RepoClient {
       // overwrite a single inbox ref (D1 §4.1).
       return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, content);
     },
+    /**
+     * Post a signed entry through the thin-API write path
+     * (`POST /{o}/{r}/api/collab/entries`, D1 §11): the server materializes
+     * the entry as a bucket pack and publishes the inbox ref — the browser
+     * write path (no git needed). The actor must be the authenticated
+     * principal.
+     */
+    post: async (entry: Record<string, unknown>, opts?: CallOptions): Promise<{ ref: string; oid: string; seq: number }> => {
+      return this.client.json<{ ref: string; oid: string; seq: number }>(`${this.p}/collab/entries`, opts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry }),
+      });
+    },
     /** First-use registration of a principal's Ed25519 public key at
         `refs/collab/meta/principals/<principal>` (D1 §5: the token binds the
         principal; this ref binds the key). Content is stored as-is. */
