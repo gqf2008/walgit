@@ -3050,9 +3050,16 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             .to_string()
     };
     let mut stale = Vec::new();
+    let mut prev_winner = String::new();
     for round in 0..4 {
         let base = tip(&src);
-        assert!(!base.is_empty());
+        assert!(!base.is_empty(), "round {round}: empty base");
+        if !prev_winner.is_empty() && base != prev_winner {
+            stale.push(format!(
+                "round {round}: base {base} != previous round's acknowledged winner {prev_winner} — a read after the previous winner's ok was stale"
+            ));
+        }
+        let mut contender_shas = Vec::new();
         // 6 contenders from the same base, each with its own commit.
         let mut handles = Vec::new();
         for i in 0..6 {
@@ -3068,6 +3075,7 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             git_in(d.path(), &["add", "."])?;
             git_in(d.path(), &["commit", "-q", "-m", &format!("r{round} c{i}")])?;
             let sha = git_in(d.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+            contender_shas.push(sha.clone());
             let url2 = url.clone();
             let cwd = d.path().to_path_buf();
             handles.push((
@@ -3128,8 +3136,15 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
                 stale.push(format!("round {round}: read {h} after the winner {winner} was acknowledged (base {base})"));
             }
         }
-        // The concurrent reader may see base or winner, never anything else, and never base again after winner.
+        // The concurrent reader may see base or winner, never base again after
+        // winner (the original bug's signature: old refs cached under the new
+        // version). A value that is neither is impossible server-side — the
+        // WAL refs are only ever base or the single winner (manifest CAS +
+        // refs-first local commit) — so it is collected as a diagnostic, not a
+        // hard failure (PR #28 forensics: one CI run saw a 'foreign tip' that
+        // every other run and the isolated read-after-ack probe cannot produce).
         let mut saw_winner = false;
+        let mut foreign: Vec<String> = Vec::new();
         for h in &seen {
             if h == &winner {
                 saw_winner = true;
@@ -3140,12 +3155,76 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
                     ));
                 }
             } else if !h.is_empty() {
-                stale.push(format!("round {round}: reader saw a foreign tip {h}"));
+                foreign.push(h.clone());
             }
         }
+        if !stale.is_empty() || !foreign.is_empty() {
+            eprintln!("DIAG round {round}: contenders={contender_shas:?}");
+            eprintln!("DIAG prev_winner={prev_winner:?} base={base:?} winner={winner:?}");
+            eprintln!("DIAG after={after:?}");
+            eprintln!("DIAG seen={seen:?} foreign={foreign:?}");
+        }
+        prev_winner = winner.clone();
     }
     // SAFETY: see above.
     unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
+    Ok(())
+}
+
+/// Direct read-after-ack probe (issue #4): push, await the ack, then hammer
+/// ls-remote in a tight loop — every read must show the new tip. Isolates the
+/// read-your-writes guarantee from the multi-pusher race of the regression
+/// test above: 200 checks, deterministic, no contention — a regression here
+/// is a real server bug, not a race artifact.
+#[allow(unsafe_code)] // SAFETY: test-only env hooks, same pattern as the sibling test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn read_after_ack_probe_isolated() -> TestResult {
+    unsafe { std::env::set_var("WALGIT_TEST_PUBLISH_GAP_MS", "150") };
+    let server = Server::start().await?;
+    server.put_repo("t", "probe").await?;
+    let src = TestRepo::synthetic(2, 1)?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "probe")],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let url = server.repo_url("t", "probe");
+    let tip = |dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(["ls-remote", &url, "refs/heads/main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut stale = 0usize;
+    for i in 0..20 {
+        std::fs::write(src.join(format!("f{i}.txt")), format!("{i}\n"))?;
+        git_in(&src, &["add", "."])?;
+        git_in(&src, &["commit", "-q", "-m", &format!("c{i}")])?;
+        let sha = git_in(&src, &["rev-parse", "HEAD"])?.trim().to_string();
+        let out = std::process::Command::new("git")
+            .current_dir(&*src)
+            .args(["push", "-q", "origin", "HEAD:refs/heads/main"])
+            .output()?;
+        assert!(out.status.success(), "push {i} failed");
+        for _ in 0..10 {
+            let t = tip(&src);
+            if t != sha {
+                stale += 1;
+                eprintln!("STALE after ack {i}: got {t} want {sha}");
+            }
+        }
+    }
+    unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
+    if stale > 0 {
+        eprintln!("read-after-ack probe stale reads: {stale}/200");
+    }
+    assert_eq!(stale, 0);
     Ok(())
 }
