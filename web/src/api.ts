@@ -103,6 +103,9 @@ export const api = {
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
   /** Who am I (principal + write + anonymous) — D1 collab identity. */
   me: () => authRedirect(client.me()),
+  /** Unified/stat/name-status diff between two revisions (D1 PR review). */
+  diff: (repo: string, from: string, to: string, format: "patch" | "stat" | "name-status" = "patch") =>
+    authRedirect(client.repo(repo).diff({ from, to, format })),
   /** What is happening to this repo on the instance that answers (API.md §2c). Never cached. */
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
   /** D24 settings + policy (Settings tab). Writes are never cached. */

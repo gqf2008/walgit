@@ -1,4 +1,7 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { parsePatchFiles } from "@pierre/diffs";
+import { FileDiff } from "@pierre/diffs/react";
 import { api, type CollabEntryRef } from "../api";
 import { useRepo } from "./RepoLayout";
 import { useData } from "../data";
@@ -36,6 +39,7 @@ export function CollabThreadPage() {
             <dd>{thread.pr.merge.allowed ? "allowed" : thread.pr.merge.reason}</dd>
           </div>
         )}
+        {thread.pr && <PrDiff full={full} base={thread.pr.pr.base} head={thread.pr.pr.head} />}
         <div className="box-header" style={{ marginTop: 8 }}>Write</div>
         <CollabWriteBox full={full} id={thread.id} parent={lastOid} />
       </Box>
@@ -45,6 +49,54 @@ export function CollabThreadPage() {
       ))}
     </>
   );
+}
+
+/** The PR's base→head diff, rendered on demand (the diff can be large). */
+function PrDiff({ full, base, head }: { full: string; base: string | null; head: string | null }) {
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState<{ patch: string; error?: string } | null>(null);
+  const load = async () => {
+    setOpen(true);
+    if (state) return;
+    try {
+      if (!base || !head) throw new Error("base/head missing");
+      const d = await api.diff(full, base, head, "patch");
+      setState({ patch: d.patch ?? "" });
+    } catch (e) {
+      setState({ patch: "", error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+  const files = state ? parsePatchFilesSafe(state.patch, head ?? "") : [];
+  return (
+    <>
+      <div className="box-header" style={{ marginTop: 8 }}>
+        <button className="btn small" onClick={load} aria-expanded={open}>
+          {open ? "Diff" : "Show diff"} {base ?? "?"} → {head ?? "?"}
+        </button>
+      </div>
+      {open && state && (
+        <div className="pad">
+          {state.error && <div className="muted" style={{ color: "var(--danger, #f85149)" }}>{state.error}</div>}
+          {!state.error && files.length === 0 && <div className="muted">No file changes.</div>}
+          {files.map((f, i) => (
+            <div key={f.name + i} className="diff-file">
+              <FileDiff fileDiff={f} options={{ diffStyle: "unified", themeType: "light", overflow: "scroll" }} />
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function parsePatchFilesSafe(patch: string, sha: string) {
+  if (!patch) return [];
+  try {
+    return parsePatchFiles(patch, sha).flatMap((p) => p.files);
+  } catch (e) {
+    console.error(e);
+    return [];
+  }
 }
 
 function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
