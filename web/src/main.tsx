@@ -20,6 +20,7 @@ const OverviewPage = lazy(() => track(import("./pages/OverviewPage")).then((m) =
 const SettingsPage = lazy(() => track(import("./pages/SettingsPage")).then((m) => ({ default: m.SettingsPage })));
 const ApiPage = lazy(() => track(import("./pages/ApiPage")).then((m) => ({ default: m.ApiPage })));
 const CollabPage = lazy(() => track(import("./pages/CollabPage")).then((m) => ({ default: m.CollabPage })));
+const CollabBoardPage = lazy(() => track(import("./pages/CollabBoardPage")).then((m) => ({ default: m.CollabBoardPage })));
 const CollabThreadPage = lazy(() => track(import("./pages/CollabThreadPage")).then((m) => ({ default: m.CollabThreadPage })));
 
 createRoot(document.getElementById("root")!).render(
@@ -40,6 +41,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="commits/*" element={<CommitsPage />} />
             <Route path="commit/:sha" element={<CommitPage />} />
             <Route path="collab" element={<CollabPage />} />
+            <Route path="collab/board" element={<CollabBoardPage />} />
             <Route path="collab/thread/:id" element={<CollabThreadPage />} />
           </Route>
         </Route>

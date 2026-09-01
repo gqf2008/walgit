@@ -654,7 +654,59 @@ thread id.
 }
 ```
 
-Both read endpoints answer from the synced WAL view (`Need::Objects`): entry
+#### `GET /{owner}/{repo}/api/collab/board`
+
+The work-unit board (D1 §8): every thread projected under the declarative
+column rules of `.walgit/board.toml` **at HEAD**. The board is a *pure
+function of the collab refs and the definition* — `build_board` in
+`walgit-wal::collab` — and there is no board state anywhere: moving a card is
+an ordinary signed `status` entry (POST to `…/collab/entries` above) and the
+columns re-derive. The SPA board page and `walgit collab board` render from
+this same shape; the CLI's `--format json` writes these exact bytes, which is
+what the cross-client acceptance test asserts.
+
+Definition: absent → the built-in default (`open` by status, `merged`,
+`closed`, `other` catch-all); **present but invalid → `400`** (fail closed —
+a typo'd column rule must never silently fold cards into the wrong lane).
+
+```json
+{
+  "columns": [
+    {
+      "name": "review",
+      "cards": [
+        {
+          "id": "t1",
+          "title": "add the thing",
+          "actor": "alice",
+          "status": "needs-review",
+          "created_ts": 1786500000,
+          "last_ts": 1786500123,
+          "entries": 2,
+          "verified": 2,
+          "unverified": 0,
+          "kinds": ["issue", "status"],
+          "last_oid": "…",
+          "merge": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+A card's `status` is decided in thread order and the last match wins:
+`status` entries set their `body.status`, a `merge_result` with
+`merged = true` sets `merged` (a later `status` entry still overrides it);
+default `open`. `last_oid` — the parent-chain tip — is what a follow-up
+entry chains to.
+Column order is declaration order, **first matching column wins**, cards
+matching no column are omitted, and within a column cards sort by the
+definition's `sort` (default `last_ts` descending, card id as the total-order
+tie-break, so the bytes are deterministic). Cards without a `patch` never
+match a `merge = "allowed"|"blocked"` column (there is no verdict).
+
+All three read endpoints answer from the synced WAL view (`Need::Objects`): entry
 blobs are read locally when packs fit, faulted through the remote reader
 otherwise (one batched fault, one `git cat-file --batch` — never one read or
 one process per entry). The namespace is budgeted at 20 000 refs per request:
@@ -741,6 +793,7 @@ GET /o/r/api/commit/deadbeef                    → 404 text/plain
 POST /o/r/api/collab/entries                    → 200 {ref,oid,seq} | 403 (actor≠principal, or policy denial) | 401 (no credential)
 POST /o/r/api/collab/principal                  → 200 {ref,oid,seq} | 403 (registering another principal, or policy denial)
 GET /o/r/api/collab/report                      → 200 CollabReport; SWR | 503 (namespace past the 20k-ref budget)
+GET /o/r/api/collab/board                       → 200 {columns[{name,cards}]}; SWR | 400 (HEAD `.walgit/board.toml` unparseable) | 503 (budget)
 GET /o/r/api/collab/threads/t1                  → 200 {id,entries,pr?} | 404 unknown thread
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)

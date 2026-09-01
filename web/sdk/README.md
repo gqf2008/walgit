@@ -62,6 +62,9 @@ r.blame(rev, path)                           → { sha, path, blame: [{line, com
 r.archive(rev, "tar.gz"|"zip")               → ArrayBuffer                          (D1)
 r.collab.entry({…}) / .principal({…}) / .revokePrincipal(p)
                                              → { ref, content, commands }  (signed entry + git push via receive-pack; SDK cannot run git — CLI/agent executes `commands`)
+r.collab.post(entry) / .registerPrincipal(p, key) / .buildEntry({…})
+                                             → thin-API writes: { ref, oid, seq }  (a signed entry/principal straight to the inbox over HTTP — the browser path, D1 §11)
+r.collab.report() / .thread(id) / .board()   → the D1 aggregation reads (exactly what `walgit collab report|thread|board` compute; board = the work-unit projection of `.walgit/board.toml`)
 r.resolve("feature/x/src/main.go")           → { ref, sha, path, kind }           (server splits ref/path, API.md §3)
 r.tree(rev, path?)                           → { ref, sha, path, entries, commit?, readme? }
 r.blob(rev, path)                            → { …, contents | binary | too_large }

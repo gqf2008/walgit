@@ -37,6 +37,10 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
             {report.total_entries} · <span className="ok">✓ {report.verified_entries} verified</span> ·{" "}
             <span className="muted">{report.unverified_entries} unverified</span> · {report.missing_principals} missing keys
           </dd>
+          <dt>Board</dt>
+          <dd>
+            <Link to={`/${full}/collab/board`}>work-unit board →</Link>
+          </dd>
         </div>
         <div className="box-header" style={{ marginTop: 8 }}>New thread</div>
         <CollabWriteBox full={full} id={newId} parent="" onPosted={() => setNewId(uuid())} />

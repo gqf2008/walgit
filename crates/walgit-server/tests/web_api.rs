@@ -1298,3 +1298,76 @@ async fn collab_thin_api_honors_repo_policy() -> TestResult {
     assert_eq!(resp.status(), 200, "unfrozen collab writes again");
     Ok(())
 }
+
+/// D1 board (`GET /{o}/{r}/api/collab/board`): the deterministic projection
+/// under the DEFAULT board (the repository defines none), auth like every
+/// repo-scoped read; a thread lands in its effective-status lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_board_projects_threads_under_the_default_definition() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "alice".into(),
+            token: "alice-token".into(),
+            token_env: None,
+            write: true,
+            admin: false,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("{}/o/r", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
+    let url = format!("{}/o/r/api/collab/entries", server.base_url);
+    for e in [
+        serde_json::json!({
+            "version": 1, "kind": "issue", "id": "t1", "actor": "alice",
+            "ts": 1_786_500_000, "parent": "", "body": {"title": "hi"}, "sig": "ed25519:AAAA"
+        }),
+        serde_json::json!({
+            "version": 1, "kind": "status", "id": "t1", "actor": "alice",
+            "ts": 1_786_500_001, "parent": "", "body": {"status": "needs-review"}, "sig": "ed25519:BBBB"
+        }),
+    ] {
+        let resp = client
+            .post(&url)
+            .bearer_auth("alice-token")
+            .json(&serde_json::json!({ "entry": e }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200, "post entry");
+    }
+
+    // No credential -> a real 401 (token mode).
+    let (st, _, _) = get(&server, "/o/r/api/collab/board").await?;
+    assert_eq!(st, 401);
+
+    let (st, text, headers) = get_h(
+        &server,
+        "/o/r/api/collab/board",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    // Ref-dependent answer: SWR, never immutable.
+    assert!(hdr(&headers, "cache-control").contains("stale-while-revalidate"));
+    let board: serde_json::Value = serde_json::from_str(&text)?;
+    let columns = board["columns"].as_array().unwrap();
+    assert_eq!(
+        columns.iter().map(|c| c["name"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["open", "merged", "closed", "other"],
+        "the built-in default board"
+    );
+    let open = &columns[0]["cards"];
+    assert_eq!(open.as_array().unwrap().len(), 0);
+    let other = &columns[3]["cards"];
+    assert_eq!(other[0]["id"], "t1");
+    assert_eq!(other[0]["status"], "needs-review", "the status entry moved the card");
+    assert_eq!(other[0]["title"], "hi");
+    Ok(())
+}

@@ -274,3 +274,218 @@ async fn watch_reports_new_collab_entries_via_callback() -> TestResult {
     assert_eq!(comment_v["kind"], "comment");
     Ok(())
 }
+
+/// The work-unit board (D1 §8): two independent clients — the CLI's offline
+/// aggregation over a fetched clone and the server's `GET …/collab/board` —
+/// must project the same collab refs to **byte-identical** output, and moving
+/// a card (an ordinary signed `status` entry) must move the projection for
+/// every client, verified against the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn board_projection_is_byte_identical_across_clients_and_moves_with_status() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit");
+    let keydir = tempfile::tempdir()?;
+    let key = keydir.path().join("key");
+    std::fs::write(&key, "07".repeat(32))?;
+    let key_s = key.to_str().unwrap();
+
+    let run = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "walgit {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // The board definition is versioned with the repository: the author
+    // commits `.walgit/board.toml` to main before any collab traffic, so both
+    // clients read the same committed definition.
+    let board_toml = "version = 1\n\n[[column]]\nname = \"review\"\nstatus = \"needs-review\"\n\n[[column]]\nname = \"done\"\nstatus = \"merged\"\n\n[[column]]\nname = \"open\"\nstatus = \"open\"\n";
+    let a = tempfile::tempdir()?;
+    git_in(a.path(), &["init", "-q", "-b", "main"])?;
+    git_in(a.path(), &["config", "user.email", "t@t"])?;
+    git_in(a.path(), &["config", "user.name", "T"])?;
+    git_in(
+        a.path(),
+        &["remote", "add", "origin", &format!("{base}/o/r.git")],
+    )?;
+    std::fs::write(a.path().join(".walgit-board.toml"), board_toml)?;
+    std::fs::create_dir_all(a.path().join(".walgit"))?;
+    std::fs::rename(a.path().join(".walgit-board.toml"), a.path().join(".walgit/board.toml"))?;
+    git_in(a.path(), &["add", ".walgit/board.toml"])?;
+    git_in(a.path(), &["commit", "-q", "-m", "board"])?;
+    git_in(a.path(), &["push", "-q", "origin", "main"])?;
+    let repo_a = a.path().to_str().unwrap();
+
+    // Thread t1 walks onto the review lane; t2 stays open.
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "alice", "--key", key_s,
+        "--push", "origin",
+    ])?;
+    let issue_out = run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t1", "--actor", "alice",
+        "--body", r#"{"title":"add the thing"}"#, "--key", key_s, "--push", "origin",
+    ])?;
+    let issue_oid = issue_out.split_whitespace().nth(1).unwrap().to_string();
+    let status_out = run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "status", "--id", "t1", "--actor", "alice",
+        "--parent", &issue_oid, "--body", r#"{"status":"needs-review"}"#, "--key", key_s, "--push",
+        "origin",
+    ])?;
+    let status_oid = status_out.split_whitespace().nth(1).unwrap().to_string();
+    run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "review", "--id", "t1", "--actor", "alice",
+        "--parent", &status_oid, "--body", r#"{"decision":"approve"}"#, "--key", key_s, "--push",
+        "origin",
+    ])?;
+    run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t2", "--actor", "alice",
+        "--body", r#"{"title":"open work"}"#, "--key", key_s, "--push", "origin",
+    ])?;
+
+    // Client 1: a fresh clone, aggregating offline from the fetched refs.
+    let b = tempfile::tempdir()?;
+    git_in(
+        b.path(),
+        &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."],
+    )?;
+    git_in(b.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let repo_b = b.path().to_str().unwrap();
+    let cli_bytes = run(&["collab", "board", "--repo", repo_b, "--format", "json"])?;
+
+    // Client 2: the server endpoint over HTTP.
+    let resp = reqwest::get(format!("{base}/o/r/api/collab/board")).await?;
+    assert_eq!(resp.status(), 200, "board endpoint status");
+    let server_bytes = resp.bytes().await?;
+    assert_eq!(
+        cli_bytes.as_bytes(),
+        &server_bytes[..],
+        "CLI and server must project the same refs to identical bytes"
+    );
+
+    let board: serde_json::Value = serde_json::from_str(&cli_bytes)?;
+    let column_of = |name: &str| -> Vec<String> {
+        board["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .map(|c| {
+                c["cards"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|card| card["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(column_of("review"), vec!["t1"], "status entry put t1 on review: {board}");
+    assert_eq!(column_of("open"), vec!["t2"]);
+    assert_eq!(column_of("done"), Vec::<String>::new());
+    // text/markdown render the same projection (no need for byte equality).
+    let text = run(&["collab", "board", "--repo", repo_b])?;
+    assert!(text.contains("== review (1) =="), "{text}");
+    let md = run(&["collab", "board", "--repo", repo_b, "--format", "markdown"])?;
+    assert!(md.contains("## review (1)"), "{md}");
+
+    // Move the t2 card: an ordinary signed `status` entry pushed to the
+    // server's inbox — no second write semantics anywhere.
+    let t2_out = run(&["collab", "thread", "t2", "--repo", repo_b])?;
+    let t2: serde_json::Value = serde_json::from_str(&t2_out)?;
+    let t2_tip = t2[0]["oid"].as_str().unwrap().to_string();
+    // Timestamps are whole seconds and the whole run above finishes inside one:
+    // sleep past the boundary so the move's `last_ts` is strictly newer than
+    // t1's review entry and the default (last_ts desc, id asc) sort is decided
+    // by activity, not by the id tie-break.
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // ensure distinct ts
+    run(&[
+        "collab", "entry", "--repo", repo_b, "--kind", "status", "--id", "t2", "--actor", "alice",
+        "--parent", &t2_tip, "--body", r#"{"status":"needs-review"}"#, "--key", key_s, "--push",
+        "origin",
+    ])?;
+
+    // A third, independent clone sees the move: the new entry chains onto the
+    // thread, verifies against the registry, and the projection moved.
+    let c = tempfile::tempdir()?;
+    git_in(
+        c.path(),
+        &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."],
+    )?;
+    git_in(c.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let repo_c = c.path().to_str().unwrap();
+    let moved_thread = run(&["collab", "thread", "t2", "--repo", repo_c])?;
+    let moved: serde_json::Value = serde_json::from_str(&moved_thread)?;
+    let arr = moved.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "issue + the moving status entry: {moved_thread}");
+    assert!(
+        arr.iter().all(|e| e["verified"] == serde_json::Value::Bool(true)),
+        "every entry verifies, including the move: {moved_thread}"
+    );
+    assert_eq!(arr[1]["entry"]["body"]["status"], "needs-review");
+
+    let moved_cli = run(&["collab", "board", "--repo", repo_c, "--format", "json"])?;
+    let moved_server = reqwest::get(format!("{base}/o/r/api/collab/board")).await?.bytes().await?;
+    assert_eq!(moved_cli.as_bytes(), &moved_server[..], "post-move: still byte-identical");
+    let moved_board: serde_json::Value = serde_json::from_str(&moved_cli)?;
+    let review = moved_board["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "review")
+        .unwrap()["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    // Default sort is last-activity descending: the just-moved t2 leads.
+    let mut review_sorted = review.clone();
+    review_sorted.sort();
+    assert_eq!(review_sorted, vec!["t1", "t2"], "the move put t2 on review: {moved_board}");
+    assert_eq!(review.first(), Some(&"t2".to_string()), "newest activity first: {moved_board}");
+
+    // Fail closed: an unparseable definition must be a loud error everywhere —
+    // the CLI refuses to render, the server answers 400 — never a silent
+    // fallback to the default board (that would hide a typo'd column rule).
+    let bad = "version = 1\n\n[[column]]\nname = \"x\"\nbogus = true\n";
+    let bad_dir = tempfile::tempdir()?;
+    let bad_file = bad_dir.path().join("bad.toml");
+    std::fs::write(&bad_file, bad)?;
+    let bad_out = std::process::Command::new(bin)
+        .arg("--config")
+        .arg("/dev/null")
+        .args([
+            "collab",
+            "board",
+            "--repo",
+            repo_b,
+            "--format",
+            "json",
+            "--board",
+            bad_file.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        !bad_out.status.success(),
+        "CLI must refuse a definition with an unknown field: {}",
+        String::from_utf8_lossy(&bad_out.stdout)
+    );
+    std::fs::write(a.path().join(".walgit/board.toml"), bad)?;
+    git_in(a.path(), &["commit", "-qam", "break the board"])?;
+    git_in(a.path(), &["push", "-q", "origin", "main"])?;
+    let bad_resp = reqwest::get(format!("{base}/o/r/api/collab/board")).await?;
+    assert_eq!(
+        bad_resp.status(),
+        400,
+        "server must refuse a repo whose HEAD definition does not parse"
+    );
+    Ok(())
+}

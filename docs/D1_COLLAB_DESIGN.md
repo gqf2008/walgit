@@ -169,6 +169,11 @@
 - **只读、无状态、无写权限**：它只是"确定性聚合 + walgit API/指标"的一个渲染端。
 - **视图**：issue/PR 线程、评审状态、approve 覆盖、agent 活动流、合并统计、
   事件滞后（`head_seq − cursor`）。
+- **工作单元看板**：列规则声明式定义在 `.walgit/board.toml`（随仓库版本化），
+  投影 = `build_board(threads, principals, rules, def)` 纯函数（`walgit-wal::collab`
+  一处实现，CLI / 端点 / SPA 三端同源、字节一致）；卡片在列间的移动不新增写语义
+  ——就是一条既有签名的 `status` 条目。缺省（无定义文件）时内置 open/merged/
+  closed/other 兜底板；定义非法 fail-closed（见 §9 进度与 web/API.md）。
 - **指标来源**：walgit `/metrics/prometheus`、`/healthz`、`/readyz`、`/api/*`（SSE 实时流），
   加上聚合视图。
 - **实时**：订阅 events 桥 / SSE 信封，dashboard 与数据同步无轮询竞态。
@@ -229,6 +234,25 @@
 > - **Web UI（Collab 页）**：线程列表 + 总量健康 + PR 合并评估 + 单线程时间线
 >   （条目流、验签徽标、PR/评审面板），浏览器 Ed25519 密钥（WebCrypto，私钥不出浏览器）
 >   一键注册并发布 issue/评论/评审/状态/patch 条目。
+>
+> **工作单元看板**由 [issue #30](https://github.com/gqf2008/walgit/issues/30)
+> 批次落地（§8 的看板视图 + §11 问题 3 的决定）：
+> - **投影核心**：`BoardDef`（`.walgit/board.toml`，`version = 1`，`[[column]]`
+>   谓词 kind / status / merge(allowed\|blocked) / unverified，声明序
+>   first-match-wins，无列匹配的卡不上板）+ `build_board` 纯函数进
+>   `walgit-wal::collab`；定义解析 fail-closed（坏版本 / 无列 / 空或重名列 /
+>   未知 merge 判词 / 未知字段 = 错误，绝不静默兜底）；排序默认 last_ts 降序、
+>   卡 id 作全序兜底——同一 refs 集合必然投影出逐字节一致的看板。
+> - **端点**：`GET /{o}/{r}/api/collab/board`（定义读 HEAD 的
+>   `.walgit/board.toml`，remote 仓经 remote reader fault；缺失 = 内置默认板
+>   open/merged/closed/other，非法 = 400；SWR，永不 immutable）。
+> - **CLI**：`walgit collab board --format text|markdown|json`（`--board`
+>   预览未提交的定义；`json` 输出与端点字节一致，e2e 断言）。
+> - **SPA**：`/{o}/{r}/collab/board` 只读页（列 + 卡 + SSE 实时刷新）；
+>   移动卡片 = 薄 API 的一条签名 `status` 条目（parent = 卡 `last_oid`）。
+> - **e2e**：双客户端字节一致断言（CLI 离线聚合 vs 服务端点，移动前后各一次）；
+>   移动 = 第二个克隆经 receive-pack push 签名 status 条目，第三个克隆看到移动
+>   且全部条目对注册表验签通过。
 
 ## 10. 一致性、并发与安全
 
@@ -270,6 +294,13 @@
    聚合读单请求预算 20k refs，超限 503 指向 CLI 离线聚合（条目对象一次
    `cat-file --batch` 读完，无逐条目子进程）。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
+   **不复用（issue #30 决定）**。render cache 的契约是"答案按内容寻址、不可变"
+   （键 = 答案自身的哈希：可无限重放、谁先算好谁受益）；而协作聚合的输入是活的
+   collab refs，每次 push 都可能改变答案——不存在可缓存的不可变答案，硬套 render
+   cache 等于把 TTL 伪装成内容寻址，违反原则 IV（每次读都重验证，没有"最终一致"）。
+   因此聚合端点（report / threads / board）一律 SWR + ETag、永不 immutable；
+   读路径的成本控制来自共享的 `collab_load`（单次 refs 级同步 + 条目一次
+   `cat-file --batch` 读完，20k refs 预算），不来自跨请求缓存答案。
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
 5. 原型顺序建议：
    ① walgit 侧：通用 refs API + 评审原语端点；
