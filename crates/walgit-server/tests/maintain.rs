@@ -895,9 +895,23 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .clone();
     let rows = server.state.bundles.plan(&id, now, ctx).await?;
     let planned: Vec<_> = rows.iter().filter(|r| r.strategy == "hourly").collect();
+    // The hourly window is anchored at the weekly cut above: planned rows are
+    // the integer-hour slots in (weekly anchor, now], truncated to the newest
+    // INCREMENTALS_KEPT (D21). Derive the expectation from the anchor instead
+    // of assuming a constant — right after the weekly's Sunday 23:00Z fire
+    // that is 0 slots, then 1 until 01:00 Monday UTC, and a constant
+    // expectation is deterministically red in that window (PR #28 review;
+    // probe-verified equal to the plan at every point of the window).
+    let expected = walgit_bundle::slots::slots_between(
+        &hourly,
+        walgit_bundle::slots::from_epoch(sunday),
+        now,
+    )?
+    .len()
+    .min(walgit_bundle::slots::INCREMENTALS_KEPT);
     assert_eq!(
         planned.len(),
-        walgit_bundle::slots::INCREMENTALS_KEPT,
+        expected,
         "only the newest slots are planned: {rows:?}"
     );
     // All CLOSED planned hourlies are Missing. The current hour is Pending
@@ -920,10 +934,16 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
                 && walgit_bundle::slots::slot_closed(&hourly, r.slot, now)
         })
         .count();
-    assert!(
-        missing_before >= 1,
-        "no closed missing hourly planned: {rows:?}"
-    );
+    // A closed missing row is guaranteed only when both newest slots are
+    // planned: the older one fired ≥ 1 h ago and is always closed. In the tie
+    // window the only planned slot may still be within the close grace (or
+    // there is no planned slot at all).
+    if expected == walgit_bundle::slots::INCREMENTALS_KEPT {
+        assert!(
+            missing_before >= 1,
+            "no closed missing hourly planned: {rows:?}"
+        );
+    }
 
     // ONE pass.
     let report = step!("pass", walgit_server::maintain::run_pass(&server.state))?;
@@ -935,10 +955,14 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .iter()
         .filter(|b| b.strategy == "hourly")
         .collect();
-    assert!(
-        !list.skipped.is_empty(),
-        "closed empty slots recorded in the list: {report:?}"
-    );
+    // Nothing to settle in the tie window's first hour (no closed missing
+    // slot was planned) — the pass legitimately records no skip then.
+    if missing_before >= 1 {
+        assert!(
+            !list.skipped.is_empty(),
+            "closed empty slots recorded in the list: {report:?}"
+        );
+    }
     // Every CLOSED missing slot is settled in that one pass. The open (current)
     // slot may stay missing: the commit above was pushed after its fire time, so
     // as of the slot there is nothing new — it belongs to the next hour (D22).
@@ -959,7 +983,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         hourlies.len()
     );
     assert!(
-        list.skipped.len() >= missing_before - 1,
+        list.skipped.len() >= missing_before.saturating_sub(1),
         "settled at plan time, not one per pass: skipped={} missing_before={missing_before}",
         list.skipped.len()
     );
