@@ -447,6 +447,35 @@ function entrySegment(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** Build a signed collab entry object (the bytes the server stores, ready
+    for `collab.post`): canonical form signed with `sign(canonical)` returning
+    the raw Ed25519 signature as base64. Shared by `collab.entry` (which packs
+    it into a receive-pack push) and `collab.buildEntry` (browser thin API). */
+async function signedEntry(input: {
+  principal: string;
+  kind: string;
+  id: string;
+  actor: string;
+  parent: string;
+  refs?: { base?: string; head?: string };
+  body: Record<string, unknown>;
+  sign: (canonical: string) => Promise<string>;
+}): Promise<Record<string, unknown>> {
+  refSegment("entry.principal", input.principal);
+  const entry: Record<string, unknown> = {
+    version: 1,
+    kind: input.kind,
+    id: input.id,
+    actor: input.actor,
+    ts: Math.floor(Date.now() / 1000),
+    parent: input.parent,
+  };
+  if (input.refs) entry.refs = input.refs;
+  entry.body = input.body;
+  const sig = `ed25519:${await input.sign(canonicalize(entry))}`;
+  return { ...entry, sig };
+}
+
 function pushFor(ref: string, content: string | null): CollabPush {
   if (content === null) {
     return { ref, content: null, commands: [`set -e\ngit push origin ":${ref}"`] };
@@ -846,24 +875,25 @@ export class RepoClient {
       body: Record<string, unknown>;
       sign: (canonical: string) => Promise<string>;
     }): Promise<CollabPush> => {
-      refSegment("entry.principal", input.principal);
-      const entry: Record<string, unknown> = {
-        version: 1,
-        kind: input.kind,
-        id: input.id,
-        actor: input.actor,
-        ts: Math.floor(Date.now() / 1000),
-        parent: input.parent,
-      };
-      if (input.refs) entry.refs = input.refs;
-      entry.body = input.body;
-      const canonical = canonicalize(entry);
-      const sig = `ed25519:${await input.sign(canonical)}`;
-      const content = JSON.stringify({ ...entry, sig }, null, 2);
+      const entry = await signedEntry(input);
       // Per-entry ref: a thread with many entries by one principal must not
       // overwrite a single inbox ref (D1 §4.1).
-      return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, content);
+      return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, JSON.stringify(entry, null, 2));
     },
+    /**
+     * Build a signed entry object ready for `collab.post` (the browser thin
+     * API). Same signing contract as `entry()`.
+     */
+    buildEntry: (input: {
+      principal: string;
+      kind: "issue" | "comment" | "patch" | "review" | "status" | "merge_result" | "agent_action";
+      id: string;
+      actor: string;
+      parent: string;
+      refs?: { base?: string; head?: string };
+      body: Record<string, unknown>;
+      sign: (canonical: string) => Promise<string>;
+    }): Promise<Record<string, unknown>> => signedEntry(input),
     /**
      * Post a signed entry through the thin-API write path
      * (`POST /{o}/{r}/api/collab/entries`, D1 §11): the server materializes

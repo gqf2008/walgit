@@ -101,6 +101,8 @@ export const api = {
   commits: (repo: string, sha: string, path: string, skip: number) => authRedirect(client.repo(repo).commits({ ref: sha, path, skip })),
   commit: (repo: string, sha: string) => authRedirect(client.repo(repo).commit(sha)),
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
+  /** Who am I (principal + write + anonymous) — D1 collab identity. */
+  me: () => authRedirect(client.me()),
   /** What is happening to this repo on the instance that answers (API.md §2c). Never cached. */
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
   /** D24 settings + policy (Settings tab). Writes are never cached. */
@@ -114,6 +116,18 @@ export const api = {
     registerPrincipal: (principal: string, publicKey: string) =>
       authRedirect(client.repo(repo).collab.registerPrincipal({ principal, publicKey })),
   }),
+  /** Build a signed collab entry (SDK canonical form + caller's Ed25519 sign)
+      ready for `collab.post` — the browser write path. */
+  collabBuildEntry: (repo: string, input: {
+    principal: string;
+    kind: "issue" | "comment" | "patch" | "review" | "status" | "merge_result" | "agent_action";
+    id: string;
+    actor: string;
+    parent: string;
+    refs?: { base?: string; head?: string };
+    body: Record<string, unknown>;
+    sign: (canonical: string) => Promise<string>;
+  }) => client.repo(repo).collab.buildEntry(input),
   /** Clone/setup recipes rendered by the server (`setup::Recipes`) — one source of truth. */
   setupRecipes: async (repo?: string): Promise<SetupRecipes> => {
     const u = repo ? `/services/setup.json?repo=${enc(repo)}` : "/services/setup.json";
