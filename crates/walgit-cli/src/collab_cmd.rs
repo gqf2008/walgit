@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use walgit_wal::collab::{
-    Board, BoardDef, Entry, EntryRef, EntryRefs, MergeRules, BOARD_PATH, Report, build_board,
+    BOARD_PATH, Board, BoardDef, Entry, EntryRef, EntryRefs, MergeRules, Report, build_board,
     build_report, default_board, merge_rule_eval, parse_board_def, pr_view, sign_entry, thread,
 };
 
@@ -591,26 +591,20 @@ fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()
 /// silently mis-folded board).
 fn load_board_def(repo: &Path, override_path: Option<&Path>) -> Result<BoardDef> {
     if let Some(p) = override_path {
-        let doc = std::fs::read_to_string(p)
-            .with_context(|| format!("read board {}", p.display()))?;
+        let doc =
+            std::fs::read_to_string(p).with_context(|| format!("read board {}", p.display()))?;
         return parse_board_def(&doc).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()));
     }
     let reader = CollabReader::new(repo);
     match reader.git(&["cat-file", "blob", &format!("HEAD:{BOARD_PATH}")]) {
-        Ok(bytes) => {
-            parse_board_def(&String::from_utf8_lossy(&bytes))
-                .map_err(|e| anyhow::anyhow!("{BOARD_PATH}: {e}"))
-        }
+        Ok(bytes) => parse_board_def(&String::from_utf8_lossy(&bytes))
+            .map_err(|e| anyhow::anyhow!("{BOARD_PATH}: {e}")),
         Err(_) => Ok(default_board()),
     }
 }
 
 fn card_label(c: &walgit_wal::collab::BoardCard) -> &str {
-    if c.title.is_empty() {
-        &c.id
-    } else {
-        &c.title
-    }
+    if c.title.is_empty() { &c.id } else { &c.title }
 }
 
 fn render_board_text(b: &Board) -> String {
@@ -643,7 +637,10 @@ fn render_board_markdown(b: &Board) -> String {
             let _ = writeln!(out, "_(empty)_\n");
             continue;
         }
-        let _ = writeln!(out, "| card | status | actor | entries | verified | last |\n|---|---|---|---|---|---|");
+        let _ = writeln!(
+            out,
+            "| card | status | actor | entries | verified | last |\n|---|---|---|---|---|---|"
+        );
         for c in &col.cards {
             let _ = writeln!(
                 out,
