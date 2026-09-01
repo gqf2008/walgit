@@ -884,15 +884,45 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         can_incremental: true,
         wrong_host_reason: None,
     };
-    let rows = server.state.bundles.plan(&id, now, ctx).await?;
-    let missing_before = rows
+    let hourly = server
+        .state
+        .cfg
+        .bundles
+        .strategy
         .iter()
-        .filter(|r| r.strategy == "hourly" && r.status == walgit_bundle::slots::SlotStatus::Missing)
-        .count();
+        .find(|s| s.name == "hourly")
+        .unwrap()
+        .clone();
+    let rows = server.state.bundles.plan(&id, now, ctx).await?;
+    let planned: Vec<_> = rows.iter().filter(|r| r.strategy == "hourly").collect();
     assert_eq!(
-        missing_before,
+        planned.len(),
         walgit_bundle::slots::INCREMENTALS_KEPT,
         "only the newest slots are planned: {rows:?}"
+    );
+    // All CLOSED planned hourlies are Missing. The current hour is Pending
+    // (not Missing) while it is still within SLOT_CLOSE_GRACE of its fire —
+    // the plan's `now` is real, so the test used to flake in the two minutes
+    // after every hour boundary (issue #4 follow-up: one CI run at 07:01Z).
+    for r in &planned {
+        if walgit_bundle::slots::slot_closed(&hourly, r.slot, now) {
+            assert_eq!(
+                r.status,
+                walgit_bundle::slots::SlotStatus::Missing,
+                "closed planned slot not missing: {r:?}"
+            );
+        }
+    }
+    let missing_before = planned
+        .iter()
+        .filter(|r| {
+            r.status == walgit_bundle::slots::SlotStatus::Missing
+                && walgit_bundle::slots::slot_closed(&hourly, r.slot, now)
+        })
+        .count();
+    assert!(
+        missing_before >= 1,
+        "no closed missing hourly planned: {rows:?}"
     );
 
     // ONE pass.
@@ -912,19 +942,16 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     // Every CLOSED missing slot is settled in that one pass. The open (current)
     // slot may stay missing: the commit above was pushed after its fire time, so
     // as of the slot there is nothing new — it belongs to the next hour (D22).
-    let hourly = server
-        .state
-        .cfg
-        .bundles
-        .strategy
-        .iter()
-        .find(|s| s.name == "hourly")
-        .unwrap()
-        .clone();
     let rows = server.state.bundles.plan(&id, now, ctx).await?;
     {
-        let hb1 = walgit_bundle::slots::base_for_incremental(&server.state.cfg.bundles, &list, &hourly, 1788181200).map(|b| b.id.clone());
-        }
+        let hb1 = walgit_bundle::slots::base_for_incremental(
+            &server.state.cfg.bundles,
+            &list,
+            &hourly,
+            1788181200,
+        )
+        .map(|b| b.id.clone());
+    }
     let still_missing_closed: Vec<u64> = rows
         .iter()
         .filter(|r| {
