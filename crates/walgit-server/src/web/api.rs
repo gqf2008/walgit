@@ -33,7 +33,10 @@ use serde::Serialize;
 use walgit_store::{GetOptions, ObjectStore, Prefixed, PutBody, PutMode};
 use walgit_wal::{
     ObjectAccess, RepoHandle, Reporter,
-    collab::{Entry, EntryRef, MergeRules, build_report, merge_rule_eval, pr_view, thread},
+    collab::{
+        Board, BoardDef, Entry, EntryRef, MergeRules, BOARD_PATH, build_board, build_report,
+        default_board, merge_rule_eval, parse_board_def, pr_view, thread,
+    },
 };
 
 use crate::sse::Rendered;
@@ -212,6 +215,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/collab/entries"), post(collab_entries))
             .route(&format!("{base}/collab/principal"), post(collab_principal))
             .route(&format!("{base}/collab/report"), get(collab_report))
+            .route(&format!("{base}/collab/board"), get(collab_board))
             .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
@@ -1580,6 +1584,89 @@ async fn collab_thread(
         },
     )
     .await
+}
+
+/// The work-unit board (D1 §8): `build_board` — the same projection the
+/// `walgit collab` CLI computes offline — over the collab state, under the
+/// board definition versioned at `.walgit/board.toml` (HEAD).
+///
+/// The render cache (`cache/api/v1/*.json`, D1 §11 open question 3) is
+/// deliberately **not** used: it exists for sha-addressed immutable answers,
+/// while the projection's input is the live collab refs, which move with every
+/// entry push — keying it would need a second cache with its own invalidation
+/// story, i.e. a staleness surface, for a computation that is refs-level plus
+/// one bounded blob fan-out (principle IV: every read revalidates). SWR like
+/// `collab/report`, never immutable.
+async fn collab_board(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let state = collab_load(&r).await?;
+            let board_def = load_board_def(&r).await?;
+            let refs: Vec<&EntryRef> = state.entries.iter().collect();
+            let board: Board = build_board(&refs, &state.principals, &state.rules, &board_def);
+            Ok(Rendered::json(json_bytes(&board), SWR, None))
+        },
+    )
+    .await
+}
+
+/// The board definition: `.walgit/board.toml` at HEAD — versioned with the
+/// repository, so every client (this endpoint, the CLI, a fresh clone) reads
+/// the same committed definition. Absent file ⇒ `default_board()` (the
+/// definition is optional); **present but invalid fails the request** with the
+/// parse error — a broken definition must not silently fold cards into the
+/// wrong lane.
+async fn load_board_def(r: &Repo) -> Result<BoardDef, ApiError> {
+    let head = r.index.head().map(|(_, sha)| sha);
+    let bytes = async {
+        let sha = head.ok_or_else(|| ApiError::NotFound("unborn HEAD".into()))?;
+        if let Some(remote) = r.remote() {
+            let oid = gix_hash::ObjectId::from_hex(sha.as_bytes())
+                .map_err(|_| not_found("HEAD revision"))?;
+            let (_, blob_oid, mode) = remote
+                .fault_path(&oid, BOARD_PATH)
+                .await
+                .map_err(|e| match e {
+                    ApiError::NotFound(_) => ApiError::NotFound(format!("{BOARD_PATH} at HEAD")),
+                    other => other,
+                })?;
+            if !mode.is_blob() {
+                return Err(ApiError::BadRequest(format!("{BOARD_PATH} is not a blob")));
+            }
+            Ok(remote.get(&blob_oid).await?.data.to_vec())
+        } else {
+            git(
+                &r.local,
+                vec![
+                    "cat-file".into(),
+                    "blob".into(),
+                    format!("{sha}:{BOARD_PATH}"),
+                ],
+            )
+            .await
+            .map_err(|_| ApiError::NotFound(format!("{BOARD_PATH} at HEAD")))
+        }
+    }
+    .await;
+    match bytes {
+        Ok(b) => parse_board_def(&String::from_utf8_lossy(&b))
+            .map_err(|e| ApiError::BadRequest(format!("{BOARD_PATH}: {e}"))),
+        // No definition (or no HEAD yet): the board is optional. A present but
+        // broken definition fails closed above; store failures keep their own
+        // status (only NotFound means "absent").
+        Err(ApiError::NotFound(_)) => Ok(default_board()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---- resolve -----------------------------------------------------------------
