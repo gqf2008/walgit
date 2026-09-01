@@ -20,9 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use walgit_wal::ci::{
-    CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunState, RunView, run_id,
-};
+use walgit_wal::ci::{CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id};
 use walgit_wal::collab::{Entry, EntryRef, sign_entry};
 
 // ---- schema limits (docs/D1_CI_PROTOCOL.md §3.1, normative bounds) -------------
@@ -634,6 +632,21 @@ impl Runner {
     /// <actor>`, the same shape `walgit collab principal register` writes.
     /// Idempotent — re-registering republishes the same key.
     fn register(&self) -> Result<()> {
+        let ref_name = format!("refs/collab/meta/principals/{}", self.actor);
+        // Idempotent: walgit's receive-pack refuses a non-force update of a
+        // non-commit ref, so an already-registered runner must not push its
+        // principal ref again — re-registering (key rotation) is an explicit
+        // `walgit collab principal-register`, never a side effect of `ci run`.
+        let _ = crate::collab_cmd::git_fetch_collab(&self.repo, &self.remote);
+        let known = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["rev-parse", "--verify", "--quiet", &ref_name])
+            .output()
+            .context("git rev-parse")?;
+        if known.status.success() {
+            return Ok(());
+        }
         let public_key =
             base64::engine::general_purpose::STANDARD.encode(self.key.verifying_key().to_bytes());
         let content = serde_json::to_string_pretty(&serde_json::json!({
@@ -643,7 +656,6 @@ impl Runner {
             "registered_at": chrono::Utc::now().timestamp(),
         }))?;
         let oid = crate::collab_cmd::git_write_blob(&self.repo, &content)?;
-        let ref_name = format!("refs/collab/meta/principals/{}", self.actor);
         crate::collab_cmd::git_update_ref(&self.repo, &ref_name, Some(&oid))?;
         crate::collab_cmd::git_push(&self.repo, &self.remote, &ref_name)
     }
@@ -923,10 +935,11 @@ impl Runner {
         let Some(meta) = line.split('\t').next() else {
             return Ok(None);
         };
-        // `100644 blob <oid>`; a non-blob entry (submodule) is no declaration.
+        // `100644 blob <oid>`: mode, kind, oid. A non-blob entry (a
+        // submodule) is no declaration.
         let Some(oid) = meta
             .split_whitespace()
-            .nth(1)
+            .nth(2)
             .filter(|_| meta.contains(" blob "))
         else {
             return Ok(None);
@@ -1299,6 +1312,7 @@ fn write_processed(path: &Path, map: &HashMap<String, String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use walgit_wal::ci::RunState;
 
     fn ok(raw: &str) -> CiResolved {
         parse_and_validate(raw.as_bytes()).unwrap_or_else(|e| panic!("should validate: {e}"))
