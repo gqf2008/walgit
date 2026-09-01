@@ -178,6 +178,33 @@ export interface CollabThread {
   entries: CollabEntryRef[];
   pr: { pr: CollabPr; merge: CollabMergeEval } | null;
 }
+/** One card of the work-unit board (D1 §8): a thread flattened by the
+    deterministic `build_board` projection the CLI renders too. */
+export interface CollabBoardCard {
+  id: string;
+  title: string;
+  actor: string;
+  /** Effective work-unit status: the latest `status` entry's value. */
+  status: string;
+  created_ts: number;
+  last_ts: number;
+  entries: number;
+  verified: number;
+  unverified: number;
+  kinds: string[];
+  /** Tip of the parent chain — the `parent` a follow-up entry chains to
+      (the board's move posts its `status` entry on it). */
+  last_oid: string;
+  /** Merge-rule verdict when the thread has a patch, else null. */
+  merge: { allowed: boolean; reason: string } | null;
+}
+export interface CollabBoardColumn {
+  name: string;
+  cards: CollabBoardCard[];
+}
+export interface CollabBoard {
+  columns: CollabBoardColumn[];
+}
 export interface Resolved {
   ref: string;
   sha: string;
@@ -915,6 +942,12 @@ export class RepoClient {
     /** One thread: parent-ordered entries with per-entry verification, plus
         the PR view + merge evaluation when the thread has a patch. */
     thread: (id: string, opts?: CallOptions) => this.client.json<CollabThread>(`${this.p}/collab/threads/${enc(id)}`, opts),
+    /** The work-unit board (D1 §8): the threads projected under the board
+        definition versioned at `.walgit/board.toml` (HEAD) — the same
+        `build_board` the `walgit collab board` CLI renders offline. Read-only;
+        moving a card posts an ordinary signed `status` entry (`buildEntry` +
+        `post`). */
+    board: (opts?: CallOptions) => this.client.json<CollabBoard>(`${this.p}/collab/board`, opts),
     /**
      * First-use self-registration of the authenticated principal's Ed25519
      * public key through the thin API (`POST /{o}/{r}/api/collab/principal`):

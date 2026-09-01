@@ -33,6 +33,9 @@ export type {
   CollabEntryRef,
   CollabPr,
   CollabMergeEval,
+  CollabBoard,
+  CollabBoardColumn,
+  CollabBoardCard,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, StrategyInfo, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -115,6 +118,7 @@ export const api = {
   collab: (repo: string) => ({
     report: () => authRedirect(client.repo(repo).collab.report()),
     thread: (id: string) => authRedirect(client.repo(repo).collab.thread(id)),
+    board: () => authRedirect(client.repo(repo).collab.board()),
     post: (entry: Record<string, unknown>) => authRedirect(client.repo(repo).collab.post(entry)),
     registerPrincipal: (principal: string, publicKey: string) =>
       authRedirect(client.repo(repo).collab.registerPrincipal({ principal, publicKey })),
@@ -253,10 +257,12 @@ export function runOp(
  * Streaming form of `refList` (API.md §refs: `Accept: text/event-stream` →
  * `event: ref` per match, `event: done` with `{more}`): the picker paints
  * matches as the server finds them instead of waiting for the whole page.
+ * `collab` streams the D1 namespace — the board page reopens it as its live
+ * change signal (refs-level reads are cheap, D1 §7).
  */
 export function refListStream(
   repo: string,
-  kind: "branches" | "tags",
+  kind: "branches" | "tags" | "collab",
   q: { q?: string; prefix?: string; after?: string; n?: number },
   onRef: (r: RefInfo) => void,
   signal?: AbortSignal,

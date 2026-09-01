@@ -19,6 +19,28 @@ export interface CollabWriteProps {
   onPosted?: () => void;
 }
 
+/**
+ * Shared D1 browser-write setup, used by the write box and the board's
+ * move-card action: WebCrypto Ed25519 available, session signed in, and the
+ * public key self-registered through the thin API. Resolves the principal or
+ * throws with the reason it could not.
+ */
+export async function enableCollabKey(full: string): Promise<string> {
+  if (!(await ed25519Supported())) {
+    throw new Error("This browser has no WebCrypto Ed25519 support — use the walgit collab CLI to sign entries.");
+  }
+  const me = await api.me();
+  if (me.anonymous) {
+    throw new Error("Signed out — sign in to participate in the collaboration layer.");
+  }
+  const publicKey = await publicKeyB64();
+  // Self-registration is idempotent in effect (re-registering the same key
+  // just appends a log entry; the aggregation reads the latest key).
+  await api.collab(full).registerPrincipal(me.principal, publicKey);
+  invalidate(`collab:${full}`);
+  return me.principal;
+}
+
 type Kind = "issue" | "comment" | "review" | "status" | "patch";
 
 export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps) {
@@ -36,22 +58,9 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
     setBusy(true);
     setError(null);
     try {
-      if (!(await ed25519Supported())) {
-        setError("This browser has no WebCrypto Ed25519 support — use the walgit collab CLI to sign entries.");
-        return null;
-      }
-      const me = await api.me();
-      if (me.anonymous) {
-        setError("Signed out — sign in to participate in the collaboration layer.");
-        return null;
-      }
-      const publicKey = await publicKeyB64();
-      // Self-registration is idempotent in effect (re-registering the same key
-      // just appends a log entry; the aggregation reads the latest key).
-      await api.collab(full).registerPrincipal(me.principal, publicKey);
-      invalidate(`collab:${full}`);
-      setReady(me.principal);
-      return me.principal;
+      const principal = await enableCollabKey(full);
+      setReady(principal);
+      return principal;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return null;
