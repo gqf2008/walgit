@@ -65,7 +65,7 @@ export function RepoLayout() {
   }, [full]);
   const walActive = pathname.endsWith("/wal");
   const settingsActive = pathname.endsWith("/settings");
-  const collabActive = pathname.includes("/collab");
+  const collabActive = pathname === `/${full}/collab` || pathname.startsWith(`/${full}/collab/`);
   const codeActive = !walActive && !settingsActive && !collabActive && !/\/commits?(\/|$)/.test(pathname);
   return (
     <>

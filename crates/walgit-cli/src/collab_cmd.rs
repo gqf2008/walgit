@@ -233,6 +233,7 @@ pub fn run(action: CollabAction) -> Result<()> {
 fn ref_segment(label: &str, s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 255
+        && !s.contains("..") // git forbids `..` inside a component
         && s != "."
         && s != ".."
         && !s.to_ascii_lowercase().ends_with(".lock")

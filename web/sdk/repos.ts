@@ -433,7 +433,7 @@ function canonicalize(value: unknown): string {
 /** Refname-safe segment for collab refs (D1 §5): no `:`, `/`, `..`, `.lock`. */
 const REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/;
 function refSegment(label: string, s: string): void {
-  if (!REF_SEGMENT.test(s) || s === "." || s === ".." || s.endsWith(".lock")) {
+  if (!REF_SEGMENT.test(s) || s === "." || s === ".." || s.includes("..") || s.endsWith(".lock")) {
     throw new ReposError(400, `collab.${label}: ${JSON.stringify(s)} is not a refname-safe segment ([A-Za-z0-9._@-]+)`);
   }
 }
