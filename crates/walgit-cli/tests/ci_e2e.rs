@@ -37,7 +37,7 @@ fn git_in(dir: &Path, args: &[&str]) -> TestResult<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// In-process walgit server (the collab_e2e harness): memory store, loopback
+/// In-process walgit server (the `collab_e2e` harness): memory store, loopback
 /// `none` auth, `auto_create_on_push` so the first `git push` creates the repo.
 async fn start_server() -> TestResult<(String, tokio::sync::oneshot::Sender<()>)> {
     let store: Arc<MemoryStore> = MemoryStore::shared();
@@ -489,11 +489,11 @@ timeout = "60s"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_secret_boundary_holds_in_every_published_object() -> TestResult {
+    const SECRET: &str = "s3cret-e2e-value-do-not-publish";
     let (base, _shutdown) = start_server().await?;
     let bin = env!("CARGO_BIN_EXE_walgit").to_string();
     let keydir = tempfile::tempdir()?;
     let key = write_key(keydir.path(), 0x41)?;
-    const SECRET: &str = "s3cret-e2e-value-do-not-publish";
 
     // The allowlist carries only NAMES. The command itself is the positive
     // guard: the allowed variable is truly injected, the secret truly absent —

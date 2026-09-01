@@ -728,7 +728,9 @@ pub(crate) fn absolute_git_dir(repo: &Path) -> Result<PathBuf> {
     if !git_dir.status.success() {
         bail!("{} is not a git checkout", repo.display());
     }
-    Ok(PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim()))
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&git_dir.stdout).trim(),
+    ))
 }
 
 pub(crate) fn state_path(repo: &Path, override_path: Option<&Path>) -> Result<PathBuf> {
