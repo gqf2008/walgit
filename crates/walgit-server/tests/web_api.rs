@@ -985,3 +985,110 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     assert_eq!(resp.status(), 403, "unauthenticated refused (token mode, no credential)");
     Ok(())
 }
+
+/// D1 aggregation read path: after posting entries, `/api/collab/report` and
+/// `/api/collab/threads/{id}` answer with the deterministic aggregation
+/// (thread summaries, ordered entries, PR view + merge rule evaluation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_report_and_thread_aggregate_entries() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "alice".into(),
+            token: "alice-token".into(),
+            token_env: None,
+            write: true,
+            admin: false,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("{}/o/r", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
+    let url = format!("{}/o/r/api/collab/entries", server.base_url);
+
+    let issue = serde_json::json!({
+        "version": 1, "kind": "issue", "id": "t1", "actor": "alice",
+        "ts": 1786500000, "parent": "", "body": {"title": "hi"},
+        "sig": "ed25519:AAAA"
+    });
+    let patch = serde_json::json!({
+        "version": 1, "kind": "patch", "id": "t1", "actor": "alice",
+        "ts": 1786500001, "parent": "", "body": {},
+        "refs": {"base": "refs/heads/main", "head": "refs/heads/topic"},
+        "sig": "ed25519:BBBB"
+    });
+    let review = serde_json::json!({
+        "version": 1, "kind": "review", "id": "t1", "actor": "alice",
+        "ts": 1786500002, "parent": "", "body": {"decision": "approve"},
+        "sig": "ed25519:CCCC"
+    });
+    let mut oids = Vec::new();
+    for e in [&issue, &patch, &review] {
+        let resp = client
+            .post(&url)
+            .bearer_auth("alice-token")
+            .json(&serde_json::json!({ "entry": e }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200, "post entry");
+        let body: serde_json::Value = resp.json().await?;
+        oids.push(body["oid"].as_str().unwrap().to_string());
+    }
+
+    let (st, text, _) = get_h(
+        &server,
+        "/o/r/api/collab/report",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    let report: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(report["total_entries"], 3);
+    assert_eq!(report["threads"].as_array().unwrap().len(), 1);
+    assert_eq!(report["threads"][0]["id"], "t1");
+    assert_eq!(report["threads"][0]["entries"], 3);
+    assert_eq!(report["prs"].as_array().unwrap().len(), 1);
+    assert_eq!(report["prs"][0]["base"], "refs/heads/main");
+    assert_eq!(report["prs"][0]["head"], "refs/heads/topic");
+    assert_eq!(report["prs"][0]["status"], "open");
+    // Default rules protect nothing -> merge allowed.
+    assert_eq!(report["prs"][0]["merge_allowed"], true);
+
+    let (st, text, _) = get_h(
+        &server,
+        "/o/r/api/collab/threads/t1",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    let thread: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(thread["id"], "t1");
+    let entries = thread["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let kinds: Vec<&str> = entries
+        .iter()
+        .map(|e| e["entry"]["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["issue", "patch", "review"], "parent-ordered");
+    let pr = thread["pr"].as_object().expect("thread has a patch -> pr view");
+    assert_eq!(pr["pr"]["base"], "refs/heads/main");
+    assert_eq!(pr["pr"]["head"], "refs/heads/topic");
+    assert_eq!(pr["pr"]["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(pr["merge"]["allowed"], true);
+
+    // Unknown thread -> 404.
+    let (st, _, _) = get_h(
+        &server,
+        "/o/r/api/collab/threads/nope",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 404);
+    Ok(())
+}

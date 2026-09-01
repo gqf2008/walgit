@@ -17,6 +17,7 @@
 //! accepts it: notices + progress from the repo's task channel, then
 //! `result`/`error`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -30,7 +31,10 @@ use axum::{
 use futures::StreamExt;
 use serde::Serialize;
 use walgit_store::{GetOptions, ObjectStore, Prefixed, PutBody, PutMode};
-use walgit_wal::{ObjectAccess, RepoHandle, Reporter};
+use walgit_wal::{
+    ObjectAccess, RepoHandle, Reporter,
+    collab::{Entry, EntryRef, MergeRules, build_report, merge_rule_eval, pr_view, thread},
+};
 
 use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
@@ -206,6 +210,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
             .route(&format!("{base}/collab/entries"), post(collab_entries))
+            .route(&format!("{base}/collab/report"), get(collab_report))
+            .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
@@ -1227,6 +1233,160 @@ async fn collab_entries(
         None,
     )
     .into_response(&headers))
+}
+
+// ---- D1 collab aggregation API (read path; D1 §8 dashboard + thread views) -----
+
+/// The collab state a read request needs: every inbox entry, the principals
+/// registry and the merge-rule document (`refs/collab/meta/rules`, D1 §6).
+/// Entries that do not parse are skipped — one corrupt inbox entry must not
+/// take the dashboard down; the deterministic aggregation over the rest is
+/// identical to what the `walgit collab` CLI computes locally.
+struct CollabState {
+    entries: Vec<EntryRef>,
+    principals: HashMap<String, String>,
+    rules: MergeRules,
+}
+
+async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
+    // Refs-level work: the byte-sorted index, no LIST on the bucket.
+    let mut principals: HashMap<String, String> = HashMap::new();
+    let mut plan: Vec<(&str, String, String)> = Vec::new(); // (kind, rest, oid)
+    let mut rules = MergeRules::default();
+    let mut rules_oid: Option<String> = None;
+    for (name, oid) in &r.index.all {
+        if let Some(rest) = name.strip_prefix("refs/collab/meta/principals/") {
+            plan.push(("principal", rest.to_string(), oid.clone()));
+        } else if let Some(rest) = name.strip_prefix("refs/collab/inbox/") {
+            plan.push(("entry", rest.to_string(), oid.clone()));
+        } else if name == "refs/collab/meta/rules" {
+            rules_oid = Some(oid.clone());
+        }
+    }
+    if let Some(remote) = r.remote() {
+        let mut oids: Vec<gix_hash::ObjectId> = plan
+            .iter()
+            .filter_map(|(_, _, oid)| gix_hash::ObjectId::from_hex(oid.as_bytes()).ok())
+            .collect();
+        if let Some(oid) = rules_oid
+            .as_deref()
+            .and_then(|o| gix_hash::ObjectId::from_hex(o.as_bytes()).ok())
+        {
+            oids.push(oid);
+        }
+        remote.fault_many(&oids).await?;
+    }
+    let mut entries = Vec::new();
+    for (kind, rest, oid) in plan {
+        let bytes = git(&r.local, vec!["cat-file".into(), "blob".into(), oid.clone()]).await?;
+        match kind {
+            "principal" => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
+                {
+                    principals.insert(rest, k.to_string());
+                }
+            }
+            _ => {
+                if let Ok(entry) = serde_json::from_slice::<Entry>(&bytes) {
+                    let principal = rest
+                        .rsplit_once('/')
+                        .map(|(p, _)| p.to_string())
+                        .unwrap_or_default();
+                    entries.push(EntryRef {
+                        oid,
+                        principal,
+                        entry,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(oid) = rules_oid {
+        let bytes = git(&r.local, vec!["cat-file".into(), "blob".into(), oid]).await?;
+        rules = serde_json::from_slice(&bytes)
+            .map_err(|e| internal(format!("refs/collab/meta/rules: {e}")))?;
+    }
+    Ok(CollabState {
+        entries,
+        principals,
+        rules,
+    })
+}
+
+/// The full observability report (D1 §8): thread summaries, PR status + merge
+/// rule evaluation, verification health and per-actor/per-kind activity.
+async fn collab_report(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let state = collab_load(&r).await?;
+            let refs: Vec<&EntryRef> = state.entries.iter().collect();
+            let report = build_report(&refs, &state.principals, &state.rules);
+            Ok(Rendered::json(json_bytes(&report), SWR, None))
+        },
+    )
+    .await
+}
+
+/// One thread's ordered entries with per-entry verification, plus the
+/// aggregated PR view + merge rule evaluation when the thread has a `patch`.
+async fn collab_thread(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let state = collab_load(&r).await?;
+            let filtered: Vec<&EntryRef> = state
+                .entries
+                .iter()
+                .filter(|e| e.entry.id == id)
+                .collect();
+            if filtered.is_empty() {
+                return Err(not_found(format!("no collab thread {id}")));
+            }
+            let ordered = thread(&filtered);
+            let entries: Vec<serde_json::Value> = ordered
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "oid": e.oid,
+                        "principal": e.principal,
+                        "verified": e.is_verified(&state.principals),
+                        "entry": e.entry,
+                    })
+                })
+                .collect();
+            let pr = filtered.iter().any(|e| e.entry.kind == "patch").then(|| {
+                let pr = pr_view(&filtered, &state.principals);
+                let merge = merge_rule_eval(&state.rules, &pr);
+                serde_json::json!({ "pr": pr, "merge": merge })
+            });
+            Ok(Rendered::json(
+                json_bytes(&serde_json::json!({ "id": id, "entries": entries, "pr": pr })),
+                SWR,
+                None,
+            ))
+        },
+    )
+    .await
 }
 
 // ---- resolve -----------------------------------------------------------------
