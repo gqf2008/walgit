@@ -212,6 +212,17 @@ pub enum RunState {
     Done,
 }
 
+impl RunState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunState::Pending => "pending",
+            RunState::Claimed => "claimed",
+            RunState::Stale => "stale",
+            RunState::Done => "done",
+        }
+    }
+}
+
 /// One run (= one collab thread): every attempt, the latest attempt's state.
 #[derive(Serialize, Clone, Debug)]
 pub struct RunView {
@@ -389,8 +400,41 @@ pub fn run_view(
     })
 }
 
-// ---- §7.3 decide: the runner's normative decision --------------------------------
+// ---- §7.1/§8.3 the whole log, aggregated ------------------------------------------
 
+/// The CI-relevant slice of a log: every `ci_claim`/`ci_result` entry,
+/// verified or not — the reds stay visible (§7.1/§8.3), everything else is
+/// not this protocol's business.
+pub fn ci_entries<'a>(entries: &[&'a EntryRef]) -> Vec<&'a EntryRef> {
+    entries
+        .iter()
+        .filter(|e| e.entry.kind == CI_CLAIM_KIND || e.entry.kind == CI_RESULT_KIND)
+        .copied()
+        .collect()
+}
+
+/// Every run in the log, by id, as of `now` (§7.1). The one aggregation
+/// behind `walgit ci status`, the collab report's CI section and the SPA's
+/// thread display — three surfaces, one answer, no second semantics.
+pub fn collect_runs(
+    entries: &[&EntryRef],
+    principals: &HashMap<String, String, impl std::hash::BuildHasher>,
+    now: i64,
+) -> BTreeMap<String, RunView> {
+    let mut by_id: BTreeMap<&str, Vec<&EntryRef>> = BTreeMap::new();
+    for e in entries {
+        by_id.entry(e.entry.id.as_str()).or_default().push(e);
+    }
+    by_id
+        .into_iter()
+        .filter_map(|(id, es)| {
+            let view = run_view(id, &es, principals, now)?;
+            Some((id.to_string(), view))
+        })
+        .collect()
+}
+
+// ---- §7.3 decide: the runner's normative decision --------------------------------
 /// What a runner must do for a run right now (§6.2 step 2 / §7.3).
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "action")]
@@ -953,5 +997,70 @@ mod tests {
             "smuggled claim is not a claim"
         );
         assert_eq!(view.unverified, 1);
+    }
+
+    #[test]
+    fn collect_runs_aggregates_the_whole_log_by_id() {
+        let (sk_a, pk_a) = keypair(1);
+        let mut principals = HashMap::new();
+        principals.insert("ci-a".to_string(), pk_a);
+        let id1 = run_ref("runA");
+        let id2 = run_ref("runB");
+        let claim = signed_entry(
+            &sk_a,
+            &id1,
+            CI_CLAIM_KIND,
+            "ci-a",
+            "a1",
+            900,
+            claim_body("t", "r", "c", 300, 1),
+        );
+        let result = signed_entry(
+            &sk_a,
+            &id1,
+            CI_RESULT_KIND,
+            "ci-a",
+            "r1",
+            950,
+            result_body("t", "r", "c", 1, "a1", "success"),
+        );
+        let pending = signed_entry(
+            &sk_a,
+            &id2,
+            CI_CLAIM_KIND,
+            "ci-a",
+            "a2",
+            960,
+            claim_body("u", "r2", "c2", 300, 1),
+        );
+        let noise = signed_entry(
+            &sk_a,
+            &id2,
+            "issue",
+            "ci-a",
+            "n1",
+            970,
+            serde_json::json!({ "title": "not a CI entry" }),
+        );
+        let all: Vec<EntryRef> = vec![claim, result, pending, noise];
+        let refs: Vec<&EntryRef> = all.iter().collect();
+        let runs = collect_runs(&refs, &principals, NOW);
+        assert_eq!(runs.len(), 2, "two run ids");
+        let done = runs.get(&id1).expect("runA");
+        assert_eq!(done.state, RunState::Done);
+        assert_eq!(done.conclusion, Some(Conclusion::Success));
+        let claimed = runs.get(&id2).expect("runB");
+        assert_eq!(
+            claimed.state,
+            RunState::Claimed,
+            "the issue entry is not a claim"
+        );
+        assert_eq!(
+            claimed.unverified, 0,
+            "non-CI kinds are simply not CI entries"
+        );
+        // `ci_entries` is the slice every caller aggregates over.
+        let only_ci = ci_entries(&refs);
+        assert_eq!(only_ci.len(), 3, "the issue entry is filtered out");
     }
 }

@@ -558,7 +558,7 @@ fn render_report_html(r: &Report) -> String {
     )
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -573,10 +573,26 @@ fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()
         None => MergeRules::default(),
     };
     let report = build_report(&refs, &principals, &rules);
+    // The CI section rides the same loaded log and the same aggregation core
+    // as `walgit ci status` (§8.3) — one answer, no second semantics.
+    let ci = walgit_wal::ci::ci_entries(&refs);
+    let runs = walgit_wal::ci::collect_runs(&ci, &principals, chrono::Utc::now().timestamp());
     match format {
-        "text" => print!("{}", render_report_text(&report)),
-        "markdown" => print!("{}", render_report_markdown(&report)),
-        "html" => print!("{}", render_report_html(&report)),
+        "text" => print!(
+            "{}\nci runs\n{}",
+            render_report_text(&report),
+            crate::ci_cmd::ci_runs_text(&runs)
+        ),
+        "markdown" => print!(
+            "{}\n## CI runs\n\n{}",
+            render_report_markdown(&report),
+            crate::ci_cmd::ci_runs_markdown(&runs)
+        ),
+        "html" => {
+            let section = crate::ci_cmd::ci_runs_html(&runs);
+            let html = render_report_html(&report);
+            print!("{}", html.replace("</body>", &format!("{section}</body>")));
+        }
         other => bail!("unknown report format {other} (text|markdown|html)"),
     }
     Ok(())

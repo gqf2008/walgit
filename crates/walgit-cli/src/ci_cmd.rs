@@ -14,12 +14,15 @@ use base64::Engine as _;
 use clap::Subcommand;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use walgit_wal::ci::{CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id};
+use walgit_wal::ci::{
+    CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunState, RunView, run_id,
+};
 use walgit_wal::collab::{Entry, EntryRef, sign_entry};
 
 // ---- schema limits (docs/D1_CI_PROTOCOL.md §3.1, normative bounds) -------------
@@ -91,6 +94,15 @@ pub enum CiAction {
         /// State file (default `<gitdir>/ci-run.json`, §4).
         #[arg(long)]
         state: Option<PathBuf>,
+    },
+    /// Every run in the checkout's collab log, aggregated (§8.3).
+    Status {
+        /// Repository checkout whose collab refs are read.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// text | markdown | json
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -165,6 +177,29 @@ pub fn run(action: CiAction) -> Result<()> {
                 let _ = runner.run_pass(claim_ttl)?;
                 std::thread::sleep(Duration::from_secs(interval.max(1)));
             }
+        }
+        CiAction::Status { repo, format } => {
+            let (entries, principals) = crate::collab_cmd::CollabReader::new(&repo).load()?;
+            let refs: Vec<&EntryRef> = entries.iter().collect();
+            let ci = walgit_wal::ci::ci_entries(&refs);
+            let now = chrono::Utc::now().timestamp();
+            let runs = walgit_wal::ci::collect_runs(&ci, &principals, now);
+            match format.as_str() {
+                "json" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "now": now,
+                        "runs": runs.values().collect::<Vec<_>>(),
+                    }))?
+                ),
+                "markdown" => print!(
+                    "ci status: {} run(s)\n\n{}",
+                    runs.len(),
+                    ci_runs_markdown(&runs)
+                ),
+                _ => print!("ci status: {} run(s)\n{}", runs.len(), ci_runs_text(&runs)),
+            }
+            Ok(())
         }
     }
 }
@@ -448,6 +483,93 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+// ---- read side (§8.3): one aggregation, three renderings ------------------------
+
+/// The run table shared by `walgit ci status` and the `collab report`'s CI
+/// section — they consume the same `RunView`s, never a second aggregation.
+pub(crate) fn ci_runs_text(runs: &std::collections::BTreeMap<String, RunView>) -> String {
+    let mut out = String::new();
+    for r in sorted_runs(runs) {
+        let _ = writeln!(
+            out,
+            "{:<19} {:<10} {:<24} @ {:<8} {:<8} {:<9} attempt {}{}",
+            r.id,
+            r.task,
+            r.repo_ref,
+            short_oid(&r.commit),
+            r.state.as_str(),
+            r.conclusion.as_ref().map_or("-", Conclusion::as_str),
+            r.latest_attempt,
+            r.runner
+                .as_ref()
+                .map_or(String::new(), |a| format!(" by {a}")),
+        );
+        if r.unverified > 0 {
+            let _ = writeln!(
+                out,
+                "{:<19} {} unverified/malformed entry(ies) — visible red, not counted",
+                "", r.unverified
+            );
+        }
+    }
+    out
+}
+
+pub(crate) fn ci_runs_markdown(runs: &std::collections::BTreeMap<String, RunView>) -> String {
+    let mut out = String::from(
+        "| run | task | ref | commit | state | conclusion | attempt | runner |\n\
+         |---|---|---|---|---|---|---|---|\n",
+    );
+    for r in sorted_runs(runs) {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.id,
+            r.task,
+            r.repo_ref,
+            short_oid(&r.commit),
+            r.state.as_str(),
+            r.conclusion.as_ref().map_or("-", Conclusion::as_str),
+            r.latest_attempt,
+            r.runner.as_deref().unwrap_or("-"),
+        );
+    }
+    out
+}
+
+pub(crate) fn ci_runs_html(runs: &std::collections::BTreeMap<String, RunView>) -> String {
+    let mut rows = String::new();
+    for r in sorted_runs(runs) {
+        let _ = writeln!(
+            rows,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            crate::collab_cmd::esc(&r.id),
+            crate::collab_cmd::esc(&r.task),
+            crate::collab_cmd::esc(&r.repo_ref),
+            crate::collab_cmd::esc(&short_oid(&r.commit)),
+            r.state.as_str(),
+            r.conclusion.as_ref().map_or("-", Conclusion::as_str),
+            r.latest_attempt,
+            crate::collab_cmd::esc(r.runner.as_deref().unwrap_or("-")),
+        );
+    }
+    format!(
+        "<h2>CI runs</h2><table><tr><th>run</th><th>task</th><th>ref</th><th>commit</th>\
+         <th>state</th><th>conclusion</th><th>attempt</th><th>runner</th></tr>{rows}</table>"
+    )
+}
+
+/// Newest first — the same order every surface shows.
+fn sorted_runs(runs: &std::collections::BTreeMap<String, RunView>) -> Vec<&RunView> {
+    let mut views: Vec<&RunView> = runs.values().collect();
+    views.sort_by_key(|r| std::cmp::Reverse(r.last_ts));
+    views
+}
+
+fn short_oid(commit: &str) -> String {
+    commit.chars().take(8).collect()
 }
 
 // ---- runner (`walgit ci run`, docs/D1_CI_PROTOCOL.md §4–§9) ---------------------
@@ -1399,6 +1521,40 @@ max_attempts = 2
         m.insert("refs/tags/v1".to_string(), "def".to_string());
         write_processed(&p, &m).expect("write");
         assert_eq!(read_processed(&p).expect("read"), m);
+    }
+
+    #[test]
+    fn status_renders_the_same_view_three_ways() {
+        let mut runs = std::collections::BTreeMap::new();
+        runs.insert(
+            "ci-0123456789abcdef".to_string(),
+            RunView {
+                id: "ci-0123456789abcdef".to_string(),
+                task: "test".to_string(),
+                repo_ref: "refs/heads/main".to_string(),
+                commit: "76d957cabc".to_string(),
+                attempts: Vec::new(),
+                latest_attempt: 2,
+                state: RunState::Done,
+                conclusion: Some(Conclusion::Success),
+                runner: Some("ci-1".to_string()),
+                last_ts: 100,
+                unverified: 1,
+            },
+        );
+        let t = ci_runs_text(&runs);
+        assert!(t.contains("done") && t.contains("success"), "{t}");
+        assert!(t.contains("attempt 2 by ci-1"), "{t}");
+        assert!(t.contains("unverified/malformed"), "{t}");
+        let m = ci_runs_markdown(&runs);
+        assert!(m.starts_with("| run | task | ref | commit |"), "{m}");
+        assert!(m.contains("refs/heads/main") && m.contains("ci-1"), "{m}");
+        let h = ci_runs_html(&runs);
+        assert!(h.starts_with("<h2>CI runs</h2>"), "{h}");
+        assert!(
+            h.contains("<td>done</td>") && h.contains("<td>success</td>"),
+            "{h}"
+        );
     }
 
     // ---- the executor (§8.1): where the runtime hazards live --------------------
