@@ -398,6 +398,16 @@ pub fn build_report(
     }
     let mut report = Report::default();
     for (id, group) in &by_thread {
+        // CI run threads are not work-unit cards (docs/D1_CI_PROTOCOL.md
+        // §8.3): their surfaces are `walgit ci status`, the report's CI
+        // section and the SPA thread badge — on a board they would only ever
+        // be untitled "open" cards.
+        if group
+            .iter()
+            .all(|r| r.entry.kind == crate::ci::CI_CLAIM_KIND || r.entry.kind == crate::ci::CI_RESULT_KIND)
+        {
+            continue;
+        }
         let ordered = thread(group);
         let verified = ordered.iter().filter(|r| r.is_verified(principals)).count();
         let mut kinds: Vec<String> = group.iter().map(|r| r.entry.kind.clone()).collect();
@@ -740,6 +750,16 @@ pub fn build_board(
         })
         .collect();
     for (id, group) in &by_thread {
+        // CI run threads are not work-unit cards (docs/D1_CI_PROTOCOL.md
+        // §8.3): their surfaces are `walgit ci status`, the report's CI
+        // section and the SPA thread badge — on a board they would only ever
+        // be untitled "open" cards.
+        if group
+            .iter()
+            .all(|r| r.entry.kind == crate::ci::CI_CLAIM_KIND || r.entry.kind == crate::ci::CI_RESULT_KIND)
+        {
+            continue;
+        }
         let ordered = thread(group);
         let verified = ordered.iter().filter(|r| r.is_verified(principals)).count();
         let mut kinds: Vec<String> = group.iter().map(|r| r.entry.kind.clone()).collect();
@@ -839,6 +859,44 @@ mod board_tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no column {name}"))
+    }
+
+    #[test]
+    fn board_skips_ci_run_threads() {
+        let (_sk, pk) = keypair();
+        let mut principals = HashMap::new();
+        principals.insert("ci-a".to_string(), pk);
+        let claim = entry(
+            "ci-deadbeef",
+            crate::ci::CI_CLAIM_KIND,
+            "ci-a",
+            "",
+            900,
+            serde_json::json!({"task": "build", "ttl": 300, "attempt": 1}),
+        );
+        let result = entry(
+            "ci-deadbeef",
+            crate::ci::CI_RESULT_KIND,
+            "ci-a",
+            &test_oid(&claim),
+            950,
+            serde_json::json!({"task": "build", "conclusion": "success", "claim": "x"}),
+        );
+        let issue = entry("pr1", "issue", "alice", "", 900, serde_json::json!({"title": "add thing"}));
+        let owned = refs_of(&[claim, result, issue]);
+        let refs: Vec<&EntryRef> = owned.iter().collect();
+        let board = build_board(&refs, &principals, &MergeRules::default(), &default_board());
+        assert!(
+            board
+                .columns
+                .iter()
+                .all(|c| c.cards.iter().all(|card| card.id != "ci-deadbeef")),
+            "a ci run thread must not become a board card"
+        );
+        assert!(
+            column_of(&board, "open").cards.iter().any(|c| c.id == "pr1"),
+            "work units still board"
+        );
     }
 
     #[test]

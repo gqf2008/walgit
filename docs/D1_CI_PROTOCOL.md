@@ -33,7 +33,9 @@
 
 - **runner 是一个普通 principal**（D1 §5）：一份 token（git 认证）+ 一对 Ed25519 密钥
   + 一个 principal（惯例前缀 `ci-` 或 `svc-`，如 `ci-runner-1`；语法与校验同 D1）。
-  首次使用自注册进 `refs/collab/meta/principals/<principal>`。
+  首次使用自注册进 `refs/collab/meta/principals/<principal>`——**只建不改**：receive-pack
+  拒绝对非 commit ref 的非 force 更新，所以 `walgit ci run` 仅在该 ref 不存在时创建；
+  轮换密钥是显式的 `walgit collab principal-register`，不是 runner 的副作用。
 - 写路径与人类/agent 完全同构：签名条目 → 自己的收件箱 ref → receive-pack。仓库若用
   `policy.json` 保护 `refs/collab/*`（D1 §6），CI 条目同样受其约束——CI 没有特权路径。
 - 同一仓库可以并存任意多个 runner；同一 principal 也可以有多个 runner 进程（认领以
@@ -304,9 +306,11 @@ done    : effective 存在                               → Settled(conclusion)
 
 ### 8.3 展示（读侧）
 
-- `walgit-wal::ci` 输出 `RunView` / `CiReport`（§7）；`walgit ci status`（text/markdown/json）
-  与 `walgit collab report` 的 CI 段、SPA 线程时间线的红绿徽标 + 日志摘要，全部消费
-  同一聚合——三端同源，无第二套语义。
+- `walgit-wal::ci` 输出 `run_view` / `collect_runs`（§7，全仓库运行视图）；`walgit ci status`
+  （text/markdown/json）与 `walgit collab report` 的 CI 段、SPA 线程时间线的红绿徽标 +
+  日志摘要，全部消费同一聚合——三端同源，无第二套语义。
+- **与看板的边界**（D1 ⑥）：纯 CI 线程（只含 `ci_claim`/`ci_result`）不投影成看板卡片
+  ——`build_board` 跳过它们；CI 的展示面就是上面三个，不是工作单元看板。
 - 验签失败 / malformed 条目永远可见（计数为红），不被静默吞掉。
 
 ## 9. 秘密边界（normative，可机器检验）
