@@ -5822,6 +5822,7 @@ dependencies = [
  "gix-hash",
  "hex",
  "humantime",
+ "libc",
  "mimalloc",
  "parking_lot",
  "rand 0.9.5",

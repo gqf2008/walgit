@@ -266,7 +266,10 @@ done    : effective 存在                               → Settled(conclusion)
   `WALGIT_CI_*`。
 - **注入的任务变量**（保留名，V8 禁止 ci.toml 声明）：`WALGIT_CI_TASK`、`WALGIT_CI_REF`、
   `WALGIT_CI_COMMIT`、`WALGIT_CI_RUN_ID`、`WALGIT_CI_ATTEMPT`、`WALGIT_CI_ACTOR`。
-- **超时**：到 `timeout` 杀进程（含子进程尽力而为），`conclusion = "timeout"`。
+- **超时**：任务命令 spawn 即置于**独立进程组**（Unix `process_group(0)`/`setpgid`；
+  Windows 新控制台进程组），到 `timeout` 杀**整棵树**——Unix `killpg(SIGKILL)`，
+  Windows `taskkill /T /F`，直接子进程兜底（`sh -c` 不总是 exec 单命令，fork 出的
+  孙进程不杀会一直握着捕获管道），`conclusion = "timeout"`。
 - **结论映射**：exit 0 → `success`；exit ≠ 0 → `failure`；超时 → `timeout`；runner 自身
   故障（fetch 失败、无法 spawn、工作区无法创建）→ `error`（不产出任务结论）。
 

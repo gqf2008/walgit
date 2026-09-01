@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use walgit_wal::ci::{CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id};
@@ -1118,8 +1118,9 @@ impl Runner {
 
     /// Spawn the command (§8.1): `sh -c` (POSIX) / `cmd /C` (Windows), cwd =
     /// worktree, cleared environment with the platform basics + `env_allow` +
-    /// `WALGIT_CI_*`, capped capture of the merged output, hard timeout. Never
-    /// returns `Err`: spawn failures are `Conclusion::Error`.
+    /// `WALGIT_CI_*`, capped capture of the merged output, hard timeout — the
+    /// child runs in its own process group, so the timeout kills its whole
+    /// tree. Never returns `Err`: spawn failures are `Conclusion::Error`.
     fn run_command(
         &self,
         dir: &Path,
@@ -1165,6 +1166,7 @@ impl Runner {
             .env("WALGIT_CI_RUN_ID", id)
             .env("WALGIT_CI_ATTEMPT", attempt.to_string())
             .env("WALGIT_CI_ACTOR", &self.actor);
+        spawn_in_own_group(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return fail(format!("spawn `{}`: {e}", task.command)),
@@ -1178,7 +1180,7 @@ impl Runner {
         let mut status = child.try_wait().ok().flatten();
         while status.is_none() {
             if Instant::now() >= deadline {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 for r in readers {
                     let _ = r.join();
@@ -1214,6 +1216,62 @@ impl Runner {
 /// Milliseconds elapsed since `started`, saturating (§8.2 `duration_ms`).
 fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Put the child in its own process group (§8.1): Unix `setpgid` via
+/// `process_group(0)`, Windows a fresh console process group. `sh -c` does
+/// not always exec its single command (it forks on some shells), so a timeout
+/// that killed only the direct child would leave a grandchild holding the
+/// capture pipes open — and the drain threads' joins unbounded.
+fn spawn_in_own_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+/// Kill a timed-out command's whole tree (§8.1): one group signal (Unix) or a
+/// tree walk (`taskkill /T`, Windows) so every forked descendant dies with the
+/// child and the capture pipes reach EOF. Falls back to the direct child.
+#[cfg(unix)]
+#[allow(unsafe_code)] // killpg — the same platform-seam exception as walgit-wal/src/platform.rs
+fn kill_tree(child: &mut Child) {
+    // `spawn_in_own_group` made the child its own group leader: pgid == pid.
+    let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
+        let _ = child.kill();
+        return;
+    };
+    // SAFETY: a plain signal dispatch — SIGKILL to the child's own process
+    // group, no state read or written.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+        let _ = child.kill();
+    }
+}
+
+/// Windows twin of the Unix `kill_tree`: `taskkill /T /F` walks the process
+/// tree by snapshot (CREATE_NEW_PROCESS_GROUP alone would not reach
+/// grandchildren of `cmd /C`); the direct child is the fallback.
+#[cfg(windows)]
+fn kill_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let killed = Command::new("taskkill")
+        .arg("/PID")
+        .arg(&pid)
+        .args(["/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !killed {
+        let _ = child.kill();
+    }
 }
 
 /// The captured tail out of the shared buffer (poison-tolerant: a panicking
@@ -1697,10 +1755,15 @@ max_attempts = 2
 
         #[test]
         fn timeout_kills_the_command() {
+            // `sh -c` execs its single command on some shells and forks on
+            // others; the background job + `wait` forces the forked shape on
+            // every platform, so this guards the process-group kill (the
+            // grandchild would otherwise hold the capture pipes open past the
+            // kill — the ubuntu failure this regression came from).
             let f = fixture_repo();
             let r = runner(&f.repo);
             let out = r.execute(
-                &task("sleep 30", 1, &[]),
+                &task("sleep 30 & wait", 1, &[]),
                 "refs/heads/main",
                 &f.commit,
                 "ci-x",
