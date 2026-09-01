@@ -22,10 +22,10 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{Json, Path, Query, State},
     http::{HeaderMap, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -205,6 +205,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
+            .route(&format!("{base}/collab/entries"), post(collab_entries))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
@@ -1072,6 +1073,160 @@ async fn archive(
         },
     )
     .await
+}
+
+// ---- D1 collab thin-API write path (browser writes; D1 §11) -------------------
+
+#[derive(serde::Deserialize)]
+struct CollabPost {
+    entry: serde_json::Value,
+}
+
+fn ref_segment_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s != "."
+        && s != ".."
+        && !s.to_ascii_lowercase().ends_with(".lock")
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+}
+
+async fn git_hash_object(local: &walgit_git::LocalRepo, content: &[u8]) -> Result<String, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("hash-object stdin".into()))?
+        .write_all(content)
+        .await
+        .map_err(internal)?;
+    let out = child.wait_with_output().await.map_err(internal)?;
+    if !out.status.success() {
+        return Err(internal(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn git_pack_object(local: &walgit_git::LocalRepo, oid: &str) -> Result<Vec<u8>, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["pack-objects", "--stdout", "-q"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("pack-objects stdin".into()))?
+        .write_all(format!("{oid}\n").as_bytes())
+        .await
+        .map_err(internal)?;
+    let out = child.wait_with_output().await.map_err(internal)?;
+    if !out.status.success() {
+        return Err(internal(format!(
+            "git pack-objects failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Accept a signed collab entry, materialize it as a one-object bucket pack and
+/// publish `refs/collab/inbox/<actor>/<uuid>` through the WAL — the
+/// receive-pack-equivalent that lets a browser write (D1 §11 thin API).
+/// Verification is client-side (signatures over the canonical form); the
+/// server enforces identity (actor == the authenticated principal) and that
+/// the ref lands in the actor's own inbox.
+async fn collab_entries(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Json(body): Json<CollabPost>,
+) -> Result<Response, ApiError> {
+    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let handle = open(&st, &headers, &owner, &repo_name).await?;
+    let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
+    let entry = body.entry;
+    let actor = entry
+        .get("actor")
+        .and_then(|a| a.as_str())
+        .ok_or_else(|| ApiError::BadRequest("entry.actor is required".into()))?;
+    // Auth `none` (loopback dev) has no distinct identity; otherwise the entry
+    // must be posted by its own principal (no posting as someone else).
+    if !principal.anonymous && actor != principal.name {
+        return Err(ApiError::Forbidden);
+    }
+    if !ref_segment_ok(actor) {
+        return Err(ApiError::BadRequest(format!(
+            "actor {actor:?} is not a refname-safe segment"
+        )));
+    }
+    let content = serde_json::to_vec(&entry).map_err(internal)?;
+    let oid = git_hash_object(&r.local, &content).await?;
+    let pack_bytes = git_pack_object(&r.local, &oid).await?;
+    let tmp = std::env::temp_dir().join(format!("walgit-collab-{}.pack", uuid::Uuid::new_v4()));
+    tokio::fs::write(&tmp, &pack_bytes).await.map_err(internal)?;
+    let f = tokio::fs::File::open(&tmp).await.map_err(internal)?;
+    let pack = r
+        .local
+        .ingest_pack(
+            f,
+            walgit_git::IngestOptions {
+                fsck: false,
+                max_bytes: None,
+                thin: false,
+            },
+        )
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::Internal("ingest produced no pack".into()))?;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
+    let txn = walgit_proto::v1::RefTransaction {
+        updates: vec![walgit_proto::v1::RefUpdate {
+            name: ref_name.clone(),
+            old_oid: String::new(),
+            new_oid: oid.clone(),
+            new_symbolic_target: String::new(),
+            new_peeled: String::new(),
+        }],
+        push_options: Vec::new(),
+        atomic: true,
+    };
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("principal".to_string(), principal.name.clone());
+    meta.insert("agent".to_string(), "walgit-web".into());
+    let result = handle
+        .publish_push_synced(Some(pack), txn, meta)
+        .await
+        .map_err(crate::smart::wal_err)?;
+    for (_, res) in &result.per_ref {
+        if let Err(e) = res {
+            return Err(internal(format!("publish ref: {e}")));
+        }
+    }
+    Ok(json_swr(
+        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": result.seq }),
+        None,
+    )
+    .into_response(&headers))
 }
 
 // ---- resolve -----------------------------------------------------------------

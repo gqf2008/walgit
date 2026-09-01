@@ -898,3 +898,90 @@ async fn remote_merge_base_deep_fork() -> TestResult {
     );
     Ok(())
 }
+
+/// D1 thin-API write path: POST a signed collab entry -> the ref lands in
+/// refs/collab/inbox/<actor>/; posting as someone else is forbidden; no
+/// credential is 401. (Signature verification is client-side; the server
+/// enforces identity and inbox ownership.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_thin_api_posts_signed_entries() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "alice".into(),
+            token: "alice-token".into(),
+            token_env: None,
+            write: true,
+            admin: false,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("{}/o/r", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
+    let url = format!("{}/o/r/api/collab/entries", server.base_url);
+
+    let entry = serde_json::json!({
+        "version": 1, "kind": "issue", "id": "t1", "actor": "alice",
+        "ts": 1786500000, "parent": "", "body": {"title": "hi"},
+        "sig": "ed25519:AAAA"
+    });
+    let resp = client
+        .post(&url)
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "entry": entry }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "post signed entry");
+    let body: serde_json::Value = resp.json().await?;
+    let ref_name = body["ref"].as_str().expect("ref").to_string();
+    assert!(ref_name.starts_with("refs/collab/inbox/alice/"), "{ref_name}");
+    assert_eq!(body["oid"].as_str().unwrap().len(), 40);
+
+    // Visible in the collab namespace listing (authenticated read).
+    let (st, text, _) = get_h(
+        &server,
+        "/o/r/api/refs/collab",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    let r: serde_json::Value = serde_json::from_str(&text)?;
+    let names: Vec<String> = r["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&ref_name), "ref in refs/collab: {names:?}");
+
+    // Posting as someone else -> 403.
+    let bad = serde_json::json!({
+        "entry": serde_json::json!({
+            "version": 1, "kind": "comment", "id": "t1", "actor": "bob",
+            "ts": 1, "parent": "", "body": {}, "sig": ""
+        })
+    });
+    let resp = client
+        .post(&url)
+        .bearer_auth("alice-token")
+        .json(&bad)
+        .send()
+        .await?;
+    let bad_status = resp.status();
+    assert_eq!(bad_status, 403, "actor != principal refused");
+
+    // No credential -> 401.
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "entry": entry }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 403, "unauthenticated refused (token mode, no credential)");
+    Ok(())
+}
