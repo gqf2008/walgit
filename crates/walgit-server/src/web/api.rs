@@ -1098,6 +1098,9 @@ struct CollabPrincipalPost {
 fn ref_segment_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
+        && !s.contains("..") // git forbids `..` inside a component; the WAL
+        // publish path does not re-check refnames, so an invalid one would only
+        // explode when a replica materializes packed-refs.
         && s != "."
         && s != ".."
         && !s.to_ascii_lowercase().ends_with(".lock")
@@ -1193,7 +1196,7 @@ async fn collab_entries(
     }
     let content = serde_json::to_vec(&entry).map_err(internal)?;
     let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
-    let (oid, seq) = publish_collab_ref(handle, &r, &principal.name, &ref_name, content).await?;
+    let (oid, seq) = publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
     Ok(json_swr(
         &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
         None,
@@ -1201,10 +1204,87 @@ async fn collab_entries(
     .into_response(&headers))
 }
 
+/// Upper bound on the collab namespace one aggregation request may read: the
+/// inbox is append-only (D1 §11 open question 4) and the report/thread views
+/// load it whole — past this size the answer is a 503 pointing at the CLI,
+/// not an unbounded fan-out of faults and objects.
+const COLLAB_MAX_ENTRIES: usize = 20_000;
+
+/// One `git cat-file --batch` for many oids: a process per entry made the
+/// aggregation O(refs) subprocesses per request. Requests go out in small
+/// chunks so neither pipe can fill while the other side waits; a missing or
+/// unreadable oid is simply absent from the map (the aggregation skips
+/// unparsable entries anyway).
+async fn git_cat_file_batch(
+    local: &walgit_git::LocalRepo,
+    oids: &[String],
+) -> Result<HashMap<String, Vec<u8>>, ApiError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    const CHUNK: usize = 512;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(internal)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("cat-file stdin".into()))?;
+    let mut stdout = tokio::io::BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| ApiError::Internal("cat-file stdout".into()))?,
+    );
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    for chunk in oids.chunks(CHUNK) {
+        let mut req = String::with_capacity(chunk.len() * 41);
+        for oid in chunk {
+            req.push_str(oid);
+            req.push('\n');
+        }
+        stdin.write_all(req.as_bytes()).await.map_err(internal)?;
+        stdin.flush().await.map_err(internal)?;
+        for oid in chunk {
+            let mut header = String::new();
+            let n = stdout.read_line(&mut header).await.map_err(internal)?;
+            if n == 0 {
+                return Err(ApiError::Internal("cat-file --batch closed early".into()));
+            }
+            let header = header.trim_end();
+            let mut it = header.split(' ');
+            let (got, kind, size) = (
+                it.next().unwrap_or(""),
+                it.next().unwrap_or(""),
+                it.next().unwrap_or(""),
+            );
+            if kind == "missing" || got != *oid {
+                continue;
+            }
+            let size: usize = size
+                .parse()
+                .map_err(|_| ApiError::Internal(format!("cat-file header {header:?}")))?;
+            let mut body = vec![0u8; size];
+            stdout.read_exact(&mut body).await.map_err(internal)?;
+            let mut nl = [0u8; 1];
+            stdout.read_exact(&mut nl).await.map_err(internal)?;
+            out.insert(oid.clone(), body);
+        }
+    }
+    drop(stdin);
+    let _ = child.wait().await;
+    Ok(out)
+}
+
 /// Materialize a JSON blob as a one-object bucket pack and publish one ref
 /// through the WAL (D1 §11 thin API). Shared by inbox entries and principal
 /// registration; returns `(oid, seq)`.
 async fn publish_collab_ref(
+    st: &Arc<AppState>,
     handle: Arc<RepoHandle>,
     r: &Repo,
     principal_name: &str,
@@ -1221,7 +1301,7 @@ async fn publish_collab_ref(
         .ingest_pack(
             f,
             walgit_git::IngestOptions {
-                fsck: false,
+                fsck: st.cfg.wal.fsck_objects,
                 max_bytes: None,
                 thin: false,
             },
@@ -1230,10 +1310,19 @@ async fn publish_collab_ref(
         .map_err(internal)?
         .ok_or_else(|| ApiError::Internal("ingest produced no pack".into()))?;
     let _ = tokio::fs::remove_file(&tmp).await;
+    // Honor the repo's own value as `old`: registration of an existing
+    // principal is an update (CAS), a fresh inbox ref a create — exactly what
+    // receive-pack would have parsed from the client's command line.
+    let old_oid = r
+        .index
+        .by_name
+        .get(ref_name)
+        .map(|(sha, _)| sha.clone())
+        .unwrap_or_default();
     let txn = walgit_proto::v1::RefTransaction {
         updates: vec![walgit_proto::v1::RefUpdate {
             name: ref_name.to_string(),
-            old_oid: String::new(),
+            old_oid,
             new_oid: oid.clone(),
             new_symbolic_target: String::new(),
             new_peeled: String::new(),
@@ -1241,11 +1330,36 @@ async fn publish_collab_ref(
         push_options: Vec::new(),
         atomic: true,
     };
+    // The same authorization gate as receive-pack (D16): load policy, classify
+    // non-fast-forward moves when anything is protected, evaluate the
+    // transaction. `refs/collab/*` protection configured by an admin binds the
+    // browser path too — one ref, one guard level, no second write semantics.
+    let policy = crate::policy::load(&st.store, handle.id())
+        .await
+        .map_err(|e| internal(format!("load policy: {e}")))?;
+    let mut forces = std::collections::HashSet::<String>::new();
+    if policy.has_protect() {
+        for u in &txn.updates {
+            if crate::policy::classify(&u.old_oid, &u.new_oid) == crate::policy::RefOp::Update
+                && !matches!(
+                    r.local.is_ancestor(&u.old_oid, &u.new_oid).await,
+                    Ok(true)
+                )
+            {
+                forces.insert(u.name.clone());
+            }
+        }
+    }
+    let ev = crate::policy::evaluate(&policy, principal_name, &txn, |u| forces.contains(&u.name));
+    if let Some((_, Err(reason))) = ev.per_ref.iter().find(|(name, _)| name == ref_name) {
+        tracing::warn!(repo = %handle.id(), ref = ref_name, %reason, "collab thin API: policy denied");
+        return Err(ApiError::Forbidden);
+    }
     let mut meta = std::collections::HashMap::new();
     meta.insert("principal".to_string(), principal_name.to_string());
     meta.insert("agent".to_string(), "walgit-web".into());
     let result = handle
-        .publish_push_synced(Some(pack), txn, meta)
+        .publish_push_synced(Some(pack), ev.publish, meta)
         .await
         .map_err(crate::smart::wal_err)?;
     for (_, res) in &result.per_ref {
@@ -1287,7 +1401,7 @@ async fn collab_principal(
     }))
     .map_err(internal)?;
     let ref_name = format!("refs/collab/meta/principals/{}", body.principal);
-    let (oid, seq) = publish_collab_ref(handle, &r, &principal.name, &ref_name, content).await?;
+    let (oid, seq) = publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
     Ok(json_swr(
         &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
         None,
@@ -1323,6 +1437,11 @@ async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
             rules_oid = Some(oid.clone());
         }
     }
+    if plan.len() > COLLAB_MAX_ENTRIES {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "collab namespace has more than {COLLAB_MAX_ENTRIES} refs; aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
+        )));
+    }
     if let Some(remote) = r.remote() {
         let mut oids: Vec<gix_hash::ObjectId> = plan
             .iter()
@@ -1335,20 +1454,32 @@ async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
             oids.push(oid);
         }
         remote.fault_many(&oids).await?;
+        // The batched cat-file below must see the faulted loose objects.
+        r.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
+    let mut want: Vec<String> = plan.iter().map(|(_, _, oid)| oid.clone()).collect();
+    if let Some(oid) = &rules_oid {
+        want.push(oid.clone());
+    }
+    let blobs = git_cat_file_batch(&r.local, &want).await?;
     let mut entries = Vec::new();
     for (kind, rest, oid) in plan {
-        let bytes = git(&r.local, vec!["cat-file".into(), "blob".into(), oid.clone()]).await?;
+        let Some(bytes) = blobs.get(&oid) else {
+            continue; // pruned between index and read: skip like an unparsable entry
+        };
         match kind {
             "principal" => {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes)
                     && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
                 {
                     principals.insert(rest, k.to_string());
                 }
             }
             _ => {
-                if let Ok(entry) = serde_json::from_slice::<Entry>(&bytes) {
+                if let Ok(entry) = serde_json::from_slice::<Entry>(bytes) {
                     let principal = rest
                         .rsplit_once('/')
                         .map(|(p, _)| p.to_string())
@@ -1362,9 +1493,10 @@ async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
             }
         }
     }
-    if let Some(oid) = rules_oid {
-        let bytes = git(&r.local, vec!["cat-file".into(), "blob".into(), oid]).await?;
-        rules = serde_json::from_slice(&bytes)
+    if let Some(oid) = rules_oid
+        && let Some(bytes) = blobs.get(&oid)
+    {
+        rules = serde_json::from_slice(bytes)
             .map_err(|e| internal(format!("refs/collab/meta/rules: {e}")))?;
     }
     Ok(CollabState {

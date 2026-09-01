@@ -236,6 +236,11 @@
 - **读一致性**：以单次 manifest CAS 为同步点读取全部 collab refs。
 - **防滥用**：条目大小上限、频率配额（policy/代理层）、公钥吊销（删
   `refs/collab/meta/principals/<principal>` tombstone，SDK `collab.revokePrincipal`）。
+  薄 API（浏览器路径）与 receive-pack 同经 `policy.json` 评估——冻结/保护
+  `refs/collab/*` 对两条写路径同样生效。浏览器签名的 Ed25519 私钥存于
+  localStorage（可导出 JWK，持久化所迫）：同源 XSS 可整枚盗用签名身份，
+  服务端只能靠人工 tombstone 吊销——原型期接受，升级路径是不可导出密钥 +
+  服务端登记确认。
 - **隐私**：collab refs 与仓库同权限域——匿名/私有仓库的协作数据随之同权限（walgit 认证已覆盖）；
   独立的可见性控制（如 issue 对组织外可见）留作后续，本设计不引入。
 
@@ -260,6 +265,10 @@
    **交互式 Web UI（issue #26）**：`/{o}/{r}/collab` 页（线程列表 + 总量健康 +
    PR 合并评估 + by-actor/by-kind）与 `/{o}/{r}/collab/thread/{id}` 页（条目时间线、
    验签徽标、PR/评审面板、浏览器写框）已实现——薄 API 直写 + 浏览器 Ed25519 密钥。
+   写路径治理与 receive-pack 对齐：`policy.json` 同一评估链（load→分类 force→evaluate，
+   拒绝 = 403，理由记日志）、`wal.fsck_objects` 同源、principal 更新为真实 old 值 CAS；
+   聚合读单请求预算 20k refs，超限 503 指向 CLI 离线聚合（条目对象一次
+   `cat-file --batch` 读完，无逐条目子进程）。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
 5. 原型顺序建议：

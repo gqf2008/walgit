@@ -1194,3 +1194,85 @@ async fn collab_principal_registration_and_verified_entries() -> TestResult {
     assert_eq!(thread["entries"][0]["verified"], true);
     Ok(())
 }
+
+/// The thin API must honor `policy.json` exactly like receive-pack: a frozen
+/// collab namespace blocks the browser path too (one ref, one guard level —
+/// review finding MJ3 on PR #27). The refusal reason is logged; the answer is
+/// the lane's `403`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_thin_api_honors_repo_policy() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "alice".into(),
+                token: "alice-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "root".into(),
+                token: "root-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("{}/o/r", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
+
+    // Admin freezes the whole collab namespace (no bypass list).
+    let policy = r#"{
+      "version": 1,
+      "rules": [
+        { "name": "freeze-collab",
+          "match": { "refs": ["refs/collab/**"] },
+          "effect": { "protect": { "restricts": ["create", "update", "delete"] } } }
+      ]
+    }"#;
+    let resp = client
+        .put(format!("{}/o/r/policy", server.base_url))
+        .header("content-type", "application/json")
+        .bearer_auth("root-token")
+        .body(policy)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap_or_default());
+
+    let entry = serde_json::json!({
+        "version": 1, "kind": "issue", "id": "t9", "actor": "alice",
+        "ts": 1, "parent": "", "body": {}, "sig": ""
+    });
+    let resp = client
+        .post(format!("{}/o/r/api/collab/entries", server.base_url))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "entry": entry }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 403, "policy denies the collab create on the thin path");
+
+    // Lift the freeze: the same write now lands.
+    let del = client
+        .delete(format!("{}/o/r/policy", server.base_url))
+        .bearer_auth("root-token")
+        .send()
+        .await?;
+    assert_eq!(del.status(), 204);
+    let resp = client
+        .post(format!("{}/o/r/api/collab/entries", server.base_url))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "entry": entry }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "unfrozen collab writes again");
+    Ok(())
+}

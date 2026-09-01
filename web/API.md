@@ -598,7 +598,10 @@ Materializes the entry as a one-object bucket pack and publishes
 `refs/collab/inbox/<actor>/<uuid>` through the WAL — the browser write path
 (no git). `200` → `{ "ref", "oid", "seq" }`. The server does **not** verify
 the signature (client-side); it enforces `actor == authenticated principal`
-(`403` otherwise) and that the actor is a refname-safe segment. No credential
+(`403` otherwise) and that the actor is a refname-safe segment. The
+repository's `policy.json` gates this write **exactly as it gates
+receive-pack** — a rule protecting or freezing `refs/collab/*` denies the
+browser path too (`403`, the reason is logged server-side). No credential
 → `401`/`403` per lane. Signature verification happens in the aggregation.
 
 #### `POST /{owner}/{repo}/api/collab/principal`
@@ -608,9 +611,11 @@ the signature (client-side); it enforces `actor == authenticated principal`
 ```
 
 First-use self-registration: publishes the public key at
-`refs/collab/meta/principals/<principal>` (D1 §5; re-registering overwrites
-with the new key, the tombstone is a git deletion). `principal ==
-authenticated principal` is enforced. `200` → `{ "ref", "oid", "seq" }`.
+`refs/collab/meta/principals/<principal>` (D1 §5; re-registering **updates**
+the ref — CAS against its current value, so a concurrent re-registration
+loses and retries; the tombstone is a git deletion). `principal ==
+authenticated principal` is enforced, as is `policy.json` (same gate as
+receive-pack). `200` → `{ "ref", "oid", "seq" }`.
 
 #### `GET /{owner}/{repo}/api/collab/report`
 
@@ -651,8 +656,11 @@ thread id.
 
 Both read endpoints answer from the synced WAL view (`Need::Objects`): entry
 blobs are read locally when packs fit, faulted through the remote reader
-otherwise. SWR caching (stale-while-revalidate=60), never immutable — collab
-state changes with every push.
+otherwise (one batched fault, one `git cat-file --batch` — never one read or
+one process per entry). The namespace is budgeted at 20 000 refs per request:
+past it the answer is a `503` pointing at the `walgit collab` CLI, which
+aggregates offline. SWR caching (stale-while-revalidate=60), never
+immutable — collab state changes with every push.
 
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
@@ -730,9 +738,9 @@ GET /o/r/api/commits?ref=<sha>&path=&skip=0     → 200 {ref,sha,commits,more}; 
 GET /o/r/api/commit/<sha>                       → 200 {commit,stats,patch}; immutable
 GET /o/r/api/commit/<sha[:8]>                   → 200; SWR + ETag "<full sha>"
 GET /o/r/api/commit/deadbeef                    → 404 text/plain
-POST /o/r/api/collab/entries                    → 200 {ref,oid,seq} | 403 (actor≠principal) | 401 (no credential)
-POST /o/r/api/collab/principal                  → 200 {ref,oid,seq} | 403 (registering another principal)
-GET /o/r/api/collab/report                      → 200 CollabReport; SWR (threads, prs, totals, by_actor, by_kind)
+POST /o/r/api/collab/entries                    → 200 {ref,oid,seq} | 403 (actor≠principal, or policy denial) | 401 (no credential)
+POST /o/r/api/collab/principal                  → 200 {ref,oid,seq} | 403 (registering another principal, or policy denial)
+GET /o/r/api/collab/report                      → 200 CollabReport; SWR | 503 (namespace past the 20k-ref budget)
 GET /o/r/api/collab/threads/t1                  → 200 {id,entries,pr?} | 404 unknown thread
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)
