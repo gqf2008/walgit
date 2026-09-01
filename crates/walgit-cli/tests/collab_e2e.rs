@@ -401,6 +401,11 @@ async fn board_projection_is_byte_identical_across_clients_and_moves_with_status
     let t2_out = run(&["collab", "thread", "t2", "--repo", repo_b])?;
     let t2: serde_json::Value = serde_json::from_str(&t2_out)?;
     let t2_tip = t2[0]["oid"].as_str().unwrap().to_string();
+    // Timestamps are whole seconds and the whole run above finishes inside one:
+    // sleep past the boundary so the move's `last_ts` is strictly newer than
+    // t1's review entry and the default (last_ts desc, id asc) sort is decided
+    // by activity, not by the id tie-break.
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // ensure distinct ts
     run(&[
         "collab", "entry", "--repo", repo_b, "--kind", "status", "--id", "t2", "--actor", "alice",
         "--parent", &t2_tip, "--body", r#"{"status":"needs-review"}"#, "--key", key_s, "--push",
