@@ -909,3 +909,29 @@ table.kv.compact td { padding: 2px 0; }
 .chain-node:first-child .chain-root { border-top: 0; margin-top: 0; }
 .chain-edge { color: var(--fg2); font-family: monospace; width: 1.6em; display: inline-block; }
 .warn { color: #7a4a00; }
+
+/* ---- D1 collaboration layer (Collab tab) ---------------------------------- */
+.collab-body {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg, #0d1117);
+  color: inherit;
+  font-family: inherit;
+  resize: vertical;
+}
+.collab-pre {
+  margin: 4px 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg2, #161b22);
+  overflow-x: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ok { color: #3fb950; }

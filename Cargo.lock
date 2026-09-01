@@ -5921,6 +5921,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "gix-actor",
  "gix-date",
@@ -6016,9 +6017,11 @@ name = "walgit-wal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "chrono",
  "dashmap",
+ "ed25519-dalek",
  "flate2",
  "futures",
  "gix-hash",

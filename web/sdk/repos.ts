@@ -107,6 +107,77 @@ export interface CollabPush {
   content: string | null;
   commands: string[];
 }
+
+/** D1 aggregation read answers (server: `GET /{o}/{r}/api/collab/report` and
+    `/threads/{id}`; mirrors `walgit-wal::collab`) — the browser shows exactly
+    what the `walgit collab` CLI computes locally. */
+export interface CollabEntryRef {
+  oid: string;
+  principal: string;
+  verified: boolean;
+  entry: {
+    version: number;
+    kind: string;
+    id: string;
+    actor: string;
+    ts: number;
+    parent: string;
+    refs?: { base?: string; head?: string };
+    body: Record<string, unknown>;
+    sig: string;
+  };
+}
+export interface CollabReportThread {
+  id: string;
+  entries: number;
+  verified: number;
+  last_ts: number;
+  kinds: string[];
+}
+export interface CollabReview {
+  actor: string;
+  decision: string;
+  ts: number;
+  oid: string;
+}
+export interface CollabPr {
+  id: string;
+  base: string | null;
+  head: string | null;
+  status: string;
+  reviews: CollabReview[];
+  human_approvals: CollabReview[];
+  unverified: string[];
+}
+export interface CollabMergeEval {
+  allowed: boolean;
+  reason: string;
+  satisfied_by: string[];
+}
+export interface CollabReportPr {
+  id: string;
+  base: string | null;
+  head: string | null;
+  status: string;
+  approvals: number;
+  merge_allowed: boolean;
+  merge_reason: string;
+}
+export interface CollabReport {
+  threads: CollabReportThread[];
+  prs: CollabReportPr[];
+  total_entries: number;
+  verified_entries: number;
+  unverified_entries: number;
+  missing_principals: number;
+  by_actor: [string, number][];
+  by_kind: [string, number][];
+}
+export interface CollabThread {
+  id: string;
+  entries: CollabEntryRef[];
+  pr: { pr: CollabPr; merge: CollabMergeEval } | null;
+}
 export interface Resolved {
   ref: string;
   sha: string;
@@ -362,7 +433,7 @@ function canonicalize(value: unknown): string {
 /** Refname-safe segment for collab refs (D1 §5): no `:`, `/`, `..`, `.lock`. */
 const REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/;
 function refSegment(label: string, s: string): void {
-  if (!REF_SEGMENT.test(s) || s === "." || s === ".." || s.endsWith(".lock")) {
+  if (!REF_SEGMENT.test(s) || s === "." || s === ".." || s.includes("..") || s.endsWith(".lock")) {
     throw new ReposError(400, `collab.${label}: ${JSON.stringify(s)} is not a refname-safe segment ([A-Za-z0-9._@-]+)`);
   }
 }
@@ -374,6 +445,35 @@ function entrySegment(): string {
     return crypto.randomUUID();
   }
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Build a signed collab entry object (the bytes the server stores, ready
+    for `collab.post`): canonical form signed with `sign(canonical)` returning
+    the raw Ed25519 signature as base64. Shared by `collab.entry` (which packs
+    it into a receive-pack push) and `collab.buildEntry` (browser thin API). */
+async function signedEntry(input: {
+  principal: string;
+  kind: string;
+  id: string;
+  actor: string;
+  parent: string;
+  refs?: { base?: string; head?: string };
+  body: Record<string, unknown>;
+  sign: (canonical: string) => Promise<string>;
+}): Promise<Record<string, unknown>> {
+  refSegment("entry.principal", input.principal);
+  const entry: Record<string, unknown> = {
+    version: 1,
+    kind: input.kind,
+    id: input.id,
+    actor: input.actor,
+    ts: Math.floor(Date.now() / 1000),
+    parent: input.parent,
+  };
+  if (input.refs) entry.refs = input.refs;
+  entry.body = input.body;
+  const sig = `ed25519:${await input.sign(canonicalize(entry))}`;
+  return { ...entry, sig };
 }
 
 function pushFor(ref: string, content: string | null): CollabPush {
@@ -775,23 +875,59 @@ export class RepoClient {
       body: Record<string, unknown>;
       sign: (canonical: string) => Promise<string>;
     }): Promise<CollabPush> => {
-      refSegment("entry.principal", input.principal);
-      const entry: Record<string, unknown> = {
-        version: 1,
-        kind: input.kind,
-        id: input.id,
-        actor: input.actor,
-        ts: Math.floor(Date.now() / 1000),
-        parent: input.parent,
-      };
-      if (input.refs) entry.refs = input.refs;
-      entry.body = input.body;
-      const canonical = canonicalize(entry);
-      const sig = `ed25519:${await input.sign(canonical)}`;
-      const content = JSON.stringify({ ...entry, sig }, null, 2);
+      const entry = await signedEntry(input);
       // Per-entry ref: a thread with many entries by one principal must not
       // overwrite a single inbox ref (D1 §4.1).
-      return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, content);
+      return pushFor(`refs/collab/inbox/${input.principal}/${entrySegment()}`, JSON.stringify(entry, null, 2));
+    },
+    /**
+     * Build a signed entry object ready for `collab.post` (the browser thin
+     * API). Same signing contract as `entry()`.
+     */
+    buildEntry: (input: {
+      principal: string;
+      kind: "issue" | "comment" | "patch" | "review" | "status" | "merge_result" | "agent_action";
+      id: string;
+      actor: string;
+      parent: string;
+      refs?: { base?: string; head?: string };
+      body: Record<string, unknown>;
+      sign: (canonical: string) => Promise<string>;
+    }): Promise<Record<string, unknown>> => signedEntry(input),
+    /**
+     * Post a signed entry through the thin-API write path
+     * (`POST /{o}/{r}/api/collab/entries`, D1 §11): the server materializes
+     * the entry as a bucket pack and publishes the inbox ref — the browser
+     * write path (no git needed). The actor must be the authenticated
+     * principal.
+     */
+    post: async (entry: Record<string, unknown>, opts?: CallOptions): Promise<{ ref: string; oid: string; seq: number }> => {
+      return this.client.json<{ ref: string; oid: string; seq: number }>(`${this.p}/collab/entries`, opts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry }),
+      });
+    },
+
+    /** The full observability report (D1 §8): thread summaries, PR status +
+        merge rule evaluation, verification health. */
+    report: (opts?: CallOptions) => this.client.json<CollabReport>(`${this.p}/collab/report`, opts),
+    /** One thread: parent-ordered entries with per-entry verification, plus
+        the PR view + merge evaluation when the thread has a patch. */
+    thread: (id: string, opts?: CallOptions) => this.client.json<CollabThread>(`${this.p}/collab/threads/${enc(id)}`, opts),
+    /**
+     * First-use self-registration of the authenticated principal's Ed25519
+     * public key through the thin API (`POST /{o}/{r}/api/collab/principal`):
+     * the token binds the principal, this ref binds the key. The browser
+     * write path (no git needed).
+     */
+    registerPrincipal: async (input: { principal: string; publicKey: string }, opts?: CallOptions): Promise<{ ref: string; oid: string; seq: number }> => {
+      refSegment("registerPrincipal", input.principal);
+      return this.client.json<{ ref: string; oid: string; seq: number }>(`${this.p}/collab/principal`, opts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ principal: input.principal, public_key: input.publicKey }),
+      });
     },
     /** First-use registration of a principal's Ed25519 public key at
         `refs/collab/meta/principals/<principal>` (D1 §5: the token binds the

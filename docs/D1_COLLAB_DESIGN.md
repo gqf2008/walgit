@@ -212,6 +212,23 @@
 > 缺口 3（token↔公钥）落地为**首次使用自注册**：用 `collab.principal()` 把公钥
 > push 到 `refs/collab/meta/principals/<principal>`，吊销 = 删该 ref（tombstone）。
 > "签发时自动注册"（auth.rs 挂接）留待薄 API（见 §11）。
+>
+> 缺口 3、5 的**浏览器写路径 + Web UI** 由 [issue #26](https://github.com/gqf2008/walgit/issues/26)
+> 批次落地（薄 API + 交互式 dashboard）：
+> - **薄 API 写路径**：`POST /{o}/{r}/api/collab/entries`（浏览器直写收件箱，
+>   服务端把条目对象打进 pack 走 WAL publish，强制 `actor == principal`）与
+>   `POST /{o}/{r}/api/collab/principal`（首次使用自注册公钥到
+>   `refs/collab/meta/principals/<principal>`）——缺口 3 的"签发时自动注册"
+>   由此具备浏览器等价物（token ↔ principal ↔ 公钥在浏览器里一步绑定）。
+> - **聚合读端点**：`GET /{o}/{r}/api/collab/report`（全量观测报告，D1 §8）
+>   与 `GET /{o}/{r}/api/collab/threads/{id}`（单线程有序条目 + PR 视图 +
+>   合并规则评估）；与 CLI 共用 `walgit-wal::collab` 纯聚合核心，服务端与本地
+>   验证同一套（含收件箱归属校验）。
+> - **SDK**：`collab.post`/`collab.registerPrincipal`/`collab.report`/
+>   `collab.thread`/`collab.buildEntry`（canonical 签名后直接 POST）。
+> - **Web UI（Collab 页）**：线程列表 + 总量健康 + PR 合并评估 + 单线程时间线
+>   （条目流、验签徽标、PR/评审面板），浏览器 Ed25519 密钥（WebCrypto，私钥不出浏览器）
+>   一键注册并发布 issue/评论/评审/状态/patch 条目。
 
 ## 10. 一致性、并发与安全
 
@@ -219,15 +236,21 @@
 - **读一致性**：以单次 manifest CAS 为同步点读取全部 collab refs。
 - **防滥用**：条目大小上限、频率配额（policy/代理层）、公钥吊销（删
   `refs/collab/meta/principals/<principal>` tombstone，SDK `collab.revokePrincipal`）。
+  薄 API（浏览器路径）与 receive-pack 同经 `policy.json` 评估——冻结/保护
+  `refs/collab/*` 对两条写路径同样生效。浏览器签名的 Ed25519 私钥存于
+  localStorage（可导出 JWK，持久化所迫）：同源 XSS 可整枚盗用签名身份，
+  服务端只能靠人工 tombstone 吊销——原型期接受，升级路径是不可导出密钥 +
+  服务端登记确认。
 - **隐私**：collab refs 与仓库同权限域——匿名/私有仓库的协作数据随之同权限（walgit 认证已覆盖）；
   独立的可见性控制（如 issue 对组织外可见）留作后续，本设计不引入。
 
 ## 11. 开放问题 / 下一步
 
-1. 协作写走"裸 `git push` 收件箱"还是"薄 API 包装 push"？**已定（issue #10）**：
-   先裸 push——SDK `collab.*` 构造+签名条目并产出 `git hash-object` + `git push`
-   指令（receive-pack 投递），由 CLI/agent 执行；"薄 API"（服务端把条目对象打进
-   pack 并走 WAL publish，供浏览器直写）留待后续，是独立的服务端写路径改动。
+1. 协作写走"裸 `git push` 收件箱"还是"薄 API 包装 push"？**两者都落地了**：
+   裸 push（issue #10，CLI/agent 路径，SDK `collab.entry`/`collab.principal` 产出
+   receive-pack 指令）**和** 薄 API（issue #26，浏览器路径，`POST …/collab/entries`
+   与 `POST …/collab/principal`：服务端把条目对象打进 pack 走 WAL publish；
+   同一 WAL 发布路径，无第二套写语义）。
 2. Web UI 先行还是 CLI 先行？（建议 CLI + 最小 Web 视图先跑通协议）——**已定（issue #14）**：
    CLI 先行，`walgit collab ls|thread|pr|entry|principal-register|principal-revoke`
    已实现（读走本地 git 的 collab refs + 验签聚合；写走构造/签名 + 本地写 ref +
@@ -239,6 +262,13 @@
    新条目通过 `--exec` 回调（stdin 传条目 JSON，env 给 kind/thread/actor/verified）；
    agent 的“大脑”是外部命令，walgit 只做 notify+sync。
     ④ dashboard（issue #19）：`walgit collab report --format text|markdown|html` 已实现——只读观测渲染端（无状态、无写权限），全局聚合线程/PR/验签健康/agent 活动，html 为自包含单文件。
+   **交互式 Web UI（issue #26）**：`/{o}/{r}/collab` 页（线程列表 + 总量健康 +
+   PR 合并评估 + by-actor/by-kind）与 `/{o}/{r}/collab/thread/{id}` 页（条目时间线、
+   验签徽标、PR/评审面板、浏览器写框）已实现——薄 API 直写 + 浏览器 Ed25519 密钥。
+   写路径治理与 receive-pack 对齐：`policy.json` 同一评估链（load→分类 force→evaluate，
+   拒绝 = 403，理由记日志）、`wal.fsck_objects` 同源、principal 更新为真实 old 值 CAS；
+   聚合读单请求预算 20k refs，超限 503 指向 CLI 离线聚合（条目对象一次
+   `cat-file --batch` 读完，无逐条目子进程）。
 3. 聚合视图的只读缓存放哪（是否复用 walgit 的 render cache `cache/api/v1/*.json`）？
 4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
 5. 原型顺序建议：

@@ -17,20 +17,24 @@
 //! accepts it: notices + progress from the repo's task channel, then
 //! `result`/`error`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{Json, Path, Query, State},
     http::{HeaderMap, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures::StreamExt;
 use serde::Serialize;
 use walgit_store::{GetOptions, ObjectStore, Prefixed, PutBody, PutMode};
-use walgit_wal::{ObjectAccess, RepoHandle, Reporter};
+use walgit_wal::{
+    ObjectAccess, RepoHandle, Reporter,
+    collab::{Entry, EntryRef, MergeRules, build_report, merge_rule_eval, pr_view, thread},
+};
 
 use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
@@ -205,6 +209,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/refs/name/{{*rest}}"), get(ref_by_name))
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
+            .route(&format!("{base}/collab/entries"), post(collab_entries))
+            .route(&format!("{base}/collab/principal"), post(collab_principal))
+            .route(&format!("{base}/collab/report"), get(collab_report))
+            .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
@@ -1069,6 +1077,506 @@ async fn archive(
                 cache_control: SWR,
                 etag: Some(etag_for(&format!("{}:{format}", res.sha))),
             })
+        },
+    )
+    .await
+}
+
+// ---- D1 collab thin-API write path (browser writes; D1 §11) -------------------
+
+#[derive(serde::Deserialize)]
+struct CollabPost {
+    entry: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct CollabPrincipalPost {
+    principal: String,
+    public_key: String,
+}
+
+fn ref_segment_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && !s.contains("..") // git forbids `..` inside a component; the WAL
+        // publish path does not re-check refnames, so an invalid one would only
+        // explode when a replica materializes packed-refs.
+        && s != "."
+        && s != ".."
+        && !s.to_ascii_lowercase().ends_with(".lock")
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+}
+
+async fn git_hash_object(
+    local: &walgit_git::LocalRepo,
+    content: &[u8],
+) -> Result<String, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("hash-object stdin".into()))?
+        .write_all(content)
+        .await
+        .map_err(internal)?;
+    let out = child.wait_with_output().await.map_err(internal)?;
+    if !out.status.success() {
+        return Err(internal(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn git_pack_object(local: &walgit_git::LocalRepo, oid: &str) -> Result<Vec<u8>, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["pack-objects", "--stdout", "-q"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(internal)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("pack-objects stdin".into()))?
+        .write_all(format!("{oid}\n").as_bytes())
+        .await
+        .map_err(internal)?;
+    let out = child.wait_with_output().await.map_err(internal)?;
+    if !out.status.success() {
+        return Err(internal(format!(
+            "git pack-objects failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Accept a signed collab entry, materialize it as a one-object bucket pack and
+/// publish `refs/collab/inbox/<actor>/<uuid>` through the WAL — the
+/// receive-pack-equivalent that lets a browser write (D1 §11 thin API).
+/// Verification is client-side (signatures over the canonical form); the
+/// server enforces identity (actor == the authenticated principal) and that
+/// the ref lands in the actor's own inbox.
+async fn collab_entries(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Json(body): Json<CollabPost>,
+) -> Result<Response, ApiError> {
+    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let handle = open(&st, &headers, &owner, &repo_name).await?;
+    let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
+    let entry = body.entry;
+    let actor = entry
+        .get("actor")
+        .and_then(|a| a.as_str())
+        .ok_or_else(|| ApiError::BadRequest("entry.actor is required".into()))?;
+    // Auth `none` (loopback dev) has no distinct identity; otherwise the entry
+    // must be posted by its own principal (no posting as someone else).
+    if !principal.anonymous && actor != principal.name {
+        return Err(ApiError::Forbidden);
+    }
+    if !ref_segment_ok(actor) {
+        return Err(ApiError::BadRequest(format!(
+            "actor {actor:?} is not a refname-safe segment"
+        )));
+    }
+    let content = serde_json::to_vec(&entry).map_err(internal)?;
+    let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
+    let (oid, seq) =
+        publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
+    Ok(json_swr(
+        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
+        None,
+    )
+    .into_response(&headers))
+}
+
+/// Upper bound on the collab namespace one aggregation request may read: the
+/// inbox is append-only (D1 §11 open question 4) and the report/thread views
+/// load it whole — past this size the answer is a 503 pointing at the CLI,
+/// not an unbounded fan-out of faults and objects.
+const COLLAB_MAX_ENTRIES: usize = 20_000;
+
+/// One `git cat-file --batch` for many oids: a process per entry made the
+/// aggregation O(refs) subprocesses per request. Requests go out in small
+/// chunks so neither pipe can fill while the other side waits; a missing or
+/// unreadable oid is simply absent from the map (the aggregation skips
+/// unparsable entries anyway).
+async fn git_cat_file_batch(
+    local: &walgit_git::LocalRepo,
+    oids: &[String],
+) -> Result<HashMap<String, Vec<u8>>, ApiError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    const CHUNK: usize = 512;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(internal)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ApiError::Internal("cat-file stdin".into()))?;
+    let mut stdout = tokio::io::BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| ApiError::Internal("cat-file stdout".into()))?,
+    );
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    for chunk in oids.chunks(CHUNK) {
+        let mut req = String::with_capacity(chunk.len() * 41);
+        for oid in chunk {
+            req.push_str(oid);
+            req.push('\n');
+        }
+        stdin.write_all(req.as_bytes()).await.map_err(internal)?;
+        stdin.flush().await.map_err(internal)?;
+        for oid in chunk {
+            let mut header = String::new();
+            let n = stdout.read_line(&mut header).await.map_err(internal)?;
+            if n == 0 {
+                return Err(ApiError::Internal("cat-file --batch closed early".into()));
+            }
+            let header = header.trim_end();
+            let mut it = header.split(' ');
+            let (got, kind, size) = (
+                it.next().unwrap_or(""),
+                it.next().unwrap_or(""),
+                it.next().unwrap_or(""),
+            );
+            if kind == "missing" || got != *oid {
+                continue;
+            }
+            let size: usize = size
+                .parse()
+                .map_err(|_| ApiError::Internal(format!("cat-file header {header:?}")))?;
+            let mut body = vec![0u8; size];
+            stdout.read_exact(&mut body).await.map_err(internal)?;
+            let mut nl = [0u8; 1];
+            stdout.read_exact(&mut nl).await.map_err(internal)?;
+            out.insert(oid.clone(), body);
+        }
+    }
+    drop(stdin);
+    let _ = child.wait().await;
+    Ok(out)
+}
+
+/// Materialize a JSON blob as a one-object bucket pack and publish one ref
+/// through the WAL (D1 §11 thin API). Shared by inbox entries and principal
+/// registration; returns `(oid, seq)`.
+async fn publish_collab_ref(
+    st: &Arc<AppState>,
+    handle: Arc<RepoHandle>,
+    r: &Repo,
+    principal_name: &str,
+    ref_name: &str,
+    content: Vec<u8>,
+) -> Result<(String, u64), ApiError> {
+    let oid = git_hash_object(&r.local, &content).await?;
+    let pack_bytes = git_pack_object(&r.local, &oid).await?;
+    let tmp = std::env::temp_dir().join(format!("walgit-collab-{}.pack", uuid::Uuid::new_v4()));
+    tokio::fs::write(&tmp, &pack_bytes)
+        .await
+        .map_err(internal)?;
+    let f = tokio::fs::File::open(&tmp).await.map_err(internal)?;
+    let pack = r
+        .local
+        .ingest_pack(
+            f,
+            walgit_git::IngestOptions {
+                fsck: st.cfg.wal.fsck_objects,
+                max_bytes: None,
+                thin: false,
+            },
+        )
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::Internal("ingest produced no pack".into()))?;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    // Honor the repo's own value as `old`: registration of an existing
+    // principal is an update (CAS), a fresh inbox ref a create — exactly what
+    // receive-pack would have parsed from the client's command line.
+    let old_oid = r
+        .index
+        .by_name
+        .get(ref_name)
+        .map(|(sha, _)| sha.clone())
+        .unwrap_or_default();
+    let txn = walgit_proto::v1::RefTransaction {
+        updates: vec![walgit_proto::v1::RefUpdate {
+            name: ref_name.to_string(),
+            old_oid,
+            new_oid: oid.clone(),
+            new_symbolic_target: String::new(),
+            new_peeled: String::new(),
+        }],
+        push_options: Vec::new(),
+        atomic: true,
+    };
+    // The same authorization gate as receive-pack (D16): load policy, classify
+    // non-fast-forward moves when anything is protected, evaluate the
+    // transaction. `refs/collab/*` protection configured by an admin binds the
+    // browser path too — one ref, one guard level, no second write semantics.
+    let policy = crate::policy::load(&st.store, handle.id())
+        .await
+        .map_err(|e| internal(format!("load policy: {e}")))?;
+    let mut forces = std::collections::HashSet::<String>::new();
+    if policy.has_protect() {
+        for u in &txn.updates {
+            if crate::policy::classify(&u.old_oid, &u.new_oid) == crate::policy::RefOp::Update
+                && !matches!(r.local.is_ancestor(&u.old_oid, &u.new_oid).await, Ok(true))
+            {
+                forces.insert(u.name.clone());
+            }
+        }
+    }
+    let ev = crate::policy::evaluate(&policy, principal_name, &txn, |u| forces.contains(&u.name));
+    if let Some((_, Err(reason))) = ev.per_ref.iter().find(|(name, _)| name == ref_name) {
+        tracing::warn!(repo = %handle.id(), ref = ref_name, %reason, "collab thin API: policy denied");
+        return Err(ApiError::Forbidden);
+    }
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("principal".to_string(), principal_name.to_string());
+    meta.insert("agent".to_string(), "walgit-web".into());
+    let result = handle
+        .publish_push_synced(Some(pack), ev.publish, meta)
+        .await
+        .map_err(crate::smart::wal_err)?;
+    for (_, res) in &result.per_ref {
+        if let Err(e) = res {
+            return Err(internal(format!("publish ref: {e}")));
+        }
+    }
+    Ok((oid, result.seq))
+}
+
+/// First-use self-registration of the authenticated principal's Ed25519 public
+/// key at `refs/collab/meta/principals/<principal>` (D1 §5): the token binds
+/// the principal, this ref binds the key. Registration is one-directional
+/// (the tombstone is `revokePrincipal` via git); re-registration overwrites
+/// with the new key.
+async fn collab_principal(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Json(body): Json<CollabPrincipalPost>,
+) -> Result<Response, ApiError> {
+    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    if !principal.anonymous && body.principal != principal.name {
+        return Err(ApiError::Forbidden);
+    }
+    if !ref_segment_ok(&body.principal) {
+        return Err(ApiError::BadRequest(format!(
+            "principal {:?} is not a refname-safe segment",
+            body.principal
+        )));
+    }
+    let handle = open(&st, &headers, &owner, &repo_name).await?;
+    let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
+    let content = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "principal": body.principal,
+        "public_key": body.public_key,
+        "registered_at": chrono::Utc::now().timestamp(),
+    }))
+    .map_err(internal)?;
+    let ref_name = format!("refs/collab/meta/principals/{}", body.principal);
+    let (oid, seq) =
+        publish_collab_ref(&st, handle, &r, &principal.name, &ref_name, content).await?;
+    Ok(json_swr(
+        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
+        None,
+    )
+    .into_response(&headers))
+}
+
+// ---- D1 collab aggregation API (read path; D1 §8 dashboard + thread views) -----
+
+/// The collab state a read request needs: every inbox entry, the principals
+/// registry and the merge-rule document (`refs/collab/meta/rules`, D1 §6).
+/// Entries that do not parse are skipped — one corrupt inbox entry must not
+/// take the dashboard down; the deterministic aggregation over the rest is
+/// identical to what the `walgit collab` CLI computes locally.
+struct CollabState {
+    entries: Vec<EntryRef>,
+    principals: HashMap<String, String>,
+    rules: MergeRules,
+}
+
+async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
+    // Refs-level work: the byte-sorted index, no LIST on the bucket.
+    let mut principals: HashMap<String, String> = HashMap::new();
+    let mut plan: Vec<(&str, String, String)> = Vec::new(); // (kind, rest, oid)
+    let mut rules = MergeRules::default();
+    let mut rules_oid: Option<String> = None;
+    for (name, oid) in &r.index.all {
+        if let Some(rest) = name.strip_prefix("refs/collab/meta/principals/") {
+            plan.push(("principal", rest.to_string(), oid.clone()));
+        } else if let Some(rest) = name.strip_prefix("refs/collab/inbox/") {
+            plan.push(("entry", rest.to_string(), oid.clone()));
+        } else if name == "refs/collab/meta/rules" {
+            rules_oid = Some(oid.clone());
+        }
+    }
+    if plan.len() > COLLAB_MAX_ENTRIES {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "collab namespace has more than {COLLAB_MAX_ENTRIES} refs; aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
+        )));
+    }
+    if let Some(remote) = r.remote() {
+        let mut oids: Vec<gix_hash::ObjectId> = plan
+            .iter()
+            .filter_map(|(_, _, oid)| gix_hash::ObjectId::from_hex(oid.as_bytes()).ok())
+            .collect();
+        if let Some(oid) = rules_oid
+            .as_deref()
+            .and_then(|o| gix_hash::ObjectId::from_hex(o.as_bytes()).ok())
+        {
+            oids.push(oid);
+        }
+        remote.fault_many(&oids).await?;
+        // The batched cat-file below must see the faulted loose objects.
+        r.local
+            .refresh_async()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    let mut want: Vec<String> = plan.iter().map(|(_, _, oid)| oid.clone()).collect();
+    if let Some(oid) = &rules_oid {
+        want.push(oid.clone());
+    }
+    let blobs = git_cat_file_batch(&r.local, &want).await?;
+    let mut entries = Vec::new();
+    for (kind, rest, oid) in plan {
+        let Some(bytes) = blobs.get(&oid) else {
+            continue; // pruned between index and read: skip like an unparsable entry
+        };
+        match kind {
+            "principal" => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes)
+                    && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
+                {
+                    principals.insert(rest, k.to_string());
+                }
+            }
+            _ => {
+                if let Ok(entry) = serde_json::from_slice::<Entry>(bytes) {
+                    let principal = rest
+                        .rsplit_once('/')
+                        .map(|(p, _)| p.to_string())
+                        .unwrap_or_default();
+                    entries.push(EntryRef {
+                        oid,
+                        principal,
+                        entry,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(oid) = rules_oid
+        && let Some(bytes) = blobs.get(&oid)
+    {
+        rules = serde_json::from_slice(bytes)
+            .map_err(|e| internal(format!("refs/collab/meta/rules: {e}")))?;
+    }
+    Ok(CollabState {
+        entries,
+        principals,
+        rules,
+    })
+}
+
+/// The full observability report (D1 §8): thread summaries, PR status + merge
+/// rule evaluation, verification health and per-actor/per-kind activity.
+async fn collab_report(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let state = collab_load(&r).await?;
+            let refs: Vec<&EntryRef> = state.entries.iter().collect();
+            let report = build_report(&refs, &state.principals, &state.rules);
+            Ok(Rendered::json(json_bytes(&report), SWR, None))
+        },
+    )
+    .await
+}
+
+/// One thread's ordered entries with per-entry verification, plus the
+/// aggregated PR view + merge rule evaluation when the thread has a `patch`.
+async fn collab_thread(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let state = collab_load(&r).await?;
+            let filtered: Vec<&EntryRef> =
+                state.entries.iter().filter(|e| e.entry.id == id).collect();
+            if filtered.is_empty() {
+                return Err(not_found(format!("no collab thread {id}")));
+            }
+            let ordered = thread(&filtered);
+            let entries: Vec<serde_json::Value> = ordered
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "oid": e.oid,
+                        "principal": e.principal,
+                        "verified": e.is_verified(&state.principals),
+                        "entry": e.entry,
+                    })
+                })
+                .collect();
+            let pr = filtered.iter().any(|e| e.entry.kind == "patch").then(|| {
+                let pr = pr_view(&filtered, &state.principals);
+                let merge = merge_rule_eval(&state.rules, &pr);
+                serde_json::json!({ "pr": pr, "merge": merge })
+            });
+            Ok(Rendered::json(
+                json_bytes(&serde_json::json!({ "id": id, "entries": entries, "pr": pr })),
+                SWR,
+                None,
+            ))
         },
     )
     .await
