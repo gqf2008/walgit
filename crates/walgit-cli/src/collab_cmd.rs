@@ -16,8 +16,8 @@ use ed25519_dalek::SigningKey;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use walgit_wal::collab::{
-    Entry, EntryRef, EntryRefs, MergeRules, Report, build_report, merge_rule_eval, pr_view,
-    sign_entry, thread,
+    Board, BoardDef, Entry, EntryRef, EntryRefs, MergeRules, BOARD_PATH, Report, build_board,
+    build_report, default_board, merge_rule_eval, parse_board_def, pr_view, sign_entry, thread,
 };
 
 // ---- CLI commands --------------------------------------------------------------
@@ -105,6 +105,24 @@ pub enum CollabAction {
         /// Output format: text (default), markdown, html.
         #[arg(long, default_value = "text")]
         format: String,
+        /// Merge-rules JSON file (same shape as `pr --rules`).
+        #[arg(long)]
+        rules: Option<PathBuf>,
+    },
+    /// The work-unit board (D1 §8): the threads projected under the board
+    /// definition at `.walgit/board.toml` (HEAD). Read-only: moving a card is
+    /// an ordinary signed `status` entry (`collab entry --kind status`).
+    Board {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Output format: text (default), markdown, json.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Board definition override — previews an uncommitted
+        /// `.walgit/board.toml` (default: the one at HEAD, else the built-in
+        /// default board).
+        #[arg(long)]
+        board: Option<PathBuf>,
         /// Merge-rules JSON file (same shape as `pr --rules`).
         #[arg(long)]
         rules: Option<PathBuf>,
@@ -201,6 +219,12 @@ pub fn run(action: CollabAction) -> Result<()> {
             format,
             rules,
         } => run_report(&repo, &format, rules.as_deref())?,
+        CollabAction::Board {
+            repo,
+            format,
+            board,
+            rules,
+        } => run_board(&repo, &format, board.as_deref(), rules.as_deref())?,
         CollabAction::Watch {
             repo,
             remote,
@@ -554,6 +578,111 @@ fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()
         "markdown" => print!("{}", render_report_markdown(&report)),
         "html" => print!("{}", render_report_html(&report)),
         other => bail!("unknown report format {other} (text|markdown|html)"),
+    }
+    Ok(())
+}
+
+// ---- board: the threads projected under the versioned board definition -------
+
+/// The board definition from the same source the server endpoint reads —
+/// `.walgit/board.toml` at HEAD — so a pushed board renders identically
+/// everywhere. `--board` previews an uncommitted definition; absent file means
+/// the built-in default board, a present-but-invalid one is an error (never a
+/// silently mis-folded board).
+fn load_board_def(repo: &Path, override_path: Option<&Path>) -> Result<BoardDef> {
+    if let Some(p) = override_path {
+        let doc = std::fs::read_to_string(p)
+            .with_context(|| format!("read board {}", p.display()))?;
+        return parse_board_def(&doc).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()));
+    }
+    let reader = CollabReader::new(repo);
+    match reader.git(&["cat-file", "blob", &format!("HEAD:{BOARD_PATH}")]) {
+        Ok(bytes) => {
+            parse_board_def(&String::from_utf8_lossy(&bytes))
+                .map_err(|e| anyhow::anyhow!("{BOARD_PATH}: {e}"))
+        }
+        Err(_) => Ok(default_board()),
+    }
+}
+
+fn card_label(c: &walgit_wal::collab::BoardCard) -> &str {
+    if c.title.is_empty() {
+        &c.id
+    } else {
+        &c.title
+    }
+}
+
+fn render_board_text(b: &Board) -> String {
+    let mut out = String::new();
+    for col in &b.columns {
+        let _ = writeln!(out, "== {} ({}) ==", col.name, col.cards.len());
+        for c in &col.cards {
+            let _ = writeln!(
+                out,
+                "  {} [{}] {} entries ({} verified), by {}, last {}",
+                card_label(c),
+                c.status,
+                c.entries,
+                c.verified,
+                c.actor,
+                c.last_ts
+            );
+        }
+        let _ = writeln!(out);
+    }
+    out
+}
+
+fn render_board_markdown(b: &Board) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# board\n");
+    for col in &b.columns {
+        let _ = writeln!(out, "## {} ({})\n", col.name, col.cards.len());
+        if col.cards.is_empty() {
+            let _ = writeln!(out, "_(empty)_\n");
+            continue;
+        }
+        let _ = writeln!(out, "| card | status | actor | entries | verified | last |\n|---|---|---|---|---|---|");
+        for c in &col.cards {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} |",
+                esc(card_label(c)),
+                c.status,
+                c.actor,
+                c.entries,
+                c.verified,
+                c.last_ts
+            );
+        }
+        let _ = writeln!(out);
+    }
+    out
+}
+
+fn run_board(
+    repo: &Path,
+    format: &str,
+    board_path: Option<&Path>,
+    rules_path: Option<&Path>,
+) -> Result<()> {
+    let reader = CollabReader::new(repo);
+    let (entries, principals) = reader.load()?;
+    let refs: Vec<&EntryRef> = entries.iter().collect();
+    let rules: MergeRules = match rules_path {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+        None => MergeRules::default(),
+    };
+    let board_def = load_board_def(repo, board_path)?;
+    let board = build_board(&refs, &principals, &rules, &board_def);
+    match format {
+        "text" => print!("{}", render_board_text(&board)),
+        "markdown" => print!("{}", render_board_markdown(&board)),
+        // The wire form: exactly the bytes `GET /{o}/{r}/api/collab/board`
+        // returns, so the two independent clients can be diffed byte-for-byte.
+        "json" => std::io::stdout().write_all(&serde_json::to_vec(&board)?)?,
+        other => bail!("unknown board format {other} (text|markdown|json)"),
     }
     Ok(())
 }
