@@ -695,9 +695,11 @@ a typo'd column rule must never silently fold cards into the wrong lane).
 }
 ```
 
-A card's `status` is the last `status` entry's `body.status` in thread order
-(a `merge_result` with `merged = true` pins `merged`; default `open`);
-`last_oid` — the parent-chain tip — is what a follow-up entry chains to.
+A card's `status` is decided in thread order and the last match wins:
+`status` entries set their `body.status`, a `merge_result` with
+`merged = true` sets `merged` (a later `status` entry still overrides it);
+default `open`. `last_oid` — the parent-chain tip — is what a follow-up
+entry chains to.
 Column order is declaration order, **first matching column wins**, cards
 matching no column are omitted, and within a column cards sort by the
 definition's `sort` (default `last_ts` descending, card id as the total-order

@@ -644,11 +644,13 @@ pub struct Board {
     pub columns: Vec<BoardColumn>,
 }
 
-/// The card's effective status: the last `status` entry's `body.status` in
-/// thread order wins; a `merge_result` with `merged = true` pins "merged";
-/// default "open". Deliberately wider than `pr_view`'s open/merged/closed
-/// state machine: the board tracks the work unit (§4.2 names in-progress /
-/// needs-review / blocked / needs-human), the PR view tracks merge state.
+/// The card's effective status: entries are applied in thread order and the
+/// last match wins — every `status` entry sets its `body.status`, a
+/// `merge_result` with `merged = true` sets "merged" (a later `status` entry
+/// still overrides it); default "open". Deliberately wider than `pr_view`'s
+/// open/merged/closed state machine: the board tracks the work unit (§4.2
+/// names in-progress / needs-review / blocked / needs-human), the PR view
+/// tracks merge state.
 fn card_status(ordered: &[&EntryRef]) -> String {
     let mut status = "open".to_string();
     for r in ordered {
