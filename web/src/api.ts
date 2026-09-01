@@ -28,6 +28,11 @@ export type {
   OpEvent,
   RepoSummary,
   Me,
+  CollabReport,
+  CollabThread,
+  CollabEntryRef,
+  CollabPr,
+  CollabMergeEval,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, StrategyInfo, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -101,6 +106,14 @@ export const api = {
   /** D24 settings + policy (Settings tab). Writes are never cached. */
   settings: (repo: string) => client.repo(repo).settings,
   policy: (repo: string) => client.repo(repo).policy,
+  /** D1 collaboration layer: aggregation read views + the thin-API write. */
+  collab: (repo: string) => ({
+    report: () => authRedirect(client.repo(repo).collab.report()),
+    thread: (id: string) => authRedirect(client.repo(repo).collab.thread(id)),
+    post: (entry: Record<string, unknown>) => authRedirect(client.repo(repo).collab.post(entry)),
+    registerPrincipal: (principal: string, publicKey: string) =>
+      authRedirect(client.repo(repo).collab.registerPrincipal({ principal, publicKey })),
+  }),
   /** Clone/setup recipes rendered by the server (`setup::Recipes`) — one source of truth. */
   setupRecipes: async (repo?: string): Promise<SetupRecipes> => {
     const u = repo ? `/services/setup.json?repo=${enc(repo)}` : "/services/setup.json";

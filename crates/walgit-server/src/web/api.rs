@@ -210,6 +210,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/merge-base"), get(merge_base))
             .route(&format!("{base}/diff"), get(diff))
             .route(&format!("{base}/collab/entries"), post(collab_entries))
+            .route(&format!("{base}/collab/principal"), post(collab_principal))
             .route(&format!("{base}/collab/report"), get(collab_report))
             .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
@@ -1088,6 +1089,12 @@ struct CollabPost {
     entry: serde_json::Value,
 }
 
+#[derive(serde::Deserialize)]
+struct CollabPrincipalPost {
+    principal: String,
+    public_key: String,
+}
+
 fn ref_segment_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
@@ -1185,6 +1192,25 @@ async fn collab_entries(
         )));
     }
     let content = serde_json::to_vec(&entry).map_err(internal)?;
+    let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
+    let (oid, seq) = publish_collab_ref(handle, &r, &principal.name, &ref_name, content).await?;
+    Ok(json_swr(
+        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
+        None,
+    )
+    .into_response(&headers))
+}
+
+/// Materialize a JSON blob as a one-object bucket pack and publish one ref
+/// through the WAL (D1 §11 thin API). Shared by inbox entries and principal
+/// registration; returns `(oid, seq)`.
+async fn publish_collab_ref(
+    handle: Arc<RepoHandle>,
+    r: &Repo,
+    principal_name: &str,
+    ref_name: &str,
+    content: Vec<u8>,
+) -> Result<(String, u64), ApiError> {
     let oid = git_hash_object(&r.local, &content).await?;
     let pack_bytes = git_pack_object(&r.local, &oid).await?;
     let tmp = std::env::temp_dir().join(format!("walgit-collab-{}.pack", uuid::Uuid::new_v4()));
@@ -1204,10 +1230,9 @@ async fn collab_entries(
         .map_err(internal)?
         .ok_or_else(|| ApiError::Internal("ingest produced no pack".into()))?;
     let _ = tokio::fs::remove_file(&tmp).await;
-    let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
     let txn = walgit_proto::v1::RefTransaction {
         updates: vec![walgit_proto::v1::RefUpdate {
-            name: ref_name.clone(),
+            name: ref_name.to_string(),
             old_oid: String::new(),
             new_oid: oid.clone(),
             new_symbolic_target: String::new(),
@@ -1217,7 +1242,7 @@ async fn collab_entries(
         atomic: true,
     };
     let mut meta = std::collections::HashMap::new();
-    meta.insert("principal".to_string(), principal.name.clone());
+    meta.insert("principal".to_string(), principal_name.to_string());
     meta.insert("agent".to_string(), "walgit-web".into());
     let result = handle
         .publish_push_synced(Some(pack), txn, meta)
@@ -1228,8 +1253,43 @@ async fn collab_entries(
             return Err(internal(format!("publish ref: {e}")));
         }
     }
+    Ok((oid, result.seq))
+}
+
+/// First-use self-registration of the authenticated principal's Ed25519 public
+/// key at `refs/collab/meta/principals/<principal>` (D1 §5): the token binds
+/// the principal, this ref binds the key. Registration is one-directional
+/// (the tombstone is `revokePrincipal` via git); re-registration overwrites
+/// with the new key.
+async fn collab_principal(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Json(body): Json<CollabPrincipalPost>,
+) -> Result<Response, ApiError> {
+    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    if !principal.anonymous && body.principal != principal.name {
+        return Err(ApiError::Forbidden);
+    }
+    if !ref_segment_ok(&body.principal) {
+        return Err(ApiError::BadRequest(format!(
+            "principal {:?} is not a refname-safe segment",
+            body.principal
+        )));
+    }
+    let handle = open(&st, &headers, &owner, &repo_name).await?;
+    let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
+    let content = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "principal": body.principal,
+        "public_key": body.public_key,
+        "registered_at": chrono::Utc::now().timestamp(),
+    }))
+    .map_err(internal)?;
+    let ref_name = format!("refs/collab/meta/principals/{}", body.principal);
+    let (oid, seq) = publish_collab_ref(handle, &r, &principal.name, &ref_name, content).await?;
     Ok(json_swr(
-        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": result.seq }),
+        &serde_json::json!({ "ref": ref_name, "oid": oid, "seq": seq }),
         None,
     )
     .into_response(&headers))

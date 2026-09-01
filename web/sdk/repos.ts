@@ -107,6 +107,77 @@ export interface CollabPush {
   content: string | null;
   commands: string[];
 }
+
+/** D1 aggregation read answers (server: `GET /{o}/{r}/api/collab/report` and
+    `/threads/{id}`; mirrors `walgit-wal::collab`) — the browser shows exactly
+    what the `walgit collab` CLI computes locally. */
+export interface CollabEntryRef {
+  oid: string;
+  principal: string;
+  verified: boolean;
+  entry: {
+    version: number;
+    kind: string;
+    id: string;
+    actor: string;
+    ts: number;
+    parent: string;
+    refs?: { base?: string; head?: string };
+    body: Record<string, unknown>;
+    sig: string;
+  };
+}
+export interface CollabReportThread {
+  id: string;
+  entries: number;
+  verified: number;
+  last_ts: number;
+  kinds: string[];
+}
+export interface CollabReview {
+  actor: string;
+  decision: string;
+  ts: number;
+  oid: string;
+}
+export interface CollabPr {
+  id: string;
+  base: string | null;
+  head: string | null;
+  status: string;
+  reviews: CollabReview[];
+  human_approvals: CollabReview[];
+  unverified: string[];
+}
+export interface CollabMergeEval {
+  allowed: boolean;
+  reason: string;
+  satisfied_by: string[];
+}
+export interface CollabReportPr {
+  id: string;
+  base: string | null;
+  head: string | null;
+  status: string;
+  approvals: number;
+  merge_allowed: boolean;
+  merge_reason: string;
+}
+export interface CollabReport {
+  threads: CollabReportThread[];
+  prs: CollabReportPr[];
+  total_entries: number;
+  verified_entries: number;
+  unverified_entries: number;
+  missing_principals: number;
+  by_actor: [string, number][];
+  by_kind: [string, number][];
+}
+export interface CollabThread {
+  id: string;
+  entries: CollabEntryRef[];
+  pr: { pr: CollabPr; merge: CollabMergeEval } | null;
+}
 export interface Resolved {
   ref: string;
   sha: string;
@@ -805,6 +876,27 @@ export class RepoClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entry }),
+      });
+    },
+
+    /** The full observability report (D1 §8): thread summaries, PR status +
+        merge rule evaluation, verification health. */
+    report: (opts?: CallOptions) => this.client.json<CollabReport>(`${this.p}/collab/report`, opts),
+    /** One thread: parent-ordered entries with per-entry verification, plus
+        the PR view + merge evaluation when the thread has a patch. */
+    thread: (id: string, opts?: CallOptions) => this.client.json<CollabThread>(`${this.p}/collab/threads/${enc(id)}`, opts),
+    /**
+     * First-use self-registration of the authenticated principal's Ed25519
+     * public key through the thin API (`POST /{o}/{r}/api/collab/principal`):
+     * the token binds the principal, this ref binds the key. The browser
+     * write path (no git needed).
+     */
+    registerPrincipal: async (input: { principal: string; publicKey: string }, opts?: CallOptions): Promise<{ ref: string; oid: string; seq: number }> => {
+      refSegment("registerPrincipal", input.principal);
+      return this.client.json<{ ref: string; oid: string; seq: number }>(`${this.p}/collab/principal`, opts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ principal: input.principal, public_key: input.publicKey }),
       });
     },
     /** First-use registration of a principal's Ed25519 public key at

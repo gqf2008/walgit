@@ -1092,3 +1092,105 @@ async fn collab_report_and_thread_aggregate_entries() -> TestResult {
     assert_eq!(st, 404);
     Ok(())
 }
+
+/// D1 principal registration thin API + signed-entry verification: register
+/// the authenticated principal's Ed25519 key, post a signed issue, and the
+/// report/thread answers count it verified (the aggregation verifies exactly
+/// what the CLI does locally).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_principal_registration_and_verified_entries() -> TestResult {
+    use base64::Engine as _;
+    use ed25519_dalek::SigningKey;
+    use walgit_wal::collab::{Entry, sign_entry};
+
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "alice".into(),
+            token: "alice-token".into(),
+            token_env: None,
+            write: true,
+            admin: false,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("{}/o/r", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert!(put.status().is_success() || put.status() == reqwest::StatusCode::CONFLICT);
+
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let public_key = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+
+    // Register alice's key through the thin API.
+    let resp = client
+        .post(format!("{}/o/r/api/collab/principal", server.base_url))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "principal": "alice", "public_key": public_key }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "register principal");
+    let body: serde_json::Value = resp.json().await?;
+    let ref_name = body["ref"].as_str().unwrap();
+    assert_eq!(ref_name, "refs/collab/meta/principals/alice");
+
+    // Posting a registration for someone else -> 403.
+    let resp = client
+        .post(format!("{}/o/r/api/collab/principal", server.base_url))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "principal": "bob", "public_key": public_key }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 403, "registering another principal refused");
+
+    // Post a genuinely signed issue entry.
+    let mut entry = Entry {
+        version: 1,
+        kind: "issue".into(),
+        id: "t2".into(),
+        actor: "alice".into(),
+        ts: 1786500010,
+        parent: String::new(),
+        refs: None,
+        body: serde_json::json!({ "title": "signed" }),
+        sig: String::new(),
+    };
+    entry.sig = sign_entry(&mut entry, &sk);
+    let resp = client
+        .post(format!("{}/o/r/api/collab/entries", server.base_url))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({ "entry": serde_json::to_value(&entry)? }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "post signed entry");
+
+    // The report counts it verified; the thread detail marks the entry verified.
+    let (st, text, _) = get_h(
+        &server,
+        "/o/r/api/collab/report",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    let report: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(report["total_entries"], 1);
+    assert_eq!(report["verified_entries"], 1, "signed entry with registered key verifies");
+    assert_eq!(report["unverified_entries"], 0);
+    assert_eq!(report["missing_principals"], 0);
+    assert_eq!(report["threads"][0]["verified"], 1);
+
+    let (st, text, _) = get_h(
+        &server,
+        "/o/r/api/collab/threads/t2",
+        &[("Authorization", "Bearer alice-token")],
+    )
+    .await?;
+    assert_eq!(st, 200);
+    let thread: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(thread["entries"][0]["verified"], true);
+    Ok(())
+}
