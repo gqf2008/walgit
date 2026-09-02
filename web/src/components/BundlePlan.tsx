@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Overview } from "../api";
 import { Maintainers } from "./Maintainers";
+import { useI18n } from "../i18n";
 
 type Slot = Overview["bundle_plan"]["slots"][number];
 
@@ -15,6 +16,7 @@ const ACTIONABLE = new Set<Slot["status"]>(["missing", "pending", "blocked", "wr
  * row. Who can do the work (the maintainers) and what the next slot of each strategy will be.
  */
 export function BundlePlan({ plan }: { plan: Overview["bundle_plan"] }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const strategies = [...new Set(plan.slots.map((r) => r.strategy))];
   return (
@@ -24,7 +26,7 @@ export function BundlePlan({ plan }: { plan: Overview["bundle_plan"] }) {
       </div>
       {plan.upcoming?.length > 0 && (
         <div className="pad small">
-          <strong>Next slots</strong>
+          <strong>{t("bplan.nextSlots")}</strong>
           <table className="kv compact">
             <tbody>
               {plan.upcoming.map((u) => (
@@ -32,7 +34,7 @@ export function BundlePlan({ plan }: { plan: Overview["bundle_plan"] }) {
                   <th>{u.strategy}</th>
                   <td>
                     <code>{slotTime(u.slot)}</code> → {u.unit}
-                    {!u.host && <span className="pill stale"> no live maintainer</span>}
+                    {!u.host && <span className="pill stale"> {t("bplan.noMaintainer")}</span>}
                   </td>
                 </tr>
               ))}
@@ -41,14 +43,14 @@ export function BundlePlan({ plan }: { plan: Overview["bundle_plan"] }) {
         </div>
       )}
       {plan.slots.length === 0 ? (
-        <div className="muted pad">No slots planned (bundles disabled or no strategies).</div>
+        <div className="muted pad">{t("bplan.none")}</div>
       ) : (
         <table className="grid">
           <thead>
             <tr>
-              <th>strategy</th>
-              <th>slots</th>
-              <th>detail</th>
+              <th>{t("bplan.th.strategy")}</th>
+              <th>{t("bplan.th.slots")}</th>
+              <th>{t("bplan.th.detail")}</th>
             </tr>
           </thead>
           <tbody>
@@ -67,9 +69,10 @@ export function BundlePlan({ plan }: { plan: Overview["bundle_plan"] }) {
         </table>
       )}
       <div className="pad small muted">
-        A slot is the schedule's fire time; its bundle holds main as of that instant (token = slot epoch). <span className="pill pending">pending</span> =
-        fired in the last 2 minutes (a writer's entry may still land); <span className="pill missing">missing</span> = work for the next pass, oldest
-        first; <span className="pill skipped">skipped</span> = measured closed with nothing new, recorded so nobody re-measures it.
+        {t("bplan.legend.slot")} <span className="pill pending">pending</span>{" "}
+        {t("bplan.legend.pending")} <span className="pill missing">missing</span>{" "}
+        {t("bplan.legend.missing")} <span className="pill skipped">skipped</span>{" "}
+        {t("bplan.legend.skipped")}
       </div>
     </>
   );
@@ -92,6 +95,7 @@ function SlotGroup({
   open: boolean;
   toggle: () => void;
 }) {
+  const { t } = useI18n();
   const built = settled.filter((r) => r.status === "built");
   const newest = built.at(-1);
   return (
@@ -108,17 +112,17 @@ function SlotGroup({
           ))}
           {settled.length > 0 && (
             <button className="btn link small" onClick={toggle}>
-              {open ? "hide" : "show"}
+              {open ? t("bplan.hide") : t("bplan.show")}
             </button>
           )}
         </td>
         <td className="small muted">
           {newest ? (
             <>
-              newest built <code>{slotTime(newest.slot)}</code> ({newest.detail})
+              {t("bplan.newestBuilt")} <code>{slotTime(newest.slot)}</code> ({newest.detail})
             </>
           ) : (
-            "nothing built yet"
+            t("bplan.nothingBuilt")
           )}
         </td>
       </tr>
@@ -140,7 +144,7 @@ function SlotGroup({
           <td>
             <code>{slotTime(r.slot)}</code> <span className={`pill ${r.status}`}>{r.status}</span>
           </td>
-          <td className="small">{r.detail || (r.status === "missing" ? "next pass builds it" : "")}</td>
+          <td className="small">{r.detail || (r.status === "missing" ? t("bplan.nextPassBuilds") : "")}</td>
         </tr>
       ))}
     </>

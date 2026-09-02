@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type TaskRecord } from "../api";
 import { reportError } from "../data";
+import { useI18n, type I18nKey, type TFunc } from "../i18n";
 
 /** Poll cadence while something runs / when idle (API.md §2c). */
 const BUSY_MS = 1500;
@@ -8,8 +9,25 @@ const IDLE_MS = 15000;
 /** How long a finished task stays listed in the dropdown. */
 const LINGER_MS = 20000;
 
-function kindLabel(kind: string): string {
-  return kind.replace(/[-_]/g, " ");
+/** Task kinds are data slugs emitted by the server; translate the known ones
+    at render time and pass unknown future kinds through prettified. */
+const KIND_KEYS: Record<string, I18nKey> = {
+  materialize: "tasks.kind.materialize",
+  "remote-index": "tasks.kind.remote-index",
+  prewarm: "tasks.kind.prewarm",
+  checkpoint: "tasks.kind.checkpoint",
+  bundle: "tasks.kind.bundle",
+  compact: "tasks.kind.compact",
+  repair: "tasks.kind.repair",
+  "base-rebuild": "tasks.kind.base-rebuild",
+  "rev-index": "tasks.kind.rev-index",
+  fsck: "tasks.kind.fsck",
+  follow: "tasks.kind.follow",
+};
+
+function kindLabel(t: TFunc, kind: string): string {
+  const key = KIND_KEYS[kind];
+  return key ? t(key) : kind.replace(/[-_]/g, " ");
 }
 
 /**
@@ -26,6 +44,7 @@ function kindLabel(kind: string): string {
  * another instance.
  */
 export function TasksOverlay({ repo }: { repo: string }) {
+  const { t } = useI18n();
   const [running, setRunning] = useState<TaskRecord[]>([]);
   const [justDone, setJustDone] = useState<TaskRecord[]>([]);
   const [host, setHost] = useState("");
@@ -39,28 +58,28 @@ export function TasksOverlay({ repo }: { repo: string }) {
     let seen = new Map<string, TaskRecord>();
     const tick = async () => {
       try {
-        const t = await api.tasks(repo);
+        const res = await api.tasks(repo);
         if (!alive) return;
-        setHost(t.hostname);
-        const now = new Map(t.running.map((r) => [r.id, r]));
+        setHost(res.hostname);
+        const now = new Map(res.running.map((r) => [r.id, r]));
         const done: TaskRecord[] = [];
         for (const [id, prev] of seen) {
           if (now.has(id)) continue;
-          const rec = t.recent.find((r) => r.id === id);
+          const rec = res.recent.find((r) => r.id === id);
           if (rec) done.push(rec);
-          else if (t.hostname === seenHost) done.push({ ...prev, ok: true, finished: prev.finished ?? new Date().toISOString(), summary: prev.summary || "done" });
+          else if (res.hostname === seenHost) done.push({ ...prev, ok: true, finished: prev.finished ?? new Date().toISOString(), summary: prev.summary || t("tasks.done") });
           // else: a different instance answered; keep waiting for the owner.
         }
-        for (const rec of done) if (rec.ok === false) reportError(new Error(rec.summary), `${kindLabel(rec.kind)} task`);
-        seenHost = t.hostname;
+        for (const rec of done) if (rec.ok === false) reportError(new Error(rec.summary), `${kindLabel(t, rec.kind)} task`);
+        seenHost = res.hostname;
         seen = now;
-        setRunning(t.running);
+        setRunning(res.running);
         if (done.length) {
           const ids = new Set(done.map((d) => d.id));
           setJustDone((d) => [...d.filter((x) => !ids.has(x.id)), ...done].slice(-5));
           setTimeout(() => alive && setJustDone((d) => d.filter((x) => !ids.has(x.id))), LINGER_MS);
         }
-        timer = window.setTimeout(tick, t.running.length ? BUSY_MS : IDLE_MS);
+        timer = window.setTimeout(tick, res.running.length ? BUSY_MS : IDLE_MS);
       } catch (e) {
         if (!alive) return;
         // A 404 means "no such repo here"; anything else is worth a line in the tray, once.
@@ -73,7 +92,7 @@ export function TasksOverlay({ repo }: { repo: string }) {
       alive = false;
       clearTimeout(timer);
     };
-  }, [repo]);
+  }, [repo, t]);
 
   useEffect(() => {
     if (!open) return;
@@ -96,11 +115,11 @@ export function TasksOverlay({ repo }: { repo: string }) {
   if (running.length === 0 && justDone.length === 0) return null;
 
   // The headline task: the one with progress, else the newest running, else the latest finished.
-  const head = running.find((t) => t.progress) ?? running[0] ?? justDone[justDone.length - 1];
+  const head = running.find((x) => x.progress) ?? running[0] ?? justDone[justDone.length - 1];
   if (!head) return null;
   const others = running.length > 1 ? running.length - 1 : 0;
   const pct = percentOf(head);
-  const failed = justDone.some((t) => t.ok === false);
+  const failed = justDone.some((x) => x.ok === false);
 
   return (
     <div className="tasks-indicator" ref={ref}>
@@ -110,10 +129,10 @@ export function TasksOverlay({ repo }: { repo: string }) {
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-haspopup="true"
-        title={running.length ? `${running.length} task${running.length === 1 ? "" : "s"} running on this instance` : "Recently finished tasks"}
+        title={running.length ? t("tasks.title.running", { n: running.length }) : t("tasks.title.finished")}
       >
         {running.length ? <span className="spinner" aria-hidden /> : <span className={`dot ${failed ? "failed" : "ok"}`} aria-hidden />}
-        <span className="task-kind">{kindLabel(head.kind)}</span>
+        <span className="task-kind">{kindLabel(t, head.kind)}</span>
         {others > 0 && <span className="muted">+{others}</span>}
         {pct !== undefined && <span className="muted tabular">{pct.toFixed(0)}%</span>}
         <span className="caret" aria-hidden>
@@ -124,26 +143,26 @@ export function TasksOverlay({ repo }: { repo: string }) {
         <output className="tasks-pop" aria-live="polite">
           {running.length > 0 && (
             <div className="tasks-section">
-              <div className="tasks-title muted small">Running</div>
-              {running.map((t) => (
-                <TaskLine key={t.id} t={t} />
+              <div className="tasks-title muted small">{t("tasks.section.running")}</div>
+              {running.map((task) => (
+                <TaskLine key={task.id} task={task} />
               ))}
             </div>
           )}
           {justDone.length > 0 && (
             <div className="tasks-section">
-              <div className="tasks-title muted small">Finished</div>
-              {justDone.toReversed().map((t) => (
-                <div key={t.id} className={`task done ${t.ok === false ? "failed" : ""}`}>
-                  <span className={`dot ${t.ok === false ? "failed" : "ok"}`} aria-hidden />
-                  <span className="task-kind">{kindLabel(t.kind)}</span>
-                  <span className="task-text">{t.summary}</span>
-                  <span className="muted small tabular">{fmtSecs(t.elapsed_ms)}</span>
+              <div className="tasks-title muted small">{t("tasks.section.finished")}</div>
+              {justDone.toReversed().map((task) => (
+                <div key={task.id} className={`task done ${task.ok === false ? "failed" : ""}`}>
+                  <span className={`dot ${task.ok === false ? "failed" : "ok"}`} aria-hidden />
+                  <span className="task-kind">{kindLabel(t, task.kind)}</span>
+                  <span className="task-text">{task.summary}</span>
+                  <span className="muted small tabular">{fmtSecs(task.elapsed_ms)}</span>
                 </div>
               ))}
             </div>
           )}
-          {host && <div className="muted small task-host">instance {host.slice(0, 8)}</div>}
+          {host && <div className="muted small task-host">{t("tasks.instance", { host: host.slice(0, 8) })}</div>}
         </output>
       )}
     </div>
@@ -164,18 +183,19 @@ function fmtSecs(ms: number): string {
   return `${m}m ${Math.round(s - m * 60)}s`;
 }
 
-function TaskLine({ t }: { t: TaskRecord }) {
-  const p = t.progress;
-  const pct = percentOf(t);
-  const last = t.log_tail.at(-1);
+function TaskLine({ task }: { task: TaskRecord }) {
+  const { t } = useI18n();
+  const p = task.progress;
+  const pct = percentOf(task);
+  const last = task.log_tail.at(-1);
   return (
     <div className="task running">
       <div className="task-row">
         <span className="spinner" aria-hidden />
-        <span className="task-kind">{kindLabel(t.kind)}</span>
-        <span className="task-text">{p?.label ?? last ?? t.summary ?? "working…"}</span>
+        <span className="task-kind">{kindLabel(t, task.kind)}</span>
+        <span className="task-text">{p?.label ?? last ?? task.summary ?? t("tasks.working")}</span>
         {pct !== undefined && <span className="muted small tabular">{pct.toFixed(0)}%</span>}
-        <span className="muted small tabular">{fmtSecs(t.elapsed_ms)}</span>
+        <span className="muted small tabular">{fmtSecs(task.elapsed_ms)}</span>
       </div>
       {pct !== undefined && (
         <span className="activity-bar" aria-hidden>

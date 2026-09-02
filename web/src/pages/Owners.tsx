@@ -35,24 +35,36 @@ export function Owners() {
 
 /** First repo: install.sh (this host:port) sets helper + proactiveAuth + origin. */
 function BlankSlate() {
+  const { t } = useI18n();
   const origin = window.location.origin;
   const host = window.location.host;
   const install = `sh -c "$(curl -fsSLk '${origin}/services/public/install.sh')" -- area/repository`;
   return (
     <div className="blankslate">
-      <h1>Nothing here yet</h1>
+      <h1>{t("blank.title")}</h1>
       <p>
-        This host has no repositories. From a local git tree, run the installer with{" "}
-        <code>area/repository</code> — it turns on <code>http.https://{host}/.proactiveAuth=auto</code>{" "}
-        (git must send a token up front) and points <code>origin</code> at{" "}
-        <code>{origin}/area/repository.git</code>. Then push. Anything but{" "}
-        <code>area/repository.git</code> is refused.
+        {t("blank.intro.pre")}
+        <code>area/repository</code>
+        {t("blank.intro.mid1")}
+        <code>http.https://{host}/.proactiveAuth=auto</code>
+        {t("blank.intro.mid2")}
+        <code>origin</code>
+        {t("blank.intro.mid3")}
+        <code>{origin}/area/repository.git</code>
+        {t("blank.intro.mid4")}
+        <code>area/repository.git</code>
+        {t("blank.intro.post")}
       </p>
-      <Box title="Once, from your repo">
+      <Box title={t("blank.once")}>
         <CodeSample code={`${install}\ngit push -u origin HEAD`} />
       </Box>
       <p className="muted small">
-        <code>area</code> and <code>repository</code> are <code>[A-Za-z0-9._-]</code>, 1–100 characters.
+        <code>area</code>
+        {t("blank.names.and")}
+        <code>repository</code>
+        {t("blank.names.rule.pre")}
+        <code>[A-Za-z0-9._-]</code>
+        {t("blank.names.rule.post")}
       </p>
     </div>
   );

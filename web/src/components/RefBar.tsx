@@ -3,8 +3,16 @@ import { Link, useNavigate } from "react-router-dom";
 import { refListStream, type RefInfo } from "../api";
 import { reportError } from "../data";
 import { useRepo } from "../pages/RepoLayout";
+import { useI18n } from "../i18n";
 
 const PAGE = 50;
+
+/** Ref-kind values come from the wire; translate at render time. */
+const REF_KIND_KEYS = {
+  branch: "refbar.kind.branch",
+  tag: "refbar.kind.tag",
+  commit: "refbar.kind.commit",
+} as const;
 
 /** Branch/tag dropdown plus path breadcrumbs. `page` is the current page
  * kind: the dropdown keeps the page and path, swapping only the ref; crumbs
@@ -28,6 +36,7 @@ export function RefBar({
   page: "tree" | "blob" | "commits";
 }) {
   const { full, refs } = useRepo();
+  const { t } = useI18n();
   const nav = useNavigate();
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<"branches" | "tags">(refKind === "tag" ? "tags" : "branches");
@@ -42,7 +51,7 @@ export function RefBar({
   useEffect(() => {
     if (!key) return;
     const ctl = new AbortController();
-    const t = setTimeout(() => {
+    const timer = setTimeout(() => {
       setList({ key, refs: [], more: false, loading: true });
       let batch: RefInfo[] = [];
       let flush = 0;
@@ -79,7 +88,7 @@ export function RefBar({
     }, q ? 150 : 0);
     return () => {
       ctl.abort();
-      clearTimeout(t);
+      clearTimeout(timer);
     };
   }, [key, full, tab, q]);
 
@@ -94,19 +103,24 @@ export function RefBar({
     <div className="refbar">
       <div className="dropdown">
         <button className="btn" onClick={() => setOpen((o) => !o)} title={refname}>
-          <span className="muted">{refKind}:</span>{" "}
+          <span className="muted">{t(REF_KIND_KEYS[refKind])}:</span>{" "}
           <strong>{refKind === "commit" ? refname.slice(0, 7) : refname.length > 28 ? refname.slice(0, 25) + "…" : refname}</strong>{" "}
           <span className="caret">▾</span>
         </button>
         {open && (
           <div className="menu">
-            <input autoFocus placeholder={`Find a ${tab === "tags" ? "tag" : "branch"}…`} value={q} onChange={(e) => setQ(e.target.value)} />
+            <input
+              autoFocus
+              placeholder={t("refbar.find", { kind: t(tab === "tags" ? "refbar.kind.tag" : "refbar.kind.branch") })}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
             <div className="menu-tabs">
               <button className={tab === "branches" ? "active" : ""} onClick={() => setTab("branches")}>
-                Branches
+                {t("refbar.branches")}
               </button>
               <button className={tab === "tags" ? "active" : ""} onClick={() => setTab("tags")}>
-                Tags
+                {t("refbar.tags")}
               </button>
             </div>
             <ul>
@@ -114,18 +128,18 @@ export function RefBar({
                 <li key={r.name} className={r.name === refname ? "current" : ""}>
                   <button type="button" className="ref-option" onClick={() => go(r.name)} aria-current={r.name === refname ? "true" : undefined}>
                     {r.name}
-                    {tab === "branches" && r.name === refs.head?.name && <span className="pill default">default</span>}
+                    {tab === "branches" && r.name === refs.head?.name && <span className="pill default">{t("refbar.default")}</span>}
                   </button>
                 </li>
               ))}
               {list.key === key && list.error && (
                 <li className="flash error small" role="alert">
-                  Could not load {tab}: {list.error}
+                  {t("refbar.loadError", { kind: tab === "tags" ? t("refbar.tags") : t("refbar.branches"), error: list.error })}
                 </li>
               )}
-              {shown.length === 0 && !list.loading && !list.error && <li className="muted">No matches</li>}
-              {list.loading && shown.length === 0 && <li className="muted">Loading…</li>}
-              {list.more && <li className="muted small">Showing first {shown.length}; type to narrow</li>}
+              {shown.length === 0 && !list.loading && !list.error && <li className="muted">{t("refbar.noMatches")}</li>}
+              {list.loading && shown.length === 0 && <li className="muted">{t("refbar.loading")}</li>}
+              {list.more && <li className="muted small">{t("refbar.showingFirst", { n: shown.length })}</li>}
             </ul>
           </div>
         )}
@@ -148,7 +162,7 @@ export function RefBar({
       <span className="spacer" />
       {page === "tree" && (
         <Link className="btn" to={`/${full}/commits/${refname}${path ? "/" + path : ""}`}>
-          History
+          {t("refbar.history")}
         </Link>
       )}
     </div>

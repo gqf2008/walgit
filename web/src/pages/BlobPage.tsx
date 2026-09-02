@@ -8,9 +8,11 @@ import { Box } from "../components/Layout";
 import { fmtSize } from "../format";
 import { RefBar } from "../components/RefBar";
 import { Markdown } from "../components/Markdown";
+import { useI18n } from "../i18n";
 
 export function BlobPage() {
   const { full } = useRepo();
+  const { t } = useI18n();
   const rest = useParams()["*"] ?? "";
   const { r, data: b } = useResolved(full, rest, (res) => api.blob(full, res.sha, res.path));
   const isMd = /\.(md|markdown)$/i.test(rest);
@@ -27,29 +29,29 @@ export function BlobPage() {
             {isMd && b.contents !== undefined && (
               <span className="seg">
                 <button className={mode === "preview" ? "active" : ""} onClick={() => setMode("preview")}>
-                  Preview
+                  {t("blob.preview")}
                 </button>
                 <button className={mode === "code" ? "active" : ""} onClick={() => setMode("code")}>
-                  Code
+                  {t("blob.code")}
                 </button>
               </span>
             )}
             <span className="muted small">
-              {b.contents !== undefined && `${lines} lines · `}
+              {b.contents !== undefined && `${t("blob.lines", { n: lines })} · `}
               {fmtSize(b.size)}
             </span>
             <span className="spacer" />
             <a className="btn small" href={rawURL} target="_blank" rel="noreferrer">
-              Raw
+              {t("blob.raw")}
             </a>
             <Link className="btn small" to={`/${full}/commits/${b.ref}/${b.path}`}>
-              History
+              {t("blob.history")}
             </Link>
           </div>
         }
       >
-        {b.too_large && <div className="pad muted">File is too large to display ({fmtSize(b.size)}).</div>}
-        {b.binary && <div className="pad muted">Binary file not shown.</div>}
+        {b.too_large && <div className="pad muted">{t("blob.tooLarge", { size: fmtSize(b.size) })}</div>}
+        {b.binary && <div className="pad muted">{t("blob.binary")}</div>}
         {b.contents !== undefined &&
           (isMd && mode === "preview" ? (
             <div className="pad">
