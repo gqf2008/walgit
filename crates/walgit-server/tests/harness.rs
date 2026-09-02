@@ -33,7 +33,9 @@ pub struct Server {
     /// The instance's state (maintenance loop tests drive `run_pass` directly).
     pub state: Arc<walgit_server::AppState>,
     /// Cache dir; removed when the server is dropped (hermetic, no /tmp pile-up).
-    _cache: tempfile::TempDir,
+    /// `None` when the caller owns the cache dir's lifetime — a wipe/restart
+    /// test needs the cache to survive the server ("process exit").
+    _cache: Option<tempfile::TempDir>,
 }
 
 impl Server {
@@ -74,15 +76,36 @@ impl Server {
         Self::start_with_cfg(self.store.clone(), tempfile::tempdir()?, tweak).await
     }
 
+    /// A given memory store and a **caller-owned** cache dir: the caller keeps
+    /// the `TempDir`, so the cache survives dropping this server — the building
+    /// block for "fresh process, wiped bucket, leftover cache.dir" tests.
+    pub async fn start_with_store_and_cache_dir(
+        store: Arc<MemoryStore>,
+        cache_dir: &std::path::Path,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
+        Self::start_with_parts(store, cache_dir.to_path_buf(), None, tweak).await
+    }
+
     async fn start_with_cfg(
-        mut store: Arc<MemoryStore>,
+        store: Arc<MemoryStore>,
         cache: tempfile::TempDir,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
+        let dir = cache.path().to_path_buf();
+        Self::start_with_parts(store, dir, Some(cache), tweak).await
+    }
+
+    async fn start_with_parts(
+        mut store: Arc<MemoryStore>,
+        cache_dir: std::path::PathBuf,
+        cache: Option<tempfile::TempDir>,
         tweak: impl FnOnce(&mut Config),
     ) -> Result<Self> {
         let mut cfg = Config::default();
         cfg.store.backend = StoreBackend::Memory;
         cfg.store.bucket = "test".into();
-        cfg.cache.dir = cache.path().to_path_buf();
+        cfg.cache.dir = cache_dir;
         cfg.cache.max_bytes = ByteSize::gib(2);
         cfg.server.listen = "127.0.0.1:0".parse().unwrap();
         cfg.server.max_concurrent_per_repo = 8;
