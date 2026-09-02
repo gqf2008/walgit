@@ -71,7 +71,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{owner}/{repo}/commits/{*rest}", get(index_route))
         .route("/{owner}/{repo}/commit/{*rest}", get(index_route))
         .route("/{owner}/{repo}/wal", get(index_route))
-        .route("/{owner}/{repo}/settings", get(index_route));
+        .route("/{owner}/{repo}/settings", get(index_route))
+        // SPA collab pages (client-side routes in web/src/main.tsx): direct
+        // open / refresh must serve index.html like every other page.
+        .route("/{owner}/{repo}/collab", get(index_route))
+        .route("/{owner}/{repo}/collab/board", get(index_route))
+        .route("/{owner}/{repo}/collab/thread/{*rest}", get(index_route));
     let mut r = r;
     for base in crate::web::api::REPO_API_BASES {
         r = r

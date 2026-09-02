@@ -575,6 +575,12 @@ async fn api_md_conformance() -> TestResult {
     assert_eq!(st, 200);
     assert!(ct.unwrap_or_default().starts_with("text/html"));
     assert!(html.contains("<html"));
+    // SPA collab pages serve index.html on a direct hit / refresh (#34).
+    for path in ["/o/r/collab", "/o/r/collab/board", "/o/r/collab/thread/w1"] {
+        let (st, html, _) = get(&server, path).await?;
+        assert_eq!(st, 200, "{path}");
+        assert!(html.contains("<html"), "{path}");
+    }
     Ok(())
 }
 
