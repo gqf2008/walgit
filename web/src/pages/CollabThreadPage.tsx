@@ -7,12 +7,14 @@ import { useRepo } from "./RepoLayout";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { CollabWriteBox } from "../components/CollabWrite";
+import { useI18n, kindLabel } from "../i18n";
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
 export function CollabThreadPage() {
+  const { t } = useI18n();
   const { full } = useRepo();
   const id = useParams().id ?? "";
   const thread = useData(`collab:${full}:thread:${id}`, () => api.collab(full).thread(id));
@@ -20,27 +22,32 @@ export function CollabThreadPage() {
   return (
     <>
       <div className="pad">
-        <Link to={`/${full}/collab`} className="muted">← collab</Link>
+        <Link to={`/${full}/collab`} className="muted">{t("back.collab")}</Link>
       </div>
-      <Box title={`Thread ${thread.id}`}>
+      <Box title={t("thread.title", { id: thread.id })}>
         {thread.pr && (
           <div className="kv">
-            <dt>base → head</dt>
+            <dt>{t("pr.baseHead")}</dt>
             <dd className="mono">{thread.pr.pr.base ?? "?"} → {thread.pr.pr.head ?? "?"}</dd>
-            <dt>status</dt>
+            <dt>{t("pr.status")}</dt>
             <dd>{thread.pr.pr.status}</dd>
-            <dt>reviews</dt>
+            <dt>{t("pr.reviews")}</dt>
             <dd>
               {thread.pr.pr.reviews.map((r) => `${r.actor}:${r.decision}`).join(", ") || "—"}
             </dd>
-            <dt>approvals</dt>
-            <dd>{thread.pr.pr.human_approvals.length} human · {thread.pr.pr.unverified.length} unverified</dd>
-            <dt>merge rule</dt>
-            <dd>{thread.pr.merge.allowed ? "allowed" : thread.pr.merge.reason}</dd>
+            <dt>{t("pr.approvals")}</dt>
+            <dd>
+              {t("pr.approvals.value", {
+                human: thread.pr.pr.human_approvals.length,
+                unverified: thread.pr.pr.unverified.length,
+              })}
+            </dd>
+            <dt>{t("pr.mergeRule")}</dt>
+            <dd>{thread.pr.merge.allowed ? t("collab.merge.allowed") : thread.pr.merge.reason}</dd>
           </div>
         )}
         {thread.pr && <PrDiff full={full} base={thread.pr.pr.base} head={thread.pr.pr.head} />}
-        <div className="box-header" style={{ marginTop: 8 }}>Write</div>
+        <div className="box-header" style={{ marginTop: 8 }}>{t("thread.write")}</div>
         <CollabWriteBox full={full} id={thread.id} parent={lastOid} />
       </Box>
 
@@ -53,6 +60,7 @@ export function CollabThreadPage() {
 
 /** The PR's base→head diff, rendered on demand (the diff can be large). */
 function PrDiff({ full, base, head }: { full: string; base: string | null; head: string | null }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<{ patch: string; error?: string } | null>(null);
   const load = async () => {
@@ -71,13 +79,13 @@ function PrDiff({ full, base, head }: { full: string; base: string | null; head:
     <>
       <div className="box-header" style={{ marginTop: 8 }}>
         <button className="btn small" onClick={load} aria-expanded={open}>
-          {open ? "Diff" : "Show diff"} {base ?? "?"} → {head ?? "?"}
+          {open ? t("pr.diff", { base: base ?? "?", head: head ?? "?" }) : t("pr.showDiff", { base: base ?? "?", head: head ?? "?" })}
         </button>
       </div>
       {open && state && (
         <div className="pad">
           {state.error && <div className="muted" style={{ color: "var(--danger, #f85149)" }}>{state.error}</div>}
-          {!state.error && files.length === 0 && <div className="muted">No file changes.</div>}
+          {!state.error && files.length === 0 && <div className="muted">{t("pr.noChanges")}</div>}
           {files.map((f, i) => (
             <div key={f.name + i} className="diff-file">
               <FileDiff fileDiff={f} options={{ diffStyle: "unified", themeType: "light", overflow: "scroll" }} />
@@ -107,18 +115,28 @@ function ciColor(conclusion: string): string {
 }
 
 function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
+  const { t } = useI18n();
   const kind = e.entry.kind;
   const body = e.entry.body as Record<string, unknown>;
   const ciConclusion = kind === "ci_result" ? String(body.conclusion ?? "") : "";
   const title =
-    kind === "issue" ? String(body.title ?? "(issue)")
+    kind === "issue" ? String(body.title ?? t("entry.issue.untitled"))
     : kind === "review" ? String(body.decision ?? "comment")
     : kind === "status" ? String(body.status ?? "status")
-    : kind === "ci_claim" ? `claim ${String(body.task ?? "?")} · attempt ${String(body.attempt ?? "?")}`
-    : kind === "ci_result" ? `result ${String(body.task ?? "?")} · attempt ${String(body.attempt ?? "?")}`
-    : kind;
+    : kind === "ci_claim"
+      ? t("entry.claim.title", { task: String(body.task ?? "?"), attempt: String(body.attempt ?? "?") })
+      : kind === "ci_result"
+        ? t("entry.result.title", { task: String(body.task ?? "?"), attempt: String(body.attempt ?? "?") })
+        : kind;
   return (
-    <Box title={<span>#{n} <strong>{kind}</strong> · {e.entry.actor} · {fmtTime(e.entry.ts)} · {e.verified ? "✓ verified" : "✗ unverified"}</span>}>
+    <Box
+      title={
+        <span>
+          #{n} <strong>{kindLabel(t, kind)}</strong> · {e.entry.actor} · {fmtTime(e.entry.ts)} ·{" "}
+          {e.verified ? t("entry.verified") : t("entry.unverified")}
+        </span>
+      }
+    >
       <div className="pad">
         <div className="strong">
           {title}
@@ -128,9 +146,13 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
         </div>
         {kind === "ci_result" && (
           <div className="mono muted">
-            {String(body.ref ?? "")} @ {String(body.commit ?? "").slice(0, 8)} · exit{" "}
-            {body.exit_code === null || body.exit_code === undefined ? "—" : String(body.exit_code)} · {String(body.duration_ms ?? "?")} ms · log
-            sha {String(body.log_sha256 ?? "").slice(0, 12)}
+            {t("entry.result.meta", {
+              ref: String(body.ref ?? ""),
+              commit: String(body.commit ?? "").slice(0, 8),
+              code: body.exit_code === null || body.exit_code === undefined ? "—" : String(body.exit_code),
+              ms: String(body.duration_ms ?? "?"),
+              sha: String(body.log_sha256 ?? "").slice(0, 12),
+            })}
           </div>
         )}
         {ciConclusion && typeof body.log_summary === "string" && body.log_summary !== "" && (

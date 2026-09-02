@@ -8,6 +8,7 @@ import { RepoLayout } from "./pages/RepoLayout";
 import { TreePage } from "./pages/TreePage";
 import { CommitsPage } from "./pages/CommitsPage";
 import { track } from "./data";
+import { I18nProvider } from "./i18n";
 import "./styles.css";
 
 // Heavy pages (syntax highlighting / diff rendering / WAL dashboard) are split
@@ -25,7 +26,8 @@ const CollabThreadPage = lazy(() => track(import("./pages/CollabThreadPage")).th
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter>
+    <I18nProvider>
+      <BrowserRouter>
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Owners />} />
@@ -46,6 +48,7 @@ createRoot(document.getElementById("root")!).render(
           </Route>
         </Route>
       </Routes>
-    </BrowserRouter>
+      </BrowserRouter>
+    </I18nProvider>
   </StrictMode>,
 );

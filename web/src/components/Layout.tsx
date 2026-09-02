@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { RouteBoundary, TopProgress, useBusy } from "./Loading";
 import { ErrorTray } from "./ErrorTray";
 import { InstanceFooter } from "./InstanceFooter";
+import { LangSwitch } from "../i18n";
 
 export function Layout() {
   const busy = useBusy();
@@ -25,6 +26,7 @@ export function Layout() {
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
             API
           </NavLink>
+          <LangSwitch />
         </nav>
       </header>
       <TopProgress />

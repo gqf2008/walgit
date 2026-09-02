@@ -807,6 +807,13 @@ details summary { cursor: pointer; margin-top: 8px; }
 }
 .topnav-link:hover { background: var(--bg3); text-decoration: none; }
 .topnav-link.active { font-weight: 600; box-shadow: inset 0 -2px 0 #fd8c73; border-radius: 6px 6px 0 0; }
+.lang-switch {
+  margin-left: 8px; font: inherit; font-size: 12.5px; color: var(--fg2, #57606a);
+  background: transparent; border: 1px solid var(--border, #d0d7de); border-radius: 6px;
+  padding: 3px 6px; cursor: pointer;
+}
+.lang-switch:hover { background: var(--bg3); }
+.lang-switch:focus-visible { outline: 2px solid #fd8c73; outline-offset: 1px; }
 .api-page .lead { font-size: 15px; color: var(--fg); max-width: 860px; margin: 0 0 16px; }
 .api-repo-input { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .api-repo-input input { font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); width: 260px; }

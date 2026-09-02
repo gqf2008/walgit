@@ -5,10 +5,12 @@ import { useData } from "../data";
 import { RouteBoundary, Skeleton } from "../components/Loading";
 import { CloneSetup } from "../components/CloneSetup";
 import { TasksOverlay } from "../components/TasksOverlay";
+import { useI18n } from "../i18n";
 import "../clone.css";
 
 /** "Clone" dropdown: recipes come from `/services/setup.json` (cached after the first open). */
 function CloneMenu({ full }: { full: string }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -22,7 +24,7 @@ function CloneMenu({ full }: { full: string }) {
   return (
     <div className="clone-menu" ref={ref}>
       <button type="button" className="btn btn-primary" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        Clone
+        {t("clone.button")}
       </button>
       {open && (
         <div className="clone-pop">
@@ -54,6 +56,7 @@ export function useRepo(): RepoCtx {
  * only the body waits (Suspense skeleton) for the `refs` request, and page
  * navigations inside the repo keep the shell while the next page loads. */
 export function RepoLayout() {
+  const { t } = useI18n();
   const { owner = "", repo = "" } = useParams();
   const full = `${owner}/${repo}`;
   const { pathname } = useLocation();
@@ -86,19 +89,19 @@ export function RepoLayout() {
         <CloneMenu full={full} />
         <nav className="tabs">
           <NavLink to={`/${full}`} className={() => (codeActive ? "tab active" : "tab")} end>
-            Code
+            {t("tab.code")}
           </NavLink>
           <NavLink to={`/${full}/commits`} className={() => (codeActive || walActive || settingsActive || collabActive ? "tab" : "tab active")}>
-            Commits
+            {t("tab.commits")}
           </NavLink>
           <NavLink to={`/${full}/wal`} className={() => (walActive ? "tab active" : "tab")}>
-            WAL
+            {t("tab.wal")}
           </NavLink>
           <NavLink to={`/${full}/collab`} className={() => (collabActive ? "tab active" : "tab")}>
-            Collab
+            {t("tab.collab")}
           </NavLink>
           <NavLink to={`/${full}/settings`} className={() => (settingsActive ? "tab active" : "tab")}>
-            Settings
+            {t("tab.settings")}
           </NavLink>
           <TasksOverlay repo={full} />
         </nav>
