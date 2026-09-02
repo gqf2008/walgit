@@ -112,7 +112,13 @@ impl Registry {
         // Load state
         let state = load_state(local.path());
 
-        let state_is_behind = state.applied_seq < manifest.head_seq;
+        // `!=`, not `<`: the WAL is append-only, so `applied_seq > head_seq`
+        // means the bucket was wiped/rebuilt and the local refs must be
+        // rebuilt from the fold, not kept (#36). An empty manifest always
+        // reapplies: `applied_seq == head_seq == 0` can still sit on a
+        // leftover local dir whose packed-refs survived the wipe (the state
+        // file may even be lost), and resetting them is a trivial write.
+        let needs_apply = state.applied_seq != manifest.head_seq || manifest.head_seq == 0;
         let manifest_version = meta.version.clone();
 
         let handle = RepoHandle::new(
@@ -134,7 +140,7 @@ impl Registry {
         // directly instead of issuing a second manifest GET merely to learn
         // what we already hold. Cold open remains one manifest round, followed
         // by checkpoint/log objects in parallel/sequence as required.
-        if state_is_behind {
+        if needs_apply {
             crate::sync::apply_delta(&handle, &manifest, &manifest_version).await?;
         }
 
@@ -253,6 +259,14 @@ impl Registry {
             Ok(meta) => {
                 // Init local repo
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
+                // `git init --bare` is a no-op on a surviving directory: a
+                // leftover cache dir (bucket wiped, repo recreated under the
+                // same name) still holds the old packed-refs, and receive-pack
+                // would advertise refs the brand-new empty manifest does not
+                // know (#36). A fresh manifest means an empty repository —
+                // local refs are a pure function of the manifest, so reset
+                // them to empty.
+                local.load_ref_snapshot(&walgit_proto::v1::RefSnapshot::default())?;
 
                 let state = RepoState::default();
                 save_state(local.path(), &state)?;

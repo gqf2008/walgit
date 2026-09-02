@@ -428,6 +428,15 @@ pub(crate) async fn download_object(
 
 /// Apply the delta between the current local state and the new manifest.
 /// Downloads missing packs, replays log entries, applies ref transactions.
+///
+/// Local refs are a pure function of the manifest: fold(checkpoint, tail).
+/// The WAL is append-only within a repo's life, so `applied_seq > head_seq`
+/// (or the manifest's revision moving backwards) means the bucket was wiped
+/// and rebuilt — the local refs can no longer be reached incrementally and
+/// are rebuilt from the fold. An empty manifest means an empty repository: a
+/// leftover local dir (same `cache.dir`, wiped bucket — `git init --bare` is
+/// a no-op on a surviving directory) must not keep advertising refs the WAL
+/// no longer knows (#36).
 pub(crate) async fn apply_delta(
     handle: &super::handle::RepoHandle,
     new_manifest: &Manifest,
@@ -436,29 +445,46 @@ pub(crate) async fn apply_delta(
     let store = &handle.store;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
-
-    // If we have a checkpoint and haven't loaded it yet, load its refs. Its
-    // packs are a subset of `Manifest.packs` and are reconciled below.
-    let checkpoint_seq = new_manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
-    let need_checkpoint_load = checkpoint_seq > 0 && current_state.applied_seq < checkpoint_seq;
-
-    // The checkpoint's times feed `first_state_time` / `refs_as_of`; old refs
-    // carry none, the object always does.
-    handle.learn_checkpoint_times().await?;
-    if need_checkpoint_load {
-        let refs_key = keys::checkpoint_refs_key(checkpoint_seq);
-        if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
-            local.load_ref_snapshot(&snap)?;
-            handle.state.lock().applied_seq = checkpoint_seq;
-        }
-    }
-
-    // Replay log entries (refs, and superseded-pack bookkeeping) from
-    // applied_seq+1 to head_seq. Packs are never touched here.
-    let applied_seq = handle.state.lock().applied_seq;
     let head_seq = new_manifest.head_seq;
-    if applied_seq < head_seq {
-        replay_log(handle, new_manifest, applied_seq, head_seq).await?;
+    let rebuilt =
+        current_state.applied_seq > head_seq || new_manifest.revision < current_state.revision;
+
+    if head_seq == 0 {
+        // Empty manifest ⇒ empty refs, unconditionally: cheap (one small
+        // packed-refs write) and the only way to also cover a leftover dir
+        // whose state file was lost (`applied_seq == 0` yet refs present).
+        local.load_ref_snapshot(&RefSnapshot::default())?;
+        handle.state.lock().applied_seq = 0;
+    } else {
+        // If we have a checkpoint and haven't loaded it yet — or the bucket
+        // was rebuilt and we must restart from it — load its refs. Its packs
+        // are a subset of `Manifest.packs` and are reconciled below.
+        let checkpoint_seq = new_manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+        let need_checkpoint_load =
+            checkpoint_seq > 0 && (current_state.applied_seq < checkpoint_seq || rebuilt);
+
+        // The checkpoint's times feed `first_state_time` / `refs_as_of`; old refs
+        // carry none, the object always does.
+        handle.learn_checkpoint_times().await?;
+        if need_checkpoint_load {
+            let refs_key = keys::checkpoint_refs_key(checkpoint_seq);
+            if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
+                local.load_ref_snapshot(&snap)?;
+                handle.state.lock().applied_seq = checkpoint_seq;
+            }
+        } else if rebuilt {
+            // No checkpoint to rebuild from: start empty and replay the whole
+            // log (no checkpoint ⇒ min_seq ≤ 1 ⇒ the full log is present).
+            local.load_ref_snapshot(&RefSnapshot::default())?;
+            handle.state.lock().applied_seq = 0;
+        }
+
+        // Replay log entries (refs, and superseded-pack bookkeeping) from
+        // applied_seq+1 to head_seq. Packs are never touched here.
+        let applied_seq = handle.state.lock().applied_seq;
+        if applied_seq < head_seq {
+            replay_log(handle, new_manifest, applied_seq, head_seq).await?;
+        }
     }
 
     {
@@ -987,6 +1013,13 @@ pub(crate) async fn materialize_from_scratch(
 
     // Reset state
     handle.state.lock().applied_seq = 0;
+    // "From scratch" must be honest about refs too: with no checkpoint to
+    // load, apply_delta replays the whole log on top of the *existing* local
+    // refs — start from empty so the result is the fold, not the fold merged
+    // into whatever a leftover dir happened to hold (#36).
+    if manifest.checkpoint.is_none() {
+        handle.local.load_ref_snapshot(&RefSnapshot::default())?;
+    }
 
     // Apply delta from scratch (checkpoint + all log entries), then packs.
     apply_delta(handle, manifest, version)

@@ -2728,3 +2728,170 @@ async fn a_landed_cas_is_ok_even_when_the_local_apply_fails_and_the_next_sync_re
     );
     assert_eq!(handle.applied_seq(), 2);
 }
+
+// ---- #36: phantom refs from a leftover cache dir after a bucket wipe ----
+
+/// The issue's exact repro: a fresh process, a wiped bucket and a leftover
+/// cache.dir — receive-pack's auto-create must not resurrect the old refs.
+#[tokio::test]
+async fn test_recreate_after_bucket_wipe_on_leftover_cache_has_empty_refs() {
+    let cache = tempfile::tempdir().unwrap();
+    let id = repo_id("test", "wiped-recreate");
+
+    // The repo lives, gets a push, and the local cache records it.
+    {
+        let store = MemoryStore::shared();
+        let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+        let work = WorkRepo::new();
+        let c1 = work.commit("first", "hello");
+        let pack1 = work.create_pack();
+        let ingested = ingest_pack_data(&handle, pack1).await.unwrap();
+        let txn = make_txn(vec![("refs/heads/main", "", &c1)]);
+        handle
+            .publish_push(Some(ingested), txn, HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            handle
+                .local()
+                .refs()
+                .unwrap()
+                .refs
+                .iter()
+                .any(|r| r.name == "refs/heads/main"),
+            "precondition: the leftover cache holds the pushed ref"
+        );
+    } // "process exit": registry dropped, the cache dir survives
+
+    // The bucket is wiped (a fresh store); the cache dir is not.
+    let store2 = MemoryStore::shared();
+    let registry2 = Registry::new(store2.clone(), Arc::new(make_config(cache.path(), 0)));
+
+    // receive-pack's first contact: open_or_create recreates the repo, and
+    // the advertisement built from the local refs must be empty — upload-pack
+    // and receive-pack agree on the repository's state again.
+    let handle2 = registry2.open_or_create(&id, ObjectFormat::Sha1).await.unwrap();
+    let refs = handle2.local().refs().unwrap();
+    assert!(
+        refs.refs.is_empty(),
+        "phantom refs after bucket wipe: {:?}",
+        refs.refs.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// Same wipe, but another instance recreates the (still empty) repository
+/// first: `open()` on a leftover cache must reset refs from the empty manifest
+/// even though `applied_seq == head_seq == 0` would look up-to-date once the
+/// state file is lost.
+#[tokio::test]
+async fn test_open_empty_manifest_on_leftover_cache_has_empty_refs() {
+    let cache_leftover = tempfile::tempdir().unwrap();
+    let id = repo_id("test", "wiped-open");
+
+    {
+        let store = MemoryStore::shared();
+        let registry = Registry::new(
+            store.clone(),
+            Arc::new(make_config(cache_leftover.path(), 0)),
+        );
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+        let work = WorkRepo::new();
+        let c1 = work.commit("first", "hello");
+        let pack1 = work.create_pack();
+        let ingested = ingest_pack_data(&handle, pack1).await.unwrap();
+        let txn = make_txn(vec![("refs/heads/main", "", &c1)]);
+        handle
+            .publish_push(Some(ingested), txn, HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    // Wiped bucket; another instance recreates the empty repository first.
+    let store2 = MemoryStore::shared();
+    let cache_a = tempfile::tempdir().unwrap();
+    let registry_a = Registry::new(store2.clone(), Arc::new(make_config(cache_a.path(), 0)));
+    registry_a.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    // A fresh process on the leftover cache opens it: the old main must go.
+    let registry_b = Registry::new(
+        store2.clone(),
+        Arc::new(make_config(cache_leftover.path(), 0)),
+    );
+    let handle_b = registry_b.open(&id).await.unwrap();
+    let refs = handle_b.local().refs().unwrap();
+    assert!(
+        refs.refs.is_empty(),
+        "phantom refs opening a recreated repo on a leftover cache: {:?}",
+        refs.refs.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// A wiped bucket that is rebuilt *with content* must replace the leftover
+/// refs wholesale, not merge them: local state ahead of the new head with no
+/// checkpoint to load rebuilds from an empty base plus a full log replay.
+#[tokio::test]
+async fn test_rebuilt_bucket_replaces_leftover_refs() {
+    let cache_leftover = tempfile::tempdir().unwrap();
+    let id = repo_id("test", "wiped-rebuilt");
+
+    {
+        let store = MemoryStore::shared();
+        let registry = Registry::new(
+            store.clone(),
+            Arc::new(make_config(cache_leftover.path(), 0)),
+        );
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+        let work = WorkRepo::new();
+        let c1 = work.commit("first", "hello");
+        let pack1 = work.create_pack();
+        let ingested = ingest_pack_data(&handle, pack1).await.unwrap();
+        let txn = make_txn(vec![
+            ("refs/heads/main", "", &c1),
+            ("refs/heads/feature", "", &c1),
+        ]);
+        handle
+            .publish_push(Some(ingested), txn, HashMap::new())
+            .await
+            .unwrap();
+        let c2 = work.commit("second", "world");
+        let pack2 = work.create_incremental_pack(&c2, &c1);
+        let ingested2 = ingest_pack_data(&handle, pack2).await.unwrap();
+        let txn2 = make_txn(vec![("refs/heads/main", &c1, &c2)]);
+        handle
+            .publish_push(Some(ingested2), txn2, HashMap::new())
+            .await
+            .unwrap();
+    } // leftover state: applied_seq = 2, refs = main@c2 + feature@c1
+
+    // Wiped bucket; another instance recreates the repo and pushes a NEW main
+    // (head_seq 1 < leftover applied_seq 2, no checkpoint anywhere).
+    let store2 = MemoryStore::shared();
+    let cache_a = tempfile::tempdir().unwrap();
+    let registry_a = Registry::new(store2.clone(), Arc::new(make_config(cache_a.path(), 0)));
+    let handle_a = registry_a.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work_a = WorkRepo::new();
+    let new_c = work_a.commit("reborn", "fresh");
+    let pack = work_a.create_pack();
+    let ingested = ingest_pack_data(&handle_a, pack).await.unwrap();
+    let txn = make_txn(vec![("refs/heads/main", "", &new_c)]);
+    handle_a
+        .publish_push(Some(ingested), txn, HashMap::new())
+        .await
+        .unwrap();
+
+    // A fresh process on the leftover cache opens the rebuilt repo: refs must
+    // be exactly the new fold — the new main, and no leftover `feature`.
+    let registry_b = Registry::new(
+        store2.clone(),
+        Arc::new(make_config(cache_leftover.path(), 0)),
+    );
+    let handle_b = registry_b.open(&id).await.unwrap();
+    let view = handle_b.local().ref_view().unwrap();
+    assert_eq!(view.get("refs/heads/main").unwrap_or_default(), new_c);
+    assert_eq!(
+        view.get("refs/heads/feature").unwrap_or_default(),
+        String::new(),
+        "leftover ref survived a bucket rebuild"
+    );
+}

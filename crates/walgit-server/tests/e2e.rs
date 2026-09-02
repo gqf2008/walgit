@@ -3245,3 +3245,70 @@ async fn read_after_ack_probe_isolated() -> TestResult {
     assert_eq!(stale, 0);
     Ok(())
 }
+
+/// #36: a fresh process on a wiped bucket with a leftover cache.dir —
+/// receive-pack's auto-create must not advertise phantom refs, and
+/// upload-pack must agree with receive-pack about the repository's state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiped_bucket_on_leftover_cache_advertises_no_phantom_refs() -> TestResult {
+    let cache = tempfile::tempdir()?;
+
+    // Server A: the repo is auto-created by the push and lives on the bucket.
+    let server_a = Server::start_with_store_and_cache_dir(
+        walgit_store::memory::MemoryStore::shared(),
+        cache.path(),
+        |cfg| cfg.server.auto_create_on_push = true,
+    )
+    .await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "first"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server_a.repo_url("o", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+    let pushed = git_in(&src, &["rev-parse", "main"])?;
+    assert!(server_a.ls_remote("o", "r").await?.contains(pushed.trim()));
+
+    // "Process exit": the server drops; the caller-owned cache dir survives.
+    drop(server_a);
+
+    // Server B: a wiped bucket (fresh memory store) over the SAME cache dir.
+    let server_b = Server::start_with_store_and_cache_dir(
+        walgit_store::memory::MemoryStore::shared(),
+        cache.path(),
+        |cfg| cfg.server.auto_create_on_push = true,
+    )
+    .await?;
+
+    // upload-pack: the repository is gone with the bucket.
+    let out = Command::new("git")
+        .args(["ls-remote", &server_b.repo_url("o", "r")])
+        .output()?;
+    assert!(
+        !out.status.success(),
+        "upload-pack must not find the wiped repo: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // receive-pack's first contact auto-creates an EMPTY repository: the old
+    // tip must not reappear in the advertisement.
+    let adv = server_b
+        .get_text("/o/r.git/info/refs?service=git-receive-pack", &[])
+        .await?;
+    assert!(
+        !adv.contains(pushed.trim()) && !adv.contains("refs/heads/main"),
+        "phantom refs in the receive-pack advertisement after a bucket wipe"
+    );
+
+    // upload-pack now agrees: same repository, same (empty) state.
+    let adv = server_b
+        .get_text("/o/r.git/info/refs?service=git-upload-pack", &[])
+        .await?;
+    assert!(
+        !adv.contains(pushed.trim()) && !adv.contains("refs/heads/main"),
+        "phantom refs in the upload-pack advertisement after a bucket wipe"
+    );
+    Ok(())
+}
