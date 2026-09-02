@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { api } from "../api";
 import { invalidate } from "../data";
 import { ed25519Supported, publicKeyB64, signCanonical } from "../collab";
+import { useI18n, kindLabel, decisionLabel, statusLabel, type TFunc } from "../i18n";
 
 /**
  * D1 browser write box: sign in as the session principal, self-register the
@@ -25,13 +26,13 @@ export interface CollabWriteProps {
  * public key self-registered through the thin API. Resolves the principal or
  * throws with the reason it could not.
  */
-export async function enableCollabKey(full: string): Promise<string> {
+export async function enableCollabKey(full: string, t?: TFunc): Promise<string> {
   if (!(await ed25519Supported())) {
-    throw new Error("This browser has no WebCrypto Ed25519 support — use the walgit collab CLI to sign entries.");
+    throw new Error(t ? t("write.err.noWebCrypto") : "This browser has no WebCrypto Ed25519 support — use the walgit collab CLI to sign entries.");
   }
   const me = await api.me();
   if (me.anonymous) {
-    throw new Error("Signed out — sign in to participate in the collaboration layer.");
+    throw new Error(t ? t("write.err.signedOut") : "Signed out — sign in to participate in the collaboration layer.");
   }
   const publicKey = await publicKeyB64();
   // Self-registration is idempotent in effect (re-registering the same key
@@ -44,6 +45,7 @@ export async function enableCollabKey(full: string): Promise<string> {
 type Kind = "issue" | "comment" | "review" | "status" | "patch";
 
 export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps) {
+  const { t } = useI18n();
   const [ready, setReady] = useState<string | null>(null); // principal when the browser key is registered
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +60,7 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
     setBusy(true);
     setError(null);
     try {
-      const principal = await enableCollabKey(full);
+      const principal = await enableCollabKey(full, t);
       setReady(principal);
       return principal;
     } catch (e) {
@@ -67,7 +69,7 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
     } finally {
       setBusy(false);
     }
-  }, [full]);
+  }, [full, t]);
 
   const post = useCallback(async () => {
     setBusy(true);
@@ -77,7 +79,7 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
       if (!principal) return; // enable() set the error
       const body: Record<string, unknown> =
         kind === "issue"
-          ? { title: text.split("\n")[0] || "untitled", text }
+          ? { title: text.split("\n")[0] || t("write.err.untitled"), text }
           : kind === "comment"
             ? { text }
             : kind === "review"
@@ -105,16 +107,16 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
     } finally {
       setBusy(false);
     }
-  }, [ready, enable, kind, text, decision, status, base, head, full, id, parent, onPosted]);
+  }, [ready, enable, kind, text, decision, status, base, head, full, id, parent, onPosted, t]);
 
   if (!ready) {
     return (
       <div className="pad">
         {error && <div className="muted" style={{ color: "var(--danger, #f85149)" }}>{error}</div>}
         <button className="btn" disabled={busy} onClick={enable}>
-          {busy ? "Setting up…" : "Enable my key & register"}
+          {busy ? t("write.enabling") : t("write.enable")}
         </button>
-        <span className="muted"> — generate an Ed25519 keypair in this browser, self-register the public key, and post signed entries.</span>
+        <span className="muted">{t("write.enable.hint")}</span>
       </div>
     );
   }
@@ -123,43 +125,43 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
       <div className="row gap" style={{ alignItems: "center" }}>
         <strong>{ready}</strong>
         <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
-          <option value="issue">issue</option>
-          <option value="comment">comment</option>
-          <option value="review">review</option>
-          <option value="status">status</option>
-          <option value="patch">patch</option>
+          <option value="issue">{kindLabel(t, "issue")}</option>
+          <option value="comment">{kindLabel(t, "comment")}</option>
+          <option value="review">{kindLabel(t, "review")}</option>
+          <option value="status">{kindLabel(t, "status")}</option>
+          <option value="patch">{kindLabel(t, "patch")}</option>
         </select>
         {kind === "review" && (
           <select value={decision} onChange={(e) => setDecision(e.target.value as typeof decision)}>
-            <option value="approve">approve</option>
-            <option value="request_changes">request_changes</option>
-            <option value="comment">comment</option>
+            <option value="approve">{decisionLabel(t, "approve")}</option>
+            <option value="request_changes">{decisionLabel(t, "request_changes")}</option>
+            <option value="comment">{decisionLabel(t, "comment")}</option>
           </select>
         )}
         {kind === "status" && (
           <select value={status} onChange={(e) => setStatus(e.target.value as typeof status)}>
-            <option value="closed">closed</option>
-            <option value="merged">merged</option>
-            <option value="open">open</option>
+            <option value="closed">{statusLabel(t, "closed")}</option>
+            <option value="merged">{statusLabel(t, "merged")}</option>
+            <option value="open">{statusLabel(t, "open")}</option>
           </select>
         )}
       </div>
       {kind === "patch" && (
         <div className="row gap">
-          <input value={base} onChange={(e) => setBase(e.target.value)} placeholder="base ref" />
-          <input value={head} onChange={(e) => setHead(e.target.value)} placeholder="head ref" />
+          <input value={base} onChange={(e) => setBase(e.target.value)} placeholder={t("write.baseRef")} />
+          <input value={head} onChange={(e) => setHead(e.target.value)} placeholder={t("write.headRef")} />
         </div>
       )}
       <textarea
         className="collab-body"
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder={kind === "issue" ? "First line = title, rest = body" : kind === "review" || kind === "status" ? "optional note" : "Write…"}
+        placeholder={kind === "issue" ? t("write.ph.issue") : kind === "review" || kind === "status" ? t("write.ph.note") : t("write.ph.write")}
         rows={4}
       />
       <div className="row gap">
         <button className="btn primary" disabled={busy || (kind === "patch" && !head)} onClick={post}>
-          {busy ? "Posting…" : `Post ${kind}`}
+          {busy ? t("write.posting") : t("write.post", { kind: kindLabel(t, kind) })}
         </button>
         {error && <span className="muted" style={{ color: "var(--danger, #f85149)" }}>{error}</span>}
       </div>

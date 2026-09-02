@@ -6,6 +6,7 @@ import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
 import { enableCollabKey } from "../components/CollabWrite";
 import { signCanonical } from "../collab";
+import { useI18n, statusLabel } from "../i18n";
 
 /**
  * The D1 work-unit board (docs/D1_COLLAB_DESIGN.md §8): `/collab/board` — a
@@ -79,6 +80,7 @@ function BoardColumnView({ full, name, cards }: { full: string; name: string; ca
 }
 
 function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const move = useCallback(
@@ -90,7 +92,7 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
         // entry, chained on the thread tip, through the same thin API every
         // other browser write uses — the verification badge on the thread
         // page proves it exactly like a CLI-written entry.
-        const principal = await enableCollabKey(full);
+        const principal = await enableCollabKey(full, t);
         const entry = await api.collabBuildEntry(full, {
           principal,
           kind: "status",
@@ -108,7 +110,7 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
         setBusy(false);
       }
     },
-    [full, card.id, card.last_oid],
+    [full, card.id, card.last_oid, t],
   );
   return (
     <div className="pad" style={{ borderBottom: "1px solid var(--border, #ddd)" }}>
@@ -116,13 +118,17 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
         <Link to={`/${full}/collab/thread/${encodeURIComponent(card.id)}`} className="strong">
           {card.title || card.id}
         </Link>
-        <span className="muted mono">{card.status}</span>
+        <span className="muted mono">{statusLabel(t, card.status)}</span>
       </div>
       <div className="muted" style={{ fontSize: "0.85em" }}>
-        {card.actor} · {card.entries} entries · {card.verified} verified
-        {card.unverified > 0 ? <span style={{ color: "var(--danger, #f85149)" }}> · {card.unverified} unverified</span> : null}
+        {t("board.card.meta", { actor: card.actor, entries: card.entries, verified: card.verified })}
+        {card.unverified > 0 ? (
+          <span style={{ color: "var(--danger, #f85149)" }}>{t("board.card.unverified", { n: card.unverified })}</span>
+        ) : null}
         {card.merge ? (
-          <span className={card.merge.allowed ? "ok" : "muted"}> · merge {card.merge.allowed ? "allowed" : "blocked"}</span>
+          <span className={card.merge.allowed ? "ok" : "muted"}>
+            {card.merge.allowed ? t("board.card.merge.allowed") : t("board.card.merge.blocked")}
+          </span>
         ) : null}
         {" · "}
         {fmtTime(card.last_ts)}
@@ -136,10 +142,10 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
             if (e.target.value) move(e.target.value);
           }}
         >
-          <option value="">{busy ? "moving…" : "move to…"}</option>
+          <option value="">{busy ? t("board.moving") : t("board.moveTo")}</option>
           {STATUSES.filter((s) => s !== card.status).map((s) => (
             <option key={s} value={s}>
-              {s}
+              {statusLabel(t, s)}
             </option>
           ))}
         </select>
@@ -150,20 +156,17 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
 }
 
 export function CollabBoardPage() {
+  const { t } = useI18n();
   const { full } = useRepo();
   const board = useData(`collab:${full}:board`, () => api.collab(full).board());
   useCollabLive(full);
   return (
     <>
       <div className="pad">
-        <Link to={`/${full}/collab`} className="muted">← collab</Link>
+        <Link to={`/${full}/collab`} className="muted">{t("back.collab")}</Link>
       </div>
-      <Box title="Work-unit board">
-        <div className="pad muted">
-          The threads of <code>refs/collab/*</code> projected under the board definition at{" "}
-          <code>.walgit/board.toml</code> (the same <code>build_board</code> the CLI renders offline — no board state
-          exists anywhere). Moving a card posts a signed <code>status</code> entry.
-        </div>
+      <Box title={t("board.title")}>
+        <div className="pad muted">{t("board.explainer")}</div>
       </Box>
       <div className="row gap" style={{ alignItems: "flex-start" }}>
         {board.columns.map((col) => (

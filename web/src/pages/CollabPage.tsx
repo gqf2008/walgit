@@ -5,6 +5,7 @@ import { useRepo } from "./RepoLayout";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { CollabWriteBox } from "../components/CollabWrite";
+import { useI18n, kindLabel } from "../i18n";
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -23,40 +24,45 @@ export function CollabPage() {
 }
 
 function CollabView({ full, report }: { full: string; report: CollabReport }) {
+  const { t: t_ } = useI18n();
   const [newId, setNewId] = useState(() => uuid());
   return (
     <>
-      <Box title="D1 collaboration">
+      <Box title={t_("collab.title")}>
         <div className="kv">
-          <dt>Threads</dt>
+          <dt>{t_("collab.threads")}</dt>
           <dd>{report.threads.length}</dd>
-          <dt>Pull requests</dt>
+          <dt>{t_("collab.prs")}</dt>
           <dd>{report.prs.length}</dd>
-          <dt>Entries</dt>
+          <dt>{t_("collab.entries")}</dt>
           <dd>
-            {report.total_entries} · <span className="ok">✓ {report.verified_entries} verified</span> ·{" "}
-            <span className="muted">{report.unverified_entries} unverified</span> · {report.missing_principals} missing keys
+            {t_("collab.entries.summary", {
+              total: report.total_entries,
+              verified: report.verified_entries,
+              unverified: report.unverified_entries,
+              missing: report.missing_principals,
+            })}
           </dd>
-          <dt>Board</dt>
+          <dt>{t_("board.title")}</dt>
           <dd>
-            <Link to={`/${full}/collab/board`}>work-unit board →</Link>
+            <Link to={`/${full}/collab/board`}>{t_("collab.board.link")}</Link>
           </dd>
         </div>
-        <div className="box-header" style={{ marginTop: 8 }}>New thread</div>
+        <div className="box-header" style={{ marginTop: 8 }}>{t_("collab.newThread")}</div>
         <CollabWriteBox full={full} id={newId} parent="" onPosted={() => setNewId(uuid())} />
       </Box>
 
-      <Box title="Threads">
-        {report.threads.length === 0 && <div className="pad muted">No threads yet — post the first entry above.</div>}
+      <Box title={t_("collab.threads")}>
+        {report.threads.length === 0 && <div className="pad muted">{t_("collab.noThreads")}</div>}
         {report.threads.length > 0 && (
           <table className="grid">
             <thead>
               <tr>
-                <th>id</th>
-                <th>kinds</th>
-                <th>entries</th>
-                <th>verified</th>
-                <th>last activity</th>
+                <th>{t_("collab.th.id")}</th>
+                <th>{t_("collab.th.kinds")}</th>
+                <th>{t_("collab.th.entries")}</th>
+                <th>{t_("collab.th.verified")}</th>
+                <th>{t_("collab.th.lastActivity")}</th>
               </tr>
             </thead>
             <tbody>
@@ -67,7 +73,7 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
                       {t.id}
                     </Link>
                   </td>
-                  <td>{t.kinds.join(", ")}</td>
+                  <td>{t.kinds.map((k) => kindLabel(t_, k)).join(", ")}</td>
                   <td>{t.entries}</td>
                   <td>{t.verified}</td>
                   <td>{fmtTime(t.last_ts)}</td>
@@ -78,17 +84,17 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
         )}
       </Box>
 
-      <Box title="Pull requests">
-        {report.prs.length === 0 && <div className="pad muted">No patches.</div>}
+      <Box title={t_("collab.prs")}>
+        {report.prs.length === 0 && <div className="pad muted">{t_("collab.noPrs")}</div>}
         {report.prs.length > 0 && (
           <table className="grid">
             <thead>
               <tr>
-                <th>id</th>
-                <th>base → head</th>
-                <th>status</th>
-                <th>approvals</th>
-                <th>merge</th>
+                <th>{t_("collab.th.id")}</th>
+                <th>{t_("collab.th.baseHead")}</th>
+                <th>{t_("collab.th.status")}</th>
+                <th>{t_("collab.th.approvals")}</th>
+                <th>{t_("collab.th.merge")}</th>
               </tr>
             </thead>
             <tbody>
@@ -103,7 +109,7 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
                   <td>{p.status}</td>
                   <td>{p.approvals}</td>
                   <td>
-                    {p.merge_allowed ? <span className="ok">allowed</span> : <span className="muted">{p.merge_reason}</span>}
+                    {p.merge_allowed ? <span className="ok">{t_("collab.merge.allowed")}</span> : <span className="muted">{p.merge_reason}</span>}
                   </td>
                 </tr>
               ))}
@@ -114,7 +120,7 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
 
       {(report.by_actor.length > 0 || report.by_kind.length > 0) && (
         <div className="row gap">
-          <Box title="By actor" className="grow">
+          <Box title={t_("collab.byActor")} className="grow">
             <table className="kv compact">
               <tbody>
                 {report.by_actor.map(([a, n]) => (
@@ -126,12 +132,12 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
               </tbody>
             </table>
           </Box>
-          <Box title="By kind" className="grow">
+          <Box title={t_("collab.byKind")} className="grow">
             <table className="kv compact">
               <tbody>
                 {report.by_kind.map(([k, n]) => (
                   <tr key={k}>
-                    <th>{k}</th>
+                    <th>{kindLabel(t_, k)}</th>
                     <td>{n}</td>
                   </tr>
                 ))}
