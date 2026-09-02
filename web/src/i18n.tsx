@@ -22,6 +22,33 @@ export const LANGS: { value: Lang; label: string }[] = [
 const en = {
   "lang.switch": "Language",
 
+  // Top nav
+  "nav.repos": "Repositories",
+
+  // Landing hero
+  "hero.lede": "A git server that is a single binary in front of an object store.",
+  "hero.text.a": "walgit is an implementation of the ideas in the",
+  "hero.link.origin": "git hosting architecture of Origin (Cursor)",
+  "hero.text.b": "and our friends at",
+  "hero.link.turbopuffer": "Turbopuffer",
+  "hero.text.c": "who have pioneered GCS/S3 based share-nothing infrastructure to scale.",
+  "hero.exploreApi": "Explore the API",
+  "hero.readPost": "Read “Git at any scale” ↗",
+  "home.reposByOwner": "Repositories by owner",
+
+  // Landing D1 showcase (issue #43)
+  "showcase.title": "Collaboration, without a database",
+  "showcase.lede":
+    "Issues, the board and CI on this host are derived live from signed entries stored as git refs — no database, only public rules every client applies identically.",
+  "showcase.m1.t": "An issue is an append-only chain",
+  "showcase.m1.b": "Nobody edits; everyone appends a signed entry. The state is a replay — the last matching entry wins.",
+  "showcase.m2.t": "The board exists nowhere — it is computed",
+  "showcase.m2.b": "Same refs, same rule: every client derives the board independently and arrives at byte-identical results.",
+  "showcase.m3.t": "Two runners may both run — only one counts",
+  "showcase.m3.b": "CI has no scheduler. Simultaneous claims are a legal race; one deterministic winner rule yields exactly one effective result.",
+  "showcase.illustrative": "illustrative",
+  "showcase.cta.guide": "See it live in a repository →",
+
   // Repo chrome
   "tab.code": "Code",
   "tab.commits": "Commits",
@@ -184,6 +211,29 @@ export type I18nKey = keyof typeof en;
 const zhCN: Record<I18nKey, string> = {
   "lang.switch": "语言",
 
+  "nav.repos": "仓库",
+
+  "hero.lede": "一个 git 服务器 = 单个二进制 + 一个对象存储。",
+  "hero.text.a": "walgit 实现了",
+  "hero.link.origin": "Origin（Cursor）的 git 托管架构",
+  "hero.text.b": "中的思想，以及我们的朋友",
+  "hero.link.turbopuffer": "Turbopuffer",
+  "hero.text.c": "——他们开创了基于 GCS/S3 的 shared-nothing 规模化基础设施。",
+  "hero.exploreApi": "浏览 API",
+  "hero.readPost": "阅读《Git at any scale》↗",
+  "home.reposByOwner": "按属主浏览仓库",
+
+  "showcase.title": "协作，但没有数据库",
+  "showcase.lede": "本站上的议题、看板和 CI 都是从 git refs 上的签名条目实时推导出来的——没有数据库，只有一套每个客户端都一致执行的公开规则。",
+  "showcase.m1.t": "议题 = 只能追加的签名条目链",
+  "showcase.m1.b": "没有人编辑；每个人追加一条签名条目。状态是重放——最后一条匹配的条目生效。",
+  "showcase.m2.t": "看板不存在于任何地方——它是算出来的",
+  "showcase.m2.b": "同样的 refs、同样的规则：每个客户端独立推导，得到字节一致的看板。",
+  "showcase.m3.t": "两个 runner 可能都跑了——但只算一个",
+  "showcase.m3.b": "CI 没有调度器。同时认领是合法竞态；一条确定性 winner 规则让恰好一个结果生效。",
+  "showcase.illustrative": "示意",
+  "showcase.cta.guide": "在真实仓库里看现场版 →",
+
   "tab.code": "代码",
   "tab.commits": "提交",
   "tab.wal": "WAL",
@@ -329,6 +379,29 @@ const zhCN: Record<I18nKey, string> = {
 
 const zhTW: Record<I18nKey, string> = {
   "lang.switch": "語言",
+
+  "nav.repos": "倉庫",
+
+  "hero.lede": "一個 git 伺服器 = 單一執行檔 + 一個物件儲存。",
+  "hero.text.a": "walgit 實現了",
+  "hero.link.origin": "Origin（Cursor）的 git 託管架構",
+  "hero.text.b": "中的思想，以及我們的朋友",
+  "hero.link.turbopuffer": "Turbopuffer",
+  "hero.text.c": "——他們開創了基於 GCS/S3 的 shared-nothing 規模化基礎設施。",
+  "hero.exploreApi": "瀏覽 API",
+  "hero.readPost": "閱讀《Git at any scale》↗",
+  "home.reposByOwner": "按擁有者瀏覽倉庫",
+
+  "showcase.title": "協作，但沒有資料庫",
+  "showcase.lede": "本站上的議題、看板和 CI 都是從 git refs 上的簽名條目即時推導出來的——沒有資料庫，只有一套每個用戶端都一致執行的公開規則。",
+  "showcase.m1.t": "議題 = 只能追加的簽名條目鏈",
+  "showcase.m1.b": "沒有人編輯；每個人追加一條簽名條目。狀態是重放——最後一條匹配的條目生效。",
+  "showcase.m2.t": "看板不存在於任何地方——它是算出來的",
+  "showcase.m2.b": "同樣的 refs、同樣的規則：每個用戶端獨立推導，得到位元組一致的看板。",
+  "showcase.m3.t": "兩個 runner 可能都跑了——但只算一個",
+  "showcase.m3.b": "CI 沒有排程器。同時認領是合法競態；一條確定性 winner 規則讓恰好一個結果生效。",
+  "showcase.illustrative": "示意",
+  "showcase.cta.guide": "在真實倉庫裡看現場版 →",
 
   "tab.code": "程式碼",
   "tab.commits": "提交",

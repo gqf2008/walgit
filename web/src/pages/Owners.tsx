@@ -3,9 +3,12 @@ import { api } from "../api";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { Hero } from "../components/Hero";
+import { Showcase } from "../components/Showcase";
 import { CodeSample } from "../components/CopyButton";
+import { useI18n } from "../i18n";
 
 export function Owners() {
+  const { t } = useI18n();
   const owners = useData("owners", api.owners);
   if (owners.length === 0) {
     return <BlankSlate />;
@@ -13,7 +16,8 @@ export function Owners() {
   return (
     <>
       <Hero />
-      <h2 className="page-title">Repositories by owner</h2>
+      <Showcase owners={owners} />
+      <h2 className="page-title">{t("home.reposByOwner")}</h2>
       <Box>
         <ul className="list">
           {owners.map((o) => (

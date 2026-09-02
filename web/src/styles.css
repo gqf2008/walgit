@@ -1053,3 +1053,55 @@ table.kv.compact td { padding: 2px 0; }
     margin-left: 12px;
   }
 }
+
+/* Landing D1 showcase (issue #43) — reuses the .guide-* visuals */
+.showcase {
+  margin: 24px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  background: var(--bg2);
+}
+.showcase-title {
+  margin: 0 0 6px;
+  font-size: 1.5em;
+}
+.showcase-lede {
+  margin: 0 0 16px;
+  color: var(--muted);
+  max-width: 72ch;
+}
+.showcase-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+.showcase-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--bg);
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+.showcase-visual {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--bg2);
+  min-height: 88px;
+}
+.showcase-panels {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.showcase-illus {
+  margin-top: 6px;
+  font-size: 0.8em;
+  text-align: right;
+}
+.showcase-cta {
+  margin-top: 16px;
+}
