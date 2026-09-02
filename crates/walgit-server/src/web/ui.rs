@@ -76,6 +76,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // open / refresh must serve index.html like every other page.
         .route("/{owner}/{repo}/collab", get(index_route))
         .route("/{owner}/{repo}/collab/board", get(index_route))
+        .route("/{owner}/{repo}/collab/guide", get(index_route))
         .route("/{owner}/{repo}/collab/thread/{*rest}", get(index_route));
     let mut r = r;
     for base in crate::web::api::REPO_API_BASES {

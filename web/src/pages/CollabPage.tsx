@@ -28,7 +28,16 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
   const [newId, setNewId] = useState(() => uuid());
   return (
     <>
-      <Box title={t_("collab.title")}>
+      <Box
+        title={
+          <span>
+            {t_("collab.title")}
+            <Link to={`/${full}/collab/guide`} className="muted" style={{ fontWeight: "normal", fontSize: "0.85em", marginLeft: 8 }}>
+              {t_("guide.link")}
+            </Link>
+          </span>
+        }
+      >
         <div className="kv">
           <dt>{t_("collab.threads")}</dt>
           <dd>{report.threads.length}</dd>
