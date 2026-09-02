@@ -4,6 +4,7 @@ import { useRepo } from "./RepoLayout";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { useI18n, kindLabel, type TFunc } from "../i18n";
+import { ciColor } from "./CollabThreadPage";
 
 /**
  * 「了解 D1 协作」guide page (issue #41): the collaboration layer's mental
@@ -27,7 +28,12 @@ export function CollabGuidePage() {
     const board = await api.collab(full).board();
     const featuredId = report.threads.find((th) => th.entries >= 2)?.id ?? null;
     const thread = featuredId ? await api.collab(full).thread(featuredId) : null;
-    return { report, board, thread };
+    // The claim-race example (§8.3 runs): prefer a real race (≥2 claims on one
+    // run), else the newest run at all — the steps stay illustrative without one.
+    const raceRun =
+      report.runs.find((r) => r.claims >= 2) ?? report.runs[report.runs.length - 1] ?? null;
+    const race = raceRun ? await api.collab(full).thread(raceRun.id) : null;
+    return { report, board, thread, race };
   });
   return (
     <>
@@ -39,7 +45,7 @@ export function CollabGuidePage() {
       </Box>
       <ChainSection full={full} thread={data.thread} />
       <ProjectionSection board={data.board} />
-      <ClaimSection />
+      <ClaimSection full={full} race={data.race} />
       <BugsSection />
       <CommandsSection />
     </>
@@ -130,14 +136,19 @@ function MiniBoard({ board, caption, sub }: { board: CollabBoard; caption: strin
   );
 }
 
-/** ③ The claim race: both may run, one deterministic winner. */
-function ClaimSection() {
+/** ③ The claim race: both may run, one deterministic winner — on the repo's
+    real race thread when it has one (issue #38: 三张图用真实数据渲染). The
+    effective result is picked by the §7.2 rule (claims valid at `now`; when
+    every claim has expired, the earliest result wins — display only; the
+    authoritative computation lives in `walgit-wal::ci`). */
+function ClaimSection({ full, race }: { full: string; race: CollabThread | null }) {
   const { t } = useI18n();
   const steps: [string, string][] = [
     [t("guide.s3.step1"), t("guide.s3.step1.sub")],
     [t("guide.s3.step2"), t("guide.s3.step2.sub")],
     [t("guide.s3.step3"), t("guide.s3.step3.sub")],
   ];
+  const effectiveOid = race ? effectiveResultOid(race.entries) : null;
   return (
     <Box title={t("guide.s3.title")}>
       <div className="pad">{t("guide.s3.body")}</div>
@@ -152,9 +163,75 @@ function ClaimSection() {
           </div>
         ))}
       </div>
+      {race && (
+        <div className="pad">
+          <div className="muted" style={{ marginBottom: 8 }}>
+            {t("guide.s3.live")}{" "}
+            <Link to={`/${full}/collab/thread/${encodeURIComponent(race.id)}`}>{t("guide.openThread")}</Link>
+          </div>
+          <div className="guide-chain">
+            {race.entries.map((e) => {
+              const body = e.entry.body as Record<string, unknown>;
+              const claim = e.entry.kind === "ci_result" ? String(body.claim ?? "") : "";
+              const isEffective = claim
+                ? claim === effectiveOid
+                : e.entry.kind === "ci_claim" && e.oid === effectiveOid;
+              return (
+                <div key={e.oid} className="guide-entry">
+                  <strong>{kindLabel(t, e.entry.kind)}</strong> · {e.entry.actor} ·{" "}
+                  {fmtTime(e.entry.ts)} ·{" "}
+                  {e.entry.kind === "ci_result" && (
+                    <>
+                      <span style={{ color: ciColor(String(body.conclusion ?? "")) }}>
+                        ● {String(body.conclusion ?? "")}
+                      </span>{" "}
+                      ·{" "}
+                      <span className={isEffective ? "ok" : "muted"}>
+                        {isEffective ? t("guide.s3.effective") : t("guide.s3.recorded")}
+                      </span>
+                    </>
+                  )}
+                  {e.verified ? <span className="ok"> · {t("entry.verified")}</span> : <span> · {t("entry.unverified")}</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       <div className="pad muted">{t("guide.s3.note")}</div>
     </Box>
   );
+}
+
+/** Earliest by the §7.2 order (ts, actor, oid). */
+const minByWinnerOrder = (list: CollabEntryRef[]) =>
+  list.toSorted(
+    (a, b) => a.entry.ts - b.entry.ts || a.entry.actor.localeCompare(b.entry.actor) || a.oid.localeCompare(b.oid),
+  )[0];
+
+/** D1-CI §7.2, display form: the effective result's oid for a run thread.
+    valid(c) = c.ts + c.ttl > now, minus claims cited by an error result; the
+    winner is the earliest (ts, actor, oid); when no claim is valid the
+    earliest result still carries (fallback — done never regresses). */
+function effectiveResultOid(entries: CollabEntryRef[]): string | null {
+  const now = Date.now() / 1000;
+  const claims = entries.filter((e) => e.entry.kind === "ci_claim" && e.verified);
+  const results = entries.filter((e) => e.entry.kind === "ci_result" && e.verified);
+  if (results.length === 0) return null;
+  const errCited = new Set(
+    results
+      .filter((r) => String((r.entry.body as Record<string, unknown>).conclusion ?? "") === "error")
+      .map((r) => String((r.entry.body as Record<string, unknown>).claim ?? "")),
+  );
+  const valid = claims.filter(
+    (c) =>
+      !errCited.has(c.oid) &&
+      c.entry.ts + Number((c.entry.body as Record<string, unknown>).ttl ?? 0) > now,
+  );
+  const winner = valid.length > 0 ? minByWinnerOrder(valid) : null;
+  const byClaim = winner ? results.filter((r) => String((r.entry.body as Record<string, unknown>).claim ?? "") === winner.oid) : [];
+  const effective = byClaim.length > 0 ? minByWinnerOrder(byClaim) : minByWinnerOrder(results);
+  return effective?.oid ?? null;
 }
 
 /** ④ The four "looks like a bug — isn't" sights. */

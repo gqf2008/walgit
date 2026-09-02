@@ -7,7 +7,7 @@ import { useRepo } from "./RepoLayout";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { CollabWriteBox } from "../components/CollabWrite";
-import { useI18n, kindLabel } from "../i18n";
+import { useI18n, kindLabel, type TFunc } from "../i18n";
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -18,6 +18,7 @@ export function CollabThreadPage() {
   const { full } = useRepo();
   const id = useParams().id ?? "";
   const thread = useData(`collab:${full}:thread:${id}`, () => api.collab(full).thread(id));
+  const narration = ciNarration(thread.entries, t);
   const lastOid = thread.entries[thread.entries.length - 1]?.oid ?? "";
   return (
     <>
@@ -51,6 +52,7 @@ export function CollabThreadPage() {
         <CollabWriteBox full={full} id={thread.id} parent={lastOid} />
       </Box>
 
+      {narration && <div className="pad muted" style={{ borderLeft: "3px solid var(--accent, #58a6ff)" }}>{narration}</div>}
       {thread.entries.map((e, i) => (
         <EntryBox key={e.oid} e={e} n={i + 1} />
       ))}
@@ -108,10 +110,45 @@ function parsePatchFilesSafe(patch: string, sha: string) {
 }
 
 /** CI conclusions get the only colors on this page: green/red/amber (D1-CI §8.3). */
-function ciColor(conclusion: string): string {
+export function ciColor(conclusion: string): string {
   return conclusion === "success" ? "var(--ok, #2ea043)"
     : conclusion === "error" ? "var(--warning, #d29922)"
     : "var(--danger, #f85149)";
+}
+
+/** Human claim TTL: 300 → "5m", 90 → "1m30s" (D1-CI §6.3 — 「认领有效期 5 分钟」). */
+function fmtTtl(s: number): string {
+  if (s % 60 === 0) return `${s / 60}m`;
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${s % 60}s`;
+}
+
+/** run_id (D1-CI §5, normative): "ci-" + hex16(fnv1a64(task ∥ 0x1f ∥ ref ∥ 0x1f ∥ commit)).
+    Recomputed in the browser to show the derivation is checkable by anyone. */
+function fnv1a64(parts: string[]): string {
+  const bytes = new TextEncoder().encode(parts.join("\x1f"));
+  let h = 0xcbf29ce484222325n;
+  for (const b of bytes) {
+    h ^= BigInt(b);
+    h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h.toString(16).padStart(16, "0");
+}
+
+const KNOWN_KINDS = new Set(["issue", "comment", "review", "status", "patch", "ci_claim", "ci_result"]);
+
+/** The thread-level CI narration (issue #38): claims of the newest attempt tell
+    the reader what happened without the protocol vocabulary. */
+function ciNarration(entries: CollabEntryRef[], t: TFunc): string | null {
+  const claims = entries.filter((e) => e.entry.kind === "ci_claim" && e.verified);
+  if (claims.length === 0) return null;
+  const attempts = new Set(claims.map((e) => String((e.entry.body as Record<string, unknown>).attempt ?? "?")));
+  const hasResult = entries.some((e) => e.entry.kind === "ci_result" && e.verified);
+  // One claim (or one claim per attempt — retries) is the ordinary path: no banner.
+  if (claims.length === attempts.size) return null;
+  return hasResult
+    ? t("entry.claim.race", { n: claims.length })
+    : t("entry.claim.pending");
 }
 
 function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
@@ -155,10 +192,37 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
             })}
           </div>
         )}
+        {kind === "ci_claim" && (
+          <>
+            <div className="mono muted">
+              {String(body.ref ?? "")} @ {String(body.commit ?? "").slice(0, 8)}
+            </div>
+            <div className="muted">
+              {t("entry.claim.meta", {
+                ttl: fmtTtl(Number(body.ttl ?? 0)),
+                runner: String(body.runner ?? "—"),
+              })}
+              {" · "}
+              <code className="mono">{String(body.task ?? "?")}</code>
+            </div>
+            <details className="mono muted">
+              <summary>{e.entry.id}</summary>
+              {t("entry.runid.detail", {
+                hex: fnv1a64([
+                  String(body.task ?? ""),
+                  String(body.ref ?? ""),
+                  String(body.commit ?? ""),
+                ]),
+              })}
+            </details>
+          </>
+        )}
         {ciConclusion && typeof body.log_summary === "string" && body.log_summary !== "" && (
           <pre className="collab-pre">{body.log_summary}</pre>
         )}
-        {!ciConclusion && <pre className="collab-pre">{JSON.stringify(e.entry.body, null, 2)}</pre>}
+        {!ciConclusion && !KNOWN_KINDS.has(kind) && (
+          <pre className="collab-pre">{JSON.stringify(e.entry.body, null, 2)}</pre>
+        )}
         {(e.entry.refs?.base || e.entry.refs?.head) && (
           <div className="mono muted">
             {e.entry.refs?.base ?? "?"} → {e.entry.refs?.head ?? "?"}
