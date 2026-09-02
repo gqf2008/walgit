@@ -1531,7 +1531,12 @@ async fn collab_report(
         move |r| async move {
             let state = collab_load(&r).await?;
             let refs: Vec<&EntryRef> = state.entries.iter().collect();
-            let report = build_report(&refs, &state.principals, &state.rules);
+            let report = build_report(
+                &refs,
+                &state.principals,
+                &state.rules,
+                chrono::Utc::now().timestamp(),
+            );
             Ok(Rendered::json(json_bytes(&report), SWR, None))
         },
     )

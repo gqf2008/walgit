@@ -375,10 +375,31 @@ pub struct ReportPr {
     pub merge_reason: String,
 }
 
+/// One CI run, projected by the §7 aggregation (docs/D1_CI_PROTOCOL.md §8.3 —
+/// the report's CI section; pure-CI threads are not board cards, but the
+/// report and the SPA need to find them: the guide's claim-race diagram and
+/// `walgit collab report`'s CI section both read this).
+#[derive(Serialize, Clone, Debug)]
+pub struct ReportRun {
+    pub id: String,
+    pub task: String,
+    pub repo_ref: String,
+    pub commit: String,
+    /// pending | claimed | stale | done (`RunState::as_str`).
+    pub state: String,
+    pub conclusion: Option<String>,
+    pub runner: Option<String>,
+    pub claims: usize,
+    pub last_ts: i64,
+}
+
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct Report {
     pub threads: Vec<ReportThread>,
     pub prs: Vec<ReportPr>,
+    /// CI runs (§8.3) — pure-CI threads are skipped above and projected here
+    /// by `ci::collect_runs` instead.
+    pub runs: Vec<ReportRun>,
     pub total_entries: usize,
     pub verified_entries: usize,
     pub unverified_entries: usize,
@@ -391,6 +412,7 @@ pub fn build_report(
     entries: &[&EntryRef],
     principals: &HashMap<String, String, impl std::hash::BuildHasher>,
     rules: &MergeRules,
+    now: i64,
 ) -> Report {
     let mut by_thread: BTreeMap<&str, Vec<&EntryRef>> = BTreeMap::new();
     for e in entries {
@@ -456,6 +478,23 @@ pub fn build_report(
     }
     report.by_actor = by_actor.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     report.by_kind = by_kind.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    // §8.3: the skipped pure-CI threads are the report's CI section — one
+    // summary per run, straight from the §7 aggregation (only verified,
+    // well-formed entries drive it; unverified stay visible in by_kind).
+    report.runs = crate::ci::collect_runs(entries, principals, now)
+        .into_iter()
+        .map(|(id, run)| ReportRun {
+            id,
+            task: run.task,
+            repo_ref: run.repo_ref,
+            commit: run.commit,
+            state: run.state.as_str().to_string(),
+            conclusion: run.conclusion.map(|c| c.as_str().to_string()),
+            runner: run.runner,
+            claims: run.attempts.iter().map(|a| a.claims.len()).sum(),
+            last_ts: run.last_ts,
+        })
+        .collect();
     report
 }
 
