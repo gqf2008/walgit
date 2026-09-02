@@ -107,6 +107,13 @@ const en = {
   "entry.verified": "✓ verified",
   "entry.unverified": "✗ unverified",
   "entry.claim.title": "claim {task} · attempt {attempt}",
+  "entry.claim.meta": "valid for {ttl} · runner {runner}",
+  "entry.claim.race":
+    "{n} runners claimed this run — the deterministic rule (earliest wins) picked the single effective result. Duplicate execution is a legal race; every attempt stays on the refs for audit.",
+  "entry.claim.pending":
+    "Claimed but no result yet — the run may still be executing, or the runner died. The claim expires after its TTL and anyone may re-claim.",
+  "entry.runid.detail":
+    "run id derived — fnv1a64(task ⟿ ref ⟿ commit) = {hex} → this thread's id; any client recomputes it from the claim body alone",
   "entry.result.title": "result {task} · attempt {attempt}",
   "entry.result.meta": "{ref} @ {commit} · exit {code} · {ms} ms · log sha {sha}",
   "entry.issue.untitled": "(issue)",
@@ -185,6 +192,9 @@ const en = {
   "guide.s3.step3.sub": "winner = min(ts, actor, oid) — exactly one effective result",
   "guide.s3.note":
     "Why allow duplicate runs? Deduplication needs a central scheduler — exactly what this design removes. The cost is an occasional extra (idempotent) build; the gain: any machine can donate CI capacity, and everything stays auditable.",
+  "guide.s3.live": "This repository's real claim race:",
+  "guide.s3.effective": "effective result",
+  "guide.s3.recorded": "recorded, not effective",
   "guide.bugs.title": "Looks like a bug — isn't",
   "guide.bugs.lede": "Decentralization makes consistency visible instead of hiding it. Four sights you will meet:",
   "guide.bug1.sight": "The same task ran twice",
@@ -682,6 +692,13 @@ const zhCN: Record<I18nKey, string> = {
   "entry.verified": "✓ 已验证",
   "entry.unverified": "✗ 未验证",
   "entry.claim.title": "认领 {task} · 第 {attempt} 次尝试",
+  "entry.claim.meta": "认领有效期 {ttl} · runner：{runner}",
+  "entry.claim.race":
+    "{n} 个 runner 认领了这次运行——确定性规则（最早者胜）已选出唯一生效结果。重复执行是合法竞争，每次尝试都留在 ref 上可审计。",
+  "entry.claim.pending":
+    "已认领但还没有结果——任务可能仍在执行，或 runner 已退出。认领到期（TTL）后任何人可重新认领。",
+  "entry.runid.detail":
+    "run id 可独立复算——fnv1a64(task ⟿ ref ⟿ commit) = {hex}，即本讨论串 id；任何客户端只凭 claim 内容即可算出同一个值",
   "entry.result.title": "结果 {task} · 第 {attempt} 次尝试",
   "entry.result.meta": "{ref} @ {commit} · 退出码 {code} · {ms} ms · 日志 sha {sha}",
   "entry.issue.untitled": "（议题）",
@@ -760,6 +777,9 @@ const zhCN: Record<I18nKey, string> = {
   "guide.s3.step3.sub": "winner = min(ts, actor, oid)——恰好一个结果生效",
   "guide.s3.note":
     "Why allow duplicate runs? Deduplication needs a central scheduler — exactly what this design removes. The cost is an occasional extra (idempotent) build; the gain: any machine can donate CI capacity, and everything stays auditable.",
+  "guide.s3.live": "本仓库真实的认领竞争：",
+  "guide.s3.effective": "生效结果",
+  "guide.s3.recorded": "记录在案，不生效",
   "guide.bugs.title": "看起来像 bug——其实不是",
   "guide.bugs.lede": "去中心化把一致性摆到明面上，而不是藏起来。你会遇到的四种景象：",
   "guide.bug1.sight": "同一个任务跑了两次",
@@ -1255,6 +1275,13 @@ const zhTW: Record<I18nKey, string> = {
   "entry.verified": "✓ 已驗證",
   "entry.unverified": "✗ 未驗證",
   "entry.claim.title": "認領 {task} · 第 {attempt} 次嘗試",
+  "entry.claim.meta": "認領有效期 {ttl} · runner：{runner}",
+  "entry.claim.race":
+    "{n} 個 runner 認領了這次運行——確定性規則（最早者勝）已選出唯一生效結果。重複執行是合法競爭，每次嘗試都留在 ref 上可審計。",
+  "entry.claim.pending":
+    "已認領但還沒有結果——任務可能仍在執行，或 runner 已退出。認領到期（TTL）後任何人可重新認領。",
+  "entry.runid.detail":
+    "run id 可獨立複算——fnv1a64(task ⟿ ref ⟿ commit) = {hex}，即本討論串 id；任何客戶端只憑 claim 內容即可算出同一個值",
   "entry.result.title": "結果 {task} · 第 {attempt} 次嘗試",
   "entry.result.meta": "{ref} @ {commit} · 結束碼 {code} · {ms} ms · 日誌 sha {sha}",
   "entry.issue.untitled": "（議題）",
@@ -1333,6 +1360,9 @@ const zhTW: Record<I18nKey, string> = {
   "guide.s3.step3.sub": "winner = min(ts, actor, oid)——恰好一個結果生效",
   "guide.s3.note":
     "Why allow duplicate runs? Deduplication needs a central scheduler — exactly what this design removes. The cost is an occasional extra (idempotent) build; the gain: any machine can donate CI capacity, and everything stays auditable.",
+  "guide.s3.live": "本倉庫真實的認領競爭：",
+  "guide.s3.effective": "生效結果",
+  "guide.s3.recorded": "記錄在案，不生效",
   "guide.bugs.title": "看起來像 bug——其實不是",
   "guide.bugs.lede": "去中心化把一致性擺到明面上，而不是藏起來。你會遇到的四種景象：",
   "guide.bug1.sight": "同一個任務跑了兩次",

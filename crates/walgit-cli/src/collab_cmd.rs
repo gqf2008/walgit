@@ -572,7 +572,7 @@ fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()
         Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
         None => MergeRules::default(),
     };
-    let report = build_report(&refs, &principals, &rules);
+    let report = build_report(&refs, &principals, &rules, chrono::Utc::now().timestamp());
     // The CI section rides the same loaded log and the same aggregation core
     // as `walgit ci status` (§8.3) — one answer, no second semantics.
     let ci = walgit_wal::ci::ci_entries(&refs);
@@ -1184,7 +1184,7 @@ mod tests {
             protect: vec!["refs/heads/main".into()],
             require_human_approvals: 1,
         };
-        let r1 = build_report(&refs, &principals, &rules);
+        let r1 = build_report(&refs, &principals, &rules, 1_700_000_000);
         assert_eq!(r1.threads.len(), 1);
         assert_eq!(r1.threads[0].id, "pr1");
         assert_eq!(r1.threads[0].entries, 4);
@@ -1205,7 +1205,7 @@ mod tests {
         );
 
         // Determinism: identical input -> identical text render.
-        let r2 = build_report(&refs, &principals, &rules);
+        let r2 = build_report(&refs, &principals, &rules, 1_700_000_000);
         assert_eq!(render_report_text(&r1), render_report_text(&r2));
         assert_eq!(render_report_markdown(&r1), render_report_markdown(&r2));
         assert_eq!(render_report_html(&r1), render_report_html(&r2));
@@ -1230,6 +1230,81 @@ mod tests {
                 ("refs/collab/inbox/b/3".to_string(), "ddd".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn report_projects_ci_runs_not_board_cards() {
+        // §8.3: a pure-CI thread is no board card, but the report's CI section
+        // (Report.runs) still finds it — the SPA guide and `collab report` read it.
+        let (sk, pk) = keypair();
+        let mut principals = HashMap::new();
+        principals.insert("ci-runner-a".to_string(), pk.clone());
+        principals.insert("ci-runner-b".to_string(), pk.clone());
+
+        const RUN: &str = "ci-0123456789abcdef";
+        const TS: i64 = 1_700_000_000;
+        let mut ca = entry(
+            RUN,
+            "ci_claim",
+            "ci-runner-a",
+            "",
+            "ca",
+            TS,
+            serde_json::json!({"task":"test","ref":"refs/heads/main","commit":"c0ffee","ttl":300,"attempt":1}),
+        );
+        ca.entry.sig = sign_entry(&mut ca.entry, &sk);
+        let mut cb = entry(
+            RUN,
+            "ci_claim",
+            "ci-runner-b",
+            "",
+            "cb",
+            TS + 1,
+            serde_json::json!({"task":"test","ref":"refs/heads/main","commit":"c0ffee","ttl":300,"attempt":1}),
+        );
+        cb.entry.sig = sign_entry(&mut cb.entry, &sk);
+        let mut ra = entry(
+            RUN,
+            "ci_result",
+            "ci-runner-a",
+            "ca",
+            "ra",
+            TS + 2,
+            serde_json::json!({"task":"test","ref":"refs/heads/main","commit":"c0ffee","attempt":1,"claim":"ca","conclusion":"success","exit_code":0,"duration_ms":10,"log_summary":"ok","log_sha256":""}),
+        );
+        ra.entry.sig = sign_entry(&mut ra.entry, &sk);
+
+        // A pure-CI thread: not a board/report thread card…
+        let refs = vec![&ca, &cb, &ra];
+        let rules = MergeRules::default();
+        let r = build_report(&refs, &principals, &rules, TS + 3);
+        assert!(r.threads.is_empty(), "pure-CI threads must not be cards");
+        // …but it is the report's CI section, with the race visible.
+        assert_eq!(r.runs.len(), 1, "runs: {:?}", r.runs);
+        let run = &r.runs[0];
+        assert_eq!(run.id, RUN);
+        assert_eq!(run.task, "test");
+        assert_eq!(run.claims, 2, "both claims are visible");
+        assert_eq!(run.state, "done");
+        assert_eq!(run.conclusion.as_deref(), Some("success"));
+        // A claim with no result at all reads as claimed, not done.
+        let mut pending = entry(
+            "ci-ffffffffffffffff",
+            "ci_claim",
+            "ci-runner-b",
+            "",
+            "cp",
+            TS,
+            serde_json::json!({"task":"lint","ref":"refs/heads/main","commit":"c0ffee","ttl":300,"attempt":1}),
+        );
+        pending.entry.sig = sign_entry(&mut pending.entry, &sk);
+        let refs = vec![&pending];
+        let r = build_report(&refs, &principals, &rules, TS + 3);
+        assert_eq!(r.runs.len(), 1);
+        assert_eq!(r.runs[0].state, "claimed");
+        // Expired claims read as stale — the TTL sight (§6.3).
+        let r = build_report(&refs, &principals, &rules, TS + 301);
+        assert_eq!(r.runs[0].state, "stale");
     }
 
     #[test]

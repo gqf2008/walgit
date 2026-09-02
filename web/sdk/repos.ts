@@ -163,9 +163,24 @@ export interface CollabReportPr {
   merge_allowed: boolean;
   merge_reason: string;
 }
+/** One CI run in the report's CI section (D1-CI §8.3): a pure-CI thread
+    projected by the §7 aggregation — not a board card, but visible here. */
+export interface CollabReportRun {
+  id: string;
+  task: string;
+  repo_ref: string;
+  commit: string;
+  /** pending | claimed | stale | done */
+  state: string;
+  conclusion: string | null;
+  runner: string | null;
+  claims: number;
+  last_ts: number;
+}
 export interface CollabReport {
   threads: CollabReportThread[];
   prs: CollabReportPr[];
+  runs: CollabReportRun[];
   total_entries: number;
   verified_entries: number;
   unverified_entries: number;

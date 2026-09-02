@@ -620,13 +620,16 @@ receive-pack). `200` → `{ "ref", "oid", "seq" }`.
 #### `GET /{owner}/{repo}/api/collab/report`
 
 The full observability report (D1 §8) — thread summaries, PR status + merge
-rule evaluation, verification health, per-actor/per-kind activity. Shape is
-`walgit-wal::collab::Report`:
+rule evaluation, the CI runs section (D1-CI §8.3: pure-CI threads are not
+board cards but are projected here by the same aggregation as
+`walgit ci status`), verification health, per-actor/per-kind activity. Shape
+is `walgit-wal::collab::Report`:
 
 ```json
 {
   "threads": [ { "id": "t1", "entries": 4, "verified": 3, "last_ts": 1786500000, "kinds": ["comment","issue","patch","review"] } ],
   "prs": [ { "id": "t1", "base": "refs/heads/main", "head": "refs/heads/topic", "status": "open", "approvals": 1, "merge_allowed": true, "merge_reason": "…" } ],
+  "runs": [ { "id": "ci-9a1b…", "task": "test", "repo_ref": "refs/heads/main", "commit": "c0ffee…", "state": "done", "conclusion": "success", "runner": "ci-runner-a", "claims": 2, "last_ts": 1786500100 } ],
   "total_entries": 4,
   "verified_entries": 3,
   "unverified_entries": 1,
@@ -635,6 +638,13 @@ rule evaluation, verification health, per-actor/per-kind activity. Shape is
   "by_kind": [["comment", 1], ["issue", 1], ["patch", 1], ["review", 1]]
 }
 ```
+
+`state` ∈ `pending | claimed | stale | done` — the attempt state machine of
+`docs/D1_CI_PROTOCOL.md` §7.3, evaluated at request time (claims expire).
+`conclusion` is the effective result's conclusion on the latest attempt.
+`claims` counts every claim on the run: a run with more claims than attempts
+saw a race (both executed, one result is effective — that is the rule, not a
+bug).
 
 `verified` requires a registered key for the actor **and** that the entry sits
 in the actor's own inbox (the D1 inbox model). Merge rules come from
