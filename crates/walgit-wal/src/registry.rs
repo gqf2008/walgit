@@ -187,9 +187,12 @@ impl Registry {
             // Windows: git's READ_ONLY pack attribute was cleared above, but a
             // still-open handle (this process's pack-index mmap, a real-time
             // scanner) reports SHARING_VIOLATION (32) / ACCESS_DENIED (5) for
-            // a moment — give the teardown the same bounded window the
-            // supersede deletes get, and clear the attribute again in case the
-            // first pass raced a just-written file.
+            // a moment, and a concurrent writer (pack prefetch, commit-graph
+            // update, a git child just flushing) can recreate a file inside
+            // the tree mid-teardown, which the final RemoveDirectory reports
+            // as DIR_NOT_EMPTY (145) — give the teardown the same bounded
+            // window the supersede deletes get, and clear the attribute again
+            // in case the first pass raced a just-written file.
             let mut attempt: u64 = 0;
             loop {
                 match tokio::fs::remove_dir_all(&local_dir).await {
@@ -198,7 +201,7 @@ impl Registry {
                     Err(e)
                         if cfg!(windows)
                             && e.raw_os_error()
-                                .is_some_and(|c| matches!(c, 5 | 32 | 33 | 1224))
+                                .is_some_and(|c| matches!(c, 5 | 32 | 33 | 145 | 1224))
                             && attempt < 3 =>
                     {
                         attempt += 1;
