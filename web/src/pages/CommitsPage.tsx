@@ -6,6 +6,7 @@ import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { RefBar } from "../components/RefBar";
 import { CommitRow } from "../components/CommitRow";
+import { useI18n } from "../i18n";
 
 export function CommitsPage() {
   const { full } = useRepo();
@@ -18,6 +19,7 @@ export function CommitsPage() {
  * therefore immutable/cacheable. The first page suspends (route skeleton);
  * further pages are appended inside a transition, so the list never flashes. */
 function CommitList({ full, r }: { full: string; r: Resolved }) {
+  const { t } = useI18n();
   const [isPending, startTransition] = useTransition();
   const first = useData(`commits:${full}:${r.sha}:${r.path}:0`, () => api.commits(full, r.sha, r.path, 0), Infinity);
   const [extra, setExtra] = useState<{ commits: Commit[]; more: boolean }>({ commits: [], more: first.more });
@@ -43,7 +45,7 @@ function CommitList({ full, r }: { full: string; r: Resolved }) {
       <RefBar refname={r.ref} refKind={r.kind} path={r.path} page="commits" />
       {groups.map((g) => (
         <div key={g.day} className="commit-group">
-          <div className="commit-day muted">Commits on {g.day}</div>
+          <div className="commit-day muted">{t("commits.onDay", { day: g.day })}</div>
           <Box>
             {g.commits.map((c) => (
               <CommitRow key={c.sha} repo={full} commit={c} />
@@ -53,13 +55,13 @@ function CommitList({ full, r }: { full: string; r: Resolved }) {
       ))}
       {commits.length === 0 && (
         <Box>
-          <div className="pad muted">No commits.</div>
+          <div className="pad muted">{t("commits.empty")}</div>
         </Box>
       )}
       {more && (
         <div className="center pad">
           <button className="btn" disabled={isPending} aria-busy={isPending} onClick={loadMore}>
-            {isPending ? "Loading…" : "Older"}
+            {isPending ? t("commits.loading") : t("commits.older")}
           </button>
         </div>
       )}

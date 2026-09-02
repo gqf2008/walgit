@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useI18n, type I18nKey } from "../i18n";
 
 /** Which instance answered — kind is the loud part (a serverless host vs the SSD host must
  * be distinguishable at a glance), then the name, revision, build. */
@@ -12,9 +13,14 @@ export interface InstanceInfo {
   disk: "tmpfs" | "ssd" | string;
 }
 
-const LABEL: Record<string, string> = { serverless: "a serverless host", ssd: "The SSD host 🚀", dev: "dev" };
+const KIND_KEYS: Record<string, I18nKey> = {
+  serverless: "footer.kind.serverless",
+  ssd: "footer.kind.ssd",
+  dev: "footer.kind.dev",
+};
 
 export function InstanceFooter() {
+  const { t } = useI18n();
   const [info, setInfo] = useState<InstanceInfo | null>(null);
   useEffect(() => {
     let live = true;
@@ -29,9 +35,13 @@ export function InstanceFooter() {
   }, []);
   if (!info) return null;
   const where = info.kind === "serverless" ? `${info.revision || info.name}${info.instance ? ` · ${info.instance}` : ""}` : info.name;
+  const kindKey = KIND_KEYS[info.kind];
   return (
-    <footer className={`instance-footer kind-${info.kind}`} title={`roles: ${info.roles.join(", ")} · disk: ${info.disk}`}>
-      <span className="instance-kind">{LABEL[info.kind] ?? info.kind}</span>
+    <footer
+      className={`instance-footer kind-${info.kind}`}
+      title={t("footer.title", { roles: info.roles.join(", "), disk: info.disk })}
+    >
+      <span className="instance-kind">{kindKey ? t(kindKey) : info.kind}</span>
       <span className="instance-where">{where}</span>
       <span className="instance-version">{info.version}</span>
     </footer>

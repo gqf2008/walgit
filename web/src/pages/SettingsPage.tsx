@@ -5,9 +5,10 @@ import { Box } from "../components/Layout";
 import { Maintainers } from "../components/Maintainers";
 import { Link } from "react-router-dom";
 import { useRepo } from "./RepoLayout";
+import { useI18n } from "../i18n";
 
-const fmtBytes = (n: number) => {
-  if (!n) return "unlimited";
+const fmtBytes = (n: number, unlimited: string) => {
+  if (!n) return unlimited;
   if (n < 1024) return `${n} B`;
   const u = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
@@ -32,18 +33,19 @@ function useDebounced<T>(value: T, ms: number): T {
 
 /** Settings tab: scheduled tasks + placement + live plan; push policy; effective config + history. */
 export function SettingsPage() {
+  const { t } = useI18n();
   const { full } = useRepo();
   const d: SettingsDescribe = useData(`settings:${full}`, () => api.settings(full).describe(), 2_000);
   const o: Overview = useData(`overview:${full}`, () => api.overview(full), 2_000);
   const [section, setSection] = useState<"tasks" | "policy" | "config">("tasks");
   return (
     <div className="settings">
-      <nav className="subtabs" aria-label="Settings sections">
+      <nav className="subtabs" aria-label={t("settings.nav.aria")}>
         {(
           [
-            ["tasks", "Scheduled tasks"],
-            ["policy", "Push policy"],
-            ["config", "Effective config & history"],
+            ["tasks", t("settings.tab.tasks")],
+            ["policy", t("settings.tab.policy")],
+            ["config", t("settings.tab.config")],
           ] as const
         ).map(([k, label]) => (
           <button key={k} type="button" className={section === k ? "subtab active" : "subtab"} onClick={() => setSection(k)}>
@@ -61,26 +63,28 @@ export function SettingsPage() {
 // ---- 1. scheduled tasks ---------------------------------------------------------
 
 function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string }) {
+  const { t } = useI18n();
+  const fb = (n: number) => fmtBytes(n, t("settings.unlimited"));
   const host = d.maintenance.this_host;
   return (
     <>
-      <Box title={`Bundle strategies (${d.strategies.length}) — ${d.bundles.enabled ? "enabled" : "disabled"}`}>
+      <Box title={t("settings.strategies.title", { n: d.strategies.length, state: t(d.bundles.enabled ? "settings.enabled" : "settings.disabled") })}>
         {d.strategies.length === 0 ? (
-          <div className="muted pad">No strategies in the effective config.</div>
+          <div className="muted pad">{t("settings.strategies.empty")}</div>
         ) : (
           <div className="scroll-x">
             <table className="grid">
               <thead>
                 <tr>
-                  <th>name</th>
-                  <th>kind</th>
-                  <th>base</th>
-                  <th>schedule</th>
-                  <th>next (local time)</th>
-                  <th>keep</th>
-                  <th>backfill</th>
-                  <th>min commits</th>
-                  <th>refs</th>
+                  <th>{t("settings.th.name")}</th>
+                  <th>{t("settings.th.kind")}</th>
+                  <th>{t("settings.th.base")}</th>
+                  <th>{t("settings.th.schedule")}</th>
+                  <th>{t("settings.th.next")}</th>
+                  <th>{t("settings.th.keep")}</th>
+                  <th>{t("settings.th.backfill")}</th>
+                  <th>{t("settings.th.minCommits")}</th>
+                  <th>{t("settings.th.refs")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -102,15 +106,15 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
                       {s.kind === "full" ? (
                         s.keep
                       ) : s.chain ? (
-                        <span title="chained: each slot is cut on this strategy's previous bundle; every link since the newest kept base stays listed">
-                          chain since {s.base}
-                        </span>
+                        <span title={t("settings.keep.chained.title")}>{t("settings.keep.chained", { base: s.base ?? "" })}</span>
                       ) : (
-                        <span className="muted" title="cut on the base's newest bundle; the 2 newest are listed (D21)">2 newest</span>
+                        <span className="muted" title={t("settings.keep.twoNewest.title")}>
+                          {t("settings.keep.twoNewest")}
+                        </span>
                       )}
                     </td>
                     <td>{s.backfill_max || "∞"}</td>
-                    <td>{s.kind === "full" ? <span className="muted">never gated</span> : s.min_commits}</td>
+                    <td>{s.kind === "full" ? <span className="muted">{t("settings.minCommits.neverGated")}</span> : s.min_commits}</td>
                     <td className="small">{s.refs.join(", ")}</td>
                   </tr>
                 ))}
@@ -119,33 +123,40 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
           </div>
         )}
         <div className="pad small muted">
-          Calendar slots, backfilled oldest-first; content = WAL state as of the slot; creationToken = slot epoch. Fulls are never gated by
-          min_commits; an incremental below the floor is <span className="pill too-small">too-small</span> and the next slot catches up.
-          Refs {d.bundles.main_only ? "main-only" : "all"} for this repository.
+          {t("settings.strategies.noteA")} <span className="pill too-small">too-small</span> {t("settings.strategies.noteB")}{" "}
+          {t("settings.strategies.refsNote", { scope: t(d.bundles.main_only ? "settings.scope.mainOnly" : "settings.scope.all") })}
         </div>
       </Box>
 
-      <Box title="Maintenance placement (host facts, read-only)">
+      <Box title={t("settings.placement.title")}>
         <KV
           rows={[
-            ["checkpoints", d.maintenance.checkpoints ? `on · every ${d.maintenance.interval_secs}s pass` : "off"],
-            ["compaction", d.compaction.enabled ? `on · trigger ${d.compaction.trigger_packs} packs / ${fmtBytes(d.compaction.trigger_bytes)}` : "off"],
+            [t("settings.kv.checkpoints"), d.maintenance.checkpoints ? t("settings.on.everyPass", { secs: d.maintenance.interval_secs }) : t("settings.off")],
             [
-              "this instance",
+              t("settings.kv.compaction"),
+              d.compaction.enabled ? t("settings.on.trigger", { packs: d.compaction.trigger_packs, bytes: fb(d.compaction.trigger_bytes) }) : t("settings.off"),
+            ],
+            [
+              t("settings.kv.thisInstance"),
               <span key="this-instance">
-                <code>{host.name}</code> · roles {host.roles.join(", ")} ·{" "}
-                {host.serves ? <span className="pill built">serves</span> : <span className="pill">not served here</span>}{" "}{host.maintains ? <span className="pill built">maintains</span> : <span className="pill">not maintained here</span>}
+                <code>{host.name}</code> · {t("settings.roles")} {host.roles.join(", ")} ·{" "}
+                {host.serves ? <span className="pill built">{t("settings.pill.serves")}</span> : <span className="pill">{t("settings.pill.notServed")}</span>}{" "}
+                {host.maintains ? <span className="pill built">{t("settings.pill.maintains")}</span> : <span className="pill">{t("settings.pill.notMaintained")}</span>}
               </span>,
             ],
-            ["capacity here", `${host.disk} · pack cap ${fmtBytes(host.max_pack_bytes || host.cache_budget_bytes)} · cache budget ${fmtBytes(host.cache_budget_bytes)}`],
-            ["upstream follow", <UpstreamFollow key="upstream-follow" u={d.upstream} />],
-            ["maintainers", <Maintainers key="maintainers" list={o.bundle_plan.maintainers} orphaned={o.bundle_plan.orphaned} label={false} />],
+            [
+              t("settings.kv.capacity"),
+              t("settings.capacity.value", { disk: host.disk, packCap: fb(host.max_pack_bytes || host.cache_budget_bytes), cacheBudget: fb(host.cache_budget_bytes) }),
+            ],
+            [t("settings.kv.upstreamFollow"), <UpstreamFollow key="upstream-follow" u={d.upstream} />],
+            [t("settings.kv.maintainers"), <Maintainers key="maintainers" list={o.bundle_plan.maintainers} orphaned={o.bundle_plan.orphaned} label={false} />],
           ]}
         />
         <div className="pad small muted">
-          Who maintains a repository is a host rule (<code>[placement] maintain / maintain_exclude</code> + declared capacity), not a repository
-          setting. What those hosts will cut next, and the chain they have published, is on the <Link to={`/${full}/wal`}>WAL page</Link>; change
-          strategies, min_commits or compaction triggers for <code>{full}</code> under “Effective config & history”.
+          {t("settings.placement.noteA")}
+          <code>[placement] maintain / maintain_exclude</code> {t("settings.placement.noteB")}{" "}
+          <Link to={`/${full}/wal`}>{t("settings.placement.walPage")}</Link>
+          {t("settings.placement.noteC")} <code>{full}</code> {t("settings.placement.noteD", { tab: t("settings.tab.config") })}
         </div>
       </Box>
     </>
@@ -154,13 +165,14 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
 
 /** `[upstream] follow`: which refs follow which host, and what the last round here did (D33). */
 function UpstreamFollow({ u }: { u: SettingsDescribe["upstream"] }) {
+  const { t } = useI18n();
   if (!u || u.follow.length === 0) {
     return (
       <span>
-        <span className="pill">off</span>{" "}
+        <span className="pill">{t("settings.off")}</span>{" "}
         <span className="muted small">
-          set <code>[upstream] git</code> + <code>follow = ["refs/heads/main"]</code> under “Effective config & history” — the maintaining host then
-          publishes the upstream's moves as pushes
+          {t("settings.upstream.hintA")} <code>[upstream] git</code> + <code>follow = ["refs/heads/main"]</code>{" "}
+          {t("settings.upstream.hintB", { tab: t("settings.tab.config") })}
         </span>
       </span>
     );
@@ -169,8 +181,8 @@ function UpstreamFollow({ u }: { u: SettingsDescribe["upstream"] }) {
   const pill = r ? (r.outcome === "in-sync" || r.outcome === "published" ? "pill built" : "pill stale") : "pill";
   return (
     <span>
-      <code>{u.follow.join(", ")}</code> ← <code>{u.git}</code> · every {u.follow_interval_secs}s on the maintaining host
-      {u.token_env ? "" : " · no token"}
+      <code>{u.follow.join(", ")}</code> ← <code>{u.git}</code> · {t("settings.upstream.every", { secs: u.follow_interval_secs })}
+      {u.token_env ? "" : ` · ${t("settings.upstream.noToken")}`}
       <div className="small">
         {r ? (
           <>
@@ -180,7 +192,7 @@ function UpstreamFollow({ u }: { u: SettingsDescribe["upstream"] }) {
             )}
           </>
         ) : (
-          <span className="muted">no round on this instance yet (rounds run where the repository is maintained)</span>
+          <span className="muted">{t("settings.upstream.noRound")}</span>
         )}
       </div>
     </span>
@@ -203,6 +215,7 @@ function KV({ rows }: { rows: [string, ReactNode][] }) {
 // ---- 2. push policy ------------------------------------------------------------------
 
 function PolicyEditor({ full }: { full: string }) {
+  const { t } = useI18n();
   const saved = useData(`policy:${full}`, () => api.policy(full).get(), 10_000);
   const [text, setText] = useState(() => JSON.stringify(saved, null, 2));
   const [dirty, setDirty] = useState(false);
@@ -255,7 +268,7 @@ function PolicyEditor({ full }: { full: string }) {
   const valid = !dirty || (validation?.ok ?? false);
   return (
     <>
-      <Box title="Push policy (policy.json — docs/POLICY.md)">
+      <Box title={t("settings.policy.title")}>
         <div className="editor">
           <textarea
             className="code-input"
@@ -269,11 +282,17 @@ function PolicyEditor({ full }: { full: string }) {
             aria-label="policy.json"
           />
           <div className="editor-status" aria-live="polite">
-            {!dirty && <span className="muted">saved policy{Object.keys(saved).length === 0 ? " (empty = allow-all)" : ""}</span>}
-            {dirty && validation === null && <span className="muted">validating…</span>}
+            {!dirty && (
+              <span className="muted">
+                {t("settings.policy.saved")}
+                {Object.keys(saved).length === 0 ? t("settings.policy.savedEmpty") : ""}
+              </span>
+            )}
+            {dirty && validation === null && <span className="muted">{t("settings.validating")}</span>}
             {dirty && validation?.ok && (
               <span className="ok">
-                valid · {validation.rules} rule(s), {validation.groups} group(s){validation.protect ? ", protect rules present" : ""}
+                {t("settings.policy.valid", { rules: validation.rules ?? 0, groups: validation.groups ?? 0 })}
+                {validation.protect ? t("settings.policy.validProtect") : ""}
               </span>
             )}
             {dirty && validation && !validation.ok && (
@@ -286,14 +305,15 @@ function PolicyEditor({ full }: { full: string }) {
           </div>
           <div className="editor-actions">
             <label className="small">
-              dry-run against the last{" "}
-              <input type="number" min={1} max={200} value={last} onChange={(e) => setLast(Number(e.target.value) || 20)} className="num" /> pushes
+              {t("settings.policy.dryRunLabelA")}{" "}
+              <input type="number" min={1} max={200} value={last} onChange={(e) => setLast(Number(e.target.value) || 20)} className="num" />{" "}
+              {t("settings.policy.dryRunLabelB")}
             </label>
             <button type="button" className="btn small" disabled={busy !== "" || !valid} onClick={dryRun}>
-              {busy === "dry" ? "running…" : "Dry-run"}
+              {busy === "dry" ? t("settings.policy.running") : t("settings.policy.dryRun")}
             </button>
             <button type="button" className="btn small primary" disabled={busy !== "" || !dirty || !valid} onClick={save}>
-              {busy === "save" ? "saving…" : "Save policy"}
+              {busy === "save" ? t("settings.policy.saving") : t("settings.policy.save")}
             </button>
             <button
               type="button"
@@ -305,7 +325,7 @@ function PolicyEditor({ full }: { full: string }) {
                 setValidation(null);
               }}
             >
-              Discard
+              {t("settings.discard")}
             </button>
           </div>
           {err && (
@@ -316,17 +336,17 @@ function PolicyEditor({ full }: { full: string }) {
         </div>
       </Box>
       {dry && (
-        <Box title={`Dry-run: ${dry.pushes} push(es) · ${dry.allowed} ref update(s) allowed · ${dry.denied} denied`}>
+        <Box title={t("settings.policy.dryResult.title", { pushes: dry.pushes, allowed: dry.allowed, denied: dry.denied })}>
           {dry.results.length === 0 ? (
-            <div className="muted pad">No pushes in the live log to replay.</div>
+            <div className="muted pad">{t("settings.policy.dryResult.empty")}</div>
           ) : (
             <table className="grid">
               <thead>
                 <tr>
-                  <th>seq</th>
-                  <th>when</th>
-                  <th>who</th>
-                  <th>refs</th>
+                  <th>{t("settings.th.seq")}</th>
+                  <th>{t("settings.th.when")}</th>
+                  <th>{t("settings.th.who")}</th>
+                  <th>{t("settings.th.refs")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -357,6 +377,7 @@ function PolicyEditor({ full }: { full: string }) {
 // ---- 3. effective config + history -----------------------------------------------
 
 function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
+  const { t } = useI18n();
   const history: SettingsHistory = useData(`settings-history:${full}`, () => api.settings(full).history(), 5_000);
   const [text, setText] = useState(d.settings.toml);
   const [dirty, setDirty] = useState(false);
@@ -405,24 +426,24 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
   const valid = !dirty || (validation?.ok ?? false);
   return (
     <>
-      <Box title={rev ? `Repository settings — revision ${rev} by ${"author" in d.settings ? d.settings.author : ""}` : "Repository settings — none (host config)"}>
+      <Box title={rev ? t("settings.config.title.rev", { rev, author: "author" in d.settings ? d.settings.author : "" }) : t("settings.config.title.none")}>
         <div className="editor">
           <textarea
             className="code-input"
             spellCheck={false}
             rows={Math.min(24, Math.max(8, text.split("\n").length + 1))}
             value={text}
-            placeholder={"# TOML overrides of [bundles], [maintenance], [compaction], [upstream]\n[bundles]\nmin_commits = 25\n"}
+            placeholder={t("settings.config.placeholder")}
             onChange={(e) => {
               setText(e.target.value);
               setDirty(true);
             }}
-            aria-label="settings TOML"
+            aria-label={t("settings.config.aria")}
           />
           <div className="editor-status" aria-live="polite">
             {!dirty && rev > 0 && "message" in d.settings && d.settings.message && <span className="muted">“{d.settings.message}”</span>}
-            {dirty && validation === null && <span className="muted">validating…</span>}
-            {dirty && validation?.ok && <span className="ok">valid — the table below previews the effective config</span>}
+            {dirty && validation === null && <span className="muted">{t("settings.validating")}</span>}
+            {dirty && validation?.ok && <span className="ok">{t("settings.config.validPreview")}</span>}
             {dirty && validation && !validation.ok && (
               <ul className="errors">
                 {validation.errors.map((e) => (
@@ -432,9 +453,9 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
             )}
           </div>
           <div className="editor-actions">
-            <input className="text" placeholder="why (shown in history)" value={message} onChange={(e) => setMessage(e.target.value)} />
+            <input className="text" placeholder={t("settings.config.messagePh")} value={message} onChange={(e) => setMessage(e.target.value)} />
             <button type="button" className="btn small primary" disabled={busy || !dirty || !valid} onClick={() => publish(text, message)}>
-              {busy ? "publishing…" : `Publish as revision ${rev + 1}`}
+              {busy ? t("settings.config.publishing") : t("settings.config.publish", { rev: rev + 1 })}
             </button>
             <button
               type="button"
@@ -446,11 +467,11 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
                 setValidation(null);
               }}
             >
-              Discard
+              {t("settings.discard")}
             </button>
             {rev > 0 && (
               <button type="button" className="btn small danger" disabled={busy} onClick={() => publish("", "clear")}>
-                Clear (back to host config)
+                {t("settings.config.clear")}
               </button>
             )}
           </div>
@@ -465,8 +486,14 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
       <Box
         title={
           <>
-            Effective config ({fields.length} fields){" "}
-            <input className="text small" placeholder="filter keys…" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="filter keys" />
+            {t("settings.config.effectiveTitle", { n: fields.length })}{" "}
+            <input
+              className="text small"
+              placeholder={t("settings.config.filterPh")}
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              aria-label={t("settings.config.filterPh")}
+            />
           </>
         }
       >
@@ -474,9 +501,9 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
           <table className="grid">
             <thead>
               <tr>
-                <th>key</th>
-                <th>value</th>
-                <th>source</th>
+                <th>{t("settings.th.key")}</th>
+                <th>{t("settings.th.value")}</th>
+                <th>{t("settings.th.source")}</th>
               </tr>
             </thead>
             <tbody>
@@ -488,18 +515,19 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
                   <td className="small">
                     <code>{show(f.value)}</code>
                     {f.source === "setting" && f.host_value !== undefined && f.host_value !== null && show(f.host_value) !== show(f.value) && (
-                      <span className="muted"> (host: {show(f.host_value)})</span>
+                      <span className="muted"> {t("settings.config.hostValue", { value: show(f.host_value) })}</span>
                     )}
                   </td>
                   <td>
                     {f.source === "setting" ? (
-                      <span className="pill built" title={`set by the repository settings${rev ? ` @rev ${dirty ? rev + 1 : rev}` : ""}`}>
-                        repo setting{rev ? ` @${dirty && validation?.ok ? rev + 1 : rev}` : ""}
+                      <span className="pill built" title={`${t("settings.config.source.repo.title")}${rev ? ` @rev ${dirty ? rev + 1 : rev}` : ""}`}>
+                        {t("settings.config.source.repo")}
+                        {rev ? ` @${dirty && validation?.ok ? rev + 1 : rev}` : ""}
                         {"author" in d.settings && d.settings.author && !dirty ? ` · ${d.settings.author}` : ""}
                       </span>
                     ) : (
-                      <span className="pill" title="walgit.toml ⊕ WALGIT__ env on the answering host">
-                        host config
+                      <span className="pill" title={t("settings.config.source.host.title")}>
+                        {t("settings.config.source.host")}
                       </span>
                     )}
                   </td>
@@ -510,9 +538,9 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
         </div>
       </Box>
 
-      <Box title={`History (${history.entries.length} change(s) in the live log)`}>
+      <Box title={t("settings.history.title", { n: history.entries.length })}>
         {history.entries.length === 0 ? (
-          <div className="muted pad">No settings changes since seq {history.min_seq} (older ones are folded into checkpoints).</div>
+          <div className="muted pad">{t("settings.history.empty", { seq: history.min_seq })}</div>
         ) : (
           <ol className="history">
             {history.entries.toReversed().map((e, i, arr) => {
@@ -520,7 +548,10 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
               return (
                 <li key={e.seq}>
                   <div className="history-head">
-                    <strong>revision {e.revision}</strong> <span className="muted">· seq {e.seq} · {fmtTime(e.at)} · {e.author}</span>
+                    <strong>{t("settings.history.revision", { rev: e.revision })}</strong>{" "}
+                    <span className="muted">
+                      · seq {e.seq} · {fmtTime(e.at)} · {e.author}
+                    </span>
                     {e.message && <span> — {e.message}</span>}
                     {e.revision !== rev && (
                       <button
@@ -528,9 +559,9 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
                         className="btn small"
                         disabled={busy}
                         onClick={() => publish(e.toml, `revert to revision ${e.revision}`)}
-                        title="Publish this document again as a new revision"
+                        title={t("settings.history.revert.title")}
                       >
-                        Revert to this
+                        {t("settings.history.revert")}
                       </button>
                     )}
                   </div>
@@ -547,6 +578,7 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
 
 /** Minimal line diff (LCS-free: mark lines removed/added by set difference, in order). */
 function Diff({ before, after }: { before: string; after: string }) {
+  const { t } = useI18n();
   const a = before.split("\n").filter((l) => l.length);
   const b = after.split("\n").filter((l) => l.length);
   const aSet = new Set(a);
@@ -554,7 +586,7 @@ function Diff({ before, after }: { before: string; after: string }) {
   const lines: { t: "-" | "+" | " "; s: string }[] = [];
   for (const l of a) if (!bSet.has(l)) lines.push({ t: "-", s: l });
   for (const l of b) lines.push(aSet.has(l) ? { t: " ", s: l } : { t: "+", s: l });
-  if (lines.length === 0) return <pre className="diff muted">(empty document)</pre>;
+  if (lines.length === 0) return <pre className="diff muted">{t("settings.history.emptyDoc")}</pre>;
   return (
     <pre className="diff">
       {lines.map((l, i) => (

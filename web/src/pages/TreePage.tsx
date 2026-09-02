@@ -7,15 +7,17 @@ import { fmtSize, relTime } from "../format";
 import { RefBar } from "../components/RefBar";
 import { Markdown } from "../components/Markdown";
 import { Avatar } from "../components/CommitRow";
+import { useI18n } from "../i18n";
 
 export function TreePage() {
   const { full, refs } = useRepo();
+  const { t } = useI18n();
   const rest = useParams()["*"] ?? "";
   if (!refs.head) {
     return (
-      <Box title="Setup">
+      <Box title={t("tree.setup.title")}>
         <div className="pad">
-          <p>This repository is empty. Push to <code>{full}.git</code>:</p>
+          <p>{t("tree.setup.empty.pre")} <code>{full}.git</code>{t("tree.setup.empty.post")}</p>
           <pre className="code-block">
             git remote add origin {location.origin}/{full}.git{"\n"}git push -u origin HEAD
           </pre>
@@ -27,49 +29,50 @@ export function TreePage() {
 }
 
 function TreeView({ full, rest }: { full: string; rest: string }) {
-  const { r, data: t } = useResolved(full, rest, (res) => api.tree(full, res.sha, res.path));
+  const { t } = useI18n();
+  const { r, data: tree } = useResolved(full, rest, (res) => api.tree(full, res.sha, res.path));
   const base = `/${full}`;
-  const up = t.path.split("/").slice(0, -1).join("/");
+  const up = tree.path.split("/").slice(0, -1).join("/");
   return (
     <>
       <RefBar refname={r.ref} refKind={r.kind} path={r.path} page="tree" />
       <Box
         className="tree"
         title={
-          t.commit && (
+          tree.commit && (
             <div className="tree-commit">
-              <Avatar name={t.commit.author} />
-              <strong>{t.commit.author}</strong>
-              <Link to={`${base}/commit/${t.commit.sha}`} className="commit-subject ellipsis">
-                {t.commit.subject}
+              <Avatar name={tree.commit.author} />
+              <strong>{tree.commit.author}</strong>
+              <Link to={`${base}/commit/${tree.commit.sha}`} className="commit-subject ellipsis">
+                {tree.commit.subject}
               </Link>
               <span className="spacer" />
-              <Link to={`${base}/commit/${t.commit.sha}`} className="sha">
-                {t.commit.sha.slice(0, 7)}
+              <Link to={`${base}/commit/${tree.commit.sha}`} className="sha">
+                {tree.commit.sha.slice(0, 7)}
               </Link>
-              <span className="muted small">{relTime(t.commit.commit_date)}</span>
+              <span className="muted small">{relTime(tree.commit.commit_date)}</span>
             </div>
           )
         }
       >
         <table className="files">
           <tbody>
-            {t.path && (
+            {tree.path && (
               <tr>
                 <td className="icon" />
                 <td colSpan={2}>
-                  <Link to={`${base}/tree/${t.ref}${up ? "/" + up : ""}`}>..</Link>
+                  <Link to={`${base}/tree/${tree.ref}${up ? "/" + up : ""}`}>..</Link>
                 </td>
               </tr>
             )}
-            {t.entries.map((e) => (
+            {tree.entries.map((e) => (
               <tr key={e.name}>
                 <td className="icon">{e.type === "tree" ? <DirIcon /> : e.type === "commit" ? "⧉" : <FileIcon />}</td>
                 <td>
                   {e.type === "commit" ? (
-                    <span title={`submodule @ ${e.sha}`}>{e.name}</span>
+                    <span title={t("tree.submodule.at", { sha: e.sha })}>{e.name}</span>
                   ) : (
-                    <Link to={`${base}/${e.type === "tree" ? "tree" : "blob"}/${t.ref}/${t.path ? t.path + "/" : ""}${e.name}`}>
+                    <Link to={`${base}/${e.type === "tree" ? "tree" : "blob"}/${tree.ref}/${tree.path ? tree.path + "/" : ""}${e.name}`}>
                       {e.name}
                     </Link>
                   )}
@@ -80,10 +83,10 @@ function TreeView({ full, rest }: { full: string; rest: string }) {
           </tbody>
         </table>
       </Box>
-      {t.readme && (
-        <Box title={<span className="strong">{t.readme.name}</span>} className="readme">
+      {tree.readme && (
+        <Box title={<span className="strong">{tree.readme.name}</span>} className="readme">
           <div className="pad">
-            <Markdown source={t.readme.contents} />
+            <Markdown source={tree.readme.contents} />
           </div>
         </Box>
       )}

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useI18n } from "../i18n";
 
 async function copyText(text: string) {
   try {
@@ -49,17 +50,18 @@ export function CopyButton({
   label?: string;
   className?: string;
 }) {
+  const { t } = useI18n();
   const [state, setState] = useState<"idle" | "done" | "error">("idle");
   return (
     <button
       type="button"
       className={`copy-btn ${label ? "copy-btn-labelled" : ""} ${className}`}
-      title="Copy to clipboard"
-      aria-label={label ?? "Copy to clipboard"}
+      title={t("copy.title")}
+      aria-label={label ?? t("copy.title")}
       onClick={async () => {
         try {
-          const t = typeof text === "function" ? await text() : text;
-          await copyText(t);
+          const v = typeof text === "function" ? await text() : text;
+          await copyText(v);
           setState("done");
         } catch {
           setState("error");
@@ -68,7 +70,7 @@ export function CopyButton({
       }}
     >
       {state === "done" ? <CheckIcon /> : <ClipboardIcon />}
-      {label && <span>{state === "done" ? "Copied" : state === "error" ? "Failed" : label}</span>}
+      {label && <span>{state === "done" ? t("copy.copied") : state === "error" ? t("copy.failed") : label}</span>}
     </button>
   );
 }
