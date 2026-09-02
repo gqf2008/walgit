@@ -31,6 +31,9 @@ const WALK_BUDGET: usize = 50_000;
 const MERGE_BASE_BUDGET: usize = 5_000;
 /// Budget for a blame history walk (commits visited before git blame runs).
 const BLAME_BUDGET: usize = 3_000;
+/// Budget for one rename boundary: the parent commit's whole tree skeleton
+/// (tree objects only, no blobs) that git blame's rename detection reads.
+const BLAME_TREE_BUDGET: usize = 20_000;
 /// Budget for a whole-tree archive fault (trees + blobs, deduped).
 const ARCHIVE_OBJECT_BUDGET: usize = 100_000;
 
@@ -56,6 +59,26 @@ fn not_found(m: impl Into<String>) -> ApiError {
 }
 fn wal(e: walgit_wal::WalError) -> ApiError {
     ApiError::Internal(format!("remote objects: {e}"))
+}
+
+/// One pending visit of the blame walk: a `(commit, path)` pair ordered by
+/// the commit's time so the walk stays newest-first.
+struct BlameItem(i64, u64, ObjectId, String);
+impl Ord for BlameItem {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&o.0).then_with(|| o.1.cmp(&self.1))
+    }
+}
+impl PartialEq for BlameItem {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for BlameItem {}
+impl PartialOrd for BlameItem {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
 }
 
 /// A parsed commit (what the walks and renderers need).
@@ -689,34 +712,32 @@ impl Remote {
 
     /// Fault everything `git blame --porcelain <rev> -- <path>` reads into the
     /// loose store: each commit of the path history, its path trees and every
-    /// version of the file blob — bounded by BLAME_BUDGET commits. Paths that
-    /// did not yet exist are boundaries (their ancestors are not followed);
-    /// merge commits get every parent's path state faulted because blame diffs
-    /// against all of them.
+    /// version of the file blob — bounded by BLAME_BUDGET commits. The walk
+    /// unit is a `(commit, path)` pair so a rename can hand the history over
+    /// to the old name: at a boundary (path absent in a parent) the parent's
+    /// whole tree skeleton is faulted (bounded by `BLAME_TREE_BUDGET`, 503 past
+    /// it) and the walk continues along every path in it whose content is
+    /// exactly the child's blob — which is what git blame's own rename
+    /// detection picks first, so both agree on where the history went.
+    /// Merge commits get every parent's path state faulted because blame
+    /// diffs against all of them.
     pub async fn fault_blame(&self, commit_sha: &str, path: &str) -> Result<(), ApiError> {
         let start = ObjectId::from_hex(commit_sha.as_bytes())
             .map_err(|_| not_found(format!("invalid commit sha {commit_sha}")))?;
-        #[derive(PartialEq, Eq)]
-        struct Item(i64, u64, ObjectId);
-        impl Ord for Item {
-            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                self.0.cmp(&o.0).then_with(|| o.1.cmp(&self.1))
-            }
-        }
-        impl PartialOrd for Item {
-            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(o))
-            }
-        }
         let mut heap = BinaryHeap::new();
-        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut seen: HashSet<(ObjectId, String)> = HashSet::new();
         let mut seq = 0u64;
         let start_meta = self.commit(&start).await?;
-        heap.push(Item(start_meta.commit_time, seq, start));
-        seen.insert(start);
+        heap.push(BlameItem(
+            start_meta.commit_time,
+            seq,
+            start,
+            path.to_string(),
+        ));
+        seen.insert((start, path.to_string()));
         let budget = test_budget("WALGIT_TEST_BLAME_BUDGET", BLAME_BUDGET);
         let mut visited = 0usize;
-        while let Some(Item(_, _, oid)) = heap.pop() {
+        while let Some(BlameItem(_, _, oid, path)) = heap.pop() {
             visited += 1;
             if visited > budget {
                 self.reporter
@@ -733,33 +754,50 @@ impl Remote {
                     "commits",
                 );
             }
-            let (meta, target, mode) = match self.fault_path(&oid, path).await {
+            let (meta, target, mode) = match self.fault_path(&oid, &path).await {
                 Ok(x) => x,
-                Err(ApiError::NotFound(_)) => continue, // path absent: boundary
+                // Items are pushed only after a presence check; the start was
+                // resolved by the caller. A miss here is a boundary-shaped
+                // stale resolution, not a fault: stop this branch.
+                Err(ApiError::NotFound(_)) => continue,
                 Err(e) => return Err(e),
             };
             if mode.is_blob_or_symlink() {
                 self.fault(&target).await?;
             }
-            for par in meta.parents {
-                if seen.insert(par) {
-                    // Fault the parent's path state now (idempotent with its own
-                    // pop) so merge diffs have every parent's tree and blob.
-                    match self.fault_path(&par, path).await {
-                        Ok((_, ptarget, pmode)) => {
-                            if pmode.is_blob_or_symlink() {
-                                self.fault(&ptarget).await?;
+            for par in &meta.parents {
+                let pm = self.commit(par).await?;
+                let child = if mode.is_blob_or_symlink() {
+                    Some(target)
+                } else {
+                    None
+                };
+                match self.lookup_path(pm.tree, &path).await? {
+                    // Path continues in this parent: ordinary history.
+                    Some(_) => {
+                        if seen.insert((*par, path.clone())) {
+                            seq += 1;
+                            heap.push(BlameItem(pm.commit_time, seq, *par, path.clone()));
+                        }
+                    }
+                    // Boundary: the path did not exist here. If the content is
+                    // a blob, git blame will run rename detection against this
+                    // parent's tree — fault both sides' tree skeletons (the
+                    // boundary diff is full-tree on each side) and follow the
+                    // exact content predecessor (if any) under its old name.
+                    None => {
+                        if let Some(blob) = child {
+                            let olds = self
+                                .rename_predecessors(par, &pm, meta.tree, blob, &path)
+                                .await?;
+                            for old in olds {
+                                if seen.insert((*par, old.clone())) {
+                                    seq += 1;
+                                    heap.push(BlameItem(pm.commit_time, seq, *par, old));
+                                }
                             }
                         }
-                        // Path absent in this parent: a boundary, not an error.
-                        Err(ApiError::NotFound(_)) => {}
-                        // Real failures must surface, or the later `git blame`
-                        // fails with an unreproducible local error.
-                        Err(e) => return Err(e),
                     }
-                    seq += 1;
-                    let pm = self.commit(&par).await?;
-                    heap.push(Item(pm.commit_time, seq, par));
                 }
             }
         }
@@ -768,6 +806,69 @@ impl Remote {
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    /// The old names a pure rename came from: both sides of the boundary —
+    /// the child's tree (git blame diffs full trees when the path is absent
+    /// on one side, so rename detection reads every tree on both commits)
+    /// and the parent's — are faulted as skeletons (every tree object, no
+    /// blobs; the exact-rename phase compares oids over the full tree), and
+    /// the parent's side is scanned for paths whose content is exactly
+    /// `blob`. Renames that also change the content (git needs similarity
+    /// detection and reads candidate blobs) are not followed — the caller
+    /// leaves them as a boundary, the same as a path that is genuinely new
+    /// in the child. Bounded by `BLAME_TREE_BUDGET` tree objects across both
+    /// sides; 503 past it.
+    async fn rename_predecessors(
+        &self,
+        parent: &gix_hash::oid,
+        meta: &CommitMeta,
+        child_tree: ObjectId,
+        blob: ObjectId,
+        path: &str,
+    ) -> Result<Vec<String>, ApiError> {
+        let budget = test_budget("WALGIT_TEST_BLAME_TREE_BUDGET", BLAME_TREE_BUDGET);
+        let too_large = || {
+            ApiError::ServiceUnavailable(format!(
+                "the rename boundary of '{path}' at {parent} has more than {budget} tree objects; too large to follow the rename from the remote pack set — use a host with the packs or a bundle"
+            ))
+        };
+        let mut olds: Vec<String> = Vec::new();
+        let mut count = 0usize;
+        // Skeleton of each side of the boundary (child first: git diffs both
+        // trees when the path is absent on one side), breadth-first, counting
+        // every tree object against the shared budget; the parent's side also
+        // collects exact content matches as they come through.
+        for (root, collect) in [(child_tree, None), (meta.tree, Some(blob))] {
+            let mut frontier: VecDeque<(String, ObjectId)> =
+                VecDeque::from([(String::new(), root)]);
+            let mut seen_trees: HashSet<ObjectId> = HashSet::from([root]);
+            while let Some((prefix, tree)) = frontier.pop_front() {
+                count += 1;
+                if count > budget {
+                    self.reporter
+                        .notice(format!("blame: rename boundary tree over {budget} objects"));
+                    return Err(too_large());
+                }
+                self.fault(&tree).await?;
+                for e in self.tree_entries(&tree).await? {
+                    let name = format!("{prefix}{}", String::from_utf8_lossy(&e.name));
+                    if e.mode.is_tree() {
+                        if seen_trees.insert(e.oid) {
+                            frontier.push_back((format!("{name}/"), e.oid));
+                        }
+                    } else if Some(e.oid) == collect {
+                        olds.push(name);
+                    }
+                }
+            }
+        }
+        if olds.is_empty() {
+            self.reporter.notice(format!(
+                "blame: '{path}' has no exact content predecessor in {parent}'s tree; not following the rename"
+            ));
+        }
+        Ok(olds)
     }
 
     /// Fault every tree and blob reachable from `commit` into the loose store

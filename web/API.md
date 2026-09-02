@@ -435,9 +435,13 @@ context and agent lookups. `rev` resolves like `resolve`; `path` is the file.
 - **Remote limits**: a file whose *ancestry* is deeper than the budget → `503`
   (deep-history files need a host with the packs or a bundle — the budget
   counts every ancestor the walk must fault, not just lines that changed).
-  Renames are **not followed on remote** (git blame has no switch to turn
-  rename-following off and reads the never-faulted parent tree) → a defined
-  `404`; local packs follow renames natively. Tracked in the D1 issue.
+  Renames **are followed on remote** when the content did not change with the
+  move: at a boundary the walk faults both sides' tree skeletons (bounded by
+  `BLAME_TREE_BUDGET` tree objects, `503` past it) and continues along the
+  exact content predecessor — the same candidate git blame's own rename
+  detection picks first, so local and remote agree. Renames that also change
+  the content (similarity detection) are still not followed; they need a host
+  with the packs or a bundle.
 - `blame` of a directory or a missing path → `404`. Cache: SWR.
 
 ### `GET /{owner}/{repo}/api/archive/{rev}?format=`
