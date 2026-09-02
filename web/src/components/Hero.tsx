@@ -1,34 +1,36 @@
 import { useEffect, useRef } from "react";
 import { Link } from "react-router-dom";
+import { useI18n } from "../i18n";
 
 const ARCH_POST = "https://cursor.com/blog/git-at-any-scale";
 const TURBOPUFFER = "https://turbopuffer.com/blog/turbopuffer";
 
 /** Landing banner: what this is, with an animated commit-DAG backdrop. */
 export function Hero() {
+  const { t } = useI18n();
   return (
     <section className="hero" aria-labelledby="hero-title">
       <DagCanvas />
       <div className="hero-body">
         <h1 id="hero-title">walgit</h1>
-        <p className="hero-lede">A git server that is a single binary in front of an object store.</p>
+        <p className="hero-lede">{t("hero.lede")}</p>
         <p className="hero-text">
-          walgit is an implementation of the ideas in the{" "}
+          {t("hero.text.a")}{" "}
           <a href={ARCH_POST} target="_blank" rel="noreferrer" className="hero-link">
-            git hosting architecture of Origin (Cursor)
+            {t("hero.link.origin")}
           </a>{" "}
-          and our friends at{" "}
+          {t("hero.text.b")}{" "}
           <a href={TURBOPUFFER} target="_blank" rel="noreferrer" className="hero-link">
-            Turbopuffer
+            {t("hero.link.turbopuffer")}
           </a>{" "}
-          who have pioneered GCS/S3 based share-nothing infrastructure to scale.
+          {t("hero.text.c")}
         </p>
         <div className="hero-actions">
           <Link to="/api" className="btn btn-primary">
-            Explore the API
+            {t("hero.exploreApi")}
           </Link>
           <a href={ARCH_POST} target="_blank" rel="noreferrer" className="btn">
-            Read “Git at any scale” ↗
+            {t("hero.readPost")}
           </a>
         </div>
       </div>

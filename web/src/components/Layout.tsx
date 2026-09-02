@@ -3,10 +3,11 @@ import type { ReactNode } from "react";
 import { RouteBoundary, TopProgress, useBusy } from "./Loading";
 import { ErrorTray } from "./ErrorTray";
 import { InstanceFooter } from "./InstanceFooter";
-import { LangSwitch } from "../i18n";
+import { LangSwitch, useI18n } from "../i18n";
 
 export function Layout() {
   const busy = useBusy();
+  const { t } = useI18n();
   // On a repo page the API tab pre-fills that repo in the examples.
   const m = /^\/([^/_][^/]*)\/([^/]+)/.exec(useLocation().pathname);
   const apiHref = m && m[1] !== "services" ? `/api?repo=${m[1]}/${m[2]}` : "/api";
@@ -23,6 +24,9 @@ export function Layout() {
           walgit
         </Link>
         <nav className="topnav">
+          <NavLink to="/" end className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
+            {t("nav.repos")}
+          </NavLink>
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
             API
           </NavLink>
