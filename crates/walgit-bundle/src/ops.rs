@@ -454,7 +454,6 @@ where
                         Ok(meta) => return Ok(Some((meta.version, new_list))),
                         Err(StoreError::PreconditionFailed { .. }) => {
                             debug!(attempt, "cas retry: list created by another writer");
-                            continue;
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -477,7 +476,6 @@ where
                             Ok(new_meta) => return Ok(Some((new_meta.version, new_list))),
                             Err(StoreError::PreconditionFailed { .. }) => {
                                 debug!(attempt, "cas retry: list changed by another writer");
-                                continue;
                             }
                             Err(e) => return Err(e.into()),
                         }
@@ -531,8 +529,10 @@ impl LeaseGuard {
             .delete(&self.key, Some(self.version.clone()))
             .await
         {
-            Ok(()) => Ok(()),
-            Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Ok(()),
+            // `NotFound`/stale version: the lease is already gone — released either way.
+            Ok(()) | Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => {
+                Ok(())
+            }
             Err(e) => Err(e.into()),
         }
     }

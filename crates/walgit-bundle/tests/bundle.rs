@@ -28,8 +28,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::process::Command;
 
-use walgit_bundle::{BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops};
-use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, Config};
+use walgit_bundle::{
+    BundleEngine, BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops,
+};
+use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, ByteSize, Config};
 use walgit_git::{LocalRepo, ObjectFormat as GitObjectFormat};
 use walgit_store::{DynStore, ObjectStore, ObjectStoreExt, Prefixed, memory::MemoryStore};
 
@@ -137,7 +139,7 @@ impl BundleSource for TestSource {
             local: local.clone(),
             store: store.clone(),
             head_seq: head_seq.load(Ordering::Relaxed),
-            engine: Default::default(),
+            engine: BundleEngine::default(),
             cfg: None,
         })
     }
@@ -181,7 +183,7 @@ fn cfg_full_only(keep: usize) -> Config {
             chain: false,
         }],
         min_commits: 0,
-        min_bytes: Default::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
         signed_url_ttl: Duration::from_secs(3600),
         advertise: true,
@@ -226,7 +228,7 @@ fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
             },
         ],
         min_commits: 0,
-        min_bytes: Default::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
         signed_url_ttl: Duration::from_secs(3600),
         advertise: true,
@@ -963,7 +965,7 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
     // Freeze `now` on a Wednesday (2026-07-15T12:00:00Z): yesterday is Tuesday,
     // never the Sunday weekly cut, so the test is deterministic instead of
     // failing every Monday (issue #17).
-    let now = std::time::UNIX_EPOCH + std::time::Duration::from_hours(495588);
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_hours(495_588);
     let daily_strat = cfg
         .bundles
         .strategy

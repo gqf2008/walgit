@@ -171,7 +171,7 @@ impl Bundler {
         Arc::new(Self {
             source,
             cfg,
-            gates: Default::default(),
+            gates: parking_lot::Mutex::default(),
             lease_ttl: Duration::from_mins(30),
         })
     }
@@ -640,9 +640,8 @@ impl Bundler {
         let strat = self.find_strategy(&cfg, strategy)?.clone();
         let strat = &strat;
         let store = handle.store.clone();
-        let lease = match ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? {
-            Some(l) => l,
-            None => return Ok(None),
+        let Some(lease) = ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? else {
+            return Ok(None);
         };
         let res: Result<Option<BundleEntry>, BundleError> = async {
             let fresh = ops::read_list(&store).await?.unwrap_or_default();
@@ -734,7 +733,8 @@ impl Bundler {
             if missing.is_empty() {
                 continue;
             }
-            let lease = if let Some(l) = ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await? { l } else {
+            let Some(lease) = ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await?
+            else {
                 debug!(strategy = %strat.name, "lease held, skipping");
                 continue;
             };

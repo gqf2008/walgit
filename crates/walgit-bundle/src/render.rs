@@ -4,6 +4,7 @@
 //! See: <https://git-scm.com/docs/bundle-uri> and
 //!      <https://git-scm.com/docs/gitprotocol-v2> (bundle-uri command).
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use walgit_config::{BundleServe, BundlesConfig};
@@ -132,11 +133,12 @@ pub async fn render_list_text(
         )
         .await?;
         out.push('\n');
-        out.push_str(&format!("[bundle \"{}\"]\n", entry.id));
-        out.push_str(&format!("    uri = {uri}\n"));
-        out.push_str(&format!("    creationToken = {}\n", entry.creation_token));
+        // `String`'s `fmt::Write` is infallible; `let _ =` drops the impossible `Err`.
+        let _ = writeln!(out, "[bundle \"{}\"]", entry.id);
+        let _ = writeln!(out, "    uri = {uri}");
+        let _ = writeln!(out, "    creationToken = {}", entry.creation_token);
         if !entry.filter.is_empty() {
-            out.push_str(&format!("    filter = {}\n", entry.filter));
+            let _ = writeln!(out, "    filter = {}", entry.filter);
         }
     }
 

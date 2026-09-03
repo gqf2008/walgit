@@ -395,7 +395,6 @@ pub fn plan_with(
                             .unwrap_or("full bundles need the base pack locally (ssd host)")
                             .into(),
                     ),
-                    BundleKind::Full => SlotStatus::Missing,
                     BundleKind::Incremental if base_id.is_none() => {
                         SlotStatus::Blocked("no base bundle at or before this slot".into())
                     }
@@ -404,7 +403,8 @@ pub fn plan_with(
                             .unwrap_or("the serving copy does not fit this host")
                             .into(),
                     ),
-                    BundleKind::Incremental => SlotStatus::Missing,
+                    // Guards above missed: nothing rules the slot out, it just has not been cut.
+                    BundleKind::Full | BundleKind::Incremental => SlotStatus::Missing,
                 },
             };
             rows.push(SlotPlan {
