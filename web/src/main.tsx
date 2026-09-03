@@ -2,7 +2,7 @@ import { StrictMode, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Layout } from "./components/Layout";
-import { Owners } from "./pages/Owners";
+import { Home } from "./pages/Home";
 import { Repos } from "./pages/Repos";
 import { RepoLayout } from "./pages/RepoLayout";
 import { TreePage } from "./pages/TreePage";
@@ -31,7 +31,7 @@ createRoot(document.getElementById("root")!).render(
       <BrowserRouter>
       <Routes>
         <Route element={<Layout />}>
-          <Route index element={<Owners />} />
+          <Route index element={<Home />} />
           <Route path="api" element={<ApiPage />} />
           <Route path=":owner" element={<Repos />} />
           <Route path=":owner/:repo" element={<RepoLayout />}>

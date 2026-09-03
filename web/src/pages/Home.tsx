@@ -2,33 +2,46 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
-import { Hero } from "../components/Hero";
-import { Showcase } from "../components/Showcase";
 import { CodeSample } from "../components/CopyButton";
+import { ModelLanding } from "../components/ModelLanding";
 import { useI18n } from "../i18n";
 
-export function Owners() {
+/**
+ * The site root "/" (issue #55): the D1 model landing — “No database. Only
+ * rules.” — followed by this host's repositories. The model is taught in
+ * static, marked-illustrative form here (the root has no repository context);
+ * when the host has repositories, the landing links into the first one's
+ * live-data collab guide (#41). An empty host shows the install slate
+ * instead — there is nothing to explain yet.
+ */
+export function Home() {
   const { t } = useI18n();
   const owners = useData("owners", api.owners);
+  const firstOwner = owners[0] ?? null;
+  const repos = useData(firstOwner ? `repos:${firstOwner}` : "repos:none", () =>
+    firstOwner ? api.repos(firstOwner) : Promise.resolve([] as string[]),
+  );
+  const live = firstOwner && repos.length > 0 ? { owner: firstOwner, repo: repos[0]! } : null;
   if (owners.length === 0) {
     return <BlankSlate />;
   }
   return (
     <>
-      <Hero />
-      <Showcase owners={owners} />
-      <h2 className="page-title">{t("home.reposByOwner")}</h2>
-      <Box>
-        <ul className="list">
-          {owners.map((o) => (
-            <li key={o}>
-              <Link to={`/${o}`} className="strong">
-                {o}
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </Box>
+      <ModelLanding live={live} />
+      <section id="repos" className="model-wrap" aria-labelledby="repos-title">
+        <h2 id="repos-title" className="model-browse">{t("home.browse")}</h2>
+        <Box>
+          <ul className="list">
+            {owners.map((o) => (
+              <li key={o}>
+                <Link to={`/${o}`} className="strong">
+                  {o}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Box>
+      </section>
     </>
   );
 }
