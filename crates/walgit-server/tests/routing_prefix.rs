@@ -53,6 +53,10 @@ fn allowed_route(path: &str) -> bool {
         // reserves "api" (D42). git operations for such an owner are
         // unaffected — only the single-segment owner page is shadowed.
         "/repos",
+        // AI-agent collaboration guide (D42): data-free doc served verbatim,
+        // open like /repos.js; reserves the owner name "SKILL.md" (dot is a
+        // legal owner character) the same way.
+        "/SKILL.md",
         "/{owner}",
     ];
     if allow.contains(&p) {

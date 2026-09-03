@@ -87,7 +87,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   `access_token_ttl`; rotating the secret revokes all), and the HMAC **session cookie** set by `/_auth/login` →
   issuer → `/_auth/callback`. Static `tokens` work in `oidc` mode too (robots). Every path ends in the same
   allowlist and `write_domains`.
-- Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/_auth/*` (the
+- Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/SKILL.md`
+  (D42, the AI-agent guide), `/_auth/*` (the
   sign-in flow itself) and **`/services/public/*`** (data-free; today `install.sh` + `ca.pem`; everything else
   under it 404; never reads repo data or takes a bearer — test `public_lane_serves_only_the_installer_without_auth`).
 - **The server answers an invalid/expired credential with a real 401** — that is what makes git `erase` it from
@@ -404,11 +405,14 @@ decision in §4 — or the PR is; never "fix later".
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
 
-- **D42** **The host-wide repo index is the page route `/repos` (2026-09-03, #59/#60).** The top-nav「仓库」
-  entry lands there; `/` stays the landing page. Data comes from the existing `/api/v1/owners*` surface — no
-  new endpoints. As a single-segment static route it reserves the owner name "repos" for the SPA exactly as
-  `/api` reserves "api" (the `routing_prefix` allow-list records it); git operations for such an owner are
-  unaffected — only the single-segment owner page is shadowed.
+- **D42** **The host-wide repo index is the page route `/repos`, and the AI-agent guide is `/SKILL.md`
+  (2026-09-03, #59/#60).** The top-nav「仓库」entry lands on `/repos`; `/` stays the landing page (it does not
+  repeat the repo index). Data comes from the existing `/api/v1/owners*` surface — no new endpoints.
+  `/SKILL.md` serves the repository source `web/SKILL.md` verbatim (data-free, open like `/repos.js`, strong
+  ETag): the agent-facing guide to git/API/auth on this host. Both are single-segment static routes, so each
+  reserves its owner name for the SPA exactly as `/api` reserves "api" (the `routing_prefix` allow-list
+  records them); git operations for such owners are unaffected — only the single-segment owner page is
+  shadowed.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

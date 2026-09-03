@@ -149,6 +149,10 @@ export function ModelLanding({ live }: { live: { owner: string; repo: string } |
           {t("guide.protocol")}
         </p>
         <p className="model-endnote">
+          {t("home.skill.pre")}
+          <a href="/SKILL.md">SKILL.md</a>
+        </p>
+        <p className="model-endnote">
           {t("home.origin.a")}
           <a href={ORIGIN_POST} target="_blank" rel="noreferrer">{t("home.origin.l1")}</a>
           {t("home.origin.b")}

@@ -54,6 +54,35 @@ async fn page_routes_serve_index_without_cache() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_md_is_open_markdown_with_etag() -> Result<()> {
+    let server = Server::start().await?;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/SKILL.md", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()["content-type"]
+            .to_str()?
+            .starts_with("text/markdown")
+    );
+    assert_eq!(response.headers()["cache-control"], "no-cache");
+    let etag = response.headers()["etag"].clone();
+    let body = response.text().await?;
+    assert!(body.contains("walgit"), "the guide mentions walgit");
+    // Strong ETag revalidates: If-None-Match → 304.
+    let response = client
+        .get(format!("{}/SKILL.md", server.base_url))
+        .header("if-none-match", &etag)
+        .send()
+        .await?;
+    assert_eq!(response.status(), 304);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assets_have_content_type_and_immutable_cache() -> Result<()> {
     let server = Server::start().await?;
     let client = reqwest::Client::new();
