@@ -181,6 +181,7 @@ pub fn base_for_slot_chain<'a>(
 /// * `chain = true`: this strategy's own newest bundle before the slot, **if it is newer than
 ///   that base** (dailies chain from the weekly onwards; hourlies restart from every new daily
 ///   instead of chaining across it); else the base.
+///
 /// `slot = 0` (a manual cut, "now"): the same with the newest bundles overall.
 pub fn base_for_incremental<'a>(
     cfg: &BundlesConfig,
@@ -605,7 +606,7 @@ mod tests {
     }
     fn t(s: &str) -> SystemTime {
         let dt = chrono::DateTime::parse_from_rfc3339(s).unwrap();
-        from_epoch(dt.timestamp() as u64)
+        from_epoch(u64::try_from(dt.timestamp()).expect("fixture dates are after the epoch"))
     }
     fn entry(strategy: &str, slot: u64, base_id: &str) -> BundleEntry {
         BundleEntry {

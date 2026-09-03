@@ -54,7 +54,14 @@ static SIGNING_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::Ha
 
 fn warn_signing_once(owner: &str, repo: &str, e: &dyn std::fmt::Display) {
     let key = format!("{owner}/{repo}");
-    if SIGNING_WARNED.lock().unwrap().insert(key.clone()) {
+    // A poisoned process-local mutex only means another thread panicked while
+    // logging; recover and proceed — this is a once-per-repo notice, best
+    // effort by design.
+    if SIGNING_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone())
+    {
         tracing::warn!(repo = %key, error = %e, "signed bundle URL failed; serving proxy URIs instead (check the store signing permissions)");
     }
 }
@@ -90,6 +97,10 @@ fn proxy_uri(entry: &BundleEntry, owner: &str, repo: &str, base_url: &str) -> St
 ///     uri = <uri>
 ///     creationToken = <token>
 /// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one production caller (Bundler::render_list) passes the full advertisement context; protocol_v2_lines takes the same owner/repo/base_url/cfg/store set without (filter, fulls), so a params struct would not unify the module"
+)]
 pub async fn render_list_text(
     list: &BundleList,
     owner: &str,
