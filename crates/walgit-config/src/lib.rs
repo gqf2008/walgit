@@ -49,8 +49,8 @@ pub struct ServerConfig {
     pub drain_timeout: Duration,
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
-    /// Roles this instance performs. a serverless host: fronts get ["serve"], the
-    /// single maintenance instance ["maintain"] (checkpoint / bundle / compact
+    /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
+    /// single maintenance instance `["maintain"]` (checkpoint / bundle / compact
     /// loops over every repo; `compact` and `bundle` are its sub-roles). Empty = all.
     pub roles: Vec<Role>,
     pub auth: AuthConfig,
@@ -804,6 +804,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Recursive TOML-table merge used by [`Config::with_settings`]: values from
+/// `from` overwrite `into`, tables merge key by key.
+fn merge(into: &mut toml::Table, from: &toml::Table) {
+    for (k, v) in from {
+        match (into.get_mut(k), v) {
+            (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
+            _ => {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
 /// D24: the top-level sections a repository's settings may override.
 pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "upstream"];
 /// D24: maximum size of a settings document.
@@ -837,16 +850,6 @@ impl Config {
             );
         }
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        fn merge(into: &mut toml::Table, from: &toml::Table) {
-            for (k, v) in from {
-                match (into.get_mut(k), v) {
-                    (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
-                    _ => {
-                        into.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
         merge(&mut doc, &overrides);
         let cfg: Config = doc.try_into().context("settings: applying")?;
         cfg.validate()
@@ -1311,7 +1314,7 @@ impl Config {
                     }
                     let next = cur
                         .entry(path[0].clone())
-                        .or_insert_with(|| toml::Value::Table(Default::default()))
+                        .or_insert_with(|| toml::Value::Table(toml::Table::default()))
                         .as_table_mut()
                         .ok_or_else(|| format!("{} is not a table", path[0]))?;
                     set(next, &path[1..], value)
@@ -1730,7 +1733,7 @@ mod tests {
 
     /// `[placement]` is set as a group: one PLACEMENT env key replaces the whole
     /// section (unset keys = defaults), never merges with the file's values.
-    /// The SSD host 2026-08-21 07:00Z: the baked toml's `serve_exclude` = ["acme/monorepo"]
+    /// The SSD host 2026-08-21 07:00Z: the baked toml's `serve_exclude` = `["acme/monorepo"]`
     /// leaked under an env that set only MAINTAIN* → the host refused its own repo.
     #[test]
     fn env_placement_override_replaces_the_whole_section() {
