@@ -5969,6 +5969,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walgit-bundle",
+ "walgit-cli",
  "walgit-config",
  "walgit-git",
  "walgit-proto",

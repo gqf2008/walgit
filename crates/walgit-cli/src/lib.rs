@@ -21,7 +21,7 @@ mod compact;
 mod import;
 mod import_direct;
 mod mirror;
-mod repo;
+pub mod repo;
 mod serve;
 #[cfg(test)]
 mod testutil;
@@ -270,8 +270,18 @@ enum BundleAction {
     },
 }
 
+#[derive(Clone, clap::Args)]
+pub struct Conn {
+    /// Host base URL (default: `$WALGIT_URL` or `http://127.0.0.1:8080`).
+    #[arg(long, env = "WALGIT_URL")]
+    pub url: Option<String>,
+    /// Bearer token (default: `$WALGIT_TOKEN`).
+    #[arg(long, env = "WALGIT_TOKEN")]
+    pub token: Option<String>,
+}
+
 #[derive(Subcommand)]
-enum RepoAction {
+pub enum RepoAction {
     /// Create a new repository.
     Create {
         /// `owner/name`.
@@ -298,10 +308,99 @@ enum RepoAction {
         #[command(subcommand)]
         action: SettingsAction,
     },
+    /// Every ref of a repository, over HTTP from a running host (issue #61:
+    /// reads need no bucket credentials — a host URL and a bearer suffice).
+    Refs {
+        /// `owner/name`.
+        repo: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Resolve a revision to an oid over HTTP.
+    Resolve {
+        /// `owner/name`.
+        repo: String,
+        /// Revision (branch, sha, `HEAD`).
+        rev: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One directory of the tree, over HTTP.
+    Tree {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to look at.
+        rev: String,
+        /// Path inside the tree (default: the root).
+        #[arg(default_value = "")]
+        path: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One blob: `--raw` prints the bytes, default prints the JSON envelope.
+    Blob {
+        /// `owner/name`.
+        repo: String,
+        /// Revision the path is looked at.
+        rev: String,
+        /// Path inside the tree.
+        path: String,
+        /// Print the raw bytes instead of the JSON envelope.
+        #[arg(long)]
+        raw: bool,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Recent commits of a ref, over HTTP.
+    Commits {
+        /// `owner/name`.
+        repo: String,
+        /// Ref or revision (default: HEAD).
+        #[arg(long = "ref")]
+        ref_: Option<String>,
+        /// Page size (1..=200, default 35).
+        #[arg(long)]
+        n: Option<u32>,
+        /// Skip this many commits.
+        #[arg(long)]
+        skip: Option<u32>,
+        /// Only commits touching this path.
+        #[arg(long)]
+        path: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One commit with its diff stat, over HTTP.
+    Commit {
+        /// `owner/name`.
+        repo: String,
+        /// Commit sha.
+        sha: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Repository overview (head seq, pack set, health), over HTTP.
+    Overview {
+        /// `owner/name`.
+        repo: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// List the repository's tasks, or `--follow <id>` to stream one task's
+    /// live packet log (notice/progress/terminal result|error) over SSE.
+    Tasks {
+        /// `owner/name`.
+        repo: String,
+        /// Stream this task's packets instead of listing tasks.
+        #[arg(long)]
+        follow: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
 }
 
 #[derive(Subcommand)]
-enum SettingsAction {
+pub enum SettingsAction {
     /// Print the settings document (and revision/author), or "(none)".
     Show {
         /// `owner/name`.
@@ -334,7 +433,7 @@ enum SettingsAction {
 }
 
 #[derive(Subcommand)]
-enum PolicyAction {
+pub enum PolicyAction {
     /// Print the policy (empty document if none is set).
     Get {
         /// `owner/name`.
