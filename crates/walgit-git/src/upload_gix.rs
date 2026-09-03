@@ -85,6 +85,17 @@ fn line(buf: &mut Vec<u8>, data: &[u8], sideband_all: bool) {
     }
 }
 
+/// Build a `MissingObject` error naming the first object of `missing`. Every
+/// call site holds a non-empty vec (guards above); `first()` keeps the error
+/// honest if that invariant ever breaks, instead of panicking on `missing[0]`.
+fn missing_oid_error(missing: &[gix_hash::ObjectId]) -> GitError {
+    GitError::MissingObject {
+        oid: missing
+            .first()
+            .map_or_else(String::new, |o| o.to_hex().to_string()),
+    }
+}
+
 /// Outcome of one (sync) enumeration attempt.
 enum Enumerated {
     Done {
@@ -272,9 +283,7 @@ impl LocalRepo {
                 .await;
                 let found = f.fault(&missing).await?;
                 if found < missing.len() {
-                    return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
-                    });
+                    return Err(missing_oid_error(&missing));
                 }
                 self.refresh_async().await?;
             }
@@ -303,9 +312,7 @@ impl LocalRepo {
                 Enumerated::Need(missing) => {
                     rounds += 1;
                     let Some(f) = faulter else {
-                        return Err(GitError::MissingObject {
-                            oid: missing[0].to_hex().to_string(),
-                        });
+                        return Err(missing_oid_error(&missing));
                     };
                     if rounds > MAX_FAULT_ROUNDS {
                         return Err(GitError::Protocol(format!(
@@ -320,9 +327,7 @@ impl LocalRepo {
                     .await;
                     let found = f.fault(&missing).await?;
                     if found == 0 {
-                        return Err(GitError::MissingObject {
-                            oid: missing[0].to_hex().to_string(),
-                        });
+                        return Err(missing_oid_error(&missing));
                     }
                     self.refresh_async().await?;
                 }
@@ -354,9 +359,7 @@ impl LocalRepo {
             });
             if !missing.is_empty() {
                 let Some(f) = faulter else {
-                    return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
-                    });
+                    return Err(missing_oid_error(&missing));
                 };
                 sink.progress(&format!(
                     "reading {} wanted object(s) from the base pack\n",
@@ -365,9 +368,7 @@ impl LocalRepo {
                 .await;
                 let found = f.fault(&missing).await?;
                 if found < missing.len() {
-                    return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
-                    });
+                    return Err(missing_oid_error(&missing));
                 }
                 self.refresh_async().await?;
             }
@@ -420,8 +421,8 @@ impl LocalRepo {
             .await
             .map_err(|e| GitError::Protocol(format!("pack generator panicked: {e}")))??;
         tracing::debug!(
-            enumerate_ms = t_enum.as_millis() as u64,
-            total_ms = t_start.elapsed().as_millis() as u64,
+            enumerate_ms = u64::try_from(t_enum.as_millis()).unwrap_or(u64::MAX),
+            total_ms = u64::try_from(t_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             objects = num_objects,
             bytes,
             rounds,
@@ -593,7 +594,11 @@ fn generate_pack_streaming(
         out.write_all(&buf).map_err(GitError::Io)?;
         return Ok(0);
     }
-    let num_entries = counts.len() as u32;
+    // The pack header's object count is u32; a pack cannot hold more (git's
+    // own limit), so len() always fits — but degrade to Err rather than
+    // truncate if that invariant is ever broken.
+    let num_entries = u32::try_from(counts.len())
+        .map_err(|_| GitError::Protocol("object count exceeds the pack format's u32 field".into()))?;
     let progress: Box<dyn gix_features::progress::DynNestedProgress + 'static> =
         Box::new(gix_features::progress::Discard);
     let entries = entry::iter_from_counts(
@@ -833,23 +838,23 @@ fn enumerate(
     }
 
     // include-tag: annotated tags whose target is in the set.
-    if req.include_tag
-        && let Ok(snap) = crate::read_refs(repo.path()) {
-            for r in &snap.refs {
-                let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) else {
-                    continue;
-                };
-                if set.contains(&tag_oid) {
-                    continue;
-                }
-                if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf)
-                    && obj.kind == ObjKind::Tag
-                        && let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind)
-                            && set.contains(&tag.target()) {
-                                set.insert(tag_oid);
-                            }
+    if req.include_tag {
+        let snap = crate::read_refs(repo.path());
+        for r in &snap.refs {
+            let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) else {
+                continue;
+            };
+            if set.contains(&tag_oid) {
+                continue;
             }
+            if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf)
+                && obj.kind == ObjKind::Tag
+                    && let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind)
+                        && set.contains(&tag.target()) {
+                            set.insert(tag_oid);
+                        }
         }
+    }
     Ok(Enumerated::Done {
         set,
         commits,

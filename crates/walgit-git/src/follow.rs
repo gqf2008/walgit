@@ -43,6 +43,10 @@ impl FetchedDelta {
 
 /// Fetch `refs` from `upstream` into the scratch for `(owner, name)` under `dir`,
 /// negotiating from `have` (`ref → oid` we hold; missing = fetch its history).
+#[allow(
+    clippy::implicit_hasher,
+    reason = "cross-crate public API takes &HashMap<String, String>; a generic BuildHasher would leak into every caller"
+)]
 pub async fn fetch_refs(
     upstream: &str,
     token: Option<&str>,
@@ -136,7 +140,12 @@ pub async fn fetch_refs(
             .map_err(GitError::Io)?;
         {
             use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("stdin");
+            // stdin(Stdio::piped()) above guarantees the handle exists; degrade
+            // to Err rather than panic if that invariant is ever broken.
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| GitError::Io(std::io::Error::other("git update-ref stdin")))?;
             stdin
                 .write_all(input.as_bytes())
                 .await

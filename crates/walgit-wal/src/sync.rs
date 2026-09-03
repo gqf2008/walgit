@@ -82,28 +82,31 @@ pub(crate) enum SyncOutcome {
     Unchanged,
     Changed {
         meta_version: Version,
-        manifest: Manifest,
+        // Boxed: the fresh manifest (pack set, checkpoint pointer, settings)
+        // is the large variant; Unchanged is unit-sized and is the common
+        // case on every per-request freshness check.
+        manifest: Box<Manifest>,
     },
 }
 
 /// Perform a conditional GET on manifest.pb and return the outcome.
 pub(crate) async fn freshness_check(
     store: &Prefixed,
-    known: &Option<Version>,
+    known: Option<&Version>,
 ) -> Result<SyncOutcome, WalError> {
     match known {
         Some(v) => match get_message_if_changed::<Manifest>(store, keys::MANIFEST, v).await? {
             None => Ok(SyncOutcome::Unchanged),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: Box::new(manifest),
             }),
         },
         None => match get_message::<Manifest>(store, keys::MANIFEST).await? {
             None => Err(WalError::NotFound),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: Box::new(manifest),
             }),
         },
     }
@@ -379,7 +382,7 @@ pub(crate) async fn download_object(
     let file = std::fs::File::create(dest)?;
     file.set_len(size)?;
     let file = std::sync::Arc::new(file);
-    let starts: Vec<u64> = (0..size).step_by(CHUNK as usize).collect();
+    let starts: Vec<u64> = (0..size.div_ceil(CHUNK)).map(|i| i * CHUNK).collect();
     let report = &report;
     futures::stream::iter(starts)
         .map(|start| {
@@ -401,7 +404,10 @@ pub(crate) async fn download_object(
                         return Err(WalError::Corrupt(format!("unexpected 304 for {key}")));
                     }
                 };
-                let bytes = walgit_store::util::collect(body, (end - start) as usize).await?;
+                let len = usize::try_from(end - start).map_err(|_| {
+                    WalError::Corrupt(format!("range {start}..{end} of {key} exceeds usize"))
+                })?;
+                let bytes = walgit_store::util::collect(body, len).await?;
                 if bytes.len() as u64 != end - start {
                     return Err(WalError::Corrupt(format!(
                         "short range read for {key}: {}..{} got {}",
@@ -590,7 +596,7 @@ pub(crate) async fn reconcile_packs_inner(
     }
     {
         let mut st = handle.state.lock();
-        st.remote_served = remote_served.clone();
+        st.remote_served.clone_from(&remote_served);
     }
     let remote_set: std::collections::HashSet<&str> =
         remote_served.iter().map(std::string::String::as_str).collect();
@@ -711,7 +717,11 @@ pub(crate) async fn reconcile_packs_inner(
         let link_to = link_target(&p);
         tasks.push(tokio::spawn(
             async move {
-                let _permit = sem.acquire().await.unwrap();
+                // The semaphore is dropped only after all tasks are joined, so
+                // it is never closed while a task is acquiring.
+                let _permit = sem.acquire().await.map_err(|e| {
+                    WalError::Corrupt(format!("pack download semaphore closed: {e}"))
+                })?;
                 // Per-object progress arrives as absolute (done,total); turn it
                 // into deltas for the shared counter.
                 let cb = |delta: u64, _t: u64| {
@@ -862,7 +872,7 @@ pub(crate) async fn maintain_commit_graph(
     {
         tracing::warn!(repo = %handle.id, error = %e, "commit-graph update failed");
     } else {
-        tracing::info!(repo = %handle.id, packs = packs.len(), ms = started.elapsed().as_millis() as u64, "commit-graph updated");
+        tracing::info!(repo = %handle.id, packs = packs.len(), ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "commit-graph updated");
     }
 }
 
@@ -899,7 +909,13 @@ pub(crate) async fn replay_log(
                     let res = store.get(&key, GetOptions::default()).await?;
                     Ok::<Option<bytes::Bytes>, WalError>(match res {
                         GetResult::Object { meta, body } => {
-                            Some(walgit_store::util::collect(body, meta.size as usize).await?)
+                            let size = usize::try_from(meta.size).map_err(|_| {
+                                WalError::Corrupt(format!(
+                                    "log segment {} size {} exceeds usize",
+                                    key, meta.size
+                                ))
+                            })?;
+                            Some(walgit_store::util::collect(body, size).await?)
                         }
                         GetResult::NotModified { .. } => None,
                     })
@@ -977,9 +993,8 @@ pub(crate) fn apply_entries(
             EntryKind::Compact => {
                 supersedes.extend(entry.supersedes.iter().cloned());
             }
-            EntryKind::Checkpoint => {}
-            // Settings live on the manifest; the entry is history only.
-            EntryKind::Settings => {}
+            // Checkpoints and settings live on the manifest; the entries are history only.
+            EntryKind::Checkpoint | EntryKind::Settings => {}
             EntryKind::Unspecified => {
                 tracing::warn!(seq = entry.seq, "unspecified log entry kind, skipping");
             }
@@ -1042,6 +1057,9 @@ pub(crate) async fn materialize_from_scratch(
 static BULK_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 fn bulk_runtime() -> &'static tokio::runtime::Runtime {
+    // The builder fails only on OS resource exhaustion; this runtime is
+    // required for every pack-materialization path, so there is no fallback.
+    #[allow(clippy::expect_used, reason = "required runtime; build fails only under OS resource exhaustion with no recoverable fallback")]
     BULK_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -1077,12 +1095,12 @@ mod download_tests {
         // > CHUNK (32 MiB) so the ranged/striped path runs, with a ragged tail.
         let size = 70 * 1024 * 1024 + 12345;
         let mut data = vec![0u8; size];
-        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         for b in &mut data {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            *b = x as u8;
+            *b = x.to_le_bytes()[0];
         }
         let store = MemoryStore::shared();
         store

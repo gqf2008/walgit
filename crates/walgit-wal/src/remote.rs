@@ -40,7 +40,9 @@ impl BlockCache {
             cache: moka::future::Cache::builder()
                 .max_capacity(max_bytes.max(BLOCK_SIZE * 4))
                 .weigher(|_k: &(Arc<str>, u64), v: &Bytes| {
-                    v.len().clamp(1, u32::MAX as usize) as u32
+                    // The clamp caps the weight at u32::MAX, so the conversion
+                    // below cannot truncate (block payloads are 1 MiB anyway).
+                    u32::try_from(v.len().clamp(1, u32::MAX as usize)).unwrap_or(u32::MAX)
                 })
                 .build(),
             range_reads: AtomicU64::new(0),
@@ -90,7 +92,10 @@ impl BlockCache {
                         return Err(WalError::Corrupt(format!("unexpected 304 for {key}")));
                     }
                 };
-                let b = walgit_store::util::collect(body, (end - start) as usize).await?;
+                let b = walgit_store::util::collect(body, usize::try_from(end - start).map_err(|_| {
+                    WalError::Corrupt(format!("range {start}..{end} of {key} exceeds usize"))
+                })?)
+                .await?;
                 if b.len() as u64 != end - start {
                     return Err(WalError::Corrupt(format!(
                         "short range read for {key}: {start}..{end} got {}",
@@ -237,7 +242,11 @@ impl RemotePacks {
                 let reporter = reporter.clone();
                 let throttle = throttle.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
+                    // The semaphore lives for the whole download loop, so it is
+                    // never closed while a task is acquiring.
+                    let _permit = sem.acquire().await.map_err(|e| {
+                        WalError::Corrupt(format!("pack-index download semaphore closed: {e}"))
+                    })?;
                     let tmp = dir.join(format!("{}.idx.tmp", p.checksum));
                     let dest = dir.join(format!("{}.idx", p.checksum));
                     let cb = |delta: u64, _t: u64| {
@@ -305,7 +314,10 @@ impl RemotePacks {
             objects: moka::sync::Cache::builder()
                 .max_capacity(object_cache_bytes.max(8 * 1024 * 1024))
                 .weigher(|_k: &(usize, u64), v: &Arc<Obj>| {
-                    (v.data.len() + 64).clamp(1, u32::MAX as usize) as u32
+                    // The clamp caps the weight at u32::MAX, so the conversion
+                    // below cannot truncate.
+                    u32::try_from((v.data.len() + 64).clamp(1, u32::MAX as usize))
+                        .unwrap_or(u32::MAX)
                 })
                 .build(),
             hash,
@@ -384,7 +396,12 @@ impl RemotePacks {
             let (entry, _) = self.read_entry_header(cur.0, cur.1).await?;
             match entry.header {
                 Header::Blob | Header::Tree | Header::Commit | Header::Tag => {
-                    let kind = entry.header.as_kind().expect("base kind");
+                    // as_kind() is None only for the two delta variants, which
+                    // this arm excludes.
+                    let kind = entry
+                        .header
+                        .as_kind()
+                        .ok_or_else(|| WalError::Corrupt("delta header in a base-kind arm".into()))?;
                     return Ok(Some((kind, size.unwrap_or(entry.decompressed_size))));
                 }
                 Header::OfsDelta { base_distance } => {
@@ -420,11 +437,18 @@ impl RemotePacks {
         if let Some(o) = self.objects.get(&(pi, off)) {
             return Ok(o);
         }
-        let span = tracing::debug_span!("remote.decode", repo = %self.repo, pack = %self.packs[pi].checksum, offset = off, oid_kind = tracing::field::Empty, chain = tracing::field::Empty);
+        // `pi` comes from locate()/decode callers, which only return indexes
+        // into `packs`; the span is diagnostic-only, so degrade to "?" rather
+        // than panic if that invariant is ever broken.
+        let pack = self.packs.get(pi).map_or("?", |p| p.checksum.as_str());
+        let span = tracing::debug_span!("remote.decode", repo = %self.repo, pack = %pack, offset = off, oid_kind = tracing::field::Empty, chain = tracing::field::Empty);
         let r = self.decode_inner(pi, off).instrument(span.clone()).await;
         if let Ok((o, chain)) = &r {
             span.record("oid_kind", format!("{:?}", o.kind).to_lowercase());
             span.record("chain", *chain);
+            // Chain depth is capped at 4096 by decode_inner's guard, far below
+            // f64's exact-integer range; a histogram needs f64.
+            #[allow(clippy::cast_precision_loss, reason = "delta-chain depth bounded by the 4096 guard in decode_inner")]
             metrics::histogram!("walgit_remote_delta_chain").record(*chain as f64);
         }
         r.map(|(o, _)| o)
@@ -444,8 +468,14 @@ impl RemotePacks {
             let data = self.inflate_with_head(cur.0, &entry, head).await?;
             match entry.header {
                 Header::Blob | Header::Tree | Header::Commit | Header::Tag => {
+                    // as_kind() is None only for the two delta variants, which
+                    // this arm excludes.
+                    let kind = entry
+                        .header
+                        .as_kind()
+                        .ok_or_else(|| WalError::Corrupt("delta header in a base-kind arm".into()))?;
                     let o = Arc::new(Obj {
-                        kind: entry.header.as_kind().expect("base kind"),
+                        kind,
                         data: Bytes::from(data),
                     });
                     self.objects.insert(cur, o.clone());
@@ -483,7 +513,12 @@ impl RemotePacks {
     /// Bytes `[off, off+len)` of pack `pi`, assembled from cached blocks
     /// (missing blocks fetched concurrently).
     async fn read_at(&self, pi: usize, off: u64, len: u64) -> Result<Bytes, WalError> {
-        let p = &self.packs[pi];
+        // `pi` comes from locate()/decode callers, which only return indexes
+        // into `packs`.
+        let p = self
+            .packs
+            .get(pi)
+            .ok_or_else(|| WalError::Corrupt(format!("pack index {pi} out of range")))?;
         let end = (off + len).min(p.size);
         if off >= end {
             return Ok(Bytes::new());
@@ -495,18 +530,27 @@ impl RemotePacks {
                 .block(&self.store, &self.repo, &p.cache_key, &p.key, n, p.size)
         });
         let blocks = futures::future::try_join_all(futs).await?;
-        if blocks.len() == 1 {
-            let b = &blocks[0];
-            let s = (off - first * BLOCK_SIZE) as usize;
-            let e = (end - first * BLOCK_SIZE) as usize;
+        if let [b] = blocks.as_slice() {
+            // A single block: both slice bounds lie within it (first == last).
+            let s = usize::try_from(off - first * BLOCK_SIZE)
+                .map_err(|_| WalError::Corrupt("block offset exceeds usize".into()))?;
+            let e = usize::try_from(end - first * BLOCK_SIZE)
+                .map_err(|_| WalError::Corrupt("block offset exceeds usize".into()))?;
             return Ok(b.slice(s..e));
         }
-        let mut out = Vec::with_capacity((end - off) as usize);
+        let cap = usize::try_from(end - off)
+            .map_err(|_| WalError::Corrupt("range length exceeds usize".into()))?;
+        let mut out = Vec::with_capacity(cap);
         for (i, b) in blocks.iter().enumerate() {
             let bstart = (first + i as u64) * BLOCK_SIZE;
-            let s = off.saturating_sub(bstart) as usize;
-            let e = (end - bstart).min(b.len() as u64) as usize;
-            out.extend_from_slice(&b[s..e]);
+            // Per-block offsets are within one block (<= BLOCK_SIZE bytes).
+            let s = usize::try_from(off.saturating_sub(bstart))
+                .map_err(|_| WalError::Corrupt("block offset exceeds usize".into()))?;
+            let e = usize::try_from((end - bstart).min(b.len() as u64))
+                .map_err(|_| WalError::Corrupt("block offset exceeds usize".into()))?;
+            out.extend_from_slice(b.get(s..e).ok_or_else(|| {
+                WalError::Corrupt("assembled range exceeds the fetched block".into())
+            })?);
         }
         Ok(Bytes::from(out))
     }
@@ -540,10 +584,17 @@ impl RemotePacks {
         head: Bytes,
     ) -> Result<Vec<u8>, WalError> {
         use flate2::{Decompress, FlushDecompress, Status};
-        let p = &self.packs[pi];
-        let size = entry.decompressed_size as usize;
+        let p = self
+            .packs
+            .get(pi)
+            .ok_or_else(|| WalError::Corrupt(format!("pack index {pi} out of range")))?;
+        // `size` only sizes the output buffer: entries bigger than usize are
+        // impossible on this platform (Vec could not hold them either way).
+        let size = usize::try_from(entry.decompressed_size)
+            .map_err(|_| WalError::Corrupt("decompressed size exceeds usize".into()))?;
         let data_off = entry.data_offset;
-        let header_len = (data_off - entry.pack_offset()) as usize;
+        let header_len = usize::try_from(data_off - entry.pack_offset())
+            .map_err(|_| WalError::Corrupt("entry header length exceeds usize".into()))?;
         // Prefetch: blocks from data_off through data_off + size (+ slack), bounded.
         {
             let guess_end =
@@ -590,7 +641,8 @@ impl RemotePacks {
                         entry.pack_offset()
                     ))
                 })?;
-            let consumed = (z.total_in() - before_in) as usize;
+            let consumed = usize::try_from(z.total_in() - before_in)
+                .map_err(|_| WalError::Corrupt("inflate input count exceeds usize".into()))?;
             pos += consumed as u64;
             chunk = chunk.slice(consumed..);
             if out.len() >= size || status == Status::StreamEnd {
@@ -643,13 +695,17 @@ fn delta_result_size(delta: &[u8]) -> Result<u64, WalError> {
 /// Apply a git delta (`base` + `delta` instructions → result).
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
     let (base_size, i) = varint(delta, 0)?;
-    if base_size as usize != base.len() {
+    if base_size != base.len() as u64 {
         return Err("delta base size mismatch");
     }
     let (res_size, mut i) = varint(delta, i)?;
-    let mut out = Vec::with_capacity(res_size as usize);
+    // Only a capacity hint; `res_size` is re-checked against the true length
+    // before Ok. 32-bit hosts cannot allocate an object > 4 GiB either way.
+    let mut out = Vec::with_capacity(
+        usize::try_from(res_size).map_err(|_| "delta result size exceeds usize")?,
+    );
     while i < delta.len() {
-        let cmd = delta[i];
+        let cmd = *delta.get(i).ok_or("delta truncated")?;
         i += 1;
         if cmd & 0x80 != 0 {
             let mut ofs: u64 = 0;
@@ -684,10 +740,14 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
                 size = 0x10000;
             }
             let end = ofs.checked_add(size).ok_or("delta copy overflow")?;
-            if end as usize > base.len() {
-                return Err("delta copy out of base bounds");
-            }
-            out.extend_from_slice(&base[ofs as usize..end as usize]);
+            // Bounds-check through the slice itself: a copy past the base (or
+            // an offset that does not fit usize) is out of bounds for this
+            // delta. `ofs <= end` always (size >= 0x8000 or size >= 1).
+            let start = usize::try_from(ofs).map_err(|_| "delta copy offset exceeds usize")?;
+            let end = usize::try_from(end).map_err(|_| "delta copy end exceeds usize")?;
+            out.extend_from_slice(
+                base.get(start..end).ok_or("delta copy out of base bounds")?,
+            );
         } else if cmd != 0 {
             let n = cmd as usize;
             let src = delta.get(i..i + n).ok_or("delta insert truncated")?;
@@ -705,16 +765,22 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
 
 pub fn human_bytes(n: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    // Human display only: byte counts past f64's 2^53 (8 PiB) lose sub-unit
+    // precision, which is beyond what one-decimal display promises.
+    #[allow(clippy::cast_precision_loss, reason = "display formatter; f64 granularity past 2^53 bytes is beyond one-decimal precision")]
     let mut v = n as f64;
     let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
+    while v >= 1024.0 && i + 1 < U.len() {
         v /= 1024.0;
         i += 1;
     }
     if i == 0 {
         format!("{n} B")
     } else {
-        format!("{v:.1} {}", U[i])
+        // `i` advanced at most U.len() - 1 times (loop guard), so it is in
+        // 1..U.len() here; degrade to "?" rather than panic if ever not.
+        let unit = U.get(i).copied().unwrap_or("?");
+        format!("{v:.1} {unit}")
     }
 }
 
@@ -757,6 +823,7 @@ impl walgit_git::ObjectFaulter for Faulter {
         &'a self,
         oids: &'a [gix_hash::ObjectId],
     ) -> futures::future::BoxFuture<'a, Result<usize, walgit_git::GitError>> {
+        const PAR: usize = 32;
         let span = tracing::info_span!(
             "remote.fault",
             oids = oids.len(),
@@ -765,7 +832,6 @@ impl walgit_git::ObjectFaulter for Faulter {
         Box::pin(
             async move {
                 self.rounds.fetch_add(1, Ordering::Relaxed);
-                const PAR: usize = 32;
                 let mut n = 0usize;
                 for chunk in oids.chunks(PAR) {
                     let results =
@@ -804,7 +870,7 @@ mod tests {
     fn delta_roundtrip_insert_and_copy() {
         let base = b"hello world, this is the base object";
         // header: base size, result size; then copy 0..5 from base, insert "!!", copy 5..12
-        let mut d = vec![base.len() as u8, 5 + 2 + 7];
+        let mut d = vec![u8::try_from(base.len()).unwrap(), 5 + 2 + 7];
         d.extend([0x90, 5]); // copy ofs=0 (no ofs bytes), size=5 (0x10 flag)
         d.extend([2, b'!', b'!']);
         d.extend([0x91, 5, 7]); // copy ofs=5 size=7

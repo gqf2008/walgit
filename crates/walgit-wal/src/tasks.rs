@@ -71,6 +71,14 @@ pub struct TaskOutcome {
     pub value: Option<serde_json::Value>,
 }
 
+/// What a subscriber needs to attach to a running task: the replay buffer,
+/// the live broadcast feed, and the outcome so far (None until finished).
+pub type AttachView = (
+    Vec<Progress>,
+    tokio::sync::broadcast::Receiver<Progress>,
+    Option<Result<TaskOutcome, (u16, String)>>,
+);
+
 pub struct TaskState {
     pub record: Mutex<TaskRecord>,
     started_at: Instant,
@@ -106,13 +114,7 @@ impl TaskState {
         self.record.lock().clone()
     }
     /// Subscribe + snapshot of everything so far (no gap, no duplicates).
-    pub fn attach(
-        &self,
-    ) -> (
-        Vec<Progress>,
-        tokio::sync::broadcast::Receiver<Progress>,
-        Option<Result<TaskOutcome, (u16, String)>>,
-    ) {
+    pub fn attach(&self) -> AttachView {
         let replay = self.replay.lock();
         let rx = self.tx.subscribe();
         let outcome = self.outcome.lock().clone();
@@ -157,7 +159,8 @@ impl TaskState {
                 Progress::Progress { .. } => rec.progress = Some(p.clone()),
                 Progress::Task { .. } => {}
             }
-            rec.elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX);
         }
         {
             let mut replay = self.replay.lock();
@@ -389,15 +392,16 @@ impl Tasks {
         let record = {
             let mut rec = state.record.lock();
             rec.finished = Some(now_rfc3339());
-            rec.elapsed_ms = state.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms = u64::try_from(state.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX);
             match &outcome {
                 Ok((summary, _)) => {
                     rec.ok = Some(true);
-                    rec.summary = summary.clone();
+                    rec.summary.clone_from(summary);
                 }
                 Err((_, msg)) => {
                     rec.ok = Some(false);
-                    rec.summary = msg.clone();
+                    rec.summary.clone_from(msg);
                 }
             }
             rec.clone()
@@ -444,6 +448,9 @@ impl Tasks {
         };
         tracing::info!(repo = %record.repo, kind = %record.kind, id = %record.id, ok, outcome, elapsed_ms = record.elapsed_ms, bytes, objects, "task finished: {}", record.summary);
         metrics::counter!("walgit_tasks_finished_total", "kind" => record.kind.clone(), "ok" => ok.to_string()).increment(1);
+        // The histogram takes seconds as f64; elapsed_ms past f64's 2^53
+        // integer precision (~285k years in ms) is not a plausible task.
+        #[allow(clippy::cast_precision_loss, reason = "metrics histogram seconds; ms-to-seconds division needs f64 and huge tasks are not plausible")]
         metrics::histogram!("walgit_task_duration_seconds", "kind" => record.kind.clone(), "ok" => ok.to_string()).record(record.elapsed_ms as f64 / 1000.0);
         record
     }

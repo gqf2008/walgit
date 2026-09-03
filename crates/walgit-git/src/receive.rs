@@ -17,6 +17,10 @@ use crate::pkt::{self, PktLine};
 use crate::{GitError, RefSnapshotData};
 
 /// Capabilities negotiated by the client in the first receive-pack command.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one bool per wire capability mirrors receive-pack's capability tokens; a bitfield or sub-struct would obscure the protocol shape"
+)]
 #[derive(Debug, Default, Clone)]
 pub struct ReceiveCaps {
     pub report_status: bool,
@@ -63,8 +67,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
         let this = self.get_mut();
         if !this.prefix.is_empty() {
             let n = this.prefix.len().min(buf.remaining());
+            // n <= prefix.len(), so every pop succeeds until the loop bound;
+            // the match states that without panicking if the invariant breaks.
             for _ in 0..n {
-                buf.put_slice(&[this.prefix.pop_front().unwrap()]);
+                match this.prefix.pop_front() {
+                    Some(b) => buf.put_slice(&[b]),
+                    None => break,
+                }
             }
             return std::task::Poll::Ready(Ok(()));
         }
@@ -99,8 +108,11 @@ pub async fn parse<R: AsyncRead + Unpin>(
     let first = loop {
         match pkt::read_pkt_line(&mut r).await? {
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
-                caps.shallow
-                    .push(String::from_utf8_lossy(&b[8..]).trim().to_string());
+                caps.shallow.push(
+                    String::from_utf8_lossy(b.strip_prefix(b"shallow ").unwrap_or(b""))
+                        .trim()
+                        .to_string(),
+                );
             }
             other => break other,
         }
@@ -136,8 +148,11 @@ pub async fn parse<R: AsyncRead + Unpin>(
         match line {
             None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
-                caps.shallow
-                    .push(String::from_utf8_lossy(&b[8..]).trim().to_string());
+                caps.shallow.push(
+                    String::from_utf8_lossy(b.strip_prefix(b"shallow ").unwrap_or(b""))
+                        .trim()
+                        .to_string(),
+                );
             }
             Some(PktLine::Data(b)) => {
                 let (update, _) = parse_command_line(&b)?;
@@ -173,9 +188,14 @@ pub async fn parse<R: AsyncRead + Unpin>(
 
 fn parse_command_line(b: &[u8]) -> Result<(walgit_proto::v1::RefUpdate, String), GitError> {
     // First line: "<old> <new> <ref>\0<caps>". Subsequent lines have no caps.
-    let (cmd_bytes, caps_bytes) = match b.iter().position(|&c| c == 0) {
-        Some(idx) => (&b[..idx], &b[idx + 1..]),
-        None => (b, &b[..0]),
+    let (cmd_bytes, caps_bytes) = if let Some(idx) = b.iter().position(|&c| c == 0) {
+        // The NUL sits exactly at the split point (position found it);
+        // split_at keeps the bounds proven, strip drops the NUL.
+        let (cmd, after) = b.split_at(idx);
+        (cmd, after.strip_prefix(&[0]).unwrap_or(b""))
+    } else {
+        let empty_caps: &[u8] = b"";
+        (b, empty_caps)
     };
     let s = String::from_utf8_lossy(cmd_bytes);
     let s = s.trim_end_matches('\n');
@@ -214,9 +234,11 @@ fn apply_caps(caps: &mut ReceiveCaps, s: &str) {
             "quiet" => caps.quiet = true,
             "push-options" => caps.push_options = true,
             "ofs-delta" => caps.ofs_delta = true,
-            _ if tok.starts_with("agent=") => caps.agent = Some(tok[6..].to_string()),
+            _ if tok.starts_with("agent=") => {
+                caps.agent = tok.strip_prefix("agent=").map(String::from);
+            }
             _ if tok.starts_with("object-format=") => {
-                caps.object_format = Some(tok[14..].to_string());
+                caps.object_format = tok.strip_prefix("object-format=").map(String::from);
             }
             _ => {}
         }

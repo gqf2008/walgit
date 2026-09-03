@@ -40,22 +40,25 @@ mod cm {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // the peak-RSS probe is inherently FFI into libc; SAFETY per block below
 fn max_rss_kb() -> u64 {
-    #[allow(unsafe_code)] // a zeroed rusage the next call fills
+    // SAFETY: `rusage` is plain old data; an all-zero bit pattern is a valid
+    // initialized value, and getrusage overwrites every field on success (or fails,
+    // leaving the zeroed peak — which the caller's saturating_sub floors at 0).
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `ru` is a live rusage slot; getrusage fills it (its result is unused —
     // a failed read yields the zeroed peak, which the caller's saturating_sub floors at 0).
-    #[allow(unsafe_code)]
     unsafe {
         libc::getrusage(libc::RUSAGE_SELF, &raw mut ru)
     };
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
     // fails a passing result (a 16 MB delta shown as "16832 MB").
+    let maxrss = u64::try_from(ru.ru_maxrss).expect("the kernel reports a non-negative ru_maxrss");
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let kb = (ru.ru_maxrss as u64) / 1024;
+    let kb = maxrss / 1024;
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let kb = ru.ru_maxrss as u64;
+    let kb = maxrss;
     kb
 }
 
@@ -63,16 +66,17 @@ fn max_rss_kb() -> u64 {
 /// working-set analog of rusage's `ru_maxrss` (both are process-lifetime peaks, so
 /// the delta-of-peaks the bound below reads is meaningful the same way on both OSes).
 #[cfg(not(unix))]
+#[allow(unsafe_code)] // the peak-RSS probe is inherently FFI into windows-sys; SAFETY per block below
 fn max_rss_kb() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
-    #[allow(unsafe_code)] // a zeroed counters struct we size and let the callee fill
+    // SAFETY: `PROCESS_MEMORY_COUNTERS` is plain old data; an all-zero bit pattern
+    // is a valid initialized value, and the callee fills it (or we return 0 below).
     let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
     // SAFETY: `GetCurrentProcess()` is the always-valid pseudo-handle; `counters` is a
     // live out-struct whose `cb` we just set to its own size, as the API requires.
-    #[allow(unsafe_code)]
     let ok = unsafe {
         GetProcessMemoryInfo(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -139,7 +143,8 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 writeln!(w, "from :{}", c - 1).unwrap();
             }
             for _ in 0..files_per_commit {
-                let f = (next() as usize) % files;
+                let f = usize::try_from(next() % files as u64)
+                    .expect("the modulo result is < files, which already fits usize");
                 // Mostly appends (small deltas), sometimes a rewrite (a new base in the chain).
                 if next() % 17 == 0 {
                     contents[f] = format!("file {f} rewritten at {c} {:016x}\n", next());
@@ -294,7 +299,8 @@ fn count_ref_deltas(pack: &[u8]) -> usize {
         let mut d = flate2::read::ZlibDecoder::new(&pack[pos..]);
         let mut sink = Vec::new();
         d.read_to_end(&mut sink).unwrap();
-        pos += d.total_in() as usize;
+        pos += usize::try_from(d.total_in())
+            .expect("a decoder consumes at most its input slice, so total_in fits usize");
     }
     refs
 }
@@ -501,8 +507,8 @@ async fn run_shapes(commits: usize, files: usize, per_commit: usize, dirs: usize
                 took.as_secs_f64()
             );
             assert_eq!(
-                stats.objects as usize,
-                ids.len(),
+                stats.objects,
+                u64::try_from(ids.len()).expect("an indexed object count fits u64"),
                 "{name}: stats vs indexed entries"
             );
             match name {

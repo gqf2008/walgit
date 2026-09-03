@@ -110,7 +110,12 @@ pub async fn fetch_objects_as_pack(
     .map_err(GitError::Io)?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut stdin = child.stdin.take().expect("stdin");
+        // stdin(Stdio::piped()) above guarantees the handle exists; degrade to
+        // Err rather than panic if that invariant is ever broken.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::Io(std::io::Error::other("git pack-objects stdin")))?;
         let mut input = oids.join("\n");
         input.push('\n');
         stdin
