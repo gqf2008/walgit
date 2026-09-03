@@ -108,6 +108,9 @@ impl FaultPlan {
             ..Default::default()
         }
     }
+    /// Restrict fault injection to keys matching any pattern in `keys`
+    /// (substring match).
+    #[must_use = "with_only returns a new plan; the original is unchanged"]
     pub fn with_only(mut self, keys: &[&str]) -> Self {
         self.only_keys = Some(keys.iter().map(std::string::ToString::to_string).collect());
         self
@@ -168,6 +171,11 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
+    /// Uniform sample of [0, 1): 53 random bits scaled by 2^-53.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the >> 11 keeps the value below 2^53 and 2^53 is a power of two: both casts are exact (f64 represents every integer < 2^53)"
+    )]
     fn f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -255,6 +263,16 @@ impl FaultStore {
         }
     }
 
+    /// Crash the process: the injected crash is the whole point of this path
+    /// (the caller only reaches it after `fired_panics` said "first time").
+    #[allow(
+        clippy::panic,
+        reason = "fault injection: simulating a crash is FaultStore's purpose; the once-only guard lives in the decide() caller"
+    )]
+    fn inject_crash(name: &str, op: &str, key: &str) -> ! {
+        panic!("fault-store[{name}]: injected crash during {op} {key}");
+    }
+
     /// Roll the dice for one op. `mutation`: put/delete/compose; `conditional`:
     /// CAS put/delete or if-none-match get; `body_len`: for truncation.
     async fn decide(
@@ -283,10 +301,7 @@ impl FaultStore {
                 drop(fired);
                 self.stats.panics.fetch_add(1, Ordering::Relaxed);
                 self.log(format!("{} {op} {key}: PANIC", self.name));
-                panic!(
-                    "fault-store[{}]: injected crash during {op} {key}",
-                    self.name
-                );
+                Self::inject_crash(&self.name, op, key);
             }
         }
         if plan.black_hole {
@@ -300,7 +315,9 @@ impl FaultStore {
             return Decision::Denied;
         }
         if let Some((lo, hi)) = plan.delay {
-            let span = hi.saturating_sub(lo).as_micros() as u64;
+            // Duration::as_micros widened to u64: total us = secs*1e6 + sub-us part.
+            let d = hi.saturating_sub(lo);
+            let span = d.as_secs().saturating_mul(1_000_000) + u64::from(d.subsec_micros());
             let extra = self.rng.lock().below(span + 1);
             tokio::time::sleep(lo + Duration::from_micros(extra)).await;
         }
@@ -309,9 +326,12 @@ impl FaultStore {
         }
         let (roll, cut) = {
             let mut r = self.rng.lock();
+            // below(1 << 20) < 2^20, which fits any usize; the unwrap_or is
+            // unreachable and only keeps the conversion honest.
+            let cut = usize::try_from(r.below(1 << 20)).unwrap_or(usize::MAX);
             (
                 [r.f64(), r.f64(), r.f64(), r.f64(), r.f64(), r.f64()],
-                r.below(1 << 20) as usize,
+                cut,
             )
         };
         let d = if roll[0] < plan.p_hang {
@@ -549,12 +569,25 @@ impl FaultStore {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("get", key, "before")),
             Decision::Denied => Err(StoreError::NotFound { key: key.into() }),
-            Decision::Stale => Ok(GetResult::NotModified {
-                version: opts.if_none_match.clone().unwrap(),
-            }),
+            Decision::Stale => {
+                // The stale-304 fault fires only when `conditional` is true,
+                // and the only caller (get) derives conditional from
+                // `if_none_match.is_some()` — still, fail loudly rather than
+                // panic if that invariant ever breaks.
+                let version = opts.if_none_match.clone().ok_or_else(|| {
+                    StoreError::InvalidArgument(
+                        "stale-304 fault injected on an unconditional GET".into(),
+                    )
+                })?;
+                Ok(GetResult::NotModified { version })
+            }
             Decision::Truncate(at) => match self.inner.get(key, opts).await? {
                 GetResult::Object { meta, body } => {
-                    let size = meta.size as usize;
+                    let size = usize::try_from(meta.size).map_err(|_| {
+                        StoreError::InvalidArgument(format!(
+                            "fault-store: object {key} too large for this host"
+                        ))
+                    })?;
                     let at = if size == 0 { 0 } else { at % size };
                     let msg = format!(
                         "fault-store[{}]: injected truncation of {key} at {at}/{size}",

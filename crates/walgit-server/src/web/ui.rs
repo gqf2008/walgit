@@ -260,8 +260,11 @@ pub async fn sdk_asset(req: Request<Body>) -> Response {
 async fn asset(AxumPath(path): AxumPath<String>, req: Request<Body>) -> Response {
     let path = path.trim_start_matches('/');
     // Never hand out the precompressed siblings directly: their identity is the
-    // uncompressed asset (content negotiation picks the encoding).
-    if path.ends_with(".br") || path.ends_with(".gz") {
+    // uncompressed asset (content negotiation picks the encoding). The build
+    // only emits lowercase `.br`/`.gz`, but compare case-insensitively so a
+    // request in any case gets the same fast 404.
+    let ext = path.rsplit('.').next().unwrap_or("");
+    if ext.eq_ignore_ascii_case("br") || ext.eq_ignore_ascii_case("gz") {
         return (StatusCode::NOT_FOUND, "asset not found").into_response();
     }
     let Some(content) = embedded(path) else {
@@ -293,6 +296,9 @@ fn embedded_response(
     let mut resp = Response::new(Body::empty());
     {
         let h = resp.headers_mut();
+        // `etag` is quoted lowercase hex (sha256 of the asset): always a valid
+        // header value, so the parse cannot fail.
+        #[allow(clippy::unwrap_used, reason = "quoted hex (sha256) is always a valid header value")]
         h.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
         h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
@@ -1172,7 +1178,7 @@ async fn checkpoint_info(
         .await
     {
         Ok(GetResult::Object { meta, body }) => {
-            let bytes = walgit_store::util::collect(body, meta.size as usize)
+            let bytes = walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             let checkpoint = Checkpoint::decode(bytes.as_ref())
@@ -1266,7 +1272,11 @@ async fn bundle_infos(
 }
 
 fn timestamp(value: &prost_types::Timestamp) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(value.seconds, value.nanos as u32)
+    // `Timestamp.nanos` is a proto i32 that is 0..=999_999_999 by the google
+    // Timestamp contract; an out-of-range value makes `from_timestamp` return
+    // None below (empty string), so saturating here preserves that behaviour.
+    let nanos = u32::try_from(value.nanos).unwrap_or(u32::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(value.seconds, nanos)
         .map(|date| date.to_rfc3339())
         .unwrap_or_default()
 }

@@ -339,6 +339,10 @@ pub struct CacheConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a documented `walgit.toml` key (serde `pub` field); grouping them would change the config schema and every call site"
+)]
 pub struct WalConfig {
     /// Coalesce concurrent publishes to one repo within this window into one index CAS.
     #[serde(with = "humantime_serde")]
@@ -470,6 +474,7 @@ impl Default for MaintenanceConfig {
 ///   everywhere, so the edge's read-only fallback (D29) works.
 /// * **maintain**: the maintainer loop's units (checkpoints, bundles, compaction,
 ///   fsck/repair) — only on hosts with the `maintain` role.
+///
 /// Placement is by rule, not by capacity: a repo is either this host's or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -531,6 +536,10 @@ pub enum RepackEngine {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a documented `walgit.toml` key (serde `pub` field); grouping them would change the config schema and every call site"
+)]
 pub struct BundlesConfig {
     pub enabled: bool,
     pub strategy: Vec<BundleStrategy>,
@@ -684,6 +693,10 @@ pub struct UpstreamConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a documented `walgit.toml` key (serde `pub` field); grouping them would change the config schema and every call site"
+)]
 pub struct GitConfig {
     /// Path to the upstream git binary (repack, bundle, optional upload-pack engine).
     pub binary: PathBuf,
@@ -1016,7 +1029,7 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            listen: "127.0.0.1:8080".parse().unwrap(),
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             http2: true,
             max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
@@ -1308,16 +1321,21 @@ impl Config {
                     path: &[String],
                     value: toml::Value,
                 ) -> std::result::Result<(), String> {
-                    if path.len() == 1 {
-                        cur.insert(path[0].clone(), value);
+                    let Some((head, rest)) = path.split_first() else {
+                        // Callers split env keys with "__" and skip empty segments,
+                        // so a path always has at least one element.
+                        return Err("empty override path".into());
+                    };
+                    if rest.is_empty() {
+                        cur.insert(head.clone(), value);
                         return Ok(());
                     }
                     let next = cur
-                        .entry(path[0].clone())
+                        .entry(head.clone())
                         .or_insert_with(|| toml::Value::Table(toml::Table::default()))
                         .as_table_mut()
-                        .ok_or_else(|| format!("{} is not a table", path[0]))?;
-                    set(next, &path[1..], value)
+                        .ok_or_else(|| format!("{head} is not a table"))?;
+                    set(next, rest, value)
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),

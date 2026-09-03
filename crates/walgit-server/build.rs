@@ -10,7 +10,7 @@ use std::path::Path;
 const PLACEHOLDER: &str = "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>walgit</title></head>\n\
 <body><p>walgit web UI is not built in this binary. Run <code>just web-build</code> (vite via pnpm) and rebuild.</p></body></html>\n";
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     watch_git_head(manifest);
     println!("cargo:rustc-env=WALGIT_BUILD_SHA={}", build_sha());
@@ -18,12 +18,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dist.display());
     let index = dist.join("index.html");
     if !index.exists() {
-        fs::create_dir_all(&dist).expect("create web/dist");
-        fs::write(&index, PLACEHOLDER).expect("write placeholder web/dist/index.html");
+        // Fail the build loudly, like the expects did, when web/dist cannot
+        // be created or written.
+        std::fs::create_dir_all(&dist)?;
+        fs::write(&index, PLACEHOLDER)?;
         println!(
             "cargo:warning=web/dist was missing; wrote a placeholder index.html (run `just web-build` for the real UI)"
         );
     }
+    Ok(())
 }
 
 /// Rerun this script when the checked-out commit moves. `git pull`, a branch

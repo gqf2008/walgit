@@ -28,7 +28,10 @@ fn to_chrono(t: SystemTime) -> DateTime<Utc> {
 
 /// Convert a chrono UTC datetime back to [`SystemTime`].
 fn to_system(dt: DateTime<Utc>) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0) as u64)
+    // A pre-epoch timestamp (negative seconds) maps to the epoch — exactly
+    // the old `.max(0) as u64` clamp: try_from fails only for negatives,
+    // which default to 0.
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(dt.timestamp()).unwrap_or_default())
 }
 
 /// Next fire time of `schedule` strictly after `after`, or `None` if the

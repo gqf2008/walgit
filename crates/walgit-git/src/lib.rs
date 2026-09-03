@@ -69,6 +69,10 @@ pub fn validate_ref_name(name: &str) -> Result<(), GitError> {
     if name == "HEAD" {
         return Ok(());
     }
+    #[allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "git's refname grammar forbids a literal .lock suffix; refnames are case-sensitive, so this is not a file-extension check"
+    )]
     let bad = name.is_empty()
         || !name.starts_with("refs/")
         || name.bytes().any(|b| {
@@ -417,6 +421,11 @@ impl Service {
     }
 }
 
+/// A parsed upload-pack v2 request (`fetch` command body).
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent wire capability of the fetch request; the shape is dictated by protocol-v2, not by internal design"
+)]
 #[derive(Debug, Clone)]
 pub struct UploadPackRequest {
     pub wants: Vec<gix_hash::ObjectId>,
@@ -511,7 +520,7 @@ impl RefView {
             .refs
             .binary_search_by(|r| r.name.as_str().cmp(name))
             .ok()
-            .map(|i| self.base.refs[i].oid.clone())
+            .and_then(|i| self.base.refs.get(i).map(|r| r.oid.clone()))
     }
     pub fn head_target(&self) -> &str {
         self.head_target
@@ -710,7 +719,7 @@ impl LocalRepo {
             let t = std::time::Instant::now();
             // `iter()` snapshots the store with all indices loaded.
             let _ = repo.objects.iter();
-            let ms = t.elapsed().as_millis() as u64;
+            let ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
             if ms > 200 {
                 tracing::info!(repo = %self.inner.path.display(), ms, "odb indices loaded");
             }
@@ -808,7 +817,8 @@ impl LocalRepo {
                         "pack exceeds max_bytes {max}"
                     )));
                 }
-            tmp.write_all(&buf[..n])
+            let (filled, _) = buf.split_at(n);
+            tmp.write_all(filled)
                 .instrument(span.clone())
                 .await
                 .map_err(GitError::Io)?;
@@ -909,12 +919,22 @@ impl LocalRepo {
     ) -> Result<(), GitError> {
         let pack_dir = self.objects_pack_dir();
         std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
-        let dst_pack = pack_dir.join(pack.file_name().unwrap());
-        let dst_idx = pack_dir.join(idx.file_name().unwrap());
+        // `file_name()` is None only for a path ending in `..`; rename would
+        // fail anyway, so degrade to Err rather than panic.
+        let pack_name = pack
+            .file_name()
+            .ok_or_else(|| GitError::Io(std::io::Error::other("install_pack: pack path has no file name")))?;
+        let idx_name = idx
+            .file_name()
+            .ok_or_else(|| GitError::Io(std::io::Error::other("install_pack: idx path has no file name")))?;
+        let dst_pack = pack_dir.join(pack_name);
+        let dst_idx = pack_dir.join(idx_name);
         rename_atomic(pack, &dst_pack)?;
         rename_atomic(idx, &dst_idx)?;
         for e in extra {
-            let dst = pack_dir.join(e.file_name().unwrap());
+            let dst = pack_dir.join(e.file_name().ok_or_else(|| {
+                GitError::Io(std::io::Error::other("install_pack: extra path has no file name"))
+            })?);
             rename_atomic(e, &dst)?;
         }
         self.refresh_async().await?;
@@ -1067,7 +1087,12 @@ impl LocalRepo {
             if !name.starts_with("pack-") || !name.ends_with(".pack") {
                 continue;
             }
-            let hex = &name["pack-".len()..name.len() - ".pack".len()];
+            let Some(hex) = name
+                .strip_prefix("pack-")
+                .and_then(|n| n.strip_suffix(".pack"))
+            else {
+                continue;
+            };
             let Ok(checksum) = gix_hash::ObjectId::from_hex(hex.as_bytes()) else {
                 continue;
             };
@@ -1134,19 +1159,19 @@ impl LocalRepo {
                     c.data = Arc::new(patched);
                     c.pending.clear();
                     if c.data.refs.len() >= 10_000 {
-                        tracing::debug!(repo = %self.inner.id, refs = c.data.refs.len(), ms = t.elapsed().as_millis() as u64, "refs cache materialized from pending txns");
+                        tracing::debug!(repo = %self.inner.id, refs = c.data.refs.len(), ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "refs cache materialized from pending txns");
                     }
                 }
                 return Ok(c.data.clone());
             }
         }
         let t = std::time::Instant::now();
-        let data = Arc::new(read_refs(&self.inner.path)?);
+        let data = Arc::new(read_refs(&self.inner.path));
         self.inner
             .refs_parses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if data.refs.len() >= 10_000 {
-            tracing::debug!(repo = %self.inner.id, refs = data.refs.len(), ms = t.elapsed().as_millis() as u64, "refs parsed into the cache");
+            tracing::debug!(repo = %self.inner.id, refs = data.refs.len(), ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "refs parsed into the cache");
         }
         *self.inner.refs_cache.lock() = Some(RefsCached {
             key,
@@ -1318,7 +1343,11 @@ impl LocalRepo {
                 .spawn()
                 .and_then(|mut c| {
                     {
-                        let stdin = c.stdin.as_mut().unwrap();
+                        // stdin(Stdio::piped()) above guarantees the handle; an
+                        // Err here is an io failure like any other.
+                        let stdin = c.stdin.as_mut().ok_or_else(|| {
+                            std::io::Error::other("update-ref stdin unavailable")
+                        })?;
                         stdin.write_all(input.as_bytes())?;
                     }
                     c.wait_with_output()
@@ -1404,13 +1433,18 @@ impl LocalRepo {
                 (pos, false) => {
                     let mut peeled = u.new_peeled.clone();
                     if peeled.is_empty() && u.name.starts_with("refs/tags/") {
-                        let r = repo.get_or_insert_with(|| {
-                            gix::Repository::from(
-                                &gix::ThreadSafeRepository::open(&self.inner.path)
-                                    .expect("repo open"),
-                            )
-                        });
-                        if let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()) {
+                        if repo.is_none() {
+                            // Peel the new annotated tag against our own repo.
+                            // A failed open previously panicked the whole ref
+                            // apply; the peel is an optional optimization, so
+                            // degrade to no peel instead.
+                            repo = gix::ThreadSafeRepository::open(&self.inner.path)
+                                .ok()
+                                .map(|r| gix::Repository::from(&r));
+                        }
+                        if let Some(r) = repo.as_ref()
+                            && let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes())
+                        {
                             peeled = peel_tag(r, oid)
                                 .map(|p| p.to_hex().to_string())
                                 .unwrap_or_default();
@@ -1422,7 +1456,13 @@ impl LocalRepo {
                         peeled,
                     };
                     match pos {
-                        Ok(i) => refs[i] = entry,
+                        Ok(i) => {
+                            // binary_search's Ok(i) is in-bounds by contract;
+                            // the guard keeps this hot path panic-free.
+                            if let Some(slot) = refs.get_mut(i) {
+                                *slot = entry;
+                            }
+                        }
                         Err(i) => refs.insert(i, entry),
                     }
                 }
@@ -1562,12 +1602,15 @@ impl LocalRepo {
     ) -> Result<(), GitError> {
         use gix_object::Write as _;
         let hex = oid.to_hex().to_string();
+        // Hex is ASCII, so the byte split is char-safe; split_at avoids the
+        // (linted) str slice.
+        let (lo, hi) = hex.split_at(2);
         let path = self
             .inner
             .path
             .join("objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
+            .join(lo)
+            .join(hi);
         if path.exists() {
             return Ok(());
         }
@@ -1844,7 +1887,7 @@ impl LocalRepo {
             snap.refs
                 .binary_search_by(|r| r.name.as_str().cmp(head_target.as_str()))
                 .ok()
-                .map(|i| snap.refs[i].oid.clone())
+                .and_then(|i| snap.refs.get(i).map(|r| r.oid.clone()))
         };
         // Prefix selection is O(log n + k) over the name-sorted list: each
         // prefix is one range (binary search for its start, scan while it
@@ -1857,10 +1900,12 @@ impl LocalRepo {
                 .iter()
                 .map(|p| {
                     let start = snap.refs.partition_point(|r| r.name.as_str() < p.as_str());
-                    let mut end = start;
-                    while end < snap.refs.len() && snap.refs[end].name.starts_with(p.as_str()) {
-                        end += 1;
-                    }
+                    // All names sharing the byte prefix form one contiguous run
+                    // in the sorted list (prefix sets are lexicographic
+                    // intervals), so a second partition finds the run's end.
+                    let end = snap.refs.partition_point(|r| {
+                        r.name.as_str() < p.as_str() || r.name.starts_with(p.as_str())
+                    });
                     (start, end)
                 })
                 .collect();
@@ -1870,7 +1915,7 @@ impl LocalRepo {
             for (a, b) in ranges {
                 let a = a.max(cursor);
                 if a < b {
-                    out.extend(snap.refs[a..b].iter());
+                    out.extend(snap.refs.iter().skip(a).take(b - a));
                     cursor = b;
                 }
             }
@@ -2113,7 +2158,7 @@ impl LocalRepo {
             let po_stdout: Stdio = po
                 .stdout
                 .take()
-                .expect("stdout")
+                .ok_or_else(|| GitError::Io(std::io::Error::other("pack-objects stdout")))?
                 .try_into()
                 .map_err(GitError::Io)?;
             let ip = tokio::process::Command::new("git")
@@ -2135,7 +2180,12 @@ impl LocalRepo {
                 .map_err(GitError::Io)?;
             {
                 use tokio::io::AsyncWriteExt;
-                let mut stdin = po.stdin.take().expect("stdin");
+                // stdin(Stdio::piped()) above guarantees the handle; an Err
+                // here is an io failure like any other.
+                let mut stdin = po
+                    .stdin
+                    .take()
+                    .ok_or_else(|| GitError::Io(std::io::Error::other("pack-objects stdin")))?;
                 stdin
                     .write_all(revs.as_bytes())
                     .await
@@ -2268,7 +2318,9 @@ impl LocalRepo {
                     }
                 }
         }
-        let preferred = names[0].clone();
+        // history is non-empty here (checked above); the fallback keeps this
+        // panic-free if that invariant ever breaks (git then fails the write).
+        let preferred = names.first().cloned().unwrap_or_default();
         let mut input = String::new();
         for n in &names {
             let _ = writeln!(input, "{n}");
@@ -2287,7 +2339,16 @@ impl LocalRepo {
             .stderr(Stdio::piped())
             .spawn()
             .and_then(|mut c| {
-                c.stdin.take().unwrap().write_all(input.as_bytes())?;
+                // The write handle must drop (EOF to git) before waiting:
+                // `git multi-pack-index write --stdin-packs` reads until EOF,
+                // so a handle alive across wait_with_output deadlocks.
+                {
+                    let mut stdin = c
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("multi-pack-index stdin"))?;
+                    stdin.write_all(input.as_bytes())?;
+                }
                 c.wait_with_output()
             })
             .map_err(GitError::Io)?;
@@ -2608,7 +2669,11 @@ impl LocalRepo {
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(GitError::Io)?;
             {
-                let stdin = child.stdin.as_mut().unwrap();
+                // stdin(Stdio::piped()) above guarantees the handle; an Err
+                // here is an io failure like any other.
+                let stdin = child.stdin.as_mut().ok_or_else(|| {
+                    GitError::Io(std::io::Error::other("git stdin unavailable"))
+                })?;
                 stdin.write_all(&stdin_bytes).map_err(GitError::Io)?;
             }
             child.wait_with_output().map_err(GitError::Io)
@@ -2648,8 +2713,15 @@ impl LocalRepo {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(GitError::Io)?;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        // Both handles exist (piped above); Err here is an io failure like any other.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::Io(std::io::Error::other("upload-pack stdin")))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitError::Io(std::io::Error::other("upload-pack stdout")))?;
         // Copy the request body into stdin first, then close stdin so the
         // subprocess sees EOF and can finish + exit. Only then drain stdout:
         // `copy_out` blocks on stdout EOF (subprocess exit), and the subprocess
@@ -2759,8 +2831,8 @@ fn idx_object_count(idx_path: &Path) -> Result<u64, GitError> {
     let mut head = [0u8; 8];
     f.read_exact(&mut head).map_err(GitError::Io)?;
     let is_v2 = &head[..4] == b"\xfftOc";
-    let fanout_off = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
-    f.seek(std::io::SeekFrom::Start(fanout_off as u64))
+    let fanout_off: u64 = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
+    f.seek(std::io::SeekFrom::Start(fanout_off))
         .map_err(GitError::Io)?;
     let mut buf = [0u8; 4];
     f.read_exact(&mut buf).map_err(GitError::Io)?;
@@ -2845,7 +2917,7 @@ fn git_index_pack(
         let mut file = file;
         std::io::copy(&mut file, &mut stdin).map_err(GitError::Io)?;
     }
-    let feed_ms = feed_started.elapsed().as_millis() as u64;
+    let feed_ms = u64::try_from(feed_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let output = child.wait_with_output().map_err(GitError::Io)?;
     let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
     let _ = std::fs::remove_file(&trace_path);
@@ -2903,16 +2975,35 @@ struct Trace2Phases {
 }
 
 fn secs_to_ms(t: f64) -> u64 {
+    // NaN / non-positive t has no milliseconds; ceil() of a tiny positive
+    // duration floors to 0, and the caller wants >= 1 ms of credit there.
+    // `!(t > 0.0)` rather than `t <= 0.0`: the latter is false for NaN, which
+    // would turn a NaN timestamp into 1 ms below.
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "NaN must take the zero branch; t <= 0.0 is false for NaN and would yield 1 ms"
+    )]
+    if !(t > 0.0) {
+        return 0;
+    }
+    // t is a TRACE2 seconds value (epoch timestamp or phase duration), far
+    // below f64's 2^53 exact-integer range, so the cast is exact.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "TRACE2 seconds values are bounded far below f64's 2^53 exact-integer range"
+    )]
     let ms = (t * 1000.0).ceil() as u64;
-    if t > 0.0 && ms == 0 { 1 } else { ms }
+    if ms == 0 { 1 } else { ms }
 }
 
 /// Pull a JSON string field (`"key":"value"`) out of a TRACE2 event line.
 fn json_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{key}\":\"");
     let rest = line.split_once(&pat)?.1;
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+    // Up to the closing quote (a quote's byte offset is always a char
+    // boundary); split_once avoids a (linted) str slice.
+    rest.split_once('"').map(|(value, _)| value)
 }
 
 fn json_f64_field(line: &str, key: &str) -> Option<f64> {
@@ -3008,7 +3099,7 @@ fn find_conflict(stderr: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
+pub(crate) fn read_refs(repo_path: &Path) -> RefSnapshotData {
     // HEAD symbolic target.
     let head_target = match std::fs::read_to_string(repo_path.join("HEAD")) {
         Ok(s) => {
@@ -3084,7 +3175,7 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
             }
         }
     }
-    Ok(data)
+    data
 }
 
 fn walk_loose_refs(dir: &Path, prefix: &str, map: &mut BTreeMap<String, (String, String)>) {
@@ -3235,7 +3326,9 @@ fn locate_pack_offset(path: &Path) -> Option<u64> {
         if n == 0 {
             return None;
         }
-        if let Some(i) = find_subsequence(&buf[..n], b"PACK") {
+        // n <= buf.len() (read's contract); None here is impossible.
+        let filled = buf.get(..n)?;
+        if let Some(i) = find_subsequence(filled, b"PACK") {
             return Some(pos + i as u64);
         }
         // Seek back a little to handle boundary splits.
@@ -3466,21 +3559,19 @@ pub(crate) fn compute_object_set(
     // If include_tag, find annotated tags whose target is in the set.
     if include_tag {
         let snap = read_refs(repo.path());
-        if let Ok(snap) = snap {
-            for r in &snap.refs {
-                if let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) {
-                    if set.contains(&tag_oid) {
-                        continue;
-                    }
-                    if let Ok(obj) = repo.find_object(tag_oid)
-                        && obj.kind == ObjKind::Tag
-                            && let Ok(tag) = gix_object::TagRef::from_bytes(&obj.data, kind) {
-                                let target = tag.target();
-                                if set.contains(&target) {
-                                    set.insert(tag_oid);
-                                }
-                            }
+        for r in &snap.refs {
+            if let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) {
+                if set.contains(&tag_oid) {
+                    continue;
                 }
+                if let Ok(obj) = repo.find_object(tag_oid)
+                    && obj.kind == ObjKind::Tag
+                        && let Ok(tag) = gix_object::TagRef::from_bytes(&obj.data, kind) {
+                            let target = tag.target();
+                            if set.contains(&target) {
+                                set.insert(tag_oid);
+                            }
+                        }
             }
         }
     }
@@ -3597,7 +3688,12 @@ pub(crate) fn compute_pack_trailer(data: &[u8], kind: gix_hash::Kind) -> gix_has
     use gix_hash::hasher;
     let mut h = hasher(kind);
     h.update(data);
-    // try_finalize always succeeds when the hasher has been fed data.
+    // try_finalize fails only when no data was fed; update() above always fed
+    // data and the hash size is fixed by `kind` — infallible by construction.
+    #[allow(
+        clippy::expect_used,
+        reason = "the hasher was fed data above; try_finalize only fails on an empty hasher"
+    )]
     h.try_finalize().expect("hash finalization must succeed")
 }
 
@@ -3606,20 +3702,25 @@ pub(crate) fn compute_pack_trailer(data: &[u8], kind: gix_hash::Kind) -> gix_has
 fn commit_graph_layer_hash(path: &Path) -> Result<String, GitError> {
     let data = std::fs::read(path).map_err(GitError::Io)?;
     // Header: "CGPH" version(1) hash-version(1) chunks(1) base-graphs(1)
-    if data.len() < 8 || &data[..4] != b"CGPH" {
+    if data.len() < 8 || !data.starts_with(b"CGPH") {
         return Err(GitError::InvalidInput(format!(
             "{} is not a commit-graph",
             path.display()
         )));
     }
-    let len = if data[5] == 2 { 32 } else { 20 };
+    // Hash size from the header's hash-version byte (data[5]; the len < 8
+    // guard above makes it exist).
+    let len = if data.get(5) == Some(&2) { 32 } else { 20 };
     if data.len() < 8 + len {
         return Err(GitError::InvalidInput(format!(
             "{} is truncated",
             path.display()
         )));
     }
-    Ok(hex::encode(&data[data.len() - len..]))
+    // The trailing checksum occupies the last `len` bytes (checked above to
+    // exist); degrade to empty hex if that ever changes.
+    let tail = data.get(data.len() - len..).unwrap_or(&[]);
+    Ok(hex::encode(tail))
 }
 
 /// Derive a pack's reverse index (`.rev`, RIDX v1) from its `.idx`: header
@@ -3636,11 +3737,12 @@ pub fn write_rev_from_idx(
 ) -> Result<(), GitError> {
     let index =
         gix_pack::index::File::at(idx_path, kind).map_err(|e| GitError::Gix(Box::new(e)))?;
+    // The .rev format stores index positions as u32; the .idx's own object
+    // count is u32 too, so the range and the iteration have equal lengths.
     let n = index.num_objects();
-    let mut by_offset: Vec<(u64, u32)> = index
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.pack_offset, i as u32))
+    let mut by_offset: Vec<(u64, u32)> = (0..n)
+        .zip(index.iter())
+        .map(|(i, e)| (e.pack_offset, i))
         .collect();
     by_offset.sort_unstable();
     let mut out = Vec::with_capacity(12 + 4 * n as usize + 2 * kind.len_in_bytes());

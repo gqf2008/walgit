@@ -83,7 +83,7 @@ pub async fn receive_pack(
             .or_else(|| broker_token.map(str::to_string).filter(|v| !v.is_empty()));
         if let Some(token) = token { request = request.bearer_auth(token) } else {
             tracing::warn!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "push broker token unset (wal.push_broker_token / WALGIT_BROKER_TOKEN); falling back"
             );
             return ForwardOutcome::Fallback;
@@ -93,7 +93,7 @@ pub async fn receive_pack(
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "push broker unavailable; falling back");
+            tracing::warn!(%error, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "push broker unavailable; falling back");
             return ForwardOutcome::Fallback;
         }
     };
@@ -103,7 +103,7 @@ pub async fn receive_pack(
     ) {
         tracing::warn!(
             status = response.status().as_u16(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "push broker gateway failure; falling back"
         );
         return ForwardOutcome::Fallback;
@@ -132,7 +132,7 @@ pub async fn receive_pack(
     metrics::counter!("walgit_push_forwarded_total", "outcome" => outcome).increment(1);
     tracing::info!(
         status = status.as_u16(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "push broker response streamed"
     );
     ForwardOutcome::Response(output)

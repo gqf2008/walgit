@@ -65,7 +65,10 @@ async fn assets_have_content_type_and_immutable_cache() -> Result<()> {
     let marker = "/_ui/assets/";
     let asset = index
         .split('"')
-        .find(|part| part.starts_with(marker) && part.ends_with(".js"))
+        .find(|part| {
+            part.starts_with(marker)
+                && part.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("js"))
+        })
         .expect("built index references a JavaScript asset");
     let response = client
         .get(format!("{}{}", server.base_url, asset))

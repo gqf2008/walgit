@@ -42,8 +42,13 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let (cert_pem, key_pem) = match cfg.server.tls.mode {
         TlsMode::Off => return Ok(None),
         TlsMode::Files => {
-            let cert = cfg.server.tls.cert.as_ref().expect("validated");
-            let key = cfg.server.tls.key.as_ref().expect("validated");
+            // Config::validate requires both paths in Files mode.
+            let cert = cfg.server.tls.cert.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("server.tls.cert is required when tls.mode = \"files\"")
+            })?;
+            let key = cfg.server.tls.key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("server.tls.key is required when tls.mode = \"files\"")
+            })?;
             (
                 std::fs::read_to_string(cert)
                     .with_context(|| format!("reading server.tls.cert {}", cert.display()))?,
@@ -56,10 +61,9 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .context("parsing TLS certificate PEM")?;
-    anyhow::ensure!(
-        !certs.is_empty(),
-        "TLS certificate PEM holds no certificate"
-    );
+    let first_cert = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("TLS certificate PEM holds no certificate"))?;
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .context("parsing TLS private key PEM")?
         .ok_or_else(|| anyhow::anyhow!("TLS key PEM holds no private key"))?;
@@ -67,7 +71,7 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
         use sha2::Digest;
         format!(
             "sha256:{}",
-            hex::encode(sha2::Sha256::digest(certs[0].as_ref()))
+            hex::encode(sha2::Sha256::digest(first_cert.as_ref()))
         )
     };
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::new(

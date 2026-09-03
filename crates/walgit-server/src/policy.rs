@@ -218,7 +218,7 @@ impl RepoPolicy {
 fn valid_name(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=63).contains(&b.len())
-        && b[0].is_ascii_lowercase()
+        && b.first().is_some_and(u8::is_ascii_lowercase)
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
@@ -232,17 +232,21 @@ fn check_overlap_bypass(p: &RepoPolicy) -> Result<(), String> {
         .filter(|r| r.effect.protect.is_some())
         .collect();
     for (i, a) in protect.iter().enumerate() {
-        for b in &protect[i + 1..] {
+        for b in protect.iter().skip(i + 1) {
+            let (Some(pa), Some(pb)) = (a.effect.protect.as_ref(), b.effect.protect.as_ref())
+            else {
+                continue; // both were filtered as Some above; unreachable
+            };
             if !ref_patterns_may_overlap(&a.match_.refs, &b.match_.refs) {
                 continue;
             }
-            let ra = restrict_set(a.effect.protect.as_ref().unwrap());
-            let rb = restrict_set(b.effect.protect.as_ref().unwrap());
+            let ra = restrict_set(pa);
+            let rb = restrict_set(pb);
             if ra.is_disjoint(&rb) {
                 continue;
             }
-            let ba = &a.effect.protect.as_ref().unwrap().bypass;
-            let bb = &b.effect.protect.as_ref().unwrap().bypass;
+            let ba = &pa.bypass;
+            let bb = &pb.bypass;
             if ba.is_empty() || bb.is_empty() {
                 continue;
             }
@@ -322,20 +326,24 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
 }
 
 fn glob_bytes(pat: &[u8], text: &[u8]) -> bool {
+    // Bounds note: every `.get` below sits behind the pi/ti guards of the
+    // original index arithmetic (pi < pat.len() at the loop head, ti ≤
+    // text.len() by the increments), so the unwrap_or_default fallbacks are
+    // unreachable — they only exist to keep the slice accesses lint-clean.
     let mut pi = 0;
     let mut ti = 0;
-    while pi < pat.len() {
-        if pat[pi] == b'*' && pi + 1 < pat.len() && pat[pi + 1] == b'*' {
-            let mut rest = &pat[pi + 2..];
+    while let Some(pc) = pat.get(pi).copied() {
+        if pc == b'*' && pat.get(pi + 1) == Some(&b'*') {
+            let mut rest = pat.get(pi + 2..).unwrap_or_default(); // pi+2 ≤ pat.len(): pi+1 was checked
             if rest.first() == Some(&b'/') {
-                rest = &rest[1..];
+                rest = rest.get(1..).unwrap_or_default();
             }
             if rest.is_empty() {
                 return true;
             }
             let mut i = ti;
             loop {
-                if glob_bytes(rest, &text[i..]) {
+                if glob_bytes(rest, text.get(i..).unwrap_or_default()) {
                     return true;
                 }
                 if i >= text.len() {
@@ -343,26 +351,26 @@ fn glob_bytes(pat: &[u8], text: &[u8]) -> bool {
                 }
                 i += 1;
             }
-        } else if pat[pi] == b'*' {
-            let rest = &pat[pi + 1..];
-            if glob_bytes(rest, &text[ti..]) {
+        } else if pc == b'*' {
+            let rest = pat.get(pi + 1..).unwrap_or_default(); // pi < pat.len()
+            if glob_bytes(rest, text.get(ti..).unwrap_or_default()) {
                 return true;
             }
-            while ti < text.len() && text[ti] != b'/' {
+            while ti < text.len() && text.get(ti) != Some(&b'/') {
                 ti += 1;
-                if glob_bytes(rest, &text[ti..]) {
+                if glob_bytes(rest, text.get(ti..).unwrap_or_default()) {
                     return true;
                 }
             }
             return false;
-        } else if pat[pi] == b'?' {
-            if ti >= text.len() || text[ti] == b'/' {
+        } else if pc == b'?' {
+            if ti >= text.len() || text.get(ti) == Some(&b'/') {
                 return false;
             }
             ti += 1;
             pi += 1;
         } else {
-            if ti >= text.len() || text[ti] != pat[pi] {
+            if ti >= text.len() || text.get(ti) != Some(&pc) {
                 return false;
             }
             ti += 1;
@@ -434,9 +442,10 @@ fn actor_list_matches(
         if let Some(rest) = p.strip_prefix('^') {
             let mut seen = HashSet::new();
             // Unresolvable exclude still excludes: treat missing group as hit.
-            if rest.starts_with("group:") && !groups.contains_key(&rest[6..]) {
-                exc = true;
-            } else if principal_matches(rest, principal, groups, &mut seen) {
+            let group_missing = rest
+                .strip_prefix("group:")
+                .is_some_and(|g| !groups.contains_key(g));
+            if group_missing || principal_matches(rest, principal, groups, &mut seen) {
                 exc = true;
             }
         } else {

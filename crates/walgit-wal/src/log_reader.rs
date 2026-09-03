@@ -18,9 +18,9 @@ pub(crate) async fn read_log_impl(
     // the repo's write lock here would deadlock callers that hold a read
     // guard (overview, tests), and freshness_ttl=0 makes that the common case.
     let known = handle.manifest_version.lock().clone();
-    let manifest = match crate::sync::freshness_check(&handle.store, &known).await? {
+    let manifest = match crate::sync::freshness_check(&handle.store, known.as_ref()).await? {
         crate::sync::SyncOutcome::Unchanged => handle.manifest.read().clone(),
-        crate::sync::SyncOutcome::Changed { manifest, .. } => std::sync::Arc::new(manifest),
+        crate::sync::SyncOutcome::Changed { manifest, .. } => std::sync::Arc::new(*manifest),
     };
     let head_seq = manifest.head_seq;
     let to = to_seq.unwrap_or(head_seq).min(head_seq);
@@ -41,7 +41,13 @@ pub(crate) async fn read_log_impl(
         let res = handle.store.get(&seg.key, GetOptions::default()).await?;
         let bytes = match res {
             GetResult::Object { meta, body } => {
-                walgit_store::util::collect(body, meta.size as usize).await?
+                let size = usize::try_from(meta.size).map_err(|_| {
+                    WalError::Corrupt(format!(
+                        "log segment {} size {} does not fit usize",
+                        seg.key, meta.size
+                    ))
+                })?;
+                walgit_store::util::collect(body, size).await?
             }
             GetResult::NotModified { .. } => continue,
         };
@@ -165,7 +171,7 @@ async fn replay_refs(
             for u in &txn.updates {
                 if !u.new_symbolic_target.is_empty() {
                     if u.name == "HEAD" {
-                        head_target = u.new_symbolic_target.clone();
+                        head_target.clone_from(&u.new_symbolic_target);
                     }
                     continue;
                 }

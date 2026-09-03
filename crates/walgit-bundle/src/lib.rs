@@ -4,8 +4,8 @@
 //! # Architecture
 //!
 //! The [`Bundler`] is the public entry point. It depends on a [`BundleSource`]
-//! trait that provides repo-scoped access (local git repo + [`Prefixed`] store
-//! + `head_seq`). When `walgit_wal::Registry` lands it will implement
+//! trait that provides repo-scoped access (a local git repo, a [`Prefixed`]
+//! store and `head_seq`). When `walgit_wal::Registry` lands it will implement
 //! `BundleSource` (impl lives in this crate) and the `new` signature will
 //! accept `Arc<Registry>` directly. Until then, [`Bundler::new_with_source`]
 //! accepts any `BundleSource` impl (used by tests).
@@ -183,14 +183,14 @@ impl Bundler {
         Self::new_with_source(registry, cfg)
     }
 
-    /// Find a strategy config by name.
-    /// The config to plan/build `handle`'s repository with (D24).
+    /// Find a strategy config by name in `cfg` (the config to plan/build
+    /// `handle`'s repository with; D24: host ⊕ settings).
     fn cfg_for<'a>(&'a self, handle: &'a BundleRepoHandle) -> &'a Config {
         handle.cfg.as_deref().unwrap_or(&self.cfg)
     }
 
+    /// Find a strategy config by name.
     fn find_strategy<'a>(
-        &self,
         cfg: &'a Config,
         name: &str,
     ) -> Result<&'a walgit_config::BundleStrategy, BundleError> {
@@ -235,7 +235,7 @@ impl Bundler {
         cut: &ops::Cut,
     ) -> Result<BundleEntry, BundleError> {
         let cfg = self.cfg_for(handle);
-        let strat = self.find_strategy(cfg, strategy_name)?;
+        let strat = Self::find_strategy(cfg, strategy_name)?;
         let store = &handle.store;
         let refs = slots::default_refs(&cfg.bundles, strat);
 
@@ -300,6 +300,12 @@ impl Bundler {
                     .map(|t| t.oid.clone())
                     .collect();
                 let commits = ops::count_commits(&handle.local, &tip_oids, &prerequisites).await?;
+                // A histogram sample must be f64; the cast rounds only above
+                // 2^53 (~9e15) — unreachable for a per-slot commit count.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "metrics histogram samples are f64; no per-slot commit count approaches 2^53 where f64 starts rounding"
+                )]
                 metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(commits as f64);
                 tracing::info!(
                     strategy = strategy_name,
@@ -637,7 +643,7 @@ impl Bundler {
     ) -> Result<Option<BundleEntry>, BundleError> {
         let mut handle = self.source.open_repo(id).await?;
         let cfg = self.cfg_for(&handle).clone();
-        let strat = self.find_strategy(&cfg, strategy)?.clone();
+        let strat = Self::find_strategy(&cfg, strategy)?.clone();
         let strat = &strat;
         let store = handle.store.clone();
         let Some(lease) = ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? else {

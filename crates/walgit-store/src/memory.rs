@@ -63,7 +63,12 @@ impl MemoryStore {
 async fn body_bytes(body: PutBody) -> Result<Bytes> {
     Ok(match body {
         PutBody::Bytes(b) => b,
-        PutBody::Stream { len, stream } => util::collect(stream, len as usize).await?,
+        PutBody::Stream { len, stream } => {
+            let hint = usize::try_from(len).map_err(|_| {
+                StoreError::InvalidArgument(format!("stream length {len} exceeds usize"))
+            })?;
+            util::collect(stream, hint).await?
+        }
         PutBody::File(p) => Bytes::from(tokio::fs::read(&p).await.map_err(StoreError::other)?),
     })
 }
@@ -115,8 +120,11 @@ impl ObjectStore for MemoryStore {
         let size = data.len() as u64;
         let slice = match &opts.range {
             Some(r) => {
-                let start = r.start.min(size) as usize;
-                let end = r.end.min(size) as usize;
+                // Ends are clamped to the object length first, so both values
+                // always fit back into usize (they are <= data.len()); the
+                // unwrap_or is unreachable and only keeps the types honest.
+                let start = usize::try_from(r.start.min(size)).unwrap_or(usize::MAX);
+                let end = usize::try_from(r.end.min(size)).unwrap_or(usize::MAX);
                 if start > end {
                     return Err(StoreError::InvalidArgument(format!(
                         "bad range {r:?} for size {size}"
@@ -244,8 +252,12 @@ impl ObjectStore for MemoryStore {
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .filter_map(|(k, _)| {
-                let rest = &k[prefix.len()..];
-                rest.find('/').map(|i| format!("{prefix}{}/", &rest[..i]))
+                // take_while above guarantees `starts_with(prefix)`, so the
+                // strip never fails; the '/' find result is a char boundary.
+                k.strip_prefix(prefix).and_then(|rest| {
+                    let i = rest.find('/')?;
+                    rest.get(..i).map(|head| format!("{prefix}{head}/"))
+                })
             })
             .collect();
         out.dedup();

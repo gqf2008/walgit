@@ -128,6 +128,11 @@ impl ObjectAccess {
 }
 
 impl RepoHandle {
+    // The one constructor of RepoHandle: its parameters are exactly the
+    // externally supplied fields of the struct (the rest are internal
+    // plumbing initialized inline); registry has two mechanical call sites.
+    // A params struct would duplicate the struct's own field list.
+    #[allow(clippy::too_many_arguments, reason = "constructor mirroring RepoHandle's fields; registry call sites are mechanical")]
     pub(crate) fn new(
         id: RepoId,
         local: LocalRepo,
@@ -730,8 +735,10 @@ impl RepoHandle {
                 .collect();
         }
         let mount = self.mount_dir();
-        if mount.is_none() && self.cfg.cache.store_mount.is_some() {
-            tracing::warn!(repo = %self.id, mount = %self.cfg.cache.store_mount.as_ref().unwrap().display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
+        if mount.is_none()
+            && let Some(m) = self.cfg.cache.store_mount.as_ref()
+        {
+            tracing::warn!(repo = %self.id, mount = %m.display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
         }
         manifest
             .packs
@@ -782,7 +789,7 @@ impl RepoHandle {
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
     async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
         let known = self.manifest_version.lock().clone();
-        let outcome = crate::sync::freshness_check(&self.store, &known).await?;
+        let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
         match outcome {
             crate::sync::SyncOutcome::Unchanged => self.update_freshness(),
             crate::sync::SyncOutcome::Changed {
@@ -814,7 +821,7 @@ impl RepoHandle {
                 let before = self.state.lock().applied_seq;
                 crate::sync::apply_delta(self, &manifest, &meta_version).await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = Arc::new(manifest);
+                *self.manifest.write() = Arc::new(*manifest);
                 *self.manifest_version.lock() = Some(meta_version);
                 self.update_freshness();
             }
@@ -893,14 +900,13 @@ impl RepoHandle {
         .await;
 
         // Read manifest fresh
-        let (meta, manifest) = match crate::store_proto::get_message::<Manifest>(
+        let Some((meta, manifest)) = crate::store_proto::get_message::<Manifest>(
             &self.store,
             walgit_proto::keys::MANIFEST,
         )
         .await?
-        {
-            Some((m, manifest)) => (m, manifest),
-            None => return Err(WalError::NotFound),
+        else {
+            return Err(WalError::NotFound);
         };
 
         // Reset state and re-materialize
@@ -991,7 +997,7 @@ impl RepoHandle {
             response: tx,
         };
 
-        let sender = self.get_or_init_publisher().await;
+        let sender = self.get_or_init_publisher();
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
             return Err(WalError::Corrupt("publisher channel closed".into()));
@@ -1216,6 +1222,8 @@ impl RepoHandle {
     /// Read the checkpoint object's times when the manifest ref has none
     /// (one 240-byte GET per checkpoint per process; no-op otherwise).
     pub(crate) async fn learn_checkpoint_times(&self) -> Result<(), WalError> {
+        use prost::Message;
+        use walgit_store::ObjectStoreExt;
         let m = self.manifest();
         let Some(cp) = m.checkpoint.as_ref() else {
             return Ok(());
@@ -1225,8 +1233,6 @@ impl RepoHandle {
         {
             return Ok(());
         }
-        use prost::Message;
-        use walgit_store::ObjectStoreExt;
         if let Some((_, bytes)) = self.store.get_bytes(&cp.key).await? {
             let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
                 .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
@@ -1281,7 +1287,7 @@ impl RepoHandle {
         *self.last_freshness.lock() = Some(Instant::now());
     }
 
-    async fn get_or_init_publisher(&self) -> mpsc::UnboundedSender<PublishRequest> {
+    fn get_or_init_publisher(&self) -> mpsc::UnboundedSender<PublishRequest> {
         let mut guard = self.publish_tx.lock();
         if let Some(tx) = &*guard {
             // A publisher task that died (panic mid-batch) leaves a sender to
@@ -1293,6 +1299,10 @@ impl RepoHandle {
             tracing::warn!(repo = %self.id, "publisher task is gone; respawning");
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        // `self_arc` is set by the registry right after construction, before the
+        // handle is ever handed out; every publish path runs through such a
+        // handle, so the OnceLock is always filled here.
+        #[allow(clippy::expect_used, reason = "self_arc is set at construction (registry::RepoRegistry::open) before any handle is published")]
         let arc = self
             .self_arc
             .get()

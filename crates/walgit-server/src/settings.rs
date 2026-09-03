@@ -175,24 +175,49 @@ async fn publish(
     }
 }
 
+/// ASCII hex digit → value (raw bytes: `%` in front of a multi-byte UTF-8
+/// character must never land on a non-char-boundary `str` slice).
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `+` → space and `%XX` → byte; everything else (including multi-byte UTF-8
+/// and a `%` not followed by two hex digits) passes through unchanged.
 fn percent_decode(v: &str) -> String {
-    let mut out = Vec::with_capacity(v.len());
     let b = v.as_bytes();
+    let mut out = Vec::with_capacity(v.len());
     let mut i = 0;
     while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                if let Ok(n) = u8::from_str_radix(&v[i + 1..i + 3], 16) {
-                    out.push(n);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
+        match b.get(i) {
+            Some(b'+') => {
+                out.push(b' ');
+                i += 1;
             }
-            c => out.push(c),
+            Some(b'%') => {
+                if let (Some(hi), Some(lo)) = (b.get(i + 1).copied(), b.get(i + 2).copied())
+                    && let (Some(hi), Some(lo)) = (hex_digit(hi), hex_digit(lo))
+                {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                } else {
+                    // Invalid escape (`%` not followed by two hex digits) or a
+                    // `%` with fewer than two bytes left: the `%` is literal
+                    // and the tail is processed as plain bytes.
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            Some(c) => {
+                out.push(*c);
+                i += 1;
+            }
+            None => break, // `i < b.len()` in the while guard; unreachable.
         }
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -351,15 +376,17 @@ fn human_schedule(expr: &str) -> String {
         _ => {}
     }
     let f: Vec<&str> = expr.split_whitespace().collect();
-    if f.len() != 6 {
+    // Cron is a fixed 6-field tuple: `sec min hour dom mon dow`. The slice
+    // pattern binds &&str; the fields are Copy (&str), so deref-copy them.
+    let [_, min, hour, dom, _, dow] = f.as_slice() else {
         return expr.to_string();
-    }
-    let (sec, min, hour, dom, mon, dow) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+    };
+    let (min, hour, dom, dow) = (*min, *hour, *dom, *dow);
     let hm = match (hour.parse::<u32>(), min.parse::<u32>()) {
         (Ok(h), Ok(m)) => format!("at {h:02}:{m:02} UTC"),
-        _ if hour == "*" && min.parse::<u32>().is_ok() => {
-            format!("every hour at :{:02} UTC", min.parse::<u32>().unwrap())
-        }
+        // `hour` "*" never parses, so an (Err, Ok) pair under a `*` hour is
+        // exactly "every hour at :mm"; every other pair keeps its literal text.
+        (Err(_), Ok(m)) if hour == "*" => format!("every hour at :{m:02} UTC"),
         _ => format!("at {hour}:{min}"),
     };
     let day = if dow != "*" && dow != "?" {
@@ -382,7 +409,6 @@ fn human_schedule(expr: &str) -> String {
     } else {
         "every day".to_string()
     };
-    let _ = (sec, mon);
     format!("{day} {hm}").trim().to_string()
 }
 
@@ -409,8 +435,11 @@ pub async fn http_validate(
                 message: String::new(),
             };
             let mut d = describe_json(st, &h, &eff, Some(&preview))?;
-            d["ok"] = json!(true);
-            d["errors"] = json!([]);
+            // describe_json() always returns a JSON object.
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("ok".into(), json!(true));
+                obj.insert("errors".into(), json!([]));
+            }
             d
         }
         Err(e) => json!({"ok": false, "errors": [format!("{e:#}")]}),
@@ -479,17 +508,17 @@ pub async fn http_policy_dry_run(
         .read_log(m.min_seq.max(1), None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let pushes: Vec<&walgit_proto::v1::LogEntry> = entries
+    let pushes: Vec<(&walgit_proto::v1::LogEntry, &walgit_proto::v1::RefTransaction)> = entries
         .iter()
         .rev()
-        .filter(|e| e.kind() == walgit_proto::v1::EntryKind::Push && e.txn.is_some())
+        .filter(|e| e.kind() == walgit_proto::v1::EntryKind::Push)
+        .filter_map(|e| e.txn.as_ref().map(|t| (e, t)))
         .take(last)
         .collect();
     let local = h.local();
     let mut results = Vec::new();
     let (mut allowed_n, mut denied_n) = (0usize, 0usize);
-    for e in pushes {
-        let txn = e.txn.clone().unwrap();
+    for (e, txn) in pushes {
         let principal = e
             .meta
             .get("principal")
@@ -505,7 +534,7 @@ pub async fn http_policy_dry_run(
                 }
             }
         }
-        let ev = crate::policy::evaluate(&policy, &principal, &txn, |u| forces.contains(&u.name));
+        let ev = crate::policy::evaluate(&policy, &principal, txn, |u| forces.contains(&u.name));
         let refs: Vec<serde_json::Value> = ev
             .per_ref
             .iter()

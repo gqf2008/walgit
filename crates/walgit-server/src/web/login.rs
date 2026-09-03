@@ -156,7 +156,15 @@ async fn login(
         )
             .into_response();
     };
-    let (client_id, _) = st.auth.oauth_client().unwrap();
+    // `browser_login_enabled()` above guarantees both halves are set; keep
+    // the same graceful shape `callback` uses below for the impossible case.
+    let Some((client_id, _)) = st.auth.oauth_client() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "browser sign-in not configured",
+        )
+            .into_response();
+    };
     let next = safe_next(q.next);
     let nonce: u64 = rand::random();
     let payload = format!("{}\n{nonce:x}\n{next}", now() + STATE_TTL_SECS);
@@ -193,21 +201,19 @@ async fn exchange_code(
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("reqwest client");
-    let mut last = None;
-    for attempt in 1u8..=2 {
+        .build()?;
+    let mut attempt = 1u8;
+    loop {
         match client.post(token_endpoint).form(form).send().await {
             Ok(r) => return Ok(r),
-            Err(e) if attempt < 2 && (e.is_connect() || e.is_timeout()) => {
+            Err(e) if attempt == 1 && (e.is_connect() || e.is_timeout()) => {
                 tracing::warn!(attempt, error = %e, "oauth token exchange retrying");
-                last = Some(e);
+                attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => return Err(e),
         }
     }
-    Err(last.expect("retry left an error"))
 }
 
 #[derive(serde::Deserialize)]
@@ -306,7 +312,7 @@ async fn callback(
     if !loopback_origin(&st, &headers) {
         let mut r = Redirect::to(&next).into_response();
         r.headers_mut()
-            .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+            .insert(header::SET_COOKIE, cookie_header(&cookie));
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return r;
@@ -325,7 +331,7 @@ async fn callback(
     };
     let mut r = Redirect::to(&dest).into_response();
     r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        .insert(header::SET_COOKIE, cookie_header(&cookie));
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -359,7 +365,7 @@ async fn claimed(
     let cookie = session_set_cookie(&st, &headers, value);
     let mut r = Redirect::to(&next).into_response();
     r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        .insert(header::SET_COOKIE, cookie_header(&cookie));
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -373,7 +379,7 @@ async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
     );
     let mut r = Redirect::to("/").into_response();
     r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        .insert(header::SET_COOKIE, cookie_header(&cookie));
     r
 }
 
@@ -431,6 +437,18 @@ pub fn session_set_cookie(st: &AppState, headers: &HeaderMap, value: &str) -> St
         st.auth.session_ttl().as_secs(),
         cookie_site(st, secure)
     )
+}
+
+/// A `Set-Cookie` header from a cookie string this module built (see
+/// [`session_set_cookie`] and `logout`): the name is `SESSION_COOKIE`, the
+/// value is `URL_SAFE_NO_PAD` base64 from `auth::sign`, the attributes are
+/// static ASCII — `from_str` cannot fail (it rejects only non-visible ASCII).
+#[allow(
+    clippy::unwrap_used,
+    reason = "walgit-built cookie: static ASCII name/attributes, URL_SAFE_NO_PAD base64 value — from_str cannot fail"
+)]
+fn cookie_header(cookie: &str) -> HeaderValue {
+    HeaderValue::from_str(cookie).unwrap()
 }
 
 /// Sliding sessions (middleware on every app response): a valid session cookie

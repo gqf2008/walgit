@@ -173,6 +173,10 @@ pub struct LeaseGuard {
 }
 
 impl LeaseGuard {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private constructor; the 8 args are the struct's own fields (or the clock/ttl/epoch that derive them) threaded from the two try_acquire call sites — a params struct would re-list the struct itself"
+    )]
     fn new(
         store: DynStore,
         key: &str,
@@ -285,7 +289,9 @@ impl Drop for LeaseGuard {
         let key = self.key.clone();
         let version = self.version.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
+            // Dropping the JoinHandle detaches the best-effort delete; it is
+            // intentionally not awaited (Drop must not block).
+            let _jh = handle.spawn(async move {
                 let _ = store.delete(&key, Some(version)).await;
             });
         }

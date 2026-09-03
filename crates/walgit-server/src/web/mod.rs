@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
@@ -144,7 +144,7 @@ pub async fn require_auth(
             if status == StatusCode::UNAUTHORIZED {
                 resp.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
-                    "Bearer realm=\"walgit\"".parse().unwrap(),
+                    HeaderValue::from_static("Bearer realm=\"walgit\""),
                 );
             }
             resp

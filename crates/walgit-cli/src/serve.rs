@@ -69,24 +69,26 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
         }));
     }
 
-    // Graceful shutdown on SIGTERM / SIGINT.
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-                .expect("install SIGINT handler");
+    // Graceful shutdown on SIGTERM / SIGINT. The handlers are installed here,
+    // in `run` where a (practically impossible) OS refusal is a real error, so
+    // the shutdown future handed to `serve` stays infallible as it expects.
+    #[cfg(unix)]
+    let shutdown = {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .map_err(anyhow::Error::from)?;
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .map_err(anyhow::Error::from)?;
+        async move {
             tokio::select! {
                 _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
                 _ = sigint.recv() => info!("received SIGINT, shutting down"),
             }
         }
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c().await.expect("ctrl_c");
-            info!("received Ctrl-C, shutting down");
-        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        signal::ctrl_c().await.expect("ctrl_c");
+        info!("received Ctrl-C, shutting down");
     };
 
     info!(listen = %cfg.server.listen, "starting server");

@@ -78,7 +78,7 @@ pub async fn read_pkt_line<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Pkt
     if n < 4 {
         return Err(GitError::Protocol("short pkt-line header".into()));
     }
-    let len = parse_pkt_len(&hdr)?;
+    let len = parse_pkt_len(hdr)?;
     match len {
         0 => return Ok(Some(PktLine::Flush)),
         1 => return Ok(Some(PktLine::Delim)),
@@ -102,7 +102,8 @@ async fn read_exact_or_eof<R: AsyncRead + Unpin>(
 ) -> Result<usize, GitError> {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = r.read(&mut buf[filled..]).await.map_err(io_to_git)?;
+        let (_, rest) = buf.split_at_mut(filled);
+        let n = r.read(rest).await.map_err(io_to_git)?;
         if n == 0 {
             break;
         }
@@ -111,9 +112,9 @@ async fn read_exact_or_eof<R: AsyncRead + Unpin>(
     Ok(filled)
 }
 
-fn parse_pkt_len(hdr: &[u8; 4]) -> Result<usize, GitError> {
+fn parse_pkt_len(hdr: [u8; 4]) -> Result<usize, GitError> {
     let mut val = 0usize;
-    for &b in hdr {
+    for b in hdr {
         let d = match b {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
@@ -136,17 +137,15 @@ pub async fn write_pkt_line<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Re
         w.write_all(b"0004").await.map_err(io_to_git)?;
         return Ok(());
     }
-    let mut off = 0;
-    while off < data.len() {
-        let chunk = (data.len() - off).min(MAX_PKT_DATA);
-        let total = chunk + 4;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(rest.len().min(MAX_PKT_DATA));
+        let total = chunk.len() + 4;
         w.write_all(pkt_len_hex(total).as_bytes())
             .await
             .map_err(io_to_git)?;
-        w.write_all(&data[off..off + chunk])
-            .await
-            .map_err(io_to_git)?;
-        off += chunk;
+        w.write_all(chunk).await.map_err(io_to_git)?;
+        rest = tail;
     }
     Ok(())
 }
@@ -212,20 +211,17 @@ impl<W: AsyncWrite + Unpin> Sideband<W> {
             self.w.write_all(&[channel]).await.map_err(io_to_git)?;
             return Ok(());
         }
-        let mut off = 0;
-        while off < buf.len() {
-            let chunk = (buf.len() - off).min(MAX);
-            let total = chunk + 4 + 1;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let (chunk, tail) = rest.split_at(rest.len().min(MAX));
+            let total = chunk.len() + 4 + 1;
             self.w
                 .write_all(pkt_len_hex(total).as_bytes())
                 .await
                 .map_err(io_to_git)?;
             self.w.write_all(&[channel]).await.map_err(io_to_git)?;
-            self.w
-                .write_all(&buf[off..off + chunk])
-                .await
-                .map_err(io_to_git)?;
-            off += chunk;
+            self.w.write_all(chunk).await.map_err(io_to_git)?;
+            rest = tail;
         }
         Ok(())
     }
@@ -385,14 +381,24 @@ fn io_to_git(e: std::io::Error) -> GitError {
 /// Encode a literal data pkt-line into a buffer (sync helper for building
 /// advertisement/section bytes).
 pub fn encode_data(buf: &mut Vec<u8>, data: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let total = data.len() + 4;
-    buf.extend_from_slice(&[
-        HEX[(total >> 12) & 0xf],
-        HEX[(total >> 8) & 0xf],
-        HEX[(total >> 4) & 0xf],
-        HEX[total & 0xf],
-    ]);
+    // Lowercase hex of `total`, fixed 4 digits (total <= 65520).
+    let mut hdr = [0u8; 4];
+    for (i, slot) in hdr.iter_mut().enumerate() {
+        let shift = 12 - 4 * i;
+        // `& 0xf` bounds the nibble to 0..=15, so the cast is lossless.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the & 0xf mask bounds the value to 0..=15 before the cast"
+        )]
+        let nibble = ((total >> shift) & 0xf) as u8;
+        *slot = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+    buf.extend_from_slice(&hdr);
     buf.extend_from_slice(data);
 }
 pub fn encode_flush(buf: &mut Vec<u8>) {

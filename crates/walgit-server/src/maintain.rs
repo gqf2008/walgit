@@ -232,6 +232,8 @@ fn record_plan(
                 .iter()
                 .filter(|r| r.strategy == strat.name && state_of(&r.status) == st)
                 .count();
+            // f64 is the metrics-gauge contract; slot counts are ≪ 2^53.
+            #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; slot counts ≪ 2^53")]
             metrics::gauge!("walgit_bundle_plan_slots", "repo" => id.to_string(), "strategy" => strat.name.clone(), "state" => st).set(n as f64);
         }
     }
@@ -252,6 +254,8 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
         // Checkpoint lag/age gauges: how far the fold is behind the head.
         let m = handle.manifest();
         let cp_seq = m.checkpoint.as_ref().map_or(0, |c| c.seq);
+        // f64 is the metrics-gauge contract; checkpoint lag in entries is ≪ 2^53.
+        #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; checkpoint lag in entries ≪ 2^53")]
         metrics::gauge!("walgit_checkpoint_lag_entries", "repo" => id.to_string())
             .set(m.head_seq.saturating_sub(cp_seq) as f64);
         if let Some(t) = m
@@ -275,6 +279,8 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
     // Integrity before everything else that builds on the object set.
     let fsck = crate::ops::read_fsck(&handle).await.ok().flatten();
     if let Some(f) = &fsck {
+        // f64 is the metrics-gauge contract; missing-object counts are ≪ 2^53.
+        #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; missing-object counts ≪ 2^53")]
         metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string()).set(
             if f.repaired_seq > 0 {
                 0.0
@@ -505,17 +511,25 @@ pub async fn upcoming(
         let (unit, host) = match strat.kind {
             walgit_config::BundleKind::Full => match &base {
                 Some(b) if many || base_predates_window(handle, strat, slot, b.seq).await => {
+                    // Display-only: the label rounds to tenths of a GiB and whole
+                    // minutes; exact byte counts are not the point of a status string.
+                    #[allow(clippy::cast_precision_loss, reason = "display-only size label in tenths of a GiB")]
                     let gib = b.pack_size as f64 / (1u64 << 30) as f64;
-                    let mins = (gib * 1.0).max(1.0).round() as u64;
+                    // A tier-2 base is ≥ 1 GiB in practice, and even a 2^64-byte pack
+                    // is only ~2^34 GiB: rounded and floored at 1, never negative and
+                    // never truncated by the cast.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "GiB count after round().max(1.0) is ≥ 1 and < 2^53")]
+                    let mins = gib.max(1.0).round() as u64;
                     match &ssd {
                         Some(h) => (format!("base rebuild (repack {gib:.1} GiB, ~{mins} min on {h}) + compose"), Some(h.clone())),
                         None => ("base rebuild needed — NO ssd maintainer alive; the slot would compose the stale base".to_string(), None),
                     }
                 }
                 Some(b) => (
+                    // Pack checksums are ASCII hex: byte 12 is a char boundary.
                     format!(
                         "compose header ∘ base pack-{} (no push since it)",
-                        &b.checksum[..12]
+                        b.checksum.split_at(12).0
                     ),
                     any.clone(),
                 ),
@@ -792,7 +806,7 @@ async fn run_op_value(
     }
     match task.outcome() {
         Some(Ok(o)) => {
-            info!(repo = %id, op, ms = started.elapsed().as_millis() as u64, "maintenance: done");
+            info!(repo = %id, op, ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "maintenance: done");
             Some(o.value.unwrap_or(serde_json::Value::Null))
         }
         Some(Err((_, msg))) => {

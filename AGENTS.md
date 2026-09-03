@@ -452,10 +452,11 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   full DIAG dump (contenders/prev_winner/base/winner/after/seen) — a red means the read-side race of
   issue #4 re-fired; attach the dump to issue #4, never rerun-and-forget. 1–2 stray foreign samples
   print the same dump without failing.
-- **Known-red until debt lands:** the workspace `clippy -D warnings` gate fails on pre-existing pedantic debt
-  (~1300 hits measured 2026-08-27; none from the windows port — tracked in the fork's issue). PRs must keep
-  their increment at zero; do not "fix" this by weakening the lint table, and do not treat red clippy CI as a
-  regression signal by itself.
+- **The clippy gate is green** (issue #1 debt cleared 2026-09-03): `just clippy`
+  (`cargo clippy --workspace --all-targets -- -D warnings`) exits 0. New warnings are a
+  regression — fix them in the PR; never by weakening the lint table. The `clippy` CI job
+  keeps `continue-on-error` until the branch ruleset adds it to required checks
+  (maintainer follow-up); a red there is treated as a blocker by convention.
 
 ## §6 Agent collaboration protocol
 
@@ -515,9 +516,9 @@ gh release create v0.1.0 --generate-notes
 The CI workflow posts a **summary comment** on every PR (posted by the `summary` job in
 `ci.yml`); treat it as authoritative, not raw job colors:
 
-- **Expected red — ignore as a blocker**: the `clippy (known-red debt)` job
-  (continue-on-error; ~1300 pre-existing pedantic hits, issue #1). A PR must keep its
-  increment at zero (template field), but a red clippy job alone never blocks a merge.
+- **Clippy is a real signal** (issue #1 debt cleared 2026-09-03): a red `clippy (known-red
+  debt)` job means the PR itself introduced warnings — fix before merging. The job's
+  `continue-on-error` is historical and stays only until the ruleset requires the check.
 - **Expected flaky — rerun once**: tests on the known-flaky list (§5) may fail once;
   the sim/e2e/fast-tier steps auto-rerun once, and a second failure is a regression.
   A summary line reading `real red (already rerun once): <step>` means the failing step

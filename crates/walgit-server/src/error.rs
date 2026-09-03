@@ -70,7 +70,7 @@ impl IntoResponse for ApiError {
         if self.status() == StatusCode::UNAUTHORIZED {
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                "Bearer realm=\"walgit\"".parse().unwrap(),
+                axum::http::HeaderValue::from_static("Bearer realm=\"walgit\""),
             );
         }
         // 503s are transient by contract (placement refusal during a fallback,

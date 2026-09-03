@@ -492,7 +492,7 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
     // the explicit install makes the selection independent of how features resolve.
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("install rustls ring crypto provider");
+        .map_err(|_| anyhow::anyhow!("another rustls crypto provider was already installed"))?;
 
     let cfg = load_config(config);
     tracing_init(&cfg);

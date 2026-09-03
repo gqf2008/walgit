@@ -122,6 +122,9 @@ struct SpanData {
     fields: Map<String, Value>,
 }
 
+/// Test sink for collected records (in-memory instead of stdout).
+type RecordSink = std::sync::Arc<Mutex<Vec<Map<String, Value>>>>;
+
 /// A custom `tracing` layer that emits Cloud Logging structured JSON.
 ///
 /// * **Events** produce a JSON line immediately with `severity` = event level.
@@ -133,7 +136,7 @@ pub struct CloudLoggingLayer {
     project_id: Option<String>,
     spans: Mutex<HashMap<SpanId, SpanData>>,
     /// Test sink: when set, records go here instead of stdout.
-    sink: Option<std::sync::Arc<Mutex<Vec<Map<String, Value>>>>>,
+    sink: Option<RecordSink>,
 }
 
 const HIDDEN_FIELDS: &[&str] = &["trace_id"];
@@ -149,7 +152,7 @@ impl CloudLoggingLayer {
 
     /// A layer that collects records in memory (tests of the JSON shape).
     #[cfg(test)]
-    pub fn with_sink(sink: std::sync::Arc<Mutex<Vec<Map<String, Value>>>>) -> Self {
+    pub fn with_sink(sink: RecordSink) -> Self {
         Self {
             project_id: None,
             spans: Mutex::new(HashMap::new()),
@@ -187,7 +190,7 @@ impl CloudLoggingLayer {
     }
 
     /// Build the base JSON record with standard Cloud Logging fields.
-    fn base_record(&self, severity: &str, message: &str) -> Map<String, Value> {
+    fn base_record(severity: &str, message: &str) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("severity".into(), json!(severity));
         map.insert("message".into(), json!(message));
@@ -288,7 +291,7 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
-        let severity = level_to_severity(metadata.level());
+        let severity = level_to_severity(*metadata.level());
 
         let mut visitor = FieldCollector::default();
         event.record(&mut visitor);
@@ -298,7 +301,7 @@ where
             .get("message")
             .and_then(|v| v.as_str()).map_or_else(|| metadata.name().to_string(), std::string::ToString::to_string);
 
-        let mut record = self.base_record(severity, &message);
+        let mut record = Self::base_record(severity, &message);
         record.insert("target".into(), json!(metadata.target()));
 
         // Ancestor span fields (root→leaf), then event fields (override).
@@ -343,12 +346,12 @@ where
                 return;
             }
             let end = data.last_exit.unwrap_or_else(Instant::now);
-            let elapsed_ms = end.duration_since(data.start).as_millis() as u64;
-            record = self.base_record(level_to_severity(&data.level), data.name);
+            let elapsed_ms = u64::try_from(end.duration_since(data.start).as_millis()).unwrap_or(u64::MAX);
+            record = Self::base_record(level_to_severity(data.level), data.name);
             record.insert("elapsed_ms".into(), json!(elapsed_ms));
             // Close deferred well past the last poll (a lingering child): say so
             // separately instead of inflating the work's duration.
-            let idle_ms = end.elapsed().as_millis() as u64;
+            let idle_ms = u64::try_from(end.elapsed().as_millis()).unwrap_or(u64::MAX);
             if idle_ms >= 1000 {
                 record.insert("close_deferred_ms".into(), json!(idle_ms));
             }
@@ -376,8 +379,8 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn level_to_severity(level: &Level) -> &'static str {
-    match *level {
+fn level_to_severity(level: Level) -> &'static str {
+    match level {
         Level::ERROR => "ERROR",
         Level::WARN => "WARNING",
         Level::INFO => "INFO",
@@ -456,12 +459,13 @@ pub fn parse_x_cloud_trace_context(header: &str) -> Option<String> {
 /// Format: `00-TRACE_ID-PARENT_ID-TRACE_FLAGS`
 /// Returns the `trace_id` (32-char hex).
 pub fn parse_traceparent(header: &str) -> Option<String> {
-    let parts: Vec<&str> = header.split('-').collect();
-    if parts.len() >= 4 {
-        let trace_id = parts[1].trim();
-        if trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(trace_id.to_lowercase());
-        }
+    let mut parts = header.split('-');
+    let trace_id = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(trace_id), Some(_), Some(_)) => trace_id.trim(),
+        _ => return None,
+    };
+    if trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(trace_id.to_lowercase());
     }
     None
 }

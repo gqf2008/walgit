@@ -747,6 +747,13 @@ async fn bench_fetch_engines() {
     for ent in std::fs::read_dir(&pack_dir).unwrap() {
         let p = ent.unwrap().path();
         let name = p.file_name().unwrap().to_string_lossy().to_string();
+        // git writes pack filenames in lowercase on every platform (fixed
+        // constants in git itself), so the literal comparison is exact — a
+        // case-insensitive match would admit names git cannot produce.
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "git's pack-<hex>.pack names are lowercase by construction on every platform"
+        )]
         if name.ends_with(".pack") {
             let idx = p.with_extension("idx");
             let tmp = root.path().join("tmp");

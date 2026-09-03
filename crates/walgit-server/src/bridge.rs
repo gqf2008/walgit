@@ -73,10 +73,16 @@ impl Bridge {
         }
         let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
         if let Some(url) = &cfg.events.webhook_url {
-            sinks.push(Box::new(events::WebhookSink::new(
+            match events::WebhookSink::new(
                 url.clone(),
                 cfg.events.webhook_secret.clone().filter(|s| !s.is_empty()),
-            )));
+            ) {
+                Ok(sink) => sinks.push(Box::new(sink)),
+                Err(e) => {
+                    tracing::error!(error = %e, "webhook sink init failed (reqwest client) — events bridge disabled");
+                    return None;
+                }
+            }
         }
         if sinks.is_empty() {
             return None;
@@ -127,6 +133,8 @@ impl Bridge {
                 "events bridge: entries folded into a checkpoint before they were published; consumers backfill from the WAL");
             from = readable_from;
         }
+        // f64 is the metrics-gauge contract; WAL lag in entries is ≪ 2^53.
+        #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; WAL lag in entries ≪ 2^53")]
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
             .set((head - from) as f64);
         let mut report = CatchUp {
@@ -262,19 +270,22 @@ impl Bridge {
 fn notified_keys(v: &serde_json::Value) -> Vec<String> {
     let mut keys = Vec::new();
     // GCS → Pub/Sub push envelope.
-    let attrs = &v["message"]["attributes"];
-    if attrs["eventType"] == "OBJECT_FINALIZE"
-        && let Some(k) = attrs["objectId"].as_str()
+    if let Some(attrs) = v.get("message").and_then(|m| m.get("attributes"))
+        && attrs.get("eventType").and_then(|e| e.as_str()) == Some("OBJECT_FINALIZE")
+        && let Some(k) = attrs.get("objectId").and_then(|o| o.as_str())
     {
         keys.push(k.to_string());
     }
     // S3 event notification (also what MinIO/rustfs/Ceph emit).
-    if let Some(records) = v["Records"].as_array() {
+    if let Some(records) = v.get("Records").and_then(|r| r.as_array()) {
         for r in records {
-            if r["eventName"]
-                .as_str()
-                .is_some_and(|e| e.starts_with("ObjectCreated"))
-                && let Some(k) = r["s3"]["object"]["key"].as_str()
+            if r.get("eventName").and_then(|e| e.as_str()).is_some_and(|e| {
+                e.starts_with("ObjectCreated")
+            }) && let Some(k) = r
+                .get("s3")
+                .and_then(|s| s.get("object"))
+                .and_then(|o| o.get("key"))
+                .and_then(|k| k.as_str())
             {
                 // S3 URL-encodes keys in notifications.
                 keys.push(
@@ -286,7 +297,12 @@ fn notified_keys(v: &serde_json::Value) -> Vec<String> {
                                 return part.to_string();
                             }
                             match u8::from_str_radix(part.get(..2).unwrap_or(""), 16) {
-                                Ok(b) => format!("{}{}", b as char, &part[2..]),
+                                Ok(b) => {
+                                    // The parse succeeded on part[..2] (hex
+                                    // ASCII), so byte 2 is a char boundary.
+                                    let (_, rest) = part.split_at(2);
+                                    format!("{}{}", b as char, rest)
+                                }
                                 Err(_) => format!("%{part}"),
                             }
                         })
@@ -296,10 +312,10 @@ fn notified_keys(v: &serde_json::Value) -> Vec<String> {
         }
     }
     // Plain shapes for your own glue.
-    if let Some(k) = v["key"].as_str() {
+    if let Some(k) = v.get("key").and_then(|k| k.as_str()) {
         keys.push(k.to_string());
     }
-    if let Some(r) = v["repo"].as_str() {
+    if let Some(r) = v.get("repo").and_then(|r| r.as_str()) {
         keys.push(format!("repos/{r}/manifest.pb"));
     }
     keys
@@ -355,7 +371,7 @@ fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
 }
 
 /// `events.sweep_interval` timer (0 = off).
-pub fn spawn_sweeper(state: Arc<crate::AppState>) {
+pub fn spawn_sweeper(state: &crate::AppState) {
     let Some(bridge) = state.bridge.clone() else {
         return;
     };

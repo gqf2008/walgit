@@ -218,6 +218,9 @@ fn range_not_satisfiable(meta: &ObjectMeta, opts: &ServeOptions<'_>) -> Response
     base_headers(&mut resp, meta, opts);
     resp.headers_mut().insert(
         header::CONTENT_RANGE,
+        // "bytes */<n>": a fixed prefix plus decimal digits — always a valid
+        // header value (u64 renders as visible ASCII only).
+        #[allow(clippy::unwrap_used, reason = "fixed prefix + decimal u64 always parses as a header value")]
         HeaderValue::from_str(&format!("bytes */{}", meta.size)).unwrap(),
     );
     resp.headers_mut()
@@ -303,8 +306,11 @@ pub async fn serve(
                 .insert(header::CONTENT_LENGTH, HeaderValue::from(meta.size));
             return Ok(resp);
         }
-        let spec = range.unwrap();
-        if if_range_allows(headers, &meta.version) {
+        // head == false here (a HEAD request returned above), so this branch was
+        // entered on `range.is_some()`: the spec exists by construction.
+        if let Some(spec) = range
+            && if_range_allows(headers, &meta.version)
+        {
             let Some(r) = spec.resolve(meta.size) else {
                 return Ok(range_not_satisfiable(&meta, &opts));
             };
@@ -323,16 +329,16 @@ pub async fn serve(
                         (StatusCode::PARTIAL_CONTENT, Body::from_stream(body)).into_response();
                     base_headers(&mut resp, &meta, &opts);
                     let h = resp.headers_mut();
-                    h.insert(
-                        header::CONTENT_RANGE,
-                        HeaderValue::from_str(&format!(
-                            "bytes {}-{}/{}",
-                            r.start,
-                            r.end - 1,
-                            total
-                        ))
-                        .unwrap(),
-                    );
+                    // Fixed prefix + decimal digits — always a valid header value.
+                    #[allow(clippy::unwrap_used, reason = "decimal u64 fields with '-' and '/' separators always parse as a header value")]
+                    let content_range = HeaderValue::from_str(&format!(
+                        "bytes {}-{}/{}",
+                        r.start,
+                        r.end - 1,
+                        total
+                    ))
+                    .unwrap();
+                    h.insert(header::CONTENT_RANGE, content_range);
                     h.insert(header::CONTENT_LENGTH, HeaderValue::from(r.end - r.start));
                     Ok(resp)
                 }

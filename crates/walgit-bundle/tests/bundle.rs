@@ -167,78 +167,80 @@ async fn run_git(cwd: &Path, args: &[&str]) -> String {
 
 /// Config with a single full strategy "weekly".
 fn cfg_full_only(keep: usize) -> Config {
-    let mut cfg = Config::default();
-    cfg.bundles = BundlesConfig {
-        enabled: true,
-        strategy: vec![BundleStrategy {
-            name: "weekly".into(),
-            kind: BundleKind::Full,
-            schedule: "@weekly".into(),
-            base: None,
-            keep,
-            refs: vec![],
-            backfill_max: 0,
-            min_commits: None,
-            filter: None,
-            chain: false,
-        }],
-        min_commits: 0,
-        min_bytes: ByteSize::default(),
-        serve_via: BundleServe::Proxy,
-        signed_url_ttl: Duration::from_secs(3600),
-        advertise: true,
-        advertise_filtered: false,
-        require: Vec::new(),
-        signed_url_for: Vec::new(),
-        main_only: false,
-        extra_refs: Vec::new(),
-    };
-    cfg
-}
-
-/// Config with weekly (full) + daily (incremental based on weekly).
-fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
-    let mut cfg = Config::default();
-    cfg.bundles = BundlesConfig {
-        enabled: true,
-        strategy: vec![
-            BundleStrategy {
+    Config {
+        bundles: BundlesConfig {
+            enabled: true,
+            strategy: vec![BundleStrategy {
                 name: "weekly".into(),
                 kind: BundleKind::Full,
                 schedule: "@weekly".into(),
                 base: None,
-                keep: keep_full,
+                keep,
                 refs: vec![],
                 backfill_max: 0,
                 min_commits: None,
                 filter: None,
                 chain: false,
-            },
-            BundleStrategy {
-                name: "daily".into(),
-                kind: BundleKind::Incremental,
-                schedule: "@daily".into(),
-                base: Some("weekly".into()),
-                keep: keep_inc,
-                refs: vec![],
-                backfill_max: 0,
-                min_commits: None,
-                filter: None,
-                chain: false,
-            },
-        ],
-        min_commits: 0,
-        min_bytes: ByteSize::default(),
-        serve_via: BundleServe::Proxy,
-        signed_url_ttl: Duration::from_secs(3600),
-        advertise: true,
-        advertise_filtered: false,
-        require: Vec::new(),
-        signed_url_for: Vec::new(),
-        main_only: false,
-        extra_refs: Vec::new(),
-    };
-    cfg
+            }],
+            min_commits: 0,
+            min_bytes: ByteSize::default(),
+            serve_via: BundleServe::Proxy,
+            signed_url_ttl: Duration::from_secs(3600),
+            advertise: true,
+            advertise_filtered: false,
+            require: Vec::new(),
+            signed_url_for: Vec::new(),
+            main_only: false,
+            extra_refs: Vec::new(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Config with weekly (full) + daily (incremental based on weekly).
+fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
+    Config {
+        bundles: BundlesConfig {
+            enabled: true,
+            strategy: vec![
+                BundleStrategy {
+                    name: "weekly".into(),
+                    kind: BundleKind::Full,
+                    schedule: "@weekly".into(),
+                    base: None,
+                    keep: keep_full,
+                    refs: vec![],
+                    backfill_max: 0,
+                    min_commits: None,
+                    filter: None,
+                    chain: false,
+                },
+                BundleStrategy {
+                    name: "daily".into(),
+                    kind: BundleKind::Incremental,
+                    schedule: "@daily".into(),
+                    base: Some("weekly".into()),
+                    keep: keep_inc,
+                    refs: vec![],
+                    backfill_max: 0,
+                    min_commits: None,
+                    filter: None,
+                    chain: false,
+                },
+            ],
+            min_commits: 0,
+            min_bytes: ByteSize::default(),
+            serve_via: BundleServe::Proxy,
+            signed_url_ttl: Duration::from_secs(3600),
+            advertise: true,
+            advertise_filtered: false,
+            require: Vec::new(),
+            signed_url_for: Vec::new(),
+            main_only: false,
+            extra_refs: Vec::new(),
+        },
+        ..Default::default()
+    }
 }
 
 /// Download a bundle from the store to a tempdir at the path matching a
@@ -592,13 +594,13 @@ async fn pruning_keeps_chain_valid() {
     let now = SystemTime::now();
 
     // Build 3 full bundles (each time advancing seq).
-    for i in 0..3 {
+    for i in 0..3u64 {
         if i > 0 {
             tr.commit(&format!("commit {i}")).await;
             tr.push().await;
             tr.advance_seq();
         }
-        let future = now + Duration::from_secs((i as u64) * 8 * 24 * 3600);
+        let future = now + Duration::from_secs(i * 8 * 24 * 3600);
         bundler.run_due(&id, future).await.unwrap();
     }
 

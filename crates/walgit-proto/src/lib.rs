@@ -3,6 +3,12 @@
 //! Schema lives in `proto/walgit/v1/wal.proto`; it is the contract between
 //! every walgit instance and must only evolve backward-compatibly.
 
+// Generated protobuf code; not repo-owned (prost_build output from
+// `proto/walgit/v1/wal.proto` — doc comments there are prost's, not ours).
+#[allow(
+    clippy::doc_markdown,
+    reason = "generated protobuf code; not repo-owned"
+)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/walgit.v1.rs"));
 }
@@ -95,7 +101,7 @@ pub mod keys {
 /// Appendable objects grow by appending frames; readers stop at the first
 /// incomplete trailing frame.
 pub mod frame {
-    use bytes::{Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use prost::Message;
 
     use crate::v1::LogEntry;
@@ -104,6 +110,13 @@ pub mod frame {
         let len = e.encoded_len();
         prost::encoding::encode_varint(len as u64, out);
         out.reserve(len);
+        // prost's encode only fails when the buffer cannot hold the whole
+        // message; `reserve(len)` above grew the capacity to at least
+        // current_len + len, and a message encodes to exactly `len` bytes.
+        #[allow(
+            clippy::expect_used,
+            reason = "capacity for the full message was reserved above; prost's only error is a too-small buffer"
+        )]
         e.encode(out).expect("BytesMut has capacity");
     }
 
@@ -121,15 +134,24 @@ pub mod frame {
         let mut out = Vec::new();
         let mut pos = 0usize;
         loop {
-            let mut probe = &buf[pos..];
+            // `pos` only ever advances past complete frames (each frame's
+            // length is checked against the remainder below), so it never
+            // exceeds `buf.len()`; split_at only panics on that impossible
+            // state, exactly as the previous `&buf[pos..]` did.
+            let mut probe = buf.split_at(pos).1;
             let Ok(len) = prost::encoding::decode_varint(&mut probe) else {
                 break;
             };
-            let len = len as usize;
-            if probe.remaining() < len {
+            // A length that does not fit `usize` can never match an
+            // in-memory frame: the same incomplete-trailing-frame case the
+            // remainder check below handles.
+            let Ok(len) = usize::try_from(len) else {
+                break;
+            };
+            if probe.len() < len {
                 break;
             }
-            out.push(LogEntry::decode(&probe[..len])?);
+            out.push(LogEntry::decode(probe.split_at(len).0)?);
             pos = buf.len() - probe.len() + len;
         }
         Ok((out, pos))
@@ -146,12 +168,22 @@ pub mod time {
     pub fn from_system(t: SystemTime) -> prost_types::Timestamp {
         let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
         prost_types::Timestamp {
-            seconds: d.as_secs() as i64,
-            nanos: d.subsec_nanos() as i32,
+            // `subsec_nanos` is < 1e9, so it always fits i32. `as_secs`
+            // overflows i64 only ~292 billion years after the epoch; where
+            // the old `as i64` wrapped silently negative, saturate instead.
+            seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            nanos: i32::try_from(d.subsec_nanos()).unwrap_or(i32::MAX),
         }
     }
     pub fn to_system(t: &prost_types::Timestamp) -> SystemTime {
-        UNIX_EPOCH + Duration::new(t.seconds.max(0) as u64, t.nanos.max(0) as u32)
+        UNIX_EPOCH
+            + Duration::new(
+                // Negative fields are proto garbage: clamp to zero, exactly
+                // as the old `.max(0) as u64/u32` did for every input (the
+                // Err branch is that clamp — non-negative values always fit).
+                u64::try_from(t.seconds).unwrap_or_default(),
+                u32::try_from(t.nanos).unwrap_or_default(),
+            )
     }
 }
 

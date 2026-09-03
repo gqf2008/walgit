@@ -62,6 +62,10 @@ fn cgroup_cpus() -> Option<usize> {
             && q != "max"
                 && let (Ok(q), Ok(p)) = (q.parse::<f64>(), p.parse::<f64>())
                     && p > 0.0 {
+                        // q/p is a kernel-bounded µs-quota/µs-period ratio (cgroup v2
+                        // cpu.max), rounded up to ≥ 1 CPU: never negative, never above
+                        // 2^53, so the cast cannot truncate or lose sign.
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "cpu.max quota/period ratio is kernel-bounded; round().max(1.0) is ≥ 1 and < 2^53")]
                         return Some((q / p).round().max(1.0) as usize);
                     }
     }
@@ -95,6 +99,9 @@ fn gce_machine_type() -> Option<String> {
     .clone()
 }
 fn gib(b: u64) -> String {
+    // Display-only: the label rounds to tenths of a GiB; exactness for byte
+    // counts ≥ 2^53 is not the point of a human-readable size string.
+    #[allow(clippy::cast_precision_loss, reason = "display-only size label in tenths of a GiB")]
     let g = b as f64 / (1u64 << 30) as f64;
     if g >= 10.0 {
         format!("{g:.0} GiB")
@@ -135,7 +142,9 @@ pub fn info(cfg: &walgit_config::Config) -> InstanceInfo {
         Some(sha) if !sha.is_empty() => format!(
             "{}+{}",
             env!("CARGO_PKG_VERSION"),
-            &sha[..sha.len().min(12)]
+            // build SHAs are ASCII hex (rev-parse --short=12 HEAD): byte 12 is
+            // a char boundary, so split_at cannot panic.
+            sha.split_at(sha.len().min(12)).0
         ),
         _ => env!("CARGO_PKG_VERSION").to_string(),
     };

@@ -26,7 +26,8 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
         return (String::new(), Vec::new());
     }
     // Last paragraph = after the last blank line (a line that is empty once
-    // trailing spaces are stripped).
+    // trailing spaces are stripped). `start` = i + 1 for a blank line i < len,
+    // so it is always ≤ len and split_at cannot panic.
     let lines: Vec<&str> = body.lines().collect();
     let mut start = 0usize;
     for (i, l) in lines.iter().enumerate() {
@@ -34,7 +35,7 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
             start = i + 1;
         }
     }
-    let block = &lines[start..];
+    let (head, block) = lines.split_at(start);
     if block.is_empty() {
         return (body.to_string(), Vec::new());
     }
@@ -48,13 +49,17 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
             if i == 0 {
                 first_is_trailer = true;
             }
-        } else if line.starts_with([' ', '\t']) && !trailers.is_empty() {
-            // Continuation (RFC 822 folding) of the previous trailer's value.
-            let last = trailers.last_mut().unwrap();
-            if !last.value.is_empty() {
-                last.value.push(' ');
+        } else if line.starts_with([' ', '\t']) {
+            // Continuation (RFC 822 folding) of the previous trailer's value;
+            // a leading continuation with no trailer before it is a plain line.
+            if let Some(last) = trailers.last_mut() {
+                if !last.value.is_empty() {
+                    last.value.push(' ');
+                }
+                last.value.push_str(line.trim());
+            } else {
+                non_trailer += 1;
             }
-            last.value.push_str(line.trim());
         } else {
             non_trailer += 1;
         }
@@ -66,7 +71,7 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
     if !ok {
         return (body.to_string(), Vec::new());
     }
-    let rest = lines[..start].join("\n");
+    let rest = head.join("\n");
     (rest.trim_end().to_string(), trailers)
 }
 

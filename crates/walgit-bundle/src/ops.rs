@@ -244,7 +244,13 @@ pub async fn create_bundle(
         .map_err(|e| BundleError::Io(e.to_string()))?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut stdin = child.stdin.take().expect("stdin");
+        // `.stdin(Stdio::piped())` above guarantees the child has a pipe;
+        // a None here would be a std bug, not a state to panic on.
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(BundleError::Io(
+                "git pack-objects spawned without a piped stdin".into(),
+            ));
+        };
         stdin
             .write_all(revs.as_bytes())
             .await
@@ -262,7 +268,11 @@ pub async fn create_bundle(
             .await
             .map_err(|e| BundleError::Io(e.to_string()))?;
     }
-    let mut stdout = child.stdout.take().expect("stdout");
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err(BundleError::Io(
+            "git pack-objects spawned without a piped stdout".into(),
+        ));
+    };
     let mut first = [0u8; 12];
     tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut first)
         .await
@@ -326,7 +336,16 @@ pub fn bundle_checksum_file(path: &std::path::Path) -> std::io::Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        // `Read::read` never returns more bytes than the buffer's length
+        // (the `n > len` branch is unreachable for std::fs::File; a slice
+        // index would panic there, an Err is the honest equivalent).
+        let chunk = buf.get(..n).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "read returned more bytes than the buffer's length",
+            )
+        })?;
+        hasher.update(chunk);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -795,6 +814,12 @@ pub async fn build_and_upload(
             build_span.record("bytes", s);
             build_span.record("outcome", "ok");
             metrics::histogram!("walgit_bundle_build_seconds", "strategy" => strategy_name.to_string(), "kind" => match kind { BundleKind::Full => "full", BundleKind::Incremental => "incremental" }).record(t_build.elapsed().as_secs_f64());
+            // A histogram sample must be f64; the cast rounds only above
+            // 2^53 (~9 PB) — unreachable for a bundle's byte size.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "metrics histogram samples are f64; no bundle byte size approaches 2^53 (9 PB) where f64 starts rounding"
+            )]
             metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s as f64);
             s
         }
@@ -1011,6 +1036,10 @@ pub fn full_bundle_header(
 /// by compose (falls back to streaming header + `pack_path` when the store
 /// cannot compose; then `pack_path` must be a local file) and return the entry
 /// (not yet in the list — see [`cas_update_list`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "facade forwarding one cut's full state (slot, seq, tokens, refs) to compose_full_inner; walgit-server and walgit-cli call it with the whole set — a params struct would be a cross-crate API change"
+)]
 pub async fn compose_full(
     store: &Prefixed,
     pack_checksum: &str,

@@ -93,7 +93,10 @@ fn read_marker(path: &Path) -> Option<Marker> {
 }
 
 fn write_marker(path: &Path, m: &Marker) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("marker path {} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     std::fs::rename(&tmp, path)?;
@@ -149,7 +152,10 @@ fn install_pack(
 ) -> anyhow::Result<()> {
     let src = from.pack_path(pack);
     let dst = into.pack_path(pack);
-    std::fs::create_dir_all(dst.parent().unwrap())?;
+    let pack_dir = dst
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("pack path {} has no parent directory", dst.display()))?;
+    std::fs::create_dir_all(pack_dir)?;
     for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
         let s = src.with_extension(ext);
         if !s.exists() {

@@ -71,10 +71,10 @@ async fn base_layer_roundtrip_and_incremental_update() {
     for i in 0..8 {
         src.commit_file(&format!("f{i}.txt"), "x\n", "fill");
     }
-    let a = src.commit_file("a.txt", "a\n", "a");
+    let a_oid = src.commit_file("a.txt", "a\n", "a");
     let base_pack = src.pack(&["HEAD"], &[], false);
     let base = ingest(&writer, base_pack).await;
-    set_main(&writer, "", &a);
+    set_main(&writer, "", &a_oid);
 
     let size = writer.write_pack_commit_graph(&base, true).await.unwrap();
     assert!(size > 0);
@@ -91,19 +91,19 @@ async fn base_layer_roundtrip_and_incremental_update() {
     let root2 = tempfile::TempDir::new().unwrap();
     let reader = LocalRepo::init(root2.path(), &id, ObjectFormat::Sha1).unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let p = tmp.path().join(format!("pack-{base}.pack"));
-    let i = tmp.path().join(format!("pack-{base}.idx"));
-    let g = tmp.path().join(format!("pack-{base}.commit-graph"));
-    std::fs::copy(writer.pack_path(&base), &p).unwrap();
-    std::fs::copy(writer.pack_path(&base).with_extension("idx"), &i).unwrap();
-    std::fs::copy(&side, &g).unwrap();
-    reader.install_pack(&p, &i, &[g]).await.unwrap();
+    let pack_tmp = tmp.path().join(format!("pack-{base}.pack"));
+    let idx_tmp = tmp.path().join(format!("pack-{base}.idx"));
+    let graph_tmp = tmp.path().join(format!("pack-{base}.commit-graph"));
+    std::fs::copy(writer.pack_path(&base), &pack_tmp).unwrap();
+    std::fs::copy(writer.pack_path(&base).with_extension("idx"), &idx_tmp).unwrap();
+    std::fs::copy(&side, &graph_tmp).unwrap();
+    reader.install_pack(&pack_tmp, &idx_tmp, &[graph_tmp]).await.unwrap();
     assert!(reader.install_commit_graph_base(&base).unwrap());
     assert!(
         reader.install_commit_graph_base(&base).unwrap(),
         "idempotent"
     );
-    set_main(&reader, "", &a);
+    set_main(&reader, "", &a_oid);
     let chain = reader.commit_graph_chain().unwrap();
     assert_eq!(chain, writer.commit_graph_chain().unwrap());
     let out = git(reader.path(), &["commit-graph", "verify"]);
@@ -114,8 +114,8 @@ async fn base_layer_roundtrip_and_incremental_update() {
     );
 
     // New commits arrive in a second pack; the chain grows by one layer.
-    let c = src.commit_file("c.txt", "c\n", "c");
-    let inc = ingest(&reader, src.pack(&["HEAD"], &[&a], false)).await;
+    let c_oid = src.commit_file("c.txt", "c\n", "c");
+    let inc = ingest(&reader, src.pack(&["HEAD"], &[&a_oid], false)).await;
     reader.update_commit_graph(&[inc], true).await.unwrap();
     let chain2 = reader.commit_graph_chain().unwrap();
     assert_eq!(chain2.len(), 2, "{chain2:?}");
@@ -128,13 +128,13 @@ async fn base_layer_roundtrip_and_incremental_update() {
     );
 
     // History walks from the graph: hide the base pack's data and count.
-    set_main(&reader, &a, &c);
+    set_main(&reader, &a_oid, &c_oid);
     let base_pack_path = reader.pack_path(&base);
     let hidden = base_pack_path.with_extension("pack.hidden");
     std::fs::rename(&base_pack_path, &hidden).unwrap();
     let out = git(
         reader.path(),
-        &["-c", "core.commitGraph=true", "rev-list", "--count", &c],
+        &["-c", "core.commitGraph=true", "rev-list", "--count", &c_oid],
     );
     std::fs::rename(&hidden, &base_pack_path).unwrap();
     assert!(

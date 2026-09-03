@@ -58,9 +58,11 @@ pub fn glob_match(pattern: &str, s: &str) -> bool {
             }
             pos = part.len();
         } else if i == parts.len() - 1 {
-            return s.len() >= pos && s[pos..].ends_with(part);
+            // `pos` is always on a char boundary: it starts at a verified
+            // `starts_with(part)` length and only advances past a `find` hit.
+            return s.get(pos..).is_some_and(|t| t.ends_with(part));
         } else if !part.is_empty() {
-            match s[pos..].find(part) {
+            match s.get(pos..).and_then(|t| t.find(part)) {
                 Some(at) => pos += at + part.len(),
                 None => return false,
             }
@@ -287,12 +289,19 @@ pub async fn run(
             let seq = handle
                 .publish_compact(new_pack.clone(), result.removed.clone(), 2)
                 .await?;
+            // Log field: wall-clock ms of the repack — narrowing as_millis
+            // (u128) to u64 cannot truncate short of ~584M years.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "log field: repack wall-clock ms — as_millis (u128) narrowed to u64 cannot truncate short of ~584M years"
+            )]
+            let elapsed_ms = repack_started.elapsed().as_millis() as u64;
             info!(
                 seq,
                 pack = %new_pack.checksum,
                 pack_size = new_pack.pack_size,
                 has_bitmap = new_pack.has_bitmap,
-                elapsed_ms = repack_started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 "base pack published"
             );
             println!(

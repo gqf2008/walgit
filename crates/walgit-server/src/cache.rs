@@ -362,7 +362,7 @@ impl ServerCaches {
             api_immutable: Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
                 .weigher(|k: &String, v: &bytes::Bytes| {
-                    (k.len() + v.len()).min(u32::MAX as usize) as u32
+                    u32::try_from((k.len() + v.len()).min(u32::MAX as usize)).unwrap_or(u32::MAX)
                 })
                 .build(),
             bundle_attempts: Cache::builder()
@@ -640,13 +640,15 @@ mod tests {
             .unwrap();
         let cache_ms = start.elapsed().as_millis();
 
+        // Test-only benchmark ratio; measured in milliseconds, far below f64's exact range.
+        #[allow(clippy::cast_precision_loss, reason = "test-only ms timing ratio ≪ 2^53")]
+        let speedup = if cache_ms > 0 {
+            render_ms as f64 / cache_ms as f64
+        } else {
+            render_ms as f64 * 1000.0 // sub-millisecond cache
+        };
         println!(
-            "50k refs: render={render_ms}ms ({advert_bytes} bytes), cache_hit={cache_ms}ms, speedup={:.1}x",
-            if cache_ms > 0 {
-                render_ms as f64 / cache_ms as f64
-            } else {
-                render_ms as f64 * 1000.0 // sub-millisecond cache
-            }
+            "50k refs: render={render_ms}ms ({advert_bytes} bytes), cache_hit={cache_ms}ms, speedup={speedup:.1}x"
         );
         assert!(cache_ms <= render_ms, "cache should be faster");
         assert_eq!(cached.len(), advert_bytes);

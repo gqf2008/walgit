@@ -1904,6 +1904,7 @@ fn install_git_shim() -> anyhow::Result<Option<tempfile::TempDir>> {
 /// `multi-pack-index`, starts the install on a sibling, and asserts that an
 /// unrelated refs request answers in < 1 s meanwhile (prod: every request on
 /// the instance stalled for minutes, timers included).
+#[allow(unsafe_code)] // SAFETY: test-only PATH hook for the shim; each site below names its own guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     // git shim: slow only for multi-pack-index. On Windows the shim is a
@@ -2048,6 +2049,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
         took.as_secs_f64() >= 3.0,
         "the shim should have slowed the install: {took:?}"
     );
+    // SAFETY: restores this test process's PATH after the shim experiment.
     unsafe { std::env::set_var("PATH", old_path) };
     Ok(())
 }
@@ -2056,6 +2058,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
 /// inside the install path (simulated by `WALGIT_TEST_BLOCK_INSTALL_MS`, a
 /// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
+#[allow(unsafe_code)] // SAFETY: test-only env hook for the block-install knob; each site below names its own guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
     // SAFETY: test process; read by the sibling's sync below.
@@ -2100,6 +2103,7 @@ async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResu
         worst = worst.max(t.elapsed().as_millis());
         probes += 1;
     }
+    // SAFETY: test process cleanup; the knob is unread after the install finished above.
     unsafe { std::env::remove_var("WALGIT_TEST_BLOCK_INSTALL_MS") };
     let took = install.await?;
     assert!(took.as_millis() >= 2500, "{took:?}");
@@ -2202,46 +2206,46 @@ async fn signed_url_failure_falls_back_to_proxy_uris_and_bundles_are_narrated() 
 /// sync, history lists the SETTINGS entries, DELETE clears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repo_settings_api_roundtrip() -> TestResult {
-    let (a, b) = Server::start_pair().await?;
-    a.put_repo("t", "cfg").await?;
-    let c = reqwest::Client::builder()
+    let (first, second) = Server::start_pair().await?;
+    first.put_repo("t", "cfg").await?;
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let url = |s: &Server, sub: &str| format!("{}/t/cfg/api/settings{sub}", s.base_url);
+    let url = |srv: &Server, sub: &str| format!("{}/t/cfg/api/settings{sub}", srv.base_url);
 
     // Invalid: forbidden section → 400 with the reason, nothing published.
-    let r = c
-        .put(url(&a, ""))
+    let resp = client
+        .put(url(&first, ""))
         .body("[server]\nlisten = \"0.0.0.0:1\"\n")
         .send()
         .await?;
-    assert_eq!(r.status(), 400);
-    assert!(r.text().await?.contains("[server]"));
-    let r: serde_json::Value = c.get(url(&a, "")).send().await?.json().await?;
-    assert_eq!(r["revision"], 0);
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await?.contains("[server]"));
+    let resp: serde_json::Value = client.get(url(&first, "")).send().await?.json().await?;
+    assert_eq!(resp["revision"], 0);
 
     // Valid.
-    let r = c
-        .put(url(&a, "?message=tiny+repo"))
+    let resp = client
+        .put(url(&first, "?message=tiny+repo"))
         .body("[bundles]\nmin_commits = 2\n")
         .send()
         .await?;
-    assert_eq!(r.status(), 200, "{}", r.text().await?);
-    let r: serde_json::Value = c.get(url(&a, "")).send().await?.json().await?;
-    assert_eq!(r["revision"], 1);
-    assert_eq!(r["message"], "tiny repo");
-    assert!(r["toml"].as_str().unwrap().contains("min_commits = 2"));
-    let eff = c.get(url(&a, "/effective")).send().await?.text().await?;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await?);
+    let resp: serde_json::Value = client.get(url(&first, "")).send().await?.json().await?;
+    assert_eq!(resp["revision"], 1);
+    assert_eq!(resp["message"], "tiny repo");
+    assert!(resp["toml"].as_str().unwrap().contains("min_commits = 2"));
+    let eff = client.get(url(&first, "/effective")).send().await?.text().await?;
     assert!(eff.contains("min_commits = 2"), "{eff}");
     assert!(!eff.contains("session_secret"), "{eff}");
     assert!(!eff.contains("[server]"), "{eff}");
 
     // The sibling sees it (refs-level sync, no objects).
-    let r: serde_json::Value = c.get(url(&b, "")).send().await?.json().await?;
-    assert_eq!(r["revision"], 1);
+    let resp: serde_json::Value = client.get(url(&second, "")).send().await?.json().await?;
+    assert_eq!(resp["revision"], 1);
     let id = walgit_git::RepoId::new("t", "cfg")?;
     assert_eq!(
-        b.state
+        second.state
             .registry
             .open(&id)
             .await?
@@ -2252,24 +2256,24 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     );
 
     // History + clear.
-    let h: serde_json::Value = c.get(url(&a, "/history")).send().await?.json().await?;
-    assert_eq!(h["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(c.delete(url(&a, "")).send().await?.status(), 200);
-    let r: serde_json::Value = c.get(url(&b, "")).send().await?.json().await?;
-    assert_eq!(r["revision"], 2);
-    assert_eq!(r["toml"], "");
+    let hist: serde_json::Value = client.get(url(&first, "/history")).send().await?.json().await?;
+    assert_eq!(hist["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(client.delete(url(&first, "")).send().await?.status(), 200);
+    let resp: serde_json::Value = client.get(url(&second, "")).send().await?.json().await?;
+    assert_eq!(resp["revision"], 2);
+    assert_eq!(resp["toml"], "");
     // The browser lane is the same surface (D27); the old root-level path is gone.
-    assert_eq!(a.get_status("/t/cfg/api-browser/settings").await?, 200);
+    assert_eq!(first.get_status("/t/cfg/api-browser/settings").await?, 200);
     // `/t/cfg/settings` is now only the SPA page (index.html), not an API route.
-    let r = c
-        .get(format!("{}/t/cfg/settings", a.base_url))
+    let resp = client
+        .get(format!("{}/t/cfg/settings", first.base_url))
         .header("Accept", "application/json")
         .send()
         .await?;
     assert!(
-        r.headers()
+        resp.headers()
             .get("content-type")
-            .and_then(|v| v.to_str().ok())
+            .and_then(|hval| hval.to_str().ok())
             .unwrap_or("")
             .starts_with("text/html"),
         "root-level /settings must not be an API route anymore"
@@ -2284,26 +2288,26 @@ async fn repo_settings_api_roundtrip() -> TestResult {
 // the server runs on (a current-thread test hangs forever on the first push).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
-    let s = Server::start().await?;
-    let c = reqwest::Client::builder()
+    let server = Server::start().await?;
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    s.put_repo("t", "tab").await?;
+    server.put_repo("t", "tab").await?;
     let src = TestRepo::synthetic(3, 2)?;
-    git_in(&src, &["remote", "add", "origin", &s.repo_url("t", "tab")])?;
+    git_in(&src, &["remote", "add", "origin", &server.repo_url("t", "tab")])?;
     git_in(&src, &["push", "-q", "origin", "main"])?;
     git_in(&src, &["push", "-q", "origin", "main:refs/heads/feature"])?;
-    let base = format!("{}/t/tab/api", s.base_url);
+    let base = format!("{}/t/tab/api", server.base_url);
 
-    let d: serde_json::Value = c
+    let describe: serde_json::Value = client
         .get(format!("{base}/settings/describe"))
         .send()
         .await?
         .json()
         .await?;
-    let strategies = d["strategies"].as_array().unwrap();
+    let strategies = describe["strategies"].as_array().unwrap();
     assert!(!strategies.is_empty());
-    let weekly = strategies.iter().find(|x| x["name"] == "weekly").unwrap();
+    let weekly = strategies.iter().find(|item| item["name"] == "weekly").unwrap();
     assert_eq!(weekly["kind"], "full");
     assert!(
         weekly["schedule_human"]
@@ -2314,45 +2318,45 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
     );
     assert!(weekly["next"].is_string());
     assert!(
-        d["fields"]
+        describe["fields"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|f| f["source"] == "host")
+            .all(|field| field["source"] == "host")
     );
-    assert!(d["maintenance"]["this_host"]["name"].is_string());
+    assert!(describe["maintenance"]["this_host"]["name"].is_string());
 
     // Validate: preview flips the touched field's source; errors come back as a list.
-    let v: serde_json::Value = c
+    let valid: serde_json::Value = client
         .post(format!("{base}/settings/validate"))
         .body("[bundles]\nmin_commits = 4\n")
         .send()
         .await?
         .json()
         .await?;
-    assert_eq!(v["ok"], true, "{v}");
-    let f = v["fields"]
+    assert_eq!(valid["ok"], true, "{valid}");
+    let field = valid["fields"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["key"] == "bundles.min_commits")
+        .find(|field| field["key"] == "bundles.min_commits")
         .unwrap();
-    assert_eq!(f["value"], 4);
-    assert_eq!(f["source"], "setting");
-    let v: serde_json::Value = c
+    assert_eq!(field["value"], 4);
+    assert_eq!(field["source"], "setting");
+    let valid: serde_json::Value = client
         .post(format!("{base}/settings/validate"))
         .body("[cache]\nmax_bytes = \"1GiB\"\n")
         .send()
         .await?
         .json()
         .await?;
-    assert_eq!(v["ok"], false);
-    assert!(v["errors"][0].as_str().unwrap().contains("[cache]"));
+    assert_eq!(valid["ok"], false);
+    assert!(valid["errors"][0].as_str().unwrap().contains("[cache]"));
 
     // Policy validate + dry-run: protect main from everyone but "alice" → the
     // recorded pushes (principal = anonymous test identity) are denied on main, allowed on feature.
     let policy = serde_json::json!({"version": 1, "groups": [], "rules": [{"name": "main-only-alice", "match": {"refs": ["refs/heads/main"]}, "effect": {"protect": {"restricts": ["create", "update", "delete"], "bypass": ["alice@example.com"]}}}]});
-    let pv: serde_json::Value = c
+    let pv: serde_json::Value = client
         .post(format!("{base}/policy/validate"))
         .json(&policy)
         .send()
@@ -2360,7 +2364,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .json()
         .await?;
     assert_eq!(pv["ok"], true, "{pv}");
-    let pv: serde_json::Value = c
+    let pv: serde_json::Value = client
         .post(format!("{base}/policy/validate"))
         .body("{\"version\": 1, \"rules\": [{\"name\": \"x\"}]}")
         .send()
@@ -2368,7 +2372,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .json()
         .await?;
     assert_eq!(pv["ok"], false);
-    let dr: serde_json::Value = c
+    let dr: serde_json::Value = client
         .post(format!("{base}/policy/dry-run?last=10"))
         .json(&policy)
         .send()
@@ -2382,8 +2386,8 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .as_array()
         .unwrap()
         .iter()
-        .flat_map(|r| r["refs"].as_array().unwrap().clone())
-        .find(|x| x["ok"] == false)
+        .flat_map(|entry| entry["refs"].as_array().unwrap().clone())
+        .find(|item| item["ok"] == false)
         .unwrap();
     assert_eq!(denied["name"], "refs/heads/main");
     assert!(
@@ -2394,7 +2398,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         "{denied}"
     );
     // Empty body = the saved (allow-all) policy.
-    let dr: serde_json::Value = c
+    let dr: serde_json::Value = client
         .post(format!("{base}/policy/dry-run"))
         .body("")
         .send()
@@ -3018,6 +3022,7 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
 /// the advertisement caches are keyed by the manifest version, and a publish that advertised the
 /// new version before applying the refs locally let a reader cache the OLD refs under the NEW
 /// version (reproduced roughly once in six rounds). 12 rounds × 6 pushers.
+#[allow(unsafe_code)] // SAFETY: test-only env hooks for the publish-gap knob; each site below names its own guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestResult {
     // Widen the gap between the publish's two local-commit steps (refs applied; version advertised)
@@ -3309,3 +3314,5 @@ async fn wiped_bucket_on_leftover_cache_advertises_no_phantom_refs() -> TestResu
     );
     Ok(())
 }
+
+

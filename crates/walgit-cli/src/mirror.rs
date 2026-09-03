@@ -85,21 +85,14 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
                     fetched_since_repack = true;
                 }
                 match outcome.pushed.len() {
-                    0 => debug!(
-                        elapsed_ms = t0.elapsed().as_millis() as u64,
-                        "mirror: nothing to do"
-                    ),
-                    n => info!(
-                        elapsed_ms = t0.elapsed().as_millis() as u64,
-                        refs = n,
-                        "mirror: tick done"
-                    ),
+                    0 => debug!(elapsed_ms = ms_since(t0), "mirror: nothing to do"),
+                    n => info!(elapsed_ms = ms_since(t0), refs = n, "mirror: tick done"),
                 }
             }
             Err(e) => {
                 error!(
                     error = format!("{e:#}"),
-                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    elapsed_ms = ms_since(t0),
                     "mirror: tick failed"
                 );
                 if args.once {
@@ -207,7 +200,7 @@ impl Mirror {
         for (name, sha, _) in to_push {
             match results.get(&name) {
                 Some(Ok(())) => {
-                    info!(r#ref = %name, sha = %sha, elapsed_ms = t0.elapsed().as_millis() as u64, "mirror: pushed");
+                    info!(r#ref = %name, sha = %sha, elapsed_ms = ms_since(t0), "mirror: pushed");
                     self.pushed.insert(name.clone(), sha);
                     out.pushed.push(name);
                 }
@@ -377,10 +370,7 @@ impl Mirror {
             "git repack failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        info!(
-            elapsed_ms = t0.elapsed().as_millis() as u64,
-            "mirror: repacked"
-        );
+        info!(elapsed_ms = ms_since(t0), "mirror: repacked");
         Ok(())
     }
 
@@ -502,13 +492,20 @@ async fn gce_identity_token(audience: &str) -> Result<String> {
     Ok(token)
 }
 
+/// Total milliseconds since `t0`, as a u64 log field. Widening the u64 seconds
+/// and the sub-millisecond part keeps the exact value of `Duration::as_millis`
+/// without the u128 → u64 cast.
+fn ms_since(t0: Instant) -> u64 {
+    let d = t0.elapsed();
+    d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis())
+}
+
 /// `https://git.example.com/acme/monorepo.git` → `https://git.example.com` (the token audience).
 fn origin_of(url: &str) -> String {
-    match url.find("://") {
-        Some(i) => {
-            let rest = &url[i + 3..];
-            let end = rest.find('/').unwrap_or(rest.len());
-            url[..i + 3 + end].to_string()
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split('/').next().unwrap_or(rest);
+            format!("{scheme}://{authority}")
         }
         None => url.to_string(),
     }

@@ -212,7 +212,10 @@ async fn body_to_s3(body: PutBody) -> Result<(S3ByteStream, u64)> {
             // Collect into Bytes: walgit's Stream bodies are small objects
             // (manifests, leases). Large packs use PutBody::File which
             // streams via ByteStream::read_from().
-            let collected = util::collect(stream, len as usize).await?;
+            let hint = usize::try_from(len).map_err(|_| {
+                StoreError::InvalidArgument(format!("stream length {len} exceeds usize"))
+            })?;
+            let collected = util::collect(stream, hint).await?;
             (S3ByteStream::from(collected), len)
         }
         PutBody::File(path) => {
@@ -284,7 +287,11 @@ impl ObjectStore for S3Store {
         match resp {
             Ok(out) => {
                 let etag = out.e_tag().map(|s| s.trim_matches('"').to_owned());
-                let size = out.content_length().unwrap_or(0) as u64;
+                // A HEAD content-length is never negative; u64::try_from just
+                // spells that out for the type system.
+                let size = u64::try_from(out.content_length().unwrap_or(0)).map_err(|_| {
+                    StoreError::InvalidArgument(format!("negative content-length on {key}"))
+                })?;
                 Ok(Some(ObjectMeta {
                     key: key.into(),
                     size,
@@ -321,7 +328,11 @@ impl ObjectStore for S3Store {
             .bucket(&self.bucket)
             .key(key)
             .body(s3_body)
-            .content_length(len as i64);
+            .content_length(len.try_into().map_err(|_| {
+                StoreError::InvalidArgument(format!(
+                    "object {key} is larger than i64::MAX (S3's own cap is 5 TiB)"
+                ))
+            })?);
 
         match &opts.mode {
             PutMode::Overwrite => {}
@@ -458,9 +469,15 @@ impl ObjectStore for S3Store {
                             .iter()
                             .map(|obj| {
                                 let etag = obj.e_tag().map(|s| s.trim_matches('"').to_owned());
+                                let size =
+                                    u64::try_from(obj.size().unwrap_or(0)).map_err(|_| {
+                                        StoreError::InvalidArgument(
+                                            "negative object size in list response".into(),
+                                        )
+                                    })?;
                                 Ok(ObjectMeta {
                                     key: obj.key().unwrap_or("").to_owned(),
-                                    size: obj.size().unwrap_or(0) as u64,
+                                    size,
                                     version: Version::new(etag.as_deref().unwrap_or("")),
                                 })
                             })
@@ -538,6 +555,10 @@ impl ObjectStore for S3Store {
     /// except the parts S3 will not copy: every part but the last must be >= 5 MiB, so a
     /// small source (a bundle header in front of a 30 GB pack) is fetched and uploaded
     /// together with the beginning of the next source as one ordinary part.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "every indexed read uses an index produced by the segment scan in the same loop iteration: while pos < total, the first source whose cumulative end exceeds pos exists and is < sources.len() (sizes are non-negative; zero-length sources are skipped by the same scan). offset_of(i) sums sizes[..i] only with that in-range i."
+    )]
     async fn compose(
         &self,
         dest: &str,
@@ -596,13 +617,22 @@ impl ObjectStore for S3Store {
         let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
         let mut part_number = 1i32;
         let mut pos: u64 = 0; // absolute offset into the concatenation
-        let offset_of = |i: usize| -> u64 { sizes[..i].iter().sum() };
+        // `i` below is always the index of the source that covers `pos`
+        // (see the scan comment); all `sizes[i]` / `sources[i]` reads in this
+        // method use exactly that index, so every indexed access is in range.
+        let offset_of = |i: usize| -> u64 { sizes.iter().take(i).sum() };
         let result: Result<()> = async {
             while pos < total {
                 // Which source does `pos` fall in, and how far does it run?
+                // pos < total guarantees the scan succeeds (some source's
+                // cumulative end exceeds pos); Err is only a safety net.
                 let i = (0..sources.len())
                     .find(|&i| pos < offset_of(i) + sizes[i])
-                    .unwrap();
+                    .ok_or_else(|| {
+                        StoreError::InvalidArgument(
+                            "compose: internal scan lost the segment for the current offset".into(),
+                        )
+                    })?;
                 let src_end = offset_of(i) + sizes[i];
                 let run = src_end - pos;
                 let last_part = src_end == total;
@@ -643,12 +673,22 @@ impl ObjectStore for S3Store {
                 } else {
                     // Too small to copy on its own: read MIN_PART bytes across source boundaries.
                     let want = MIN_PART.min(total - pos);
-                    let mut buf = Vec::with_capacity(want as usize);
+                    let want_usize = usize::try_from(want).map_err(|_| {
+                        StoreError::InvalidArgument(
+                            "compose gather wants more bytes than fit this host's usize".into(),
+                        )
+                    })?;
+                    let mut buf = Vec::with_capacity(want_usize);
                     let mut p = pos;
                     while (buf.len() as u64) < want {
                         let j = (0..sources.len())
                             .find(|&j| p < offset_of(j) + sizes[j])
-                            .unwrap();
+                            .ok_or_else(|| {
+                                StoreError::InvalidArgument(
+                                    "compose: internal scan lost the segment for the gather offset"
+                                        .into(),
+                                )
+                            })?;
                         let from = p - offset_of(j);
                         let take = (sizes[j] - from).min(want - buf.len() as u64);
                         let (_, bytes) = self
@@ -669,6 +709,11 @@ impl ObjectStore for S3Store {
                         p += take;
                     }
                     let len = buf.len() as u64;
+                    let len_i64 = i64::try_from(len).map_err(|_| {
+                        StoreError::InvalidArgument(
+                            "uploaded part is larger than i64::MAX (S3's own cap is 5 TiB)".into(),
+                        )
+                    })?;
                     let part = self
                         .client
                         .upload_part()
@@ -677,7 +722,7 @@ impl ObjectStore for S3Store {
                         .upload_id(&upload_id)
                         .part_number(part_number)
                         .body(S3ByteStream::from(Bytes::from(buf)))
-                        .content_length(len as i64)
+                        .content_length(len_i64)
                         .send()
                         .await
                         .map_err(|e| StoreError::Other(anyhow::anyhow!("s3 upload part: {e}")))?;
@@ -796,11 +841,21 @@ impl S3Store {
 
         while remaining > 0 {
             let this_part = part_size.min(remaining);
-            let to_read = this_part as usize;
+            let to_read = usize::try_from(this_part).map_err(|_| {
+                StoreError::InvalidArgument(format!(
+                    "configured multipart part size exceeds this host's usize ({key})"
+                ))
+            })?;
             let mut buf = vec![0u8; to_read];
             let mut read_total = 0;
 
             while read_total < to_read {
+                // The loop guard keeps the tail slice in bounds: the only
+                // slice start used is read_total < to_read == buf.len().
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "the `read_total < to_read` loop guard keeps the tail slice start below buf.len()"
+                )]
                 let n = match reader.read(&mut buf[read_total..]).await {
                     Ok(n) => n,
                     Err(e) => {
@@ -819,6 +874,11 @@ impl S3Store {
             }
             buf.truncate(read_total);
             let actual = read_total as u64;
+            let actual_i64 = i64::try_from(actual).map_err(|_| {
+                StoreError::InvalidArgument(format!(
+                    "uploaded part is larger than i64::MAX (S3's own cap is 5 TiB) ({key})"
+                ))
+            })?;
 
             let part = match self
                 .client
@@ -828,7 +888,7 @@ impl S3Store {
                 .upload_id(&upload_id)
                 .part_number(part_number)
                 .body(S3ByteStream::from(Bytes::from(buf)))
-                .content_length(actual as i64)
+                .content_length(actual_i64)
                 .send()
                 .await
             {

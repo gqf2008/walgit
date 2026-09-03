@@ -168,16 +168,18 @@ impl Rng {
     }
     /// Fills `buf` with deterministic pseudo-random bytes.
     fn fill_bytes(&mut self, buf: &mut [u8]) {
-        let mut i = 0;
-        while i + 8 <= buf.len() {
-            let v = self.next_u64().to_le_bytes();
-            buf[i..i + 8].copy_from_slice(&v);
-            i += 8;
+        // Full 8-byte words, then the trailing remainder (< 8 bytes) takes the
+        // low bytes of one more word. Same RNG call sequence either way.
+        // (as_chunks_mut is the same split as chunks_exact_mut + into_remainder.)
+        let (words, rem) = buf.as_chunks_mut::<8>();
+        for word in words {
+            word.copy_from_slice(&self.next_u64().to_le_bytes());
         }
-        if i < buf.len() {
+        if !rem.is_empty() {
             let v = self.next_u64().to_le_bytes();
-            let rem = buf.len() - i;
-            buf[i..i + rem].copy_from_slice(&v[..rem]);
+            for (dst, src) in rem.iter_mut().zip(v) {
+                *dst = src;
+            }
         }
     }
 }
@@ -240,8 +242,10 @@ fn generate_stream(
         let commit_num = commit_idx + 1; // 1-based
 
         // How many files to touch in this commit (1..=8, but capped by n_files).
-        let touch = 1 + rng.below(8).min(n_files.max(1));
-        let mut file_changes: Vec<(String, Vec<u8>)> = Vec::with_capacity(touch as usize);
+        // Inlined as `next_u64() % 8` (the exact body of `below(8)`) so the
+        // bound is visible and the usize conversion below is range-checked.
+        let touch = 1 + (rng.next_u64() % 8).min(n_files.max(1)) as usize;
+        let mut file_changes: Vec<(String, Vec<u8>)> = Vec::with_capacity(touch);
 
         for _ in 0..touch {
             let file_idx = rng.below(n_files);
@@ -335,8 +339,9 @@ fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) ->
     let path = format!("src/dir_{dir}/file_{file_idx:05}.{ext}");
 
     let content = if is_binary {
-        // Binary blob: 256..4096 random bytes.
-        let len = 256 + rng.below(3840) as usize;
+        // Binary blob: 256..4096 random bytes. Inlined as `% 3840` (the exact
+        // body of `below(3840)`) so the usize conversion is range-checked.
+        let len = 256 + (rng.next_u64() % 3840) as usize;
         let mut buf = vec![0u8; len];
         rng.fill_bytes(&mut buf);
         buf

@@ -6,6 +6,7 @@
 //! * `/{o}/{r}/api/…` — a bearer token or the same-origin session cookie for the same-origin bundled UI;
 //! * `/{o}/{r}/api-browser/…` — the browser lane for other origins (`credentials:
 //!   "include"`), authenticated by the same session cookie (`SameSite=None`).
+//!
 //! Same handlers; lanes differ by credential handling and CORS, never by a
 //! rewrite. Non-repo: `/api/v1` (discovery), `/api/v1/me`, `/api/v1/authenticate`
 //! (+ the `/api-browser/v1/me|authenticate` pair the SDK's popup uses),
@@ -80,7 +81,7 @@ fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
                 .is_some_and(|o| {
                     o.ends_with(host)
                         && o.len() > host.len()
-                        && o.as_bytes()[o.len() - host.len() - 1] == b'.'
+                        && o.as_bytes().get(o.len() - host.len() - 1) == Some(&b'.')
                         && !o.contains('/')
                 })
         } else {
@@ -394,7 +395,10 @@ async fn repo_admin(
         for lane in ["api-browser", "api"] {
             let marker = format!("/{owner}/{name}/{lane}");
             if let Some(i) = path.find(&marker) {
-                sub = path[i + marker.len()..].trim_start_matches('/').to_string();
+                // The match ends on a char boundary (the marker is ASCII), so
+                // split_at cannot panic mid-character.
+                let (_, after) = path.split_at(i + marker.len());
+                sub = after.trim_start_matches('/').to_string();
                 break;
             }
         }

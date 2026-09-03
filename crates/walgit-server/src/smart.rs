@@ -109,7 +109,10 @@ pub async fn info_refs(
                 .local()
                 .advertise_refs_v0(service, &mut buf)
                 .map_err(|e| git_err(&e))?;
-            let advert_bytes = buf[start..].to_vec();
+            // `start` was buf.len() and advertise_refs_v0 only appends, so
+            // split_at cannot panic and the tail is exactly the advertisement.
+            let (_, advert) = buf.split_at(start);
+            let advert_bytes = advert.to_vec();
             st.caches
                 .ref_advert
                 .insert_v0(&repo_key, ver.as_ref(), service, advert_bytes);
@@ -368,7 +371,9 @@ async fn upload_pack_v2(
                 let size = gix_hash::ObjectId::from_hex(hex.as_bytes())
                     .ok()
                     .and_then(|oid| repo.find_object(oid).ok())
-                    .map_or(-1, |o| o.data.len() as i64);
+                    // -1 = unknown (git's object-info semantics); a real object
+                    // is far below i64::MAX, so the cast can never wrap.
+                    .map_or(-1, |o| i64::try_from(o.data.len()).unwrap_or(i64::MAX));
                 pktline::encode_text(&mut sizes_buf, &format!("size {size}\n"));
             }
             pktline::encode_flush(&mut sizes_buf);
@@ -465,9 +470,13 @@ fn bundle_narration(
     } else {
         let bytes: u64 = applied.iter().map(|b| b.size).sum();
         let newest = applied.last().map_or(0, |b| b.creation_token);
-        let when = chrono::DateTime::from_timestamp(newest as i64, 0)
-            .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
-            .unwrap_or_default();
+        // creation_token is a calendar-slot epoch — far below i64::MAX.
+        let when = chrono::DateTime::from_timestamp(
+            i64::try_from(newest).unwrap_or(i64::MAX),
+            0,
+        )
+        .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
+        .unwrap_or_default();
         let names: Vec<String> = applied.iter().map(|b| b.strategy.clone()).collect();
         out.push(format!(
             "bundle-uri: your git applied {} bundle(s) = {} ({}) — history as of {when}; what follows is everything since",
@@ -513,7 +522,7 @@ async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
             bytes = stats.bytes,
             faulted,
             rounds,
-            ms = t0.elapsed().as_millis() as u64,
+            ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
             "gix fetch over remote-served base"
         );
         return Ok(());
@@ -569,7 +578,11 @@ async fn sync_narrated<'h, W: tokio::io::AsyncWrite + Unpin>(
     }
     let sync = handle.sync();
     tokio::pin!(sync);
-    let mut last_bar = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    // Last progress bar update, 1 s ago (or now, right after boot when the
+    // clock is younger than that).
+    let mut last_bar = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         tokio::select! {
             biased;
@@ -774,7 +787,10 @@ async fn upload_pack_v0(
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(&chunk[..n]);
+            // `n` ≤ chunk.len() by the AsyncRead contract (a read fills at
+            // most the buffer it was given), so the split cannot panic.
+            let (used, _) = chunk.split_at(n);
+            buf.extend_from_slice(used);
             if buf.len() > MAX {
                 return Err(ApiError::BadRequest("upload-pack request too large".into()));
             }
@@ -782,18 +798,39 @@ async fn upload_pack_v0(
         // Walk the pkt-lines: haves, and the bounding lines (`deepen*`,
         // `filter`) — capability words on the first want line also say
         // "deepen-since", so look at line starts, not substrings.
+        // The length is parsed straight from the bytes so a multi-byte UTF-8
+        // sequence can never fall on a non-char-boundary str slice.
         let (mut has_have, mut bounded, mut pos) = (false, false, 0usize);
         while pos + 4 <= buf.len() {
-            let Ok(len) =
-                usize::from_str_radix(std::str::from_utf8(&buf[pos..pos + 4]).unwrap_or("zz"), 16)
-            else {
-                break;
+            let Some(hex) = buf.get(pos..pos + 4) else {
+                break; // `pos + 4 <= buf.len()` in the while condition
             };
+            let mut len = 0usize;
+            let mut ok = true;
+            for &b in hex {
+                let d = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                len = len * 16 + usize::from(d);
+            }
+            if !ok {
+                break;
+            }
             if len < 4 {
                 pos += 4; // flush / delim
                 continue;
             }
-            let line = &buf[(pos + 4).min(buf.len())..(pos + len).min(buf.len())];
+            // len ≥ 4 here and pos + 4 ≤ buf.len(), so start ≤ end; the min()
+            // clamps a corrupt client's over-long length to the buffer end.
+            let Some(line) = buf.get((pos + 4).min(buf.len())..(pos + len).min(buf.len())) else {
+                break;
+            };
             if line.starts_with(b"have ") {
                 has_have = true;
             }
@@ -1146,6 +1183,11 @@ pub async fn receive_pack(
 
 /// Everything after the sync: unpack, connectivity, policy, publish → the
 /// report-status bytes (already sideband-framed when the client asked).
+// Parameters are distinct pipeline stages (sync guard, ref txn, protocol
+// caps, byte stream, identity); the guard must outlive unpack/connectivity
+// and be dropped before publish, so folding them into one context struct
+// would obscure that ordering for no gain.
+#[allow(clippy::too_many_arguments, reason = "receive-pack pipeline stages; the sync guard's drop-before-publish ordering argues against a context struct")]
 async fn receive_pack_process(
     st: &AppState,
     handle: &Arc<walgit_wal::RepoHandle>,
@@ -1241,7 +1283,7 @@ async fn receive_pack_process(
 
     // Writer-side peel: replicas advertise annotated tags without objects.
     local.fill_peeled(&mut txn);
-    let meta = push_meta(&caps, principal, &txn, &request_id);
+    let meta = push_meta(&caps, principal, &txn, request_id.as_deref());
     let pack_ref = match ingest {
         Ok(Some(p)) => Some(p),
         _ => None,
@@ -1250,13 +1292,13 @@ async fn receive_pack_process(
         .publish_push_synced(pack_ref, txn, meta)
         .instrument(tracing::info_span!("receive.publish"))
         .await;
-    let (seq, per_ref_pub): (u64, Vec<(String, Result<(), String>)>) = match publish {
+    let (seq, per_ref_pub) = match publish {
         Ok(r) => (
             r.seq,
             r.per_ref
                 .into_iter()
                 .map(|(n, r)| (n, r.map_err(|e| e.to_string())))
-                .collect(),
+                .collect::<Vec<_>>(),
         ),
         Err(e) => {
             tracing::error!(error = ?e, "receive-pack publish failed");
@@ -1348,7 +1390,7 @@ fn receive_response(report: Vec<u8>) -> Response {
     let mut resp = (StatusCode::OK, report).into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        "application/x-git-receive-pack-result".parse().unwrap(),
+        axum::http::HeaderValue::from_static("application/x-git-receive-pack-result"),
     );
     resp
 }
@@ -1357,14 +1399,14 @@ fn push_meta(
     caps: &walgit_git::receive::ReceiveCaps,
     principal: &crate::auth::Principal,
     txn: &walgit_proto::v1::RefTransaction,
-    request_id: &Option<String>,
+    request_id: Option<&str>,
 ) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("agent".to_string(), caps.agent.clone().unwrap_or_default());
     m.insert("principal".to_string(), principal.name.clone());
     m.insert("push_options".to_string(), txn.push_options.join("\n"));
     if let Some(rid) = request_id {
-        m.insert("request_id".to_string(), rid.clone());
+        m.insert("request_id".to_string(), rid.to_string());
     }
     m
 }
@@ -1502,8 +1544,15 @@ pub(crate) fn build_response<B: axum::response::IntoResponse>(
 ) -> Response {
     let mut resp = (status, body).into_response();
     let h = resp.headers_mut();
+    // Every `ct` reaching this fn is a literal or one of the two fixed service
+    // strings (`info_refs` rejected unknown services with a 400 before
+    // formatting `application/x-<service>-advertisement`), and every `extra`
+    // value is a `&'static str` literal from no_cache_headers() — all of them
+    // valid header values, so the parse cannot fail.
+    #[allow(clippy::unwrap_used, reason = "content types are fixed internal strings and extra values are &'static str literals")]
     h.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
     for (k, v) in extra {
+        #[allow(clippy::unwrap_used, reason = "extra values are &'static str literals, valid header values by construction")]
         h.insert(k, v.parse().unwrap());
     }
     resp

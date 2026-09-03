@@ -44,6 +44,10 @@ impl Progress {
         total: Option<u64>,
         unit: &'static str,
     ) -> Self {
+        // A one-decimal percent for narration: u64 byte counters lose nothing
+        // meaningful past f64's 2^53 integer precision, and the field is an
+        // approximation by design (not a byte-exact count).
+        #[allow(clippy::cast_precision_loss, reason = "narration percent of byte counters; f64 is the wire shape and exactness past 2^53 is meaningless")]
         let percent = total
             .filter(|t| *t > 0)
             .map(|t| ((done as f64 / t as f64) * 1000.0).round() / 10.0);
@@ -140,7 +144,12 @@ impl Throttle {
     }
     /// True when an update should be emitted now.
     pub fn tick(&self, force: bool) -> bool {
-        let mut last = self.last.lock().unwrap();
+        // A poisoned lock (a panic while held elsewhere) still holds a usable
+        // last-update timestamp; recover instead of panicking on this path.
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         if force
             || last
