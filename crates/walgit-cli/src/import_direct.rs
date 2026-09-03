@@ -153,10 +153,7 @@ pub struct ImportMarker {
 }
 
 fn entry_to_hex(e: &BundleEntry) -> String {
-    e.encode_to_vec()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(e.encode_to_vec())
 }
 fn entry_from_hex(s: &str) -> Option<BundleEntry> {
     let bytes: Option<Vec<u8>> = (0..s.len() / 2)
@@ -1195,7 +1192,7 @@ where
             .await
         {
             Ok(meta) => return Ok((meta.version, new_list)),
-            Err(StoreError::PreconditionFailed { .. }) => continue,
+            Err(StoreError::PreconditionFailed { .. }) => {}
             Err(e) => return Err(e.into()),
         }
     }

@@ -212,6 +212,9 @@ pub async fn materialize_at(
     at_seq: u64,
     out: &std::path::Path,
 ) -> Result<()> {
+    use walgit_proto::prost::Message;
+    use walgit_store::ObjectStoreExt;
+
     let handle = registry.open(id).await?;
 
     // Read log entries up to at_seq and replay into a fresh LocalRepo.
@@ -228,8 +231,6 @@ pub async fn materialize_at(
     };
 
     let local = walgit_git::LocalRepo::init(out, id, format)?;
-    use walgit_proto::prost::Message;
-    use walgit_store::ObjectStoreExt;
 
     // Start from the newest checkpoint at or before `at_seq` when the
     // log before it has been folded (min_seq), else from seq 0.

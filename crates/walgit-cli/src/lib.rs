@@ -507,14 +507,14 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
 async fn dispatch(command: Command, cfg: Config) -> Result<()> {
     let cfg = std::sync::Arc::new(cfg);
     match command {
-        Command::Config { action } => config_cmd::run(action, &cfg).await,
+        Command::Config { action } => config_cmd::run(action, &cfg),
         Command::Synth {
             out,
             size,
             commits,
             files,
             seed,
-        } => synth::run(out, size, commits, files, seed).await,
+        } => synth::run(&out, size, commits, files, seed),
         Command::Serve => serve::run(&cfg).await,
         Command::Compact {
             repo,
