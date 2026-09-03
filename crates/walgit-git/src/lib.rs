@@ -593,6 +593,40 @@ fn refs_key(path: &Path, generation: u64) -> RefsKey {
     }
 }
 
+// ---- issue #4 diagnostics (WALGIT_TEST_REFS_DIAG): cache + disk state, one shot ----
+
+/// Snapshot of one ref name as the local cache sees it: which generation the
+/// cache is keyed on, whether that key matches the current on-disk key, and the
+/// name's value in the folded data vs. each pending (locally applied, not yet
+/// folded) transaction. A locally committed apply must be visible in
+/// [`LocalRepo::ref_view`]; CI reds on `reads_after` show it disappearing, so
+/// these structs give the next red a full mechanism dump.
+pub struct RefsCacheDiag {
+    /// Generation the cached snapshot was parsed at.
+    pub key_generation: u64,
+    /// Whether the cache's key equals the freshly computed one (else a read
+    /// would re-parse disk and the cache state is moot).
+    pub current: bool,
+    /// Folded data's value for the ref ("" when absent; "sym:<target>" for a
+    /// symbolic ref).
+    pub data_oid: String,
+    /// Each pending txn's value for the ref, in apply order.
+    pub pending_oids: Vec<String>,
+}
+
+/// One `refs_diag` snapshot: cache summary plus the disk truth.
+pub struct RefsDiag {
+    /// Current generation (bumped on every refresh).
+    pub generation: u64,
+    pub cache: Option<RefsCacheDiag>,
+    /// How many times disk refs were parsed since this `LocalRepo` was opened.
+    pub parses: u64,
+    /// Disk truth: loose file value, packed-refs value, HEAD.
+    pub loose_oid: String,
+    pub packed_oid: String,
+    pub head: String,
+}
+
 #[derive(Clone)]
 pub struct LocalRepo {
     inner: Arc<Inner>,
@@ -1187,6 +1221,70 @@ impl LocalRepo {
         self.inner
             .refs_parses
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #4 diagnostics (`WALGIT_TEST_REFS_DIAG`): one-shot cache + disk
+    /// state for one ref name. Called by the publish-path invariant checks
+    /// only when the env var is set; never on a prod path.
+    pub fn refs_diag(&self, name: &str) -> RefsDiag {
+        let path = &self.inner.path;
+        let generation = self
+            .inner
+            .refs_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        let key = refs_key(path, generation);
+        let read = |p: std::path::PathBuf| -> String { std::fs::read_to_string(p).unwrap_or_default() };
+        let loose_oid = read(path.join(name))
+            .trim()
+            .trim_start_matches("ref: ")
+            .to_string();
+        let packed_oid = read(path.join("packed-refs"))
+            .lines()
+            .find_map(|l| {
+                let mut it = l.split_whitespace();
+                let (oid, n) = (it.next()?, it.next()?);
+                (n == name).then(|| oid.to_string())
+            })
+            .unwrap_or_default();
+        let head = read(path.join("HEAD")).trim().to_string();
+        let cache = self.inner.refs_cache.lock().as_ref().map(|c| RefsCacheDiag {
+            key_generation: c.key.generation,
+            current: c.key == key,
+            data_oid: c
+                .data
+                .refs
+                .binary_search_by(|r| r.name.as_str().cmp(name))
+                .ok()
+                .and_then(|i| c.data.refs.get(i))
+                .map(|r| r.oid.clone())
+                .unwrap_or_default(),
+            pending_oids: c
+                .pending
+                .iter()
+                .flat_map(|t| {
+                    t.updates
+                        .iter()
+                        .filter(|u| u.name == name)
+                        .map(|u| {
+                            if !u.new_symbolic_target.is_empty() {
+                                format!("sym:{}", u.new_symbolic_target)
+                            } else if u.new_oid.is_empty() || u.new_oid.chars().all(|c| c == '0') {
+                                "delete".to_string()
+                            } else {
+                                u.new_oid.clone()
+                            }
+                        })
+                })
+                .collect(),
+        });
+        RefsDiag {
+            generation,
+            cache,
+            parses: self.refs_parses(),
+            loose_oid,
+            packed_oid,
+            head,
+        }
     }
 
     /// Point lookups over the current refs without materializing: the cached snapshot plus an
