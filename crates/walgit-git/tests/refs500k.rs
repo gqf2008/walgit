@@ -10,6 +10,7 @@
 // #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! `cargo test -p walgit-git --test refs500k -- --ignored --nocapture`: the per-push ref
 //! bookkeeping at 500 k refs (AGENTS §1.4: cost must not scale with ref count on a hot path).
+use std::fmt::Write as _;
 use std::io::Write;
 use std::time::Instant;
 use walgit_git::{LocalRepo, ObjectFormat, RepoId};
@@ -97,9 +98,9 @@ fn fixture(n_heads: usize, n_tags: usize) -> (tempfile::TempDir, LocalRepo) {
     names.sort();
     for n in &names {
         if n.starts_with("refs/tags/") {
-            packed.push_str(&format!("{tag} {n}\n^{c}\n"));
+            let _ = write!(packed, "{tag} {n}\n^{c}\n");
         } else {
-            packed.push_str(&format!("{c} {n}\n"));
+            let _ = writeln!(packed, "{c} {n}");
         }
     }
     std::fs::write(dir.join("packed-refs"), packed).unwrap();
@@ -121,7 +122,7 @@ fn txn(name: &str, old: &str, new: &str) -> walgit_proto::v1::RefTransaction {
 }
 
 #[test]
-#[ignore]
+#[ignore = "scale/perf probe: 500 k refs, run manually via --ignored (see module docs)"]
 fn push_bookkeeping_at_500k_refs() {
     let (_root, repo) = fixture(400_000, 100_000);
     let c2 = commit(repo.path(), "two");
@@ -199,7 +200,7 @@ fn snap_oid(repo: &LocalRepo, name: &str) -> String {
 /// update, delete of a packed ref, a new annotated tag with its peel, a HEAD symref move).
 #[test]
 fn pushes_patch_the_refs_cache_instead_of_reparsing() {
-    let (_root, repo) = fixture(2_000, 500);
+    let (root, repo) = fixture(2_000, 500);
     let c2 = commit(repo.path(), "two");
     let zero = "0".repeat(40);
     let base = repo.refs_arc().unwrap();
@@ -265,7 +266,7 @@ fn pushes_patch_the_refs_cache_instead_of_reparsing() {
         1,
         "pushes never re-parse; one copy folds them"
     );
-    let fresh_handle = LocalRepo::open(_root.path(), &RepoId::new("t", "refs500k").unwrap())
+    let fresh_handle = LocalRepo::open(root.path(), &RepoId::new("t", "refs500k").unwrap())
         .unwrap()
         .unwrap();
     let fresh = fresh_handle.refs_arc().unwrap();

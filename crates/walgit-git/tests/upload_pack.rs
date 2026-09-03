@@ -709,7 +709,7 @@ async fn fetch_skips_gitlink_entries() {
 /// diff-sized fetch (want HEAD, have HEAD~50) and a full clone, both engines.
 /// `cargo test -p walgit-git --test upload_pack bench_fetch_engines -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "benchmark: needs WALGIT_BENCH_REPO set; run manually with --ignored --nocapture"]
 async fn bench_fetch_engines() {
     let Ok(src_path) = std::env::var("WALGIT_BENCH_REPO") else {
         eprintln!("WALGIT_BENCH_REPO not set; skipping");

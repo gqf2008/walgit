@@ -134,8 +134,7 @@ pub async fn parse<R: AsyncRead + Unpin>(
     loop {
         let line = pkt::read_pkt_line(&mut r).await?;
         match line {
-            None | Some(PktLine::Flush) => break,
-            Some(PktLine::Delim | PktLine::ResponseEnd) => break,
+            None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
                 caps.shallow
                     .push(String::from_utf8_lossy(&b[8..]).trim().to_string());
@@ -152,8 +151,7 @@ pub async fn parse<R: AsyncRead + Unpin>(
         loop {
             let line = pkt::read_pkt_line(&mut r).await?;
             match line {
-                None | Some(PktLine::Flush) => break,
-                Some(PktLine::Delim | PktLine::ResponseEnd) => break,
+                None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
                 Some(PktLine::Data(b)) => {
                     push_options.push(
                         String::from_utf8_lossy(&b)

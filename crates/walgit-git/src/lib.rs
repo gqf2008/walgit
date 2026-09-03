@@ -11,6 +11,7 @@ pub mod upload_gix;
 pub use upload_gix::ObjectFaulter;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -259,8 +260,8 @@ impl From<walgit_config::ObjectFormat> for ObjectFormat {
 impl From<gix_hash::Kind> for ObjectFormat {
     fn from(k: gix_hash::Kind) -> Self {
         match k {
-            gix_hash::Kind::Sha1 => ObjectFormat::Sha1,
             gix_hash::Kind::Sha256 => ObjectFormat::Sha256,
+            // Everything else (today only Sha1) serves as Sha1.
             _ => ObjectFormat::Sha1,
         }
     }
@@ -380,10 +381,10 @@ impl LsRefsLine {
         let mut s = format!("{} {}", self.oid, self.name);
         if (args.symrefs || self.oid == "unborn")
             && let Some(t) = &self.symref_target {
-                s.push_str(&format!(" symref-target:{t}"));
+                let _ = write!(s, " symref-target:{t}");
             }
         if args.peel && !self.peeled.is_empty() {
-            s.push_str(&format!(" peeled:{}", self.peeled));
+            let _ = write!(s, " peeled:{}", self.peeled);
         }
         s.push('\n');
         s
@@ -777,7 +778,7 @@ impl LocalRepo {
                 .open(&candidate)
             {
                 Ok(file) => break (candidate, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(GitError::Io(e)),
             }
         };
@@ -1067,9 +1068,8 @@ impl LocalRepo {
                 continue;
             }
             let hex = &name["pack-".len()..name.len() - ".pack".len()];
-            let checksum = match gix_hash::ObjectId::from_hex(hex.as_bytes()) {
-                Ok(o) => o,
-                Err(_) => continue,
+            let Ok(checksum) = gix_hash::ObjectId::from_hex(hex.as_bytes()) else {
+                continue;
             };
             let pack_path = ent.path();
             let idx_path = pack_path.with_extension("idx");
@@ -1293,16 +1293,16 @@ impl LocalRepo {
             if new_zero {
                 // delete
                 if check_old && !old_zero {
-                    input.push_str(&format!("delete {} {}\n", u.name, u.old_oid));
+                    let _ = writeln!(input, "delete {} {}", u.name, u.old_oid);
                 } else {
-                    input.push_str(&format!("delete {}\n", u.name));
+                    let _ = writeln!(input, "delete {}", u.name);
                 }
             } else if check_old && old_zero {
-                input.push_str(&format!("create {} {}\n", u.name, u.new_oid));
+                let _ = writeln!(input, "create {} {}", u.name, u.new_oid);
             } else if check_old && !old_zero {
-                input.push_str(&format!("update {} {} {}\n", u.name, u.new_oid, u.old_oid));
+                let _ = writeln!(input, "update {} {} {}", u.name, u.new_oid, u.old_oid);
             } else {
-                input.push_str(&format!("update {} {}\n", u.name, u.new_oid));
+                let _ = writeln!(input, "update {} {}", u.name, u.new_oid);
             }
         }
 
@@ -1390,7 +1390,7 @@ impl LocalRepo {
         for u in txns.iter().flat_map(|t| t.updates.iter()) {
             if !u.new_symbolic_target.is_empty() {
                 if u.name == "HEAD" {
-                    head_target = u.new_symbolic_target.clone();
+                    head_target.clone_from(&u.new_symbolic_target);
                 }
                 continue;
             }
@@ -1442,9 +1442,9 @@ impl LocalRepo {
         let mut refs = snap.refs.clone();
         refs.sort_by(|a, b| a.name.cmp(&b.name));
         for r in &refs {
-            content.push_str(&format!("{} {}\n", r.oid, r.name));
+            let _ = writeln!(content, "{} {}", r.oid, r.name);
             if !r.peeled.is_empty() {
-                content.push_str(&format!("^{}\n", r.peeled));
+                let _ = writeln!(content, "^{}", r.peeled);
             }
         }
         // Atomic write.
@@ -1500,7 +1500,7 @@ impl LocalRepo {
                 validate_ref_update(u)?;
                 if !u.new_symbolic_target.is_empty() {
                     if u.name == "HEAD" {
-                        head_target = u.new_symbolic_target.clone();
+                        head_target.clone_from(&u.new_symbolic_target);
                     }
                     continue;
                 }
@@ -2269,7 +2269,10 @@ impl LocalRepo {
                 }
         }
         let preferred = names[0].clone();
-        let input = names.iter().map(|n| format!("{n}\n")).collect::<String>();
+        let mut input = String::new();
+        for n in &names {
+            let _ = writeln!(input, "{n}");
+        }
         let out = std::process::Command::new("git")
             .current_dir(&self.inner.path)
             .env("GIT_DIR", &self.inner.path)
@@ -2421,7 +2424,7 @@ impl LocalRepo {
         }
         let mut input = String::new();
         for p in packs {
-            input.push_str(&format!("pack-{}.idx\n", p.to_hex()));
+            let _ = writeln!(input, "pack-{}.idx", p.to_hex());
         }
         let mut args = vec!["write", "--split", "--stdin-packs"];
         if changed_paths {
@@ -3085,9 +3088,8 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
 }
 
 fn walk_loose_refs(dir: &Path, prefix: &str, map: &mut BTreeMap<String, (String, String)>) {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
     };
     for ent in rd.flatten() {
         let path = ent.path();
@@ -3144,9 +3146,8 @@ fn peel_tag(repo: &gix::Repository, oid: gix_hash::ObjectId) -> Option<gix_hash:
     let kind = repo.object_hash();
     let mut cur = oid;
     for _ in 0..16 {
-        let obj = match repo.find_object(cur) {
-            Ok(o) => o,
-            Err(_) => return None,
+        let Ok(obj) = repo.find_object(cur) else {
+            return None;
         };
         if obj.kind == gix_object::Kind::Tag {
             let tag = gix_object::TagRef::from_bytes(&obj.data, kind).ok()?;
@@ -3732,8 +3733,8 @@ mod index_pack_trace_tests {
                 .spawn()
                 .unwrap();
             {
-                let mut stdin = child.stdin.take().unwrap();
                 use std::io::Write;
+                let mut stdin = child.stdin.take().unwrap();
                 stdin.write_all(b"HEAD\n").unwrap();
             }
             let out = child.wait_with_output().unwrap();

@@ -352,7 +352,7 @@ pub async fn read_ls_refs_args<R: AsyncRead + Unpin>(
                 let line = String::from_utf8_lossy(&data);
                 parse_ls_refs_line(&mut req, line.trim_end());
             }
-            Some(PktLine::Delim) => continue,
+            Some(PktLine::Delim) => {}
             Some(PktLine::Flush | PktLine::ResponseEnd) | None => break,
         }
     }
@@ -385,8 +385,8 @@ fn io_to_git(e: std::io::Error) -> GitError {
 /// Encode a literal data pkt-line into a buffer (sync helper for building
 /// advertisement/section bytes).
 pub fn encode_data(buf: &mut Vec<u8>, data: &[u8]) {
-    let total = data.len() + 4;
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    let total = data.len() + 4;
     buf.extend_from_slice(&[
         HEX[(total >> 12) & 0xf],
         HEX[(total >> 8) & 0xf],

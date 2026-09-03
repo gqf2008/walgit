@@ -12,6 +12,7 @@ mod common;
 
 use std::path::Path;
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use walgit_git::{IngestOptions, LocalRepo, ObjectFormat, RepoId, gix_hash};
@@ -242,17 +243,18 @@ async fn ingest_large_delta_pack() {
     );
     let mut stream = String::new();
     for i in 1..=2000 {
-        stream.push_str(&format!(
+        let _ = write!(
+            stream,
             "commit refs/heads/main\nmark :{i}\nauthor bench <bench@example.com> {i} +0000\ncommitter bench <bench@example.com> {i} +0000\n"
-        ));
+        );
         let message = format!("commit {i}\n");
-        stream.push_str(&format!("data {}\n{}\n", message.len(), message));
+        let _ = write!(stream, "data {}\n{}\n", message.len(), message);
         if i > 1 {
-            stream.push_str(&format!("from :{}\n", i - 1));
+            let _ = writeln!(stream, "from :{}", i - 1);
         }
         stream.push_str("M 100644 inline file.txt\n");
         let content = format!("content {i} {}\n", "x".repeat(256));
-        stream.push_str(&format!("data {}\n{}\n", content.len(), content));
+        let _ = write!(stream, "data {}\n{}\n", content.len(), content);
     }
     let mut fast_import = Command::new("git")
         .current_dir(source.path())
@@ -411,7 +413,10 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let src = cm::SourceRepo::new();
     // A big blob, then a one-line edit: `pack-objects --thin ^a b` deltas the new blob against the
     // excluded one, so the thin pack really has an external base (tiny files produce no delta).
-    let big: String = (0..4000).map(|i| format!("line {i}\n")).collect();
+    let mut big = String::new();
+    for i in 0..4000 {
+        let _ = writeln!(big, "line {i}");
+    }
     let a = src.commit_file("big.txt", &big, "big");
     let b = src.commit_file("big.txt", &format!("{big}tail\n"), "edit");
     let opts = |thin: bool, max_bytes: Option<u64>| IngestOptions {

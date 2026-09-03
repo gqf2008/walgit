@@ -29,6 +29,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -103,7 +104,7 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
     {
         let stdin = child.stdin.as_mut().unwrap();
         let mut w = std::io::BufWriter::with_capacity(1 << 20, stdin);
-        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
@@ -117,7 +118,7 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 let mut c = format!("file {f}\n");
                 let words = 200 + (next() % 6000) as usize;
                 for _ in 0..words {
-                    c.push_str(&format!("{:06x} ", next() & 0xffffff));
+                    let _ = write!(c, "{:06x} ", next() & 0xff_ffff);
                 }
                 c.push('\n');
                 c
@@ -143,7 +144,7 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 if next() % 17 == 0 {
                     contents[f] = format!("file {f} rewritten at {c} {:016x}\n", next());
                 } else {
-                    contents[f].push_str(&format!("line {c} {:016x}\n", next()));
+                    let _ = writeln!(contents[f], "line {c} {:016x}", next());
                 }
                 let path = format!("d{}/s{}/f{f}.txt", f % dirs, (f / dirs) % 7);
                 writeln!(w, "M 100644 inline {path}").unwrap();
@@ -552,7 +553,7 @@ async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_30k() {
 
 /// ~300 k objects with long delta chains across two packs: `just test-slow`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "slow tier (~300 k objects); run via just test-slow"]
 async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_300k() {
     run_shapes(12_000, 1_500, 10, 40, 10_000).await;
 }

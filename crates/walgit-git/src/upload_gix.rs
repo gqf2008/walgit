@@ -28,6 +28,7 @@
 //! (`PackCopyAndBaseObjects`); loose (faulted) objects are compressed fresh.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use futures::future::BoxFuture;
 use gix_object::{Find, FindHeader, Kind as ObjKind};
@@ -207,10 +208,11 @@ impl LocalRepo {
     ) -> Result<UploadPackStats, GitError> {
         let mut header = String::from("# v2 git bundle\n");
         for p in prerequisites {
-            header.push_str(&format!("-{} \n", p.to_hex()));
+            // The trailing space is the (empty) comment field of the bundle format.
+            let _ = writeln!(header, "-{} ", p.to_hex());
         }
         for (name, oid) in refs {
-            header.push_str(&format!("{} {name}\n", oid.to_hex()));
+            let _ = writeln!(header, "{} {name}", oid.to_hex());
         }
         header.push('\n');
         out.write_all(header.as_bytes())
@@ -1003,6 +1005,7 @@ mod frozen_source_tests {
     /// out whatever now lives at that id, or nothing.
     #[test]
     fn locations_survive_a_midx_rewrite_under_the_frozen_source() {
+        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         git(dir, &["init", "-q", "--bare"]);
@@ -1019,7 +1022,6 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
                 c.stdin
                     .take()
                     .unwrap()
@@ -1039,7 +1041,6 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
             c.stdin
                 .take()
                 .unwrap()
@@ -1108,7 +1109,6 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
                 c.stdin
                     .take()
                     .unwrap()
@@ -1127,7 +1127,6 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
             c.stdin
                 .take()
                 .unwrap()
