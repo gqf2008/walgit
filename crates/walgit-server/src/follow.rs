@@ -186,51 +186,48 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
                 report.behind += 1;
                 let mut params = HashMap::new();
                 params.insert("prefetched".to_string(), "1".to_string());
-                match run_op(state, &id, params).await {
-                    Some(v) => {
-                        let n = v.get("published").and_then(|n| n.as_u64()).unwrap_or(0);
-                        if n > 0 {
-                            report.published += 1;
-                        }
-                        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-                        let refused: Vec<String> = v
-                            .get("refused")
-                            .and_then(|r| r.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let detail = if refused.is_empty() {
-                            format!("{n} ref(s) published at seq {seq}")
-                        } else {
-                            format!(
-                                "{n} ref(s) published at seq {seq}; refused: {}",
-                                refused.join("; ")
-                            )
-                        };
-                        state.follow.set(
-                            &repo,
-                            if n > 0 { "published" } else { "refused" },
-                            detail,
-                            tips,
-                            have,
-                        );
+                if let Some(v) = run_op(state, &id, params).await {
+                    let n = v.get("published").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if n > 0 {
+                        report.published += 1;
                     }
-                    None => {
-                        report.failed += 1;
-                        // The task's summary names the reason (rewind, unpack, connectivity, publish).
-                        let why = state
-                            .registry
-                            .tasks()
-                            .recent(&repo)
-                            .into_iter()
-                            .find(|t| t.kind == "follow")
-                            .map(|t| t.summary)
-                            .unwrap_or_default();
-                        state.follow.set(&repo, "refused", why, tips, have);
-                    }
+                    let seq = v.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let refused: Vec<String> = v
+                        .get("refused")
+                        .and_then(|r| r.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let detail = if refused.is_empty() {
+                        format!("{n} ref(s) published at seq {seq}")
+                    } else {
+                        format!(
+                            "{n} ref(s) published at seq {seq}; refused: {}",
+                            refused.join("; ")
+                        )
+                    };
+                    state.follow.set(
+                        &repo,
+                        if n > 0 { "published" } else { "refused" },
+                        detail,
+                        tips,
+                        have,
+                    );
+                } else {
+                    report.failed += 1;
+                    // The task's summary names the reason (rewind, unpack, connectivity, publish).
+                    let why = state
+                        .registry
+                        .tasks()
+                        .recent(&repo)
+                        .into_iter()
+                        .find(|t| t.kind == "follow")
+                        .map(|t| t.summary)
+                        .unwrap_or_default();
+                    state.follow.set(&repo, "refused", why, tips, have);
                 }
             }
             Err(e) => {
@@ -344,7 +341,7 @@ pub(crate) async fn op(
     // completed it from our own objects, so it is not thin).
     let ingested = match &delta.pack {
         Some(p) => {
-            let bytes = tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
+            let bytes = tokio::fs::metadata(p).await.map_or(0, |m| m.len());
             log(format!("ingesting {bytes} bytes of objects from upstream"));
             let file = tokio::fs::File::open(p)
                 .await
@@ -435,8 +432,7 @@ pub(crate) async fn op(
         let (old, new) = planned
             .iter()
             .find(|(n, _, _)| n == name)
-            .map(|(_, o, n)| (o.as_str(), n.as_str()))
-            .unwrap_or(("", ""));
+            .map_or(("", ""), |(_, o, n)| (o.as_str(), n.as_str()));
         match r {
             Ok(()) => {
                 published += 1;

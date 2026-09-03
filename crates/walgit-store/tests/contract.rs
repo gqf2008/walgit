@@ -18,7 +18,7 @@
 //!
 //! The suite is executed against `MemoryStore` always, and against `S3Store`
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
-//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
+//! `WALGIT_TEST_GCS_BUCKET` is set (`StoreGcs` adds that wrapper).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -127,7 +127,7 @@ async fn test_compose(store: &DynStore, key: &str) {
 
 // ---- helpers -----------------------------------------------------------
 
-/// Collect a GetResult body into Bytes, asserting it's an Object.
+/// Collect a `GetResult` body into Bytes, asserting it's an Object.
 async fn collect_body(r: GetResult) -> (walgit_store::ObjectMeta, Bytes) {
     match r {
         GetResult::Object { meta, body } => {
@@ -199,7 +199,7 @@ async fn test_put_create_wins_once(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// Update CAS: winner updates, loser gets PreconditionFailed.
+/// Update CAS: winner updates, loser gets `PreconditionFailed`.
 async fn test_update_cas(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -276,7 +276,7 @@ async fn test_update_cas(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// if_none_match: NotModified when unchanged, Object when changed.
+/// `if_none_match`: `NotModified` when unchanged, Object when changed.
 async fn test_get_if_none_match(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -316,7 +316,7 @@ async fn test_get_if_none_match(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// if_match mismatch → PreconditionFailed.
+/// `if_match` mismatch → `PreconditionFailed`.
 async fn test_get_if_match_mismatch(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -473,7 +473,7 @@ async fn test_delete(store: &DynStore, key: &str) {
     );
 }
 
-/// list: ordering, start_after, prefix isolation.
+/// list: ordering, `start_after`, prefix isolation.
 async fn test_list(store: &DynStore, base: &str) {
     // Clean up any previous data under base.
     let existing: Vec<_> = store.list(base, None).collect::<Vec<_>>().await;
@@ -624,8 +624,8 @@ async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
 }
 
 /// Multipart path: put an object above the threshold, verify roundtrip.
-/// For MemoryStore this exercises the same code path (no multipart).
-/// For S3Store with a small threshold, this triggers multipart upload.
+/// For `MemoryStore` this exercises the same code path (no multipart).
+/// For `S3Store` with a small threshold, this triggers multipart upload.
 async fn test_multipart_path(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -677,12 +677,9 @@ async fn memory_contract() {
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
-    let endpoint = match std::env::var("WALGIT_TEST_S3_ENDPOINT") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
-            return;
-        }
+    let endpoint = if let Ok(v) = std::env::var("WALGIT_TEST_S3_ENDPOINT") { v } else {
+        eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
+        return;
     };
     let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
     let _access_key =
@@ -733,12 +730,9 @@ async fn s3_contract() {
 #[cfg(feature = "gcs")]
 #[tokio::test]
 async fn gcs_contract() {
-    let bucket = match std::env::var("WALGIT_TEST_GCS_BUCKET") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping gcs_contract: WALGIT_TEST_GCS_BUCKET not set");
-            return;
-        }
+    let bucket = if let Ok(v) = std::env::var("WALGIT_TEST_GCS_BUCKET") { v } else {
+        eprintln!("skipping gcs_contract: WALGIT_TEST_GCS_BUCKET not set");
+        return;
     };
 
     // Install the rustls crypto provider (required for TLS with google-cloud-storage).

@@ -9,7 +9,7 @@
 // Tests may panic freely (the intent recorded in clippy.toml); helpers outside
 // #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! HTTP contract of immutable store objects (LFS here; bundles share the same
-//! `static_object` path) and of the embedded UI assets: strong ETags, 304,
+//! `static_object` path) and of the embedded UI assets: strong `ETags`, 304,
 //! Range/If-Range, HEAD, Content-Length, precompressed encodings.
 
 mod harness;

@@ -18,7 +18,7 @@
 //!   A. remainder: want tip, have base tip, `thin_pack = true` (prod's failing shape),
 //!   B. remainder, `thin_pack = false` (every delta whose base is outside the set re-encoded),
 //!   C. bounded zero-have: `--depth=1 --filter=blob:none` (CI's shape),
-//!   D. full zero-have (TreeContents expansion).
+//!   D. full zero-have (`TreeContents` expansion).
 //! Every output is indexed by stock git with `--strict` (ids recomputed from content), its object
 //! set compared to `git rev-list --objects` of the source, and the process's max RSS delta is
 //! bounded by a small multiple of the pack bytes.
@@ -46,7 +46,7 @@ fn max_rss_kb() -> u64 {
     // a failed read yields the zeroed peak, which the caller's saturating_sub floors at 0).
     #[allow(unsafe_code)]
     unsafe {
-        libc::getrusage(libc::RUSAGE_SELF, &mut ru)
+        libc::getrusage(libc::RUSAGE_SELF, &raw mut ru)
     };
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
@@ -258,7 +258,7 @@ fn req(
     }
 }
 
-/// Entries of type REF_DELTA (7) in a v2 pack: walk the headers, skipping compressed data with a
+/// Entries of type `REF_DELTA` (7) in a v2 pack: walk the headers, skipping compressed data with a
 /// throwaway inflater. A self-contained pack written by pack-copy has none.
 fn count_ref_deltas(pack: &[u8]) -> usize {
     use std::io::Read;

@@ -375,7 +375,7 @@ pub struct ReportPr {
     pub merge_reason: String,
 }
 
-/// One CI run, projected by the §7 aggregation (docs/D1_CI_PROTOCOL.md §8.3 —
+/// One CI run, projected by the §7 aggregation (`docs/D1_CI_PROTOCOL.md` §8.3 —
 /// the report's CI section; pure-CI threads are not board cards, but the
 /// report and the SPA need to find them: the guide's claim-race diagram and
 /// `walgit collab report`'s CI section both read this).

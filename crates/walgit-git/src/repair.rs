@@ -141,7 +141,7 @@ pub async fn fetch_objects_as_pack(
     let mut first_missing = None;
     for o in oids {
         match gix_hash::ObjectId::from_hex(o.as_bytes()) {
-            Ok(id) if index.lookup(&id).is_some() => objects += 1,
+            Ok(id) if index.lookup(id).is_some() => objects += 1,
             _ => {
                 first_missing.get_or_insert(o.as_str());
             }

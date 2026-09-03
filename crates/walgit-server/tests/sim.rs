@@ -8,7 +8,7 @@
 )]
 // Tests may panic freely (the intent recorded in clippy.toml); helpers outside
 // #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
-//! Simulation tests: safety mode → liveness mode (after TigerBeetle's VOPR,
+//! Simulation tests: safety mode → liveness mode (after `TigerBeetle`'s VOPR,
 //! "Simulation Testing For Liveness", 2023).
 //!
 //! A *cluster* is N walgit instances (one `Registry` + cache dir each) that
@@ -228,7 +228,7 @@ struct Cluster {
 impl Cluster {
     async fn new(seed: u64, n: usize) -> Result<Self> {
         let truth: DynStore = MemoryStore::shared();
-        let id = RepoId::new("sim", &format!("r{seed}"))?;
+        let id = RepoId::new("sim", format!("r{seed}"))?;
         let mut c = Cluster {
             seed,
             truth,
@@ -315,7 +315,7 @@ impl Cluster {
     }
 }
 
-/// BundleSource adapter used by the bundle-lease liveness scenario.
+/// `BundleSource` adapter used by the bundle-lease liveness scenario.
 struct SimBundleSource(Arc<Registry>);
 
 #[async_trait::async_trait]
@@ -532,7 +532,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
     // The checkpoint (if any) folds the log prefix: refs from its RefSnapshot,
     // entries after it from the tail. Both must exist in the bucket.
     let prefix = c.repo_prefix();
-    let cp_seq = manifest.checkpoint.as_ref().map(|cp| cp.seq).unwrap_or(0);
+    let cp_seq = manifest.checkpoint.as_ref().map_or(0, |cp| cp.seq);
     let mut folded: HashMap<String, String> = HashMap::new();
     if cp_seq > 0 {
         let key = format!(
@@ -569,14 +569,14 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         );
     }
     ensure!(
-        log.first().map(|e| e.seq > cp_seq).unwrap_or(true),
+        log.first().map_or(true, |e| e.seq > cp_seq),
         "log tail starts at {} <= checkpoint {cp_seq}",
         log[0].seq
     );
     ensure!(
-        log.last().map(|e| e.seq).unwrap_or(cp_seq) == manifest.head_seq,
+        log.last().map_or(cp_seq, |e| e.seq) == manifest.head_seq,
         "log tail {} != manifest.head_seq {}",
-        log.last().map(|e| e.seq).unwrap_or(cp_seq),
+        log.last().map_or(cp_seq, |e| e.seq),
         manifest.head_seq
     );
     // Every ACK after the checkpoint is in the log at its seq with its txn.
@@ -627,12 +627,11 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
             let later = log.iter().filter(|e| e.seq > last.seq).any(|e| {
                 e.txn
                     .as_ref()
-                    .map(|t| {
+                    .is_some_and(|t| {
                         t.updates
                             .iter()
                             .any(|u| u.name == p.refname && u.new_oid == f)
                     })
-                    .unwrap_or(false)
             }) || last.seq <= cp_seq;
             ensure!(
                 f == last.new || later,
@@ -797,8 +796,8 @@ async fn check_core_liveness(
         .await
         .map_err(|_| anyhow!("liveness: compaction hung > {bound:?}"))?;
         match out {
-            Ok(walgit_server::ops::CompactOutcome::Published { .. })
-            | Ok(walgit_server::ops::CompactOutcome::NotTriggered { .. }) => break,
+            Ok(walgit_server::ops::CompactOutcome::Published { .. } |
+walgit_server::ops::CompactOutcome::NotTriggered { .. }) => break,
             Ok(walgit_server::ops::CompactOutcome::LeaseHeld) => {
                 ensure!(
                     t.elapsed() < bound,
@@ -886,7 +885,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     let per = pushes_per_pusher();
     let op_timeout = Duration::from_secs(10);
     for round in 0..per {
-        for p in pushers.iter_mut() {
+        for p in &mut pushers {
             let i = rng.below(n_instances as u64) as usize;
             let _ = p.push_once(&c.instances[i], &c.id, op_timeout).await?;
         }
@@ -1015,7 +1014,7 @@ async fn sim_safety_then_liveness() {
         let r = run_safety_then_liveness(seed).await;
         eprintln!(
             "[seed {seed}] {:?} in {:.1}s",
-            r.as_ref().map(|_| "ok"),
+            r.as_ref().map(|()| "ok"),
             t.elapsed().as_secs_f64()
         );
         if let Err(e) = r {
@@ -1167,7 +1166,7 @@ async fn liveness_stale_instance_cannot_starve_the_core() -> Result<()> {
         loop {
             let _ = stale_p.push_once(&inst, &id, Duration::from_secs(2)).await;
             n += 1;
-            if n % 10 == 0 {
+            if n.is_multiple_of(10) {
                 tracing::info!(
                     "stale pusher: {n} attempts, last: {:?}",
                     stale_p.errors.last()
@@ -1529,7 +1528,7 @@ async fn liveness_frozen_task_owner_does_not_wedge_readiness() -> Result<()> {
     Ok(())
 }
 
-/// A request ReadGuard is the pin that promises packs remain on disk. Even a
+/// A request `ReadGuard` is the pin that promises packs remain on disk. Even a
 /// leaked guard must make eviction skip the repo; after it drops, eviction may
 /// reclaim the cache.
 #[tokio::test]
@@ -1648,7 +1647,7 @@ async fn liveness_bundle_build_after_lease_holder_dies() -> Result<()> {
 }
 
 /// Exact healthy-link request counts defend the critical-path budgets in
-/// docs/ROUNDTRIPS.md. MemoryStore has no retries, so deltas are deterministic:
+/// docs/ROUNDTRIPS.md. `MemoryStore` has no retries, so deltas are deterministic:
 /// push = one freshness GET + pack/idx/log PUTs + manifest CAS; warm refs = one
 /// conditional GET; cold refs = the open's manifest GET + one log tail GET.
 #[tokio::test]
@@ -2292,7 +2291,7 @@ async fn rebuild_attempt(
     let lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let h = match c.instances[i].open(&c.id).await {
         Ok(h) => h,
-        Err(e) => return (Err(e.into()), Vec::new()),
+        Err(e) => return (Err(e), Vec::new()),
     };
     let out = walgit_server::ops::compact_repo(
         &h,
@@ -2481,7 +2480,7 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
 /// download and caches have something to evict).
 fn push_blobby(p: &mut Pusher, kb: usize, rng: &mut Lcg) -> String {
     let mut buf = vec![0u8; kb * 1024];
-    for b in buf.iter_mut() {
+    for b in &mut buf {
         *b = rng.next() as u8;
     }
     std::fs::write(p.work.path().join(format!("blob-{}.bin", p.n + 1)), &buf).unwrap();
@@ -2556,7 +2555,7 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
     for _ in 0..k {
         let h = h.clone();
         joins.push(tokio::spawn(async move {
-            h.sync().await.map(|g| drop(g)).map_err(|e| e.to_string())
+            h.sync().await.map(drop).map_err(|e| e.to_string())
         }));
     }
     let victim = rng.below(k as u64) as usize;
@@ -2677,10 +2676,10 @@ async fn sim_task_ownership_under_concurrency_and_owner_crash() {
 
 /// Budget-mode cache pressure: four repositories of which the cache holds about two, a
 /// randomized interleaving of refs-level and object-level reads, one repository pinned by a
-/// live ReadGuard throughout, plus one repository whose pack set exceeds `cache.max_bytes`.
+/// live `ReadGuard` throughout, plus one repository whose pack set exceeds `cache.max_bytes`.
 /// Asserted after every step: the pinned repo is never evicted; the too-large repo is refused
 /// with `TooLarge` (never materialized, never the cause of evicting the others); the cache
-/// stays ≤ max_bytes + one pack set; a refs-level read on a cold repo during eviction stays fast.
+/// stays ≤ `max_bytes` + one pack set; a refs-level read on a cold repo during eviction stays fast.
 async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut rng = Lcg(seed ^ 0x5EED);
     let truth: DynStore = MemoryStore::shared();
@@ -2688,7 +2687,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut ids = Vec::new();
     let mut pushers = Vec::new();
     for r in 0..4u32 {
-        let id = RepoId::new("sim", &format!("cache{seed}-{r}"))?;
+        let id = RepoId::new("sim", format!("cache{seed}-{r}"))?;
         writer.registry.create(&id, ObjectFormat::Sha1).await?;
         let mut p = Pusher::new(r as usize);
         let new = push_blobby(&mut p, 96, &mut rng);
@@ -2720,7 +2719,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
         pushers.push(p);
     }
     // The big one: ~5 × a small repo.
-    let big = RepoId::new("sim", &format!("cache{seed}-big"))?;
+    let big = RepoId::new("sim", format!("cache{seed}-big"))?;
     writer.registry.create(&big, ObjectFormat::Sha1).await?;
     {
         let mut p = Pusher::new(9);

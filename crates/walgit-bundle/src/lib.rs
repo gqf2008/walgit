@@ -172,7 +172,7 @@ impl Bundler {
             source,
             cfg,
             gates: Default::default(),
-            lease_ttl: Duration::from_secs(30 * 60),
+            lease_ttl: Duration::from_mins(30),
         })
     }
 
@@ -295,8 +295,7 @@ impl Bundler {
                     .iter()
                     .filter(|t| {
                         walgit_git::gix_hash::ObjectId::from_hex(t.oid.as_bytes())
-                            .map(|o| handle.local.has_object(&o))
-                            .unwrap_or(false)
+                            .is_ok_and(|o| handle.local.has_object(&o))
                     })
                     .map(|t| t.oid.clone())
                     .collect();
@@ -469,7 +468,7 @@ impl Bundler {
         // them as `too-small` (a later measurement or a build replaces it).
         let gates = self.gates.lock();
         if !gates.is_empty() {
-            for r in rows.iter_mut() {
+            for r in &mut rows {
                 if r.status == slots::SlotStatus::Missing
                     && let Some(c) = gates.get(&(
                         handle.local.path().display().to_string(),
@@ -584,8 +583,7 @@ impl Bundler {
                                 .iter()
                                 .filter(|t| {
                                     walgit_git::gix_hash::ObjectId::from_hex(t.oid.as_bytes())
-                                        .map(|o| handle.local.has_object(&o))
-                                        .unwrap_or(false)
+                                        .is_ok_and(|o| handle.local.has_object(&o))
                                 })
                                 .map(|t| t.oid.clone())
                                 .collect();
@@ -697,7 +695,7 @@ impl Bundler {
                     }
                     Ok(None)
                 }
-                Err(BundleError::NoNewObjects) | Err(BundleError::NoRefs) => Ok(None),
+                Err(BundleError::NoNewObjects | BundleError::NoRefs) => Ok(None),
                 Err(e) => Err(e),
             }
         }
@@ -736,12 +734,9 @@ impl Bundler {
             if missing.is_empty() {
                 continue;
             }
-            let lease = match ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await? {
-                Some(l) => l,
-                None => {
-                    debug!(strategy = %strat.name, "lease held, skipping");
-                    continue;
-                }
+            let lease = if let Some(l) = ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await? { l } else {
+                debug!(strategy = %strat.name, "lease held, skipping");
+                continue;
             };
             let res: Result<(), BundleError> = async {
                 if !prepared {
@@ -856,11 +851,10 @@ pub async fn bundle_engine(handle: &walgit_wal::RepoHandle) -> BundleEngine {
     let linked = handle
         .local()
         .packs()
-        .map(|ps| {
+        .is_ok_and(|ps| {
             ps.iter()
                 .any(|p| handle.local().pack_path(&p.checksum).is_symlink())
-        })
-        .unwrap_or(false);
+        });
     if linked {
         return BundleEngine::Gix { faulter: None };
     }
@@ -869,7 +863,7 @@ pub async fn bundle_engine(handle: &walgit_wal::RepoHandle) -> BundleEngine {
 
 #[cfg(feature = "wal")]
 mod wal_impl {
-    use super::*;
+    use super::{BundleError, BundleSource, RepoId, BundleRepoHandle, BundleEngine, bundle_engine};
     use walgit_wal::{Registry, WalError};
 
     fn wal_err(e: WalError) -> BundleError {

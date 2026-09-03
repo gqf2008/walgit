@@ -217,7 +217,7 @@ enum Command {
         /// How often to fold the buffer's small packs (`git repack --geometric=2 --write-midx`).
         #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
         repack_every: std::time::Duration,
-        /// Where the destination's bearer token comes from: `token` ($WALGIT_TOKEN), `gcloud` (a Google
+        /// Where the destination's bearer token comes from: `token` ($`WALGIT_TOKEN`), `gcloud` (a Google
         /// ID token for you) or `gce` (this VM's service account via the metadata server).
         #[arg(long, value_enum, default_value_t = mirror::Identity::Token)]
         identity: mirror::Identity,

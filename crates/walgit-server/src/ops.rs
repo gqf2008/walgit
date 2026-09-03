@@ -201,8 +201,7 @@ pub async fn read_fsck(
 fn flag(params: &HashMap<String, String>, key: &str) -> bool {
     params
         .get(key)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 async fn run(
@@ -402,7 +401,7 @@ async fn run(
                 .write_rev_index(&oid)
                 .await
                 .map_err(|e| format!("rev-index: {e}"))?;
-            let bytes = std::fs::metadata(&rev).map(|m| m.len()).unwrap_or(0);
+            let bytes = std::fs::metadata(&rev).map_or(0, |m| m.len());
             log(format!(
                 "pack-{checksum}.rev: {bytes} bytes in {:.1}s; publishing",
                 t0.elapsed().as_secs_f64()
@@ -445,8 +444,7 @@ async fn run(
                     "building {strategy} slot {slot} ({})",
                     walgit_bundle::slots::from_epoch(slot)
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
+                        .map_or(0, |d| d.as_secs())
                 ));
                 // A FULL slot of a repository that has a tier-2 base is a compose
                 // of that base (header = refs at the base's seq) — never a

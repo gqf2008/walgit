@@ -431,7 +431,7 @@ impl Tasks {
             pick_from
                 .as_ref()
                 .and_then(|v| v.get(k))
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
         };
         let (bytes, objects) = (pick("bytes").or_else(|| pick("size")), pick("objects"));
         let ok = record.ok.unwrap_or(false);

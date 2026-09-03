@@ -1,9 +1,9 @@
 //! HTTP serving of immutable store objects (bundles, LFS objects, packs) with
 //! the complete conditional/range contract a CDN or `git` expects:
 //!
-//! * strong `ETag` = the store version (GCS generation / S3 ETag), quoted;
+//! * strong `ETag` = the store version (GCS generation / S3 `ETag`), quoted;
 //! * `If-None-Match` (list or `*`) → `304` with the same validators;
-//! * `If-Range` (ETag or ignored date) gating `Range`;
+//! * `If-Range` (`ETag` or ignored date) gating `Range`;
 //! * single byte ranges incl. open-ended (`bytes=N-`) and suffix (`bytes=-N`),
 //!   `206` + `Content-Range`, `416` + `Content-Range: bytes */total`;
 //! * `HEAD` answered from metadata (no body download);
@@ -136,7 +136,7 @@ fn if_none_match_hit(headers: &HeaderMap, version: &Version) -> bool {
     tags.iter().any(|t| t == "*" || t == cur)
 }
 
-/// `If-Range`: if it names an ETag that does not match the current version the
+/// `If-Range`: if it names an `ETag` that does not match the current version the
 /// range is ignored and the full body is sent (RFC 9110 §13.1.5). Dates are
 /// not supported (we have no `Last-Modified`) and therefore also ignored.
 fn if_range_allows(headers: &HeaderMap, version: &Version) -> bool {
@@ -189,14 +189,13 @@ fn base_headers(resp: &mut Response, meta: &ObjectMeta, opts: &ServeOptions<'_>)
     h.insert(header::CACHE_CONTROL, cache_control(opts));
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    if let Some(name) = opts.filename {
-        if let Ok(v) = HeaderValue::from_str(&format!(
+    if let Some(name) = opts.filename
+        && let Ok(v) = HeaderValue::from_str(&format!(
             "attachment; filename=\"{}\"",
             name.replace('"', "")
         )) {
             h.insert(header::CONTENT_DISPOSITION, v);
         }
-    }
 }
 
 fn cache_control(opts: &ServeOptions<'_>) -> HeaderValue {
@@ -247,8 +246,7 @@ pub async fn serve(
         && !head
         && accel_requested(headers)
         && opts.peer.is_some_and(|p| p.ip().is_loopback())
-    {
-        if let Some(target) = store.accel_target(key).await {
+        && let Some(target) = store.accel_target(key).await {
             let meta = match store.head(key).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Err(ApiError::NotFound(format!("{key} not found"))),
@@ -285,7 +283,6 @@ pub async fn serve(
             h.insert("x-walgit-etag", etag_of(&meta.version));
             return Ok(resp);
         }
-    }
 
     // HEAD and Range both need the size before deciding what to fetch. For
     // a plain GET we want exactly one store round trip, so we pass the

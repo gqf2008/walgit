@@ -57,11 +57,10 @@ pub fn is_due(schedule: &Schedule, last_built: Option<SystemTime>, now: SystemTi
     }
 }
 
-/// Current Unix timestamp in seconds (for creation_token computation).
+/// Current Unix timestamp in seconds (for `creation_token` computation).
 pub fn unix_now(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -108,7 +107,7 @@ mod tests {
         let s = parse_schedule("@hourly").unwrap();
         let now = SystemTime::now();
         // Last built 2 hours ago → next fire was 1 hour ago → due.
-        let last = now - Duration::from_secs(2 * 3600);
+        let last = now - Duration::from_hours(2);
         assert!(is_due(&s, Some(last), now));
     }
 

@@ -682,10 +682,10 @@ async fn fetch_skips_gitlink_entries() {
         // present.
         let (_blobs, commits, trees, _tags) = cm::pack_object_types(&pack);
         assert_eq!(commits, 2, "unexpected commit count ({filter:?})");
-        if filter != Some("tree:0") {
-            assert!(trees >= 1, "tree missing ({filter:?})");
-        } else {
+        if filter == Some("tree:0") {
             assert_eq!(trees, 0, "tree:0 sends no trees");
+        } else {
+            assert!(trees >= 1, "tree missing ({filter:?})");
         }
         let tmp = cm::fresh_bare();
         let pack_path = tmp.path().join("objects/pack/pack-test.pack");

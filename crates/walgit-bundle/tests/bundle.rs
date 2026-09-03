@@ -106,7 +106,7 @@ impl TestRepo {
     }
 }
 
-/// Test BundleSource: holds one or more repos.
+/// Test `BundleSource`: holds one or more repos.
 struct TestSource {
     repos: HashMap<RepoId, (LocalRepo, Prefixed, Arc<AtomicU64>)>,
 }
@@ -154,14 +154,12 @@ async fn run_git(cwd: &Path, args: &[&str]) -> String {
         .current_dir(cwd)
         .output()
         .await
-        .unwrap_or_else(|e| panic!("git {:?}: {e}", args));
-    if !output.status.success() {
-        panic!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    assert!(output.status.success(), 
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
@@ -274,7 +272,7 @@ async fn get_refs(repo_path: &Path) -> Vec<String> {
         .await
         .unwrap();
     let s = String::from_utf8_lossy(&output.stdout);
-    let mut refs: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+    let mut refs: Vec<String> = s.lines().map(std::string::ToString::to_string).collect();
     refs.sort();
     refs
 }
@@ -337,7 +335,7 @@ async fn full_bundle_passes_verify() {
     assert!(!entry.tips.is_empty(), "bundle entry should have tips");
     assert!(entry.tips.iter().any(|t| t.name == "refs/heads/main"));
     assert!(entry.tips.iter().any(|t| t.name == "refs/tags/v1.0"));
-    assert!(entry.kind == "full");
+    assert_eq!(entry.kind, "full");
     assert!(entry.base_id.is_empty());
 }
 
@@ -406,8 +404,7 @@ async fn incremental_has_prerequisites() {
         let oid = prereq_line[1..].split_whitespace().next().unwrap_or("");
         assert!(
             base_tips.contains(&oid),
-            "prerequisite {oid} should be in base tips {:?}",
-            base_tips
+            "prerequisite {oid} should be in base tips {base_tips:?}"
         );
     }
 }
@@ -865,7 +862,7 @@ async fn min_commits_gate_skips_small_incrementals() {
     tr.advance_seq();
     match bundler.build(&id, "daily").await {
         Err(walgit_bundle::BundleError::TooSmall { commits, min }) => {
-            assert_eq!((commits, min), (2, 3))
+            assert_eq!((commits, min), (2, 3));
         }
         other => panic!("expected TooSmall, got {:?}", other.map(|e| e.id)),
     }
@@ -966,7 +963,7 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
     // Freeze `now` on a Wednesday (2026-07-15T12:00:00Z): yesterday is Tuesday,
     // never the Sunday weekly cut, so the test is deterministic instead of
     // failing every Monday (issue #17).
-    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_116_800);
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_hours(495588);
     let daily_strat = cfg
         .bundles
         .strategy

@@ -160,7 +160,7 @@ impl Mirror {
             };
             if before.get(name) != Some(sha) {
                 out.fetched_anything = true;
-                info!(r#ref = %name, old = before.get(name).map(String::as_str).unwrap_or("-"), new = %sha, "mirror: source moved");
+                info!(r#ref = %name, old = before.get(name).map_or("-", String::as_str), new = %sha, "mirror: source moved");
             }
             if self.pushed.get(name) != Some(sha) {
                 candidates.push((name.clone(), sha.clone()));
@@ -196,9 +196,7 @@ impl Mirror {
             let commits = match old {
                 Some(old) => self
                     .rev_list_count(old, sha)
-                    .await
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|_| "?".into()),
+                    .await.map_or_else(|_| "?".into(), |n| n.to_string()),
                 None => "all".into(),
             };
             info!(r#ref = %name, old = old.as_deref().unwrap_or("-"), new = %sha, commits = %commits, to = %self.to, "mirror: pushing");
@@ -344,7 +342,7 @@ impl Mirror {
             };
             results.insert(name.to_string(), outcome);
         }
-        if !out.status.success() && results.values().all(|r| r.is_ok()) {
+        if !out.status.success() && results.values().all(std::result::Result::is_ok) {
             // Failed before any ref status (auth, connection, pack-objects): git said why on stderr.
             self.token.invalidate();
             bail!(
@@ -416,7 +414,7 @@ struct Token {
     value: Option<(String, Instant)>,
 }
 
-const TOKEN_MAX_AGE: Duration = Duration::from_secs(50 * 60);
+const TOKEN_MAX_AGE: Duration = Duration::from_mins(50);
 const METADATA_IDENTITY_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
 
@@ -619,7 +617,7 @@ mod tests {
         }
     }
 
-    /// Source → buffer → destination over file://: first tick publishes everything, a moved
+    /// Source → buffer → destination over <file://>: first tick publishes everything, a moved
     /// source is pushed on the next tick, an unchanged source is a no-op (no push), a rewound
     /// source is rejected without `--force` and followed with it.
     #[tokio::test]

@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::SynthSize;
 
-/// (commits, files, branches, tags, binary_blobs)
+/// (commits, files, branches, tags, `binary_blobs`)
 fn size_params(
     size: SynthSize,
     commits: Option<u64>,
@@ -105,7 +105,7 @@ pub async fn run(
 
     let status = child.wait().context("waiting for git fast-import")?;
     if !status.success() {
-        bail!("git fast-import failed (exit {})", status);
+        bail!("git fast-import failed (exit {status})");
     }
 
     // Checkout the main branch so it's a working tree.
@@ -136,8 +136,7 @@ pub async fn run(
         .output()?;
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     println!(
-        "synth OK: {} commits, {} files, HEAD={}",
-        n_commits, n_files, head
+        "synth OK: {n_commits} commits, {n_files} files, HEAD={head}"
     );
 
     Ok(())
@@ -330,7 +329,7 @@ fn message_for(n: u64) -> String {
 fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) -> (String, Vec<u8>) {
     // Distribute files across directories: dir_0/, dir_1/, ...
     let dir = file_idx / 100;
-    let is_binary = binary && (file_idx % 13 == 0);
+    let is_binary = binary && file_idx.is_multiple_of(13);
     let ext = if is_binary { "bin" } else { "txt" };
     let path = format!("src/dir_{dir}/file_{file_idx:05}.{ext}");
 

@@ -31,7 +31,7 @@ async fn get(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let text = resp.text().await?;
     Ok((status, text, ct))
 }

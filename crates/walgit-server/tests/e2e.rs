@@ -991,8 +991,7 @@ fn git_lfs_present() -> bool {
     Command::new("git")
         .args(["lfs", "version"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn git_supports_sha256() -> bool {
@@ -1007,8 +1006,7 @@ fn git_supports_sha256() -> bool {
             dir.path().to_str().unwrap(),
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// A front whose `cache.max_bytes` cannot hold a repository's pack set must
@@ -1824,7 +1822,7 @@ fn real_git_path() -> anyhow::Result<String> {
         let out = std::process::Command::new("sh")
             .args(["-c", "command -v git"])
             .output()?;
-        return Ok(String::from_utf8(out.stdout)?.trim().to_string());
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
     #[cfg(windows)]
     {
@@ -1845,7 +1843,7 @@ fn real_git_path() -> anyhow::Result<String> {
 /// `multi-pack-index` and forwards everything else to the real git.
 ///
 /// Unix: a shebang script with the executable bit set. Windows: a `git.exe`
-/// built on the fly with rustc — CreateProcess resolves only `.exe` for a
+/// built on the fly with rustc — `CreateProcess` resolves only `.exe` for a
 /// bare name, so neither a script nor a `.bat` can shadow `git` there. The
 /// real git's path is embedded at compile time via `REAL_GIT`, resolved
 /// *before* the shim lands in PATH (so `where git` still finds the real one).
@@ -2056,7 +2054,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
 
 /// Materialization runs on its own runtime: even an unknown *blocking* call
 /// inside the install path (simulated by `WALGIT_TEST_BLOCK_INSTALL_MS`, a
-/// synchronous sleep in reconcile_packs) must not stall request workers —
+/// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
@@ -2886,8 +2884,7 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
     std::fs::write(
         &helper,
         format!(
-            "#!/bin/sh\necho \"$1\" >> {log}\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=fresh\\n\\n' ;; esac\n",
-            log = log_spec
+            "#!/bin/sh\necho \"$1\" >> {log_spec}\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=fresh\\n\\n' ;; esac\n"
         ),
     )?;
     #[cfg(unix)]

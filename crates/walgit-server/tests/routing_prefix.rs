@@ -118,7 +118,7 @@ fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
     let mut hits = Vec::new();
     for (i, line) in src.lines().enumerate() {
         let t = line.trim();
-        if t.starts_with("//") || t.starts_with("*") || t.starts_with("/*") {
+        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
             continue;
         }
         // Documentation of the alias in comments is fine; code that builds a URL is not.

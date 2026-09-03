@@ -66,11 +66,11 @@ fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a live NUL-terminated path buffer; `st` a valid statvfs slot
     // handed to statvfs which fills it or returns nonzero.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
         return None;
     }
-    let total = st.f_blocks as u64 * st.f_frsize as u64;
-    let avail = st.f_bavail as u64 * st.f_frsize as u64;
+    let total = u64::from(st.f_blocks) * st.f_frsize as u64;
+    let avail = u64::from(st.f_bavail) * st.f_frsize as u64;
     Some((avail, total))
 }
 

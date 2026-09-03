@@ -209,7 +209,7 @@ pub async fn batch(
 }
 
 /// `GET|HEAD /{repo}/info/lfs/objects/{oid}` — stream the object with the full
-/// immutable-object contract (strong ETag, 304, Range/If-Range, HEAD,
+/// immutable-object contract (strong `ETag`, 304, Range/If-Range, HEAD,
 /// Content-Length); see `static_object`. LFS objects are sha256-addressed.
 pub async fn get_object(
     st: &AppState,

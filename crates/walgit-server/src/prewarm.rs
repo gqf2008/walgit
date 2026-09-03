@@ -142,8 +142,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
             .find(|r| r.name == head.head_target)
             .map(|r| r.oid.clone());
         if let (Some(sha), walgit_wal::ObjectAccess::Remote(packs)) = (head_sha.as_deref(), &access)
-        {
-            if let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
+            && let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
                 reporter.notice(format!(
                     "Reading the root tree of {} from the pack set",
                     &sha[..12]
@@ -156,7 +155,6 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
                 let (_c, tree, _m) = remote.fault_path(&oid, "").await.map_err(|e| e.message())?;
                 let _ = remote.tree_entries(&tree).await;
             }
-        }
         Ok(format!("warm: {mode}"))
     }
     .instrument(span)

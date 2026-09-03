@@ -6,7 +6,7 @@ use walgit_store::{GetOptions, GetResult, ObjectStore};
 use crate::error::WalError;
 use crate::handle::RepoHandle;
 
-/// Read log entries in [from_seq, to_seq]. If `to_seq` is None, read up to
+/// Read log entries in [`from_seq`, `to_seq`]. If `to_seq` is None, read up to
 /// `manifest.head_seq`.
 pub(crate) async fn read_log_impl(
     handle: &RepoHandle,
@@ -118,7 +118,7 @@ async fn replay_refs(
                 handle.learn_checkpoint_times().await?;
                 let times = handle.checkpoint_times();
                 let cp_time = times.and_then(|t| t.as_of.or(t.created_at));
-                cp_time.map(|t| t <= at).unwrap_or(false)
+                cp_time.is_some_and(|t| t <= at)
             }
         };
         if usable {
@@ -151,7 +151,7 @@ async fn replay_refs(
         match cut {
             Cut::Time(at) => {
                 let t = e.created_at.as_ref().map(walgit_proto::time::to_system);
-                if t.map(|t| t > at).unwrap_or(false) {
+                if t.is_some_and(|t| t > at) {
                     break;
                 }
             }

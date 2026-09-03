@@ -1,4 +1,4 @@
-//! Browser sign-in: the OpenID Connect authorization-code flow against
+//! Browser sign-in: the `OpenID` Connect authorization-code flow against
 //! `server.auth.issuer`, done by walgit itself. `GET /_auth/login?next=/p`
 //! redirects to the issuer's `authorization_endpoint` (from discovery),
 //! `GET /_auth/callback` exchanges the code at the `token_endpoint`, verifies the
@@ -71,7 +71,7 @@ fn loopback_origin(st: &AppState, headers: &HeaderMap) -> bool {
     let base = crate::smart::request_base_url(st, headers);
     let host = base.split("://").nth(1).unwrap_or(&base);
     let host = host.split('/').next().unwrap_or(host);
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
     host == "walgit.localhost" || host == "localhost" || host == "127.0.0.1" || host == "[::1]"
 }
 
@@ -116,8 +116,7 @@ fn walgit_origin(st: &AppState, headers: &HeaderMap) -> String {
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn urlencode(s: &str) -> String {
@@ -125,7 +124,7 @@ fn urlencode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
             _ => out.push_str(&format!("%{b:02X}")),
         }

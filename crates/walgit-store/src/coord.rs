@@ -226,9 +226,8 @@ impl LeaseGuard {
             .delete(&self.key, Some(self.version.clone()))
             .await
         {
-            Ok(())
-            | Err(StoreError::PreconditionFailed { .. })
-            | Err(StoreError::NotFound { .. }) => Ok(()),
+            Ok(()) |
+Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Ok(()),
             Err(e) => Err(CoordError::Store(e)),
         }
     }
@@ -327,8 +326,7 @@ pub async fn try_acquire(
             let expires_at = existing
                 .expires_at
                 .as_ref()
-                .map(time::to_system)
-                .unwrap_or(UNIX_EPOCH);
+                .map_or(UNIX_EPOCH, time::to_system);
             if now >= expires_at + LEASE_SKEW_TOLERANCE {
                 let epoch = existing.epoch + 1;
                 let lease = make_lease(holder, purpose, now, ttl, epoch);

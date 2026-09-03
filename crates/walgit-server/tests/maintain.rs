@@ -743,7 +743,7 @@ async fn bundle_list_shows_a_bundle_right_after_this_host_builds_it() -> anyhow:
         .map_err(|_| anyhow::anyhow!("op start failed"))?;
     assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
     assert!(
-        t.outcome().map(|o| o.is_ok()).unwrap_or(false),
+        t.outcome().is_some_and(|o| o.is_ok()),
         "{:?}",
         t.outcome()
     );
@@ -807,7 +807,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
             // weekly (full) + hourly on weekly: the closed hours since the weekly are empty.
             c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 if s.name == "hourly" {
                     s.base = Some("weekly".into());
                     s.backfill_max = 0;
@@ -1225,7 +1225,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
         "the base is the biggest tier-2 pack, not the newest"
     );
     let next_weekly =
-        walgit_bundle::slots::from_epoch(weekly.slot) + std::time::Duration::from_secs(7 * 86400);
+        walgit_bundle::slots::from_epoch(weekly.slot) + std::time::Duration::from_hours(168);
     let up = walgit_server::maintain::upcoming(
         &h,
         &h.effective_config(),
@@ -1419,7 +1419,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
             c.maintenance.checkpoints = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
             c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 if s.name == "hourly" {
                     s.base = Some("weekly".into());
                     s.backfill_max = 0;
@@ -1947,7 +1947,7 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
             c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
             c.bundles.enabled = true;
             // The D21 shape this test pins (the default chains the dailies since 2026-08-22).
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 s.chain = false;
             }
         })

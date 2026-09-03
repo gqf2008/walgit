@@ -7,7 +7,7 @@
 //! * conditional writes (`Create` = if-absent, `Update(v)` = CAS on version),
 //! * conditional deletes, range reads, streaming bodies, prefix listing.
 //!
-//! [`Version`] is opaque to callers: GCS generation, S3/rustfs ETag, or a
+//! [`Version`] is opaque to callers: GCS generation, S3/rustfs `ETag`, or a
 //! counter in [`memory::MemoryStore`]. Callers must never parse it.
 
 use std::{fmt, ops::Range, pin::Pin, sync::Arc};
@@ -29,7 +29,7 @@ pub mod util;
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 pub type ByteStream = BoxStream<'static, Result<Bytes, StoreError>>;
 
-/// Opaque object version (GCS generation / ETag / counter). Compare only for equality.
+/// Opaque object version (GCS generation / `ETag` / counter). Compare only for equality.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Version(Arc<str>);
 
@@ -105,8 +105,10 @@ impl GetResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum PutMode {
     /// Unconditional overwrite.
+    #[default]
     Overwrite,
     /// Only if the object does not exist (if-generation-match: 0 / If-None-Match: *).
     Create,
@@ -144,11 +146,6 @@ pub struct PutOptions {
     /// Hint: content never changes under this key (all `wal/` objects). Backends may
     /// set long cache headers.
     pub immutable: bool,
-}
-impl Default for PutMode {
-    fn default() -> Self {
-        PutMode::Overwrite
-    }
 }
 impl From<PutMode> for PutOptions {
     fn from(mode: PutMode) -> Self {
@@ -370,9 +367,7 @@ impl ObjectStore for Prefixed {
         let instrument = !self.inner.is_prefixed();
         let full_key = self.full(key);
         // No span at all for nested prefix layers (avoids duplicate lines).
-        let span = if !instrument {
-            tracing::Span::none()
-        } else {
+        let span = if instrument {
             tracing::info_span!(
                 "store.get",
                 backend = self.inner.backend(),
@@ -382,6 +377,8 @@ impl ObjectStore for Prefixed {
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
             )
+        } else {
+            tracing::Span::none()
         };
         let result = if instrument {
             self.inner
@@ -425,9 +422,7 @@ impl ObjectStore for Prefixed {
         let instrument = !self.inner.is_prefixed();
         let full_key = self.full(key);
         // No span at all for nested prefix layers (avoids duplicate lines).
-        let span = if !instrument {
-            tracing::Span::none()
-        } else {
+        let span = if instrument {
             tracing::info_span!(
                 "store.head",
                 backend = self.inner.backend(),
@@ -437,6 +432,8 @@ impl ObjectStore for Prefixed {
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
             )
+        } else {
+            tracing::Span::none()
         };
         let result = if instrument {
             self.inner.head(&full_key).instrument(span.clone()).await
@@ -470,14 +467,12 @@ impl ObjectStore for Prefixed {
         let bytes = match &body {
             PutBody::Bytes(b) => b.len() as u64,
             PutBody::Stream { len, .. } => *len,
-            PutBody::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            PutBody::File(p) => std::fs::metadata(p).map_or(0, |m| m.len()),
         };
         let instrument = !self.inner.is_prefixed();
         let full_key = self.full(key);
         // No span at all for nested prefix layers (avoids duplicate lines).
-        let span = if !instrument {
-            tracing::Span::none()
-        } else {
+        let span = if instrument {
             tracing::info_span!(
                 "store.put",
                 backend = self.inner.backend(),
@@ -486,6 +481,8 @@ impl ObjectStore for Prefixed {
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
             )
+        } else {
+            tracing::Span::none()
         };
         let result = if instrument {
             self.inner
@@ -518,9 +515,7 @@ impl ObjectStore for Prefixed {
         let instrument = !self.inner.is_prefixed();
         let full_key = self.full(key);
         // No span at all for nested prefix layers (avoids duplicate lines).
-        let span = if !instrument {
-            tracing::Span::none()
-        } else {
+        let span = if instrument {
             tracing::info_span!(
                 "store.delete",
                 backend = self.inner.backend(),
@@ -528,6 +523,8 @@ impl ObjectStore for Prefixed {
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
             )
+        } else {
+            tracing::Span::none()
         };
         let result = if instrument {
             self.inner

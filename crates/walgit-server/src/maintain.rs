@@ -89,7 +89,7 @@ pub async fn run_loop(state: Arc<AppState>) {
             }
             Err(e) => {
                 span.record("outcome", "error");
-                warn!(error = %e, "maintenance pass failed")
+                warn!(error = %e, "maintenance pass failed");
             }
         }
         metrics::histogram!("walgit_maintain_pass_seconds", "host" => host.clone())
@@ -251,7 +251,7 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
     {
         // Checkpoint lag/age gauges: how far the fold is behind the head.
         let m = handle.manifest();
-        let cp_seq = m.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+        let cp_seq = m.checkpoint.as_ref().map_or(0, |c| c.seq);
         metrics::gauge!("walgit_checkpoint_lag_entries", "repo" => id.to_string())
             .set(m.head_seq.saturating_sub(cp_seq) as f64);
         if let Some(t) = m
@@ -268,11 +268,10 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             );
         }
     }
-    if cfg.maintenance.checkpoints {
-        if let Some(trigger) = handle.checkpoint_due() {
+    if cfg.maintenance.checkpoints
+        && let Some(trigger) = handle.checkpoint_due() {
             return Ok(Unit::Checkpoint(trigger.to_string()));
         }
-    }
     // Integrity before everything else that builds on the object set.
     let fsck = crate::ops::read_fsck(&handle).await.ok().flatten();
     if let Some(f) = &fsck {
@@ -298,7 +297,7 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             Ok(n) if n > 0 => tracing::info!(repo = %id, pruned = n, "bundle retention applied"),
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(repo = %id, error = %e, "bundle retention failed; the next publish applies it")
+                tracing::warn!(repo = %id, error = %e, "bundle retention failed; the next publish applies it");
             }
         }
         match state
@@ -307,11 +306,11 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             .await
         {
             Ok(n) if n > 0 => {
-                tracing::info!(repo = %id, settled = n, "closed bundle slots settled")
+                tracing::info!(repo = %id, settled = n, "closed bundle slots settled");
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(repo = %id, error = %e, "settling closed slots failed; units will measure them")
+                tracing::warn!(repo = %id, error = %e, "settling closed slots failed; units will measure them");
             }
         }
         let rows = state
@@ -371,11 +370,9 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
     if cfg.compaction.enabled
         && state.cfg.has_role(walgit_config::Role::Compact)
         && handle.packs_fit()
-    {
-        if crate::ops::compaction_triggered(&handle, &cfg) {
+        && crate::ops::compaction_triggered(&handle, &cfg) {
             return Ok(Unit::Compact);
         }
-    }
     // A big pack without its `.rev` side-file, where the pack is local (tmpfs
     // hosts link tier-2 bases from the mount: the maintainer with the disk does
     // it). Push packs (gix ingest, no .rev) stay as they are: git's in-memory
@@ -406,8 +403,7 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             Some(f) => {
                 let at =
                     f.at.as_ref()
-                        .map(walgit_proto::time::to_system)
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                        .map_or(SystemTime::UNIX_EPOCH, walgit_proto::time::to_system);
                 let age = SystemTime::now().duration_since(at).unwrap_or_default();
                 (age >= interval).then(|| format!("last audit {}h ago", age.as_secs() / 3600))
             }
@@ -505,8 +501,7 @@ pub async fn upcoming(
         };
         let slot = next
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let (unit, host) = match strat.kind {
             walgit_config::BundleKind::Full => match &base {
                 Some(b) if many || base_predates_window(handle, strat, slot, b.seq).await => {
@@ -620,7 +615,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
                         if value
                             .as_ref()
                             .and_then(|v| v.get("built"))
-                            .and_then(|b| b.as_bool())
+                            .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false)
                         {
                             report.bundles += 1;
@@ -688,7 +683,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
 }
 
 /// Heartbeats older than this are a departed host, not a stale one.
-const HEARTBEAT_EXPIRY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const HEARTBEAT_EXPIRY: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// Every maintainer heartbeat in the bucket (expired ones purged).
 pub async fn heartbeats(
@@ -700,8 +695,8 @@ pub async fn heartbeats(
     let mut keys = state.store.list(walgit_proto::keys::MAINTAIN_DIR, None);
     while let Some(m) = keys.next().await {
         let m = m?;
-        if let Some((meta, bytes)) = state.store.get_bytes(&m.key).await? {
-            if let Ok(hb) = walgit_proto::v1::MaintainerHeartbeat::decode(bytes.as_ref()) {
+        if let Some((meta, bytes)) = state.store.get_bytes(&m.key).await?
+            && let Ok(hb) = walgit_proto::v1::MaintainerHeartbeat::decode(bytes.as_ref()) {
                 // A host that has not passed for a day is gone: purge its
                 // heartbeat so the plan shows only live maintainers.
                 let age = hb
@@ -711,14 +706,13 @@ pub async fn heartbeats(
                     .and_then(|t| SystemTime::now().duration_since(t).ok());
                 if age.is_some_and(|a| a > HEARTBEAT_EXPIRY) {
                     if state.cfg.has_role(walgit_config::Role::Maintain) {
-                        info!(host = %hb.host, age_secs = age.map(|a| a.as_secs()).unwrap_or(0), "maintenance: purging expired heartbeat");
+                        info!(host = %hb.host, age_secs = age.map_or(0, |a| a.as_secs()), "maintenance: purging expired heartbeat");
                         let _ = state.store.delete(&m.key, Some(meta.version)).await;
                     }
                     continue;
                 }
                 out.push(hb);
             }
-        }
     }
     Ok(out)
 }

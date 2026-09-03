@@ -1,4 +1,4 @@
-//! Registry: process-wide map of RepoId -> Arc<RepoHandle>.
+//! Registry: process-wide map of `RepoId` -> Arc<RepoHandle>.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -101,12 +101,9 @@ impl Registry {
         };
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = match LocalRepo::open(&self.cache_root, id)? {
-            Some(l) => l,
-            None => {
-                let format = parse_object_format(&manifest.object_format);
-                LocalRepo::init(&self.cache_root, id, format)?
-            }
+        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? { l } else {
+            let format = parse_object_format(&manifest.object_format);
+            LocalRepo::init(&self.cache_root, id, format)?
         };
 
         // Load state
@@ -216,7 +213,7 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (PutMode::Create). Err(AlreadyExists) on 412.
+    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
     pub async fn create(
         &self,
         id: &RepoId,
@@ -382,7 +379,7 @@ impl Registry {
         Ok(repos)
     }
 
-    /// Disk cache maintenance: evict idle repos beyond cache.max_bytes / evict_idle_after.
+    /// Disk cache maintenance: evict idle repos beyond `cache.max_bytes` / `evict_idle_after`.
     pub async fn evict_idle(&self) -> Result<EvictReport, WalError> {
         let evict_after = self.cfg.cache.evict_idle_after;
         // D25: budget mode evicts past `cache.max_bytes`; disk mode only under
@@ -426,7 +423,7 @@ impl Registry {
 
         // Collect idle repos. In-use checks happen again while evicting: a
         // request may acquire a ReadGuard after this snapshot.
-        for entry in self.repos.iter() {
+        for entry in &self.repos {
             let handle = entry.value();
             let last_access = handle.last_access();
             if now.duration_since(last_access) > evict_after {

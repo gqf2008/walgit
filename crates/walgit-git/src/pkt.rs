@@ -251,7 +251,7 @@ pub struct V2Command {
 
 impl V2Command {
     pub fn cap(&self, key: &str) -> Option<&str> {
-        self.caps.get(key).map(|s| s.as_str())
+        self.caps.get(key).map(std::string::String::as_str)
     }
     pub fn has_cap(&self, key: &str) -> bool {
         self.caps.contains_key(key)

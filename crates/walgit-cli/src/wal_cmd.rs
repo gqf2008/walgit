@@ -31,8 +31,8 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             }
 
             println!(
-                "{:<6} {:<10} {:<12} {:<10} {}",
-                "seq", "kind", "pack", "supersedes", "refs"
+                "{:<6} {:<10} {:<12} {:<10} refs",
+                "seq", "kind", "pack", "supersedes"
             );
             for e in &entries {
                 let kind = format!("{:?}", e.kind);
@@ -42,7 +42,7 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
                     .map(|p| p.checksum[..12].to_string())
                     .unwrap_or_default();
                 let supersedes = e.supersedes.len();
-                let ref_count = e.txn.as_ref().map(|t| t.updates.len()).unwrap_or(0);
+                let ref_count = e.txn.as_ref().map_or(0, |t| t.updates.len());
                 println!(
                     "{:<6} {:<10} {:<12} {:<10} {}",
                     e.seq, kind, pack, supersedes, ref_count
@@ -95,7 +95,7 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             println!(
                 "{} ({} bytes) in {:.1}s",
                 out.display(),
-                std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0),
+                std::fs::metadata(&out).map_or(0, |m| m.len()),
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -148,14 +148,12 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             println_kv("writer", &entry.writer);
             println_kv(
                 "created_at",
-                &entry
+                entry
                     .created_at
-                    .as_ref()
-                    .map(|t| {
+                    .as_ref().map_or_else(|| "(none — predates the field)".into(), |t| {
                         humantime::format_rfc3339_seconds(walgit_proto::time::to_system(t))
                             .to_string()
-                    })
-                    .unwrap_or_else(|| "(none — predates the field)".into()),
+                    }),
             );
 
             if let Some(pack) = &entry.pack {
@@ -214,7 +212,7 @@ pub async fn materialize_at(
     at_seq: u64,
     out: &std::path::Path,
 ) -> Result<()> {
-    let handle = registry.open(&id).await?;
+    let handle = registry.open(id).await?;
 
     // Read log entries up to at_seq and replay into a fresh LocalRepo.
     if out.exists() {
@@ -229,7 +227,7 @@ pub async fn materialize_at(
         other => bail!("unknown object format in manifest: {other}"),
     };
 
-    let local = walgit_git::LocalRepo::init(out, &id, format)?;
+    let local = walgit_git::LocalRepo::init(out, id, format)?;
     use walgit_proto::prost::Message;
     use walgit_store::ObjectStoreExt;
 
@@ -273,7 +271,7 @@ pub async fn materialize_at(
             match handle.store().get_bytes(&key).await? {
                 Some((_, bytes)) => {
                     let (es, _) = walgit_proto::frame::decode_entries(&bytes)?;
-                    let last = es.last().map(|e| e.seq).unwrap_or(seq);
+                    let last = es.last().map_or(seq, |e| e.seq);
                     found.extend(es);
                     seq = last + 1;
                 }
@@ -283,8 +281,7 @@ pub async fn materialize_at(
                     manifest
                         .checkpoint
                         .as_ref()
-                        .map(|c| c.seq)
-                        .unwrap_or(manifest.min_seq)
+                        .map_or(manifest.min_seq, |c| c.seq)
                 ),
             }
         }
@@ -527,6 +524,6 @@ mod tests {
                 .success()
         );
         // The writer's live copy kept its packs.
-        assert!(handle.local().packs().unwrap().len() >= 1);
+        assert!(!handle.local().packs().unwrap().is_empty());
     }
 }

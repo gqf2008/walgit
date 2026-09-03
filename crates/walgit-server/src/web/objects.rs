@@ -279,8 +279,7 @@ impl Remote {
             let entries = self.tree_entries(&cur).await?;
             let Some(e) = entries.into_iter().find(|e| e.name == seg.as_bytes()) else {
                 return Err(not_found(format!(
-                    "path '{}' does not exist in {}",
-                    path, commit
+                    "path '{path}' does not exist in {commit}"
                 )));
             };
             cur = e.oid;
@@ -289,8 +288,7 @@ impl Remote {
                 self.fault(&cur).await?;
             } else if i + 1 < segs.len() {
                 return Err(not_found(format!(
-                    "path '{}' does not exist in {}",
-                    path, commit
+                    "path '{path}' does not exist in {commit}"
                 )));
             } else if e.mode.is_blob() {
                 // blob: caller decides whether to fault (size check)
@@ -462,7 +460,7 @@ impl Remote {
                     .notice(format!("{label}: gave up after {budget} commits"));
                 break;
             }
-            if popped % 100 == 0 {
+            if popped.is_multiple_of(100) {
                 self.reporter
                     .bar(label.to_string(), popped as u64, None, "commits");
             }
@@ -479,13 +477,10 @@ impl Remote {
                 } else {
                     let mut treesame_parent = None;
                     for par in &meta.parents {
-                        let pm = match metas.get(par) {
-                            Some(m) => m.clone(),
-                            None => {
-                                let m = self.commit(par).await?;
-                                metas.insert(*par, m.clone());
-                                m
-                            }
+                        let pm = if let Some(m) = metas.get(par) { m.clone() } else {
+                            let m = self.commit(par).await?;
+                            metas.insert(*par, m.clone());
+                            m
                         };
                         let theirs = self.path_oid(&mut path_cache, pm.tree, p).await?;
                         if theirs == mine {
@@ -508,13 +503,10 @@ impl Remote {
             for par in follow {
                 if seen.insert(par) {
                     seq += 1;
-                    let pm = match metas.get(&par) {
-                        Some(m) => m.clone(),
-                        None => {
-                            let m = self.commit(&par).await?;
-                            metas.insert(par, m.clone());
-                            m
-                        }
+                    let pm = if let Some(m) = metas.get(&par) { m.clone() } else {
+                        let m = self.commit(&par).await?;
+                        metas.insert(par, m.clone());
+                        m
                     };
                     heap.push(Item(pm.commit_time, seq, par));
                 }
@@ -594,7 +586,7 @@ impl Remote {
     /// (range reads ~50 ms each; serially a large repository commit took 300
     /// round trips = 15 s), then merge-walked; the blobs it references are
     /// faulted in a second batch. Rounds ≈ path depth. Bounded by
-    /// MAX_DIFF_OBJECTS.
+    /// `MAX_DIFF_OBJECTS`.
     async fn fault_tree_pairs(
         &self,
         mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)>,
@@ -712,7 +704,7 @@ impl Remote {
 
     /// Fault everything `git blame --porcelain <rev> -- <path>` reads into the
     /// loose store: each commit of the path history, its path trees and every
-    /// version of the file blob — bounded by BLAME_BUDGET commits. The walk
+    /// version of the file blob — bounded by `BLAME_BUDGET` commits. The walk
     /// unit is a `(commit, path)` pair so a rename can hand the history over
     /// to the old name: at a boundary (path absent in a parent) the parent's
     /// whole tree skeleton is faulted (bounded by `BLAME_TREE_BUDGET`, 503 past
