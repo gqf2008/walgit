@@ -170,11 +170,11 @@ impl Rng {
     fn fill_bytes(&mut self, buf: &mut [u8]) {
         // Full 8-byte words, then the trailing remainder (< 8 bytes) takes the
         // low bytes of one more word. Same RNG call sequence either way.
-        let mut chunks = buf.chunks_exact_mut(8);
-        for word in &mut chunks {
+        // (as_chunks_mut is the same split as chunks_exact_mut + into_remainder.)
+        let (words, rem) = buf.as_chunks_mut::<8>();
+        for word in words {
             word.copy_from_slice(&self.next_u64().to_le_bytes());
         }
-        let rem = chunks.into_remainder();
         if !rem.is_empty() {
             let v = self.next_u64().to_le_bytes();
             for (dst, src) in rem.iter_mut().zip(v) {

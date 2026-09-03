@@ -170,13 +170,14 @@ fn entry_from_hex(s: &str) -> Option<BundleEntry> {
     if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    // The even-length guard above leaves no remainder, so the as_chunks
+    // pairs cover the buffer exactly.
     let bytes: Vec<u8> = s
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| match pair {
-            [hi, lo] => (hex_val(*hi) << 4) | hex_val(*lo),
-            _ => 0, // chunks_exact(2) never yields a short chunk
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[hi, lo]| (hex_val(*hi) << 4) | hex_val(*lo))
         .collect();
     BundleEntry::decode(bytes.as_slice()).ok()
 }
@@ -722,7 +723,7 @@ pub async fn run_with_store(
                 reason = "UI line: byte counters of an import (tens of GiB max) stay far below f64's exact range 2^53; the /1e6 divisor makes any rounding invisible"
             )]
             let mb_per_s = *size as f64 / 1e6 / t.elapsed().as_secs_f64().max(0.001);
-            println!("uploaded {key} ({mb_per_s:.1} MB/s)",);
+            println!("uploaded {key} ({mb_per_s:.1} MB/s)");
             report.uploaded += 1;
             marker.uploaded.push(key.clone());
             write_import_marker(&marker_path, &marker)?;
