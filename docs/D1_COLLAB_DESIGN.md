@@ -207,6 +207,12 @@
 > 两者均需本地 packs/bundle，后续批次再补 rename 跟随（issue #13）。
 > merge-base 的"无关历史 → null"在深仓库可能先撞预算表现为 503（文案已注明）。
 >
+> **update (issue #13 已落地)**：remote blame 现在**跟随精确 rename**——游走单元是
+> `(commit, path)` 对，边界提交 fault 两侧整树骨架（`BLAME_TREE_BUDGET` 上限，
+> 超限 503），沿 blob oid 相等的内容前身（git blame 精确 rename 检测的首选候选）
+> 以旧名继续；本地/remote 输出一致（`remote_blame_follows_exact_renames` 锁死）。
+> 改内容型 rename（相似度检测需读候选 blob）仍不跟随，需本地 packs/bundle。
+>
 > 缺口 3-5 由 [issue #10](https://github.com/gqf2008/walgit/issues/10) 批次落地：
 > 缺口 4（events 桥任意 ref）golden 测试已落地（`tests/events.rs`：
 > `refs/collab/*` 的 create/delete 事件与 heads 同一套 cursor/去重/回放契约）；

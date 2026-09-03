@@ -319,6 +319,17 @@ async fn conformance(
         "feature/x's x.txt came from initial: {l2:?}"
     );
     assert_eq!(get(server, "/o/r/api/blame/main/nope.txt").await?.0, 404);
+    // the rename (src/main.rs -> src/app.rs on feature/x, merged to main):
+    // followed on BOTH local and remote (issue #13) — the line keeps its
+    // "initial" attribution through the rename, on this instance whichever
+    // way it holds the packs.
+    let br = json(server, "/o/r/api/blame/main/src/app.rs").await?;
+    let rlines = br["blame"].as_array().unwrap();
+    assert_eq!(rlines.len(), 1, "one line: {rlines:?}");
+    assert!(
+        rlines[0]["summary"].as_str().unwrap().contains("initial"),
+        "rename followed to the original commit: {rlines:?}"
+    );
 
     // archive (D1 review primitive): binary download, gzip/zip magic
     let resp = reqwest::Client::new()
@@ -812,13 +823,12 @@ async fn merge_base_unrelated_histories() -> TestResult {
     Ok(())
 }
 
-/// D1 blame known limitation (web/API.md + docs/D1_COLLAB_DESIGN.md §9): git
-/// blame has no switch to turn rename-following off, so a remote-served base
-/// cannot follow a rename (the parent tree that holds the old path is never
-/// faulted). Local blame follows it; remote must fail with a defined 404, not
-/// a silent wrong answer.
+/// Remote blame follows renames (issue #13): git blame's rename detection
+/// reads the old path's tree in the parent, so the walk faults the boundary
+/// parent's whole tree skeleton and continues along the exact content
+/// predecessor. Local and remote must then agree byte-for-byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_blame_of_renamed_file_is_a_defined_error() -> TestResult {
+async fn remote_blame_follows_exact_renames() -> TestResult {
     let big = Server::start().await?;
     big.put_repo("o", "r").await?;
     fixture(&big)?;
@@ -834,8 +844,41 @@ async fn remote_blame_of_renamed_file_is_a_defined_error() -> TestResult {
         !b["blame"].as_array().unwrap().is_empty(),
         "local blame works"
     );
-    // Remote cannot follow the rename: defined 404, not a wrong answer.
-    assert_eq!(get(&small, "/o/r/api/blame/main/src/app.rs").await?.0, 404);
+    // Remote follows the same rename and answers identically.
+    let rb = json(&small, "/o/r/api/blame/main/src/app.rs").await?;
+    assert_eq!(rb, b, "remote blame matches local through the rename");
+    Ok(())
+}
+
+/// A rename boundary whose parent tree exceeds the skeleton budget is a
+/// defined 503, not a 404 or a wrong answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The knob is environment-read at request time (the WALGIT_TEST_* pattern),
+// and `std::env::set_var` is unsafe in this edition; contained to this test.
+#[allow(unsafe_code)]
+async fn remote_blame_rename_boundary_over_tree_budget_is_503() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "r").await?;
+    fixture(&big)?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    // SAFETY: single-threaded test setup phase; the sibling reads the knob
+    // when the request walks the rename boundary.
+    unsafe { std::env::set_var("WALGIT_TEST_BLAME_TREE_BUDGET", "1") };
+    let (st, body, _) = get(&small, "/o/r/api/blame/main/src/app.rs").await?;
+    // SAFETY: restore before further awaits so other tests see no knob.
+    unsafe { std::env::remove_var("WALGIT_TEST_BLAME_TREE_BUDGET") };
+    assert_eq!(
+        st, 503,
+        "boundary tree over budget must be 503, got: {body}"
+    );
+    assert!(
+        body.contains("rename boundary"),
+        "503 names the boundary: {body}"
+    );
     Ok(())
 }
 
