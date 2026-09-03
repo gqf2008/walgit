@@ -91,7 +91,13 @@ impl GetResult {
         match self {
             GetResult::NotModified { .. } => Ok(None),
             GetResult::Object { meta, body } => {
-                let b = util::collect(body, meta.size as usize).await?;
+                let size = usize::try_from(meta.size).map_err(|_| {
+                    StoreError::InvalidArgument(format!(
+                        "object {} is too large for this host",
+                        meta.key
+                    ))
+                })?;
+                let b = util::collect(body, size).await?;
                 Ok(Some((meta, b)))
             }
         }

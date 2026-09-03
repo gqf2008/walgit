@@ -32,6 +32,10 @@ use walgit_store::{
 
 use crate::cli::parse_repo_id;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a distinct `walgit import --direct` CLI flag (`pub` field); grouping them into a bitflags struct would obscure the flag mapping and every construction site"
+)]
 pub struct DirectOptions {
     pub from: PathBuf,
     pub repo: String,
@@ -83,7 +87,7 @@ struct LocalPack {
 /// Start over even when the target's manifest moved since an interrupted import began, or
 /// re-publish a completed import (a new seq superseding the previous one).
 impl DirectOptions {
-    fn marker_path(&self, pack_dir: &Path, id: &walgit_git::RepoId) -> PathBuf {
+    fn marker_path(pack_dir: &Path, id: &walgit_git::RepoId) -> PathBuf {
         pack_dir
             .parent()
             .unwrap_or(pack_dir)
@@ -93,6 +97,10 @@ impl DirectOptions {
 }
 
 /// What a run did — the resumability contract in numbers (`tests/import_resume.rs`).
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent bit of the resumability report (a distinct clause of `run`'s summary); grouping them would obscure the per-bit meaning"
+)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     /// Objects (packs + side-files) uploaded by this run.
@@ -156,10 +164,29 @@ fn entry_to_hex(e: &BundleEntry) -> String {
     hex::encode(e.encode_to_vec())
 }
 fn entry_from_hex(s: &str) -> Option<BundleEntry> {
-    let bytes: Option<Vec<u8>> = (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+    // `entry_to_hex`'s own output is lowercase ASCII hex; anything else (a
+    // corrupted marker) is refused here instead of being pair-sliced, where a
+    // multi-byte char could land across a 2-byte boundary.
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = s
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| match pair {
+            [hi, lo] => (hex_val(*hi) << 4) | hex_val(*lo),
+            _ => 0, // chunks_exact(2) never yields a short chunk
+        })
         .collect();
-    BundleEntry::decode(bytes?.as_slice()).ok()
+    BundleEntry::decode(bytes.as_slice()).ok()
+}
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0, // the caller has checked is_ascii_hexdigit
+    }
 }
 
 fn tips_hash(snap: &RefSnapshot) -> String {
@@ -184,7 +211,10 @@ fn read_import_marker(path: &Path) -> Option<ImportMarker> {
 }
 
 fn write_import_marker(path: &Path, m: &ImportMarker) -> Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("marker path {} has no parent", path.display()))?,
+    )?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     std::fs::rename(&tmp, path)?;
@@ -279,6 +309,10 @@ pub async fn run(opts: DirectOptions, cfg: &Arc<Config>, force: bool) -> Result<
 
 /// The import proper, against `store` (tests pass a shared in-memory store). `force`: see
 /// [`ResumeDecision`]. Re-running a completed import is a no-op; an interrupted one resumes.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every indexed read in this function is guarded: `packs[0]` follows the `ensure!(!packs.is_empty())` on the scan result (the vector only ever grows, and history packs are appended after the base), and `missing[0]` sits in the `ensure!` message that formats only when `missing` is non-empty"
+)]
 pub async fn run_with_store(
     opts: DirectOptions,
     cfg: &Arc<Config>,
@@ -385,7 +419,7 @@ pub async fn run_with_store(
                 m.head_seq,
                 m.packs.len()
             );
-            let marker_path = opts.marker_path(&pack_dir, &id);
+            let marker_path = DirectOptions::marker_path(&pack_dir, &id);
             let _ = std::fs::remove_file(&marker_path);
             report.noop = true;
             report.seq = m.head_seq;
@@ -399,7 +433,7 @@ pub async fn run_with_store(
             );
         }
     }
-    let marker_path = opts.marker_path(&pack_dir, &id);
+    let marker_path = DirectOptions::marker_path(&pack_dir, &id);
     let current_version = base_version.as_ref().map(|v| v.as_str().to_string());
     let mut marker = match decide_resume(
         read_import_marker(&marker_path).as_ref(),
@@ -409,7 +443,13 @@ pub async fn run_with_store(
         force,
     ) {
         ResumeDecision::Resume => {
-            let m = read_import_marker(&marker_path).unwrap();
+            // decide_resume returns Resume only when a marker file existed.
+            let m = read_import_marker(&marker_path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "import marker {} vanished between reads",
+                    marker_path.display()
+                )
+            })?;
             println!(
                 "resuming import started at manifest {:?} (phase {:?} done, {} object(s) uploaded)",
                 m.base_manifest_version,
@@ -674,10 +714,15 @@ pub async fn run_with_store(
             )
             .await
             .with_context(|| format!("uploading {}", path.display()))?;
-            println!(
-                "uploaded {key} ({:.1} MB/s)",
-                *size as f64 / 1e6 / t.elapsed().as_secs_f64().max(0.001)
-            );
+            // UI line: size counts an imported object's bytes (a pack set of
+            // tens of GiB at most), far below f64's exact range 2^53; the /1e6
+            // divisor makes any rounding invisible.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "UI line: byte counters of an import (tens of GiB max) stay far below f64's exact range 2^53; the /1e6 divisor makes any rounding invisible"
+            )]
+            let mb_per_s = *size as f64 / 1e6 / t.elapsed().as_secs_f64().max(0.001);
+            println!("uploaded {key} ({mb_per_s:.1} MB/s)",);
             report.uploaded += 1;
             marker.uploaded.push(key.clone());
             write_import_marker(&marker_path, &marker)?;
@@ -718,7 +763,6 @@ pub async fn run_with_store(
 
     // ---- checkpoint refs (small, idempotent re-put) -----------------------------------------
     let refs_key = keys::checkpoint_refs_key(seq);
-    let mut snap = snap;
     snap.seq = seq;
     snap.object_format = format.as_str().to_string();
     snap.created_at = Some(time::now());
@@ -1004,7 +1048,11 @@ pub fn verify_refs_in_packs(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("git {}", args.join(" ")))?;
-        child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
+        child
+            .stdin
+            .take()
+            .context("git child had no stdin")?
+            .write_all(stdin.as_bytes())?;
         Ok(child.wait_with_output()?)
     };
     // Tips first (cheap, names the exact ref problem).
@@ -1070,7 +1118,7 @@ fn scan_packs(dir: &Path) -> Result<Vec<LocalPack>> {
             idx,
         });
     }
-    out.sort_by(|a, b| b.pack_size.cmp(&a.pack_size));
+    out.sort_by_key(|p| std::cmp::Reverse(p.pack_size)); // largest pack first
     Ok(out)
 }
 
@@ -1099,7 +1147,11 @@ fn build_history_pack(git_dir: &Path, dir: &Path, base: &str) -> Result<LocalPac
         .stdout(std::process::Stdio::piped())
         .spawn()
         .context("git pack-objects --filter=blob:none")?;
-    child.stdin.take().unwrap().write_all(&tips.stdout)?;
+    child
+        .stdin
+        .take()
+        .context("git pack-objects had no stdin")?
+        .write_all(&tips.stdout)?;
     let out = child.wait_with_output()?;
     anyhow::ensure!(
         out.status.success(),
@@ -1355,8 +1407,8 @@ mod resume_tests {
         sh(d.path(), &["init", "-q", "-b", "main", "."]);
         sh(d.path(), &["config", "user.email", "t@t"]);
         sh(d.path(), &["config", "user.name", "T"]);
-        for i in 0..3 {
-            std::fs::write(d.path().join(format!("f{i}")), vec![b'a' + i as u8; 20_000]).unwrap();
+        for i in 0u8..3 {
+            std::fs::write(d.path().join(format!("f{i}")), vec![b'a' + i; 20_000]).unwrap();
             sh(d.path(), &["add", "."]);
             sh(d.path(), &["commit", "-q", "-m", &format!("c{i}")]);
         }
@@ -1461,7 +1513,7 @@ mod resume_tests {
             .unwrap()
             .join("objects")
             .join("pack");
-        let marker_path = opts(src.path(), repo).marker_path(&pack_dir, &id);
+        let marker_path = DirectOptions::marker_path(&pack_dir, &id);
         // Uploads are counted from the marker's done set (the report is lost with a killed run).
         let mut prev_uploaded = 0usize;
         let mut total_uploaded = 0usize;

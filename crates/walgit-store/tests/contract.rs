@@ -66,7 +66,7 @@ async fn test_compose(store: &DynStore, key: &str) {
     let header = Bytes::from_static(b"# v3 git bundle\n@object-format=sha1\n\n");
     let mut body = vec![0u8; 6 * 1024 * 1024 + 12345];
     for (i, b) in body.iter_mut().enumerate() {
-        *b = (i % 251) as u8;
+        *b = u8::try_from(i % 251).unwrap();
     }
     let body = Bytes::from(body);
     let h = format!("{key}.hdr");
@@ -131,7 +131,7 @@ async fn test_compose(store: &DynStore, key: &str) {
 async fn collect_body(r: GetResult) -> (walgit_store::ObjectMeta, Bytes) {
     match r {
         GetResult::Object { meta, body } => {
-            let collected = walgit_store::util::collect(body, meta.size as usize)
+            let collected = walgit_store::util::collect(body, usize::try_from(meta.size).unwrap())
                 .await
                 .expect("body collect");
             (meta, collected)
@@ -829,7 +829,9 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         let big_key = big_key.clone();
         tokio::spawn(async move {
             let t = std::time::Instant::now();
-            let starts: Vec<u64> = (0..total).step_by(CHUNK as usize).collect();
+            let starts: Vec<u64> = (0..total)
+                .step_by(usize::try_from(CHUNK).unwrap())
+                .collect();
             let n = futures::stream::iter(starts)
                 .map(|start| {
                     let store = store.clone();
@@ -847,7 +849,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
                             .unwrap();
                         match r {
                             GetResult::Object { body, .. } => {
-                                walgit_store::util::collect(body, CHUNK as usize)
+                                walgit_store::util::collect(body, usize::try_from(CHUNK).unwrap())
                                     .await
                                     .unwrap()
                                     .len()
@@ -909,7 +911,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         "bulk {} MiB in {:.1}s ({:.0} MB/s); {probes} probes, worst {:?}",
         bytes >> 20,
         took.as_secs_f64(),
-        bytes as f64 / 1e6 / took.as_secs_f64(),
+        f64::from(u32::try_from(bytes).unwrap()) / 1e6 / took.as_secs_f64(),
         worst
     );
     assert!(probes >= 4);

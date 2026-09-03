@@ -54,11 +54,23 @@ fn put_deadline(bytes: u64) -> std::time::Duration {
     PUT_MIN_DEADLINE + std::time::Duration::from_secs(bytes / PUT_BYTES_PER_SEC)
 }
 
+/// Total milliseconds of a duration as `u64` — `Duration::as_millis` widened
+/// without a cast (secs * 1000 + the sub-second part).
+fn duration_ms(d: std::time::Duration) -> u64 {
+    d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis())
+}
+
+/// GCS reports object sizes as a JSON int64 byte count, which is never
+/// negative; `try_from` is the checked spelling of the old `as u64`.
+fn gcs_obj_size(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or(0)
+}
+
 fn deadline_error(op: &str, key: &str, deadline: std::time::Duration) -> StoreError {
     tracing::warn!(
         op,
         key,
-        deadline_ms = deadline.as_millis() as u64,
+        deadline_ms = duration_ms(deadline),
         "gcs call exceeded deadline"
     );
     StoreError::retryable(anyhow::anyhow!(
@@ -94,7 +106,7 @@ where
                     op,
                     key,
                     attempt,
-                    deadline_ms = deadline.as_millis() as u64,
+                    deadline_ms = duration_ms(deadline),
                     "gcs call exceeded deadline, retrying"
                 );
                 attempt += 1;
@@ -169,6 +181,7 @@ impl GcsStore {
     /// data (`Storage`) and control (`StorageControl`) clients, allowing
     /// emulator use.
     /// Set `telemetry.lock_wait_warn` for the bulk-permit WARN line (default 1 s).
+    #[must_use = "builder: with_permit_wait_warn returns a modified GcsStore"]
     pub fn with_permit_wait_warn(mut self, d: std::time::Duration) -> Self {
         self.permit_wait_warn = d;
         self
@@ -245,7 +258,10 @@ impl GcsStore {
         // bulk sat 455–472 s behind 32 stripes on the bulk semaphore while
         // info/refs waited for it).
         let name = key.rsplit('/').next().unwrap_or(key);
-        if name.ends_with(".pb") || name.ends_with(".json") {
+        // GCS object keys are case-sensitive and walgit writes lowercase
+        // extensions; Path::extension() keeps that exact semantic.
+        let ext = std::path::Path::new(name).extension();
+        if matches!(ext, Some(e) if e == "pb" || e == "json") {
             return false;
         }
         key.contains("/wal/")
@@ -288,7 +304,7 @@ impl GcsStore {
             let permit = self.bulk_permits.clone().acquire_owned().await.ok();
             let queued = t.elapsed();
             if queued.as_millis() > 0 {
-                tracing::Span::current().record("queued_ms", queued.as_millis() as u64);
+                tracing::Span::current().record("queued_ms", duration_ms(queued));
             }
             metrics::histogram!("walgit_store_bulk_queue_seconds").record(queued.as_secs_f64());
             if queued > std::time::Duration::ZERO {
@@ -299,13 +315,25 @@ impl GcsStore {
                 tracing::warn!(
                     lock = "gcs_bulk_permit",
                     key,
-                    wait_ms = queued.as_millis() as u64,
+                    wait_ms = duration_ms(queued),
                     "lock wait"
                 );
             }
+            // Gauge of permits currently held: bounded by the configured bulk
+            // concurrency (a small integer), so the conversion is exact.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "gauge value is a semaphore-permit count, bounded by the configured bulk concurrency (single digits to low hundreds) — far below f64's exact range"
+            )]
             metrics::gauge!("walgit_store_bulk_inflight")
                 .set((self.bulk_permits_total - self.bulk_permits.available_permits()) as f64);
-            (&self.bulk[i], permit)
+            // `i` is fetch_add % self.bulk.len(): a remainder, hence < len.
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "i = fetch_add(...) % self.bulk.len() — a remainder, always < len; an empty pool would already have panicked at the modulo"
+            )]
+            let picked = &self.bulk[i];
+            (picked, permit)
         } else {
             (&self.storage, None)
         }
@@ -314,7 +342,7 @@ impl GcsStore {
     fn meta_from_object(obj: &google_cloud_storage::model::Object) -> ObjectMeta {
         ObjectMeta {
             key: obj.name.clone(),
-            size: obj.size as u64,
+            size: gcs_obj_size(obj.size),
             version: gen_version(obj.generation),
         }
     }
@@ -489,7 +517,13 @@ impl BulkHttp {
                 .map(|g| format!("&ifGenerationMatch={g}"))
                 .unwrap_or_default()
         );
-        let mut req = self.clients[i].get(&url).headers(headers);
+        // `i` is a remainder of clients.len(): always in range.
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "i = fetch_add(...) % self.clients.len() — a remainder, always < len; an empty pool would already have panicked at the modulo"
+        )]
+        let client = &self.clients[i];
+        let mut req = client.get(&url).headers(headers);
         if let Some(r) = &range {
             req = req.header(
                 reqwest::header::RANGE,
@@ -585,13 +619,16 @@ impl GcsStore {
     }
 
     async fn put_inner(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        // The google-cloud-storage write futures are ~30 KB of request state;
+        // boxing each keeps the enclosing future (and put_inner's own future)
+        // small.
         let result = match body {
             PutBody::Bytes(b) => {
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), b);
                 builder = apply_put_opts(builder, &opts);
-                builder.send_unbuffered().await
+                Box::pin(builder.send_unbuffered()).await
             }
             PutBody::File(path) => {
                 let small = tokio::fs::metadata(&path)
@@ -606,7 +643,7 @@ impl GcsStore {
                         Bytes::from(bytes),
                     );
                     builder = apply_put_opts(builder, &opts);
-                    builder.send_unbuffered().await
+                    Box::pin(builder.send_unbuffered()).await
                 } else {
                     let stream = crate::util::file_stream(path, None, FILE_CHUNK_SIZE);
                     let source = StoreStreamSource {
@@ -616,16 +653,22 @@ impl GcsStore {
                     let mut builder =
                         client.write_object(self.bucket_resource.clone(), key.to_owned(), source);
                     builder = apply_put_opts(builder, &opts);
-                    builder.send_buffered().await
+                    Box::pin(builder.send_buffered()).await
                 }
             }
             PutBody::Stream { len, stream } if len <= SINGLE_SHOT_PUT_LIMIT => {
-                let bytes = crate::util::collect(stream, len as usize).await?;
+                // SINGLE_SHOT_PUT_LIMIT is far below usize::MAX on any target,
+                // so the conversion never fails; try_from is just the checked
+                // spelling of the old `as usize`.
+                let hint = usize::try_from(len).map_err(|_| {
+                    StoreError::InvalidArgument(format!("stream length {len} exceeds usize"))
+                })?;
+                let bytes = crate::util::collect(stream, hint).await?;
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), bytes);
                 builder = apply_put_opts(builder, &opts);
-                builder.send_unbuffered().await
+                Box::pin(builder.send_unbuffered()).await
             }
             PutBody::Stream { stream, .. } => {
                 let source = StoreStreamSource {
@@ -635,7 +678,7 @@ impl GcsStore {
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), source);
                 builder = apply_put_opts(builder, &opts);
-                builder.send_buffered().await
+                Box::pin(builder.send_buffered()).await
             }
         };
 
@@ -741,9 +784,10 @@ impl ObjectStore for GcsStore {
             Err(_) => return Err(deadline_error("read", key, READ_OPEN_DEADLINE)),
         };
         let obj = resp.object();
+        // ObjectHighlights carries size/generation of the read object.
         let meta = ObjectMeta {
             key: key.to_owned(),
-            size: obj.size as u64,
+            size: gcs_obj_size(obj.size),
             version: gen_version(obj.generation),
         };
 
@@ -775,7 +819,9 @@ impl ObjectStore for GcsStore {
             PutBody::Stream { len, .. } => *len,
         };
         let deadline = put_deadline(size_hint);
-        match tokio::time::timeout(deadline, self.put_inner(key, body, opts)).await {
+        // put_inner's future carries the ~30 KB write futures of all its arms;
+        // boxing keeps put()'s own future small.
+        match tokio::time::timeout(deadline, Box::pin(self.put_inner(key, body, opts))).await {
             Ok(r) => r,
             Err(_) => Err(deadline_error("put", key, deadline)),
         }
