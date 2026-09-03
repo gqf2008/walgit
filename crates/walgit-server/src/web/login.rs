@@ -11,6 +11,7 @@
 //! to paste into the credential helper; `GET` renders the small page that does it.
 //! Tokens are stateless — rotating `session_secret` revokes them all.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::{
@@ -126,7 +127,9 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -146,15 +149,12 @@ async fn login(
         )
             .into_response();
     }
-    let disco = match st.auth.discovery().await {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "identity provider unavailable (OIDC discovery failed)",
-            )
-                .into_response();
-        }
+    let Ok(disco) = st.auth.discovery().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity provider unavailable (OIDC discovery failed)",
+        )
+            .into_response();
     };
     let (client_id, _) = st.auth.oauth_client().unwrap();
     let next = safe_next(q.next);
@@ -178,7 +178,7 @@ async fn login(
     );
     // Google honours `hd` as a domain hint on its account chooser; other issuers ignore it.
     if let Some(hd) = st.cfg.server.auth.allowed_domains.first() {
-        url.push_str(&format!("&hd={}", urlencode(hd)));
+        let _ = write!(url, "&hd={}", urlencode(hd));
     }
     let mut r = Redirect::to(&url).into_response();
     r.headers_mut()

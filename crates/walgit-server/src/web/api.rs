@@ -283,7 +283,7 @@ impl Repo {
             .handle
             .sync_objects()
             .await
-            .map_err(crate::smart::wal_err)?;
+            .map_err(|e| crate::smart::wal_err(&e))?;
         drop(guard);
         self.objects = true;
         self.access = access;
@@ -326,12 +326,18 @@ async fn view(
 ) -> Result<Repo, ApiError> {
     let (guard, access, objects) = match need {
         Need::Refs => (
-            handle.sync_refs().await.map_err(crate::smart::wal_err)?,
+            handle
+                .sync_refs()
+                .await
+                .map_err(|e| crate::smart::wal_err(&e))?,
             ObjectAccess::Local,
             false,
         ),
         Need::Objects => {
-            let (g, a) = handle.sync_objects().await.map_err(crate::smart::wal_err)?;
+            let (g, a) = handle
+                .sync_objects()
+                .await
+                .map_err(|e| crate::smart::wal_err(&e))?;
             (g, a, true)
         }
     };
@@ -1365,7 +1371,7 @@ async fn publish_collab_ref(
     let result = handle
         .publish_push_synced(Some(pack), ev.publish, meta)
         .await
-        .map_err(crate::smart::wal_err)?;
+        .map_err(|e| crate::smart::wal_err(&e))?;
     for (_, res) in &result.per_ref {
         if let Err(e) = res {
             return Err(internal(format!("publish ref: {e}")));

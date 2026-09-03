@@ -34,6 +34,7 @@
 //! Failing runs print the link traces and the seed.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -121,7 +122,7 @@ impl WorkRepo {
     fn pack(&self, head: &str, base: Option<&str>) -> Vec<u8> {
         let mut revs = format!("{head}\n");
         if let Some(b) = base {
-            revs.push_str(&format!("^{b}\n"));
+            let _ = writeln!(revs, "^{b}");
         }
         let mut child = Command::new("git")
             .args(["pack-objects", "--stdout", "--revs", "-q"])
@@ -177,7 +178,7 @@ struct Instance {
     link: Arc<FaultStore>,
     registry: Arc<Registry>,
     cfg: Arc<walgit_config::Config>,
-    _cache: tempfile::TempDir,
+    cache: tempfile::TempDir,
 }
 
 impl Instance {
@@ -208,7 +209,7 @@ impl Instance {
             link,
             registry,
             cfg,
-            _cache: cache,
+            cache,
         }
     }
     async fn open(&self, id: &RepoId) -> Result<Arc<RepoHandle>> {
@@ -268,7 +269,7 @@ impl Cluster {
         let s = self.next_link_seed.fetch_add(1, Ordering::Relaxed);
         // Take the cache dir out of the old instance without dropping it.
         let placeholder = tempfile::tempdir().unwrap();
-        let cache = std::mem::replace(&mut self.instances[i]._cache, placeholder);
+        let cache = std::mem::replace(&mut self.instances[i].cache, placeholder);
         let fresh = Instance::new_at(&self.truth, &name, s, cache, tweak);
         let old = std::mem::replace(&mut self.instances[i], fresh);
         drop(old);
@@ -292,11 +293,7 @@ impl Cluster {
     fn dump_traces(&self) -> String {
         let mut s = String::new();
         for i in &self.instances {
-            s.push_str(&format!(
-                "--- link {} ({})\n",
-                i.name,
-                i.link.stats().summary()
-            ));
+            let _ = writeln!(s, "--- link {} ({})", i.name, i.link.stats().summary());
             for l in i
                 .link
                 .take_trace()
@@ -843,7 +840,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    (1..=n).map(|i| 0xC0FFEE + i * 7919).collect()
+    (1..=n).map(|i| 0x00C0_FFEE + i * 7919).collect()
 }
 fn pushes_per_pusher() -> u64 {
     std::env::var("WALGIT_SIM_PUSHES")
@@ -857,8 +854,8 @@ impl Lcg {
     fn next(&mut self) -> u64 {
         self.0 = self
             .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.0 >> 33
     }
     fn below(&mut self, n: u64) -> u64 {
@@ -977,7 +974,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
                     link,
                     registry: reg,
                     cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-                    _cache: tempfile::tempdir().unwrap(),
+                    cache: tempfile::tempdir().unwrap(),
                 };
                 for _ in 0..20 {
                     let _ = p.push_once(&inst, &id, Duration::from_millis(500)).await;
@@ -1075,7 +1072,9 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
                 );
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            other => bail!("unexpected {other:?}"),
+            other @ walgit_server::ops::CompactOutcome::NotTriggered { .. } => {
+                bail!("unexpected {other:?}")
+            }
         }
     }
     eprintln!(
@@ -1160,7 +1159,7 @@ async fn liveness_stale_instance_cannot_starve_the_core() -> Result<()> {
             link: stale_link,
             registry: stale_reg,
             cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-            _cache: tempfile::tempdir().unwrap(),
+            cache: tempfile::tempdir().unwrap(),
         };
         let mut n = 0u64;
         loop {
@@ -1445,7 +1444,7 @@ async fn liveness_black_holed_instance_is_invisible_to_the_core() -> Result<()> 
             link,
             registry: reg,
             cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-            _cache: tempfile::tempdir().unwrap(),
+            cache: tempfile::tempdir().unwrap(),
         };
         for _ in 0..5 {
             let _ = p1.push_once(&inst, &id, Duration::from_secs(30)).await;

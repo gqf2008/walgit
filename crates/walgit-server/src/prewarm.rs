@@ -86,7 +86,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         .parse()
         .map_err(|e: walgit_git::GitError| e.to_string())?;
     let handle = st.registry.open(&id).await.map_err(|e| e.to_string())?;
-    let task = match handle.begin_task("prewarm", Default::default()) {
+    let task = match handle.begin_task("prewarm", std::collections::HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => return Ok("already warming".into()),
     };

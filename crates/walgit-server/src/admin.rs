@@ -35,7 +35,7 @@ pub async fn create(
         Err(walgit_wal::WalError::AlreadyExists) => {
             Ok((StatusCode::CONFLICT, "already exists").into_response())
         }
-        Err(e) => Err(wal_err(e)),
+        Err(e) => Err(wal_err(&e)),
     }
 }
 
@@ -46,14 +46,17 @@ pub async fn delete(
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let _principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
-    st.registry.delete(&route.id).await.map_err(wal_err)?;
+    st.registry
+        .delete(&route.id)
+        .await
+        .map_err(|e| wal_err(&e))?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }
 
 /// `GET /` — list repos as text/plain, one `owner/name` per line.
 pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
     let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let repos = st.registry.list().await.map_err(wal_err)?;
+    let repos = st.registry.list().await.map_err(|e| wal_err(&e))?;
     let body = repos
         .into_iter()
         .map(|r| r.to_string())
@@ -81,8 +84,8 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         }
     }
 }
-fn wal_err(e: walgit_wal::WalError) -> ApiError {
-    match &e {
+fn wal_err(e: &walgit_wal::WalError) -> ApiError {
+    match e {
         walgit_wal::WalError::NotFound => ApiError::NotFound(e.to_string()),
         _ => ApiError::Internal(format!("wal: {e}")),
     }

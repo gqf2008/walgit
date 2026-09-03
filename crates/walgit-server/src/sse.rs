@@ -154,7 +154,7 @@ where
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,
                 }
             }
@@ -228,7 +228,7 @@ pub fn task_stream(state: std::sync::Arc<walgit_wal::tasks::TaskState>) -> Respo
             tokio::select! {
                 r = live.recv() => match r {
                     Ok(p) => { if tx.send(progress_packet(&p)).await.is_err() { return; } }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,
                 },
                 _ = done.changed() => {

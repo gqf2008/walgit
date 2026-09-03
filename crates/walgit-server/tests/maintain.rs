@@ -26,6 +26,7 @@ macro_rules! step {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Result<()> {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
     // Writer front: count trigger off, so nothing auto-checkpoints on push.
     let front = step!("start front", Server::start())?;
     step!("put repo", front.put_repo("o", "r"))?;
@@ -121,7 +122,6 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
     // not due), one unit per pass, next pass moves to the daily chain, and a
     // re-run after everything is built is idempotent (Idle).
     let id = walgit_git::RepoId::new("o", "r")?;
-    use walgit_server::maintain::{Unit, next_unit, run_pass};
     assert!(
         matches!(step!("unit 1", next_unit(&bundler.state, &id))?, Unit::BundleSlot(ref s, _) if s == "weekly")
     );
@@ -198,7 +198,7 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
 
     // The front sees the checkpoint and a fresh instance cold-starts from it.
     let cold = step!("start cold", front.start_sibling_with(|_| {}))?;
-    let refs = step!("cold ls-remote", cold.ls_remote("o", "r"))?;
+    let refs = cold.ls_remote("o", "r")?;
     let head = git_in(src.path(), &["rev-parse", "HEAD"])?;
     assert!(refs.contains(head.trim()), "{refs}");
     Ok(())
@@ -367,7 +367,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
     };
     step!(
         "move main",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, std::collections::HashMap::default())
     )?;
 
     // Pass 1: the audit (never audited) → fsck.pb lists the blob; the unit succeeds (a finding, not a failure).
@@ -532,7 +532,7 @@ async fn connectivity_failure_is_reported_per_ref_not_as_remote_failure() -> any
     };
     step!(
         "advertise x",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, std::collections::HashMap::default())
     )?;
     // A new commit on top whose tree still references the missing blob (b.txt
     // unchanged): git sends commit 3 + its root tree, the server walks into b.txt.
@@ -604,7 +604,7 @@ async fn host_excluded_from_serving_a_repo_refuses_object_work_with_503() -> any
         front.get_text("/acme/big.git/info/refs?service=git-upload-pack", &[])
     )?;
     assert!(refs.contains("refs/heads/main"), "{refs}");
-    let ls = step!("ls-remote", front.ls_remote("acme", "big"))?;
+    let ls = front.ls_remote("acme", "big")?;
     assert!(ls.contains("refs/heads/main"));
 
     // Fetch (v2) → 503 + Retry-After + ERR naming the host; no task started.
@@ -1073,7 +1073,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, std::collections::HashMap::default())
     )?;
     step!("sync after base", h.sync())?;
     std::fs::write(src.path().join("g.txt"), "two\n")?;
@@ -1486,7 +1486,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p1),
             txn("refs/heads/main", "", &c1),
-            Default::default(),
+            std::collections::HashMap::default(),
             now - 240 * hour
         )
     )?;
@@ -1496,7 +1496,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p2),
             txn("refs/heads/main", &c1, &c2),
-            Default::default(),
+            std::collections::HashMap::default(),
             now - 6 * hour
         )
     )?;
@@ -1729,7 +1729,7 @@ async fn blobless_bundle_family_is_composed_from_the_history_pack_and_served_on_
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, std::collections::HashMap::default())
     )?;
     std::fs::write(src.path().join("f2.txt"), "one and a half\n")?;
     git_in(src.path(), &["add", "."])?;

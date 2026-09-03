@@ -125,8 +125,8 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
             break;
         }
         let handle = state.registry.open(&id).await?;
-        let _refs = handle.sync_refs().await?; // the manifest carries the settings (D24)
-        drop(_refs);
+        let refs = handle.sync_refs().await?; // the manifest carries the settings (D24)
+        drop(refs);
         let cfg = handle.effective_config();
         let Some(upstream) = cfg.upstream.git.clone() else {
             continue;
@@ -145,7 +145,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
             // the scratch's alternates while git reads them.
             let guard = handle.sync().await?;
             let have = current(&handle, &cfg.upstream.follow)?;
-            let token = token_for(state, &cfg).await?;
+            let token = token_for(state, &cfg)?;
             let delta = walgit_git::follow::fetch_refs(
                 &upstream,
                 token.as_deref(),
@@ -254,8 +254,7 @@ async fn run_op(
     params: HashMap<String, String>,
 ) -> Option<serde_json::Value> {
     let task = match crate::ops::start(state.clone(), id.clone(), "follow", params).await {
-        Ok(t) => t,
-        Err(crate::ops::StartError::AlreadyRunning(t)) => t,
+        Ok(t) | Err(crate::ops::StartError::AlreadyRunning(t)) => t,
         Err(crate::ops::StartError::UnknownOp) => return None,
     };
     if !task.wait_done(std::time::Duration::from_secs(3600)).await {
@@ -298,7 +297,7 @@ pub(crate) async fn op(
             .await
             .map_err(|e| format!("reading the fetched delta: {e}"))?
     } else {
-        let token = token_for(state, &cfg).await.map_err(|e| format!("{e:#}"))?;
+        let token = token_for(state, &cfg).map_err(|e| format!("{e:#}"))?;
         log(format!("fetching {} from {upstream}", refs.join(", ")));
         walgit_git::follow::fetch_refs(
             &upstream,
@@ -479,16 +478,12 @@ fn current(
         .collect())
 }
 
-async fn token_for(
-    state: &AppState,
-    cfg: &walgit_config::Config,
-) -> anyhow::Result<Option<String>> {
+fn token_for(state: &AppState, cfg: &walgit_config::Config) -> anyhow::Result<Option<String>> {
     match cfg.upstream.token_env.as_deref() {
         Some(name) => Ok(Some(
             state
                 .lfs_upstream
                 .secret(name)
-                .await
                 .map_err(|e| anyhow::anyhow!("upstream token: {e}"))?,
         )),
         None => Ok(None),

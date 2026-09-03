@@ -584,13 +584,13 @@ async fn overview(
     state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
-    let handle = state.registry.open(&id).await.map_err(wal_err)?;
+    let handle = state.registry.open(&id).await.map_err(|e| wal_err(&e))?;
     // read_log performs its own freshness check; acquire the read guard only
     // after it has completed because read_log may need the write lock.
-    let entries = handle.read_log(1, None).await.map_err(wal_err)?;
+    let entries = handle.read_log(1, None).await.map_err(|e| wal_err(&e))?;
     // Refs-level sync only: the overview must render for repos whose packs do
     // not fit this instance (that is exactly when people look at it).
-    let _guard = handle.sync_refs().await.map_err(wal_err)?;
+    let _guard = handle.sync_refs().await.map_err(|e| wal_err(&e))?;
     let manifest = handle.manifest();
     let version = handle
         .manifest_version()
@@ -743,8 +743,7 @@ async fn overview(
                     "at the next `{w}` slot, on a maintainer whose capacity holds the pack set ({})",
                     walgit_wal::remote::human_bytes(live_bytes)
                 )),
-                (Some(_), false) => None,
-                (None, _) => None,
+                (Some(_), false) | (None, _) => None,
             },
         });
     } else if fresh >= ecfg.compaction.trigger_packs.max(2) {
@@ -1090,7 +1089,7 @@ async fn ops_start(
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     // Make sure the repo exists before spawning anything.
-    state.registry.open(&id).await.map_err(wal_err)?;
+    state.registry.open(&id).await.map_err(|e| wal_err(&e))?;
     tracing::info!(repo = %id, op = %op, by = %principal.name, ?params, "ops.start");
     let task = match crate::ops::start(state.clone(), id, &op, params).await {
         Ok(t) => t,
@@ -1188,8 +1187,9 @@ async fn checkpoint_info(
                 checkpoint.writer,
             )
         }
-        Ok(GetResult::NotModified { .. }) => (0, String::new(), String::new()),
-        Err(walgit_store::StoreError::NotFound { .. }) => (0, String::new(), String::new()),
+        Ok(GetResult::NotModified { .. }) | Err(walgit_store::StoreError::NotFound { .. }) => {
+            (0, String::new(), String::new())
+        }
         Err(error) => return Err(ApiError::Internal(error.to_string())),
     };
     Ok(Some(BundleInfo {
@@ -1225,7 +1225,7 @@ async fn bundle_infos(
     // Exactly the URIs the bundle-uri advertisement hands to git (one code
     // path: walgit_bundle::render::bundle_uri), so the WAL page never shows a
     // link that differs from what clients download.
-    let handle = state.registry.open(id).await.map_err(wal_err)?;
+    let handle = state.registry.open(id).await.map_err(|e| wal_err(&e))?;
     let mut out = Vec::with_capacity(list.bundles.len());
     for bundle in list.bundles {
         let uri = walgit_bundle::render::bundle_uri(
@@ -1296,7 +1296,7 @@ fn size_recursive(path: &Path) -> u64 {
         .sum()
 }
 
-fn wal_err(error: walgit_wal::WalError) -> ApiError {
+fn wal_err(error: &walgit_wal::WalError) -> ApiError {
     match error {
         walgit_wal::WalError::NotFound => ApiError::NotFound("repository not found".into()),
         other => ApiError::Internal(format!("wal: {other}")),

@@ -70,7 +70,7 @@ pub async fn run_loop(state: Arc<AppState>) {
         match outcome {
             Ok(r) => {
                 if let Some(u) = &r.last_unit {
-                    last_unit = u.clone();
+                    last_unit.clone_from(u);
                 }
                 span.record("repos", r.repos);
                 span.record("units", r.units);
@@ -778,8 +778,7 @@ async fn run_op_value(
 ) -> Option<serde_json::Value> {
     let started = Instant::now();
     let task = match crate::ops::start(state.clone(), id.clone(), op, params).await {
-        Ok(t) => t,
-        Err(crate::ops::StartError::AlreadyRunning(t)) => t,
+        Ok(t) | Err(crate::ops::StartError::AlreadyRunning(t)) => t,
         Err(crate::ops::StartError::UnknownOp) => {
             warn!(repo = %id, op, "maintenance: cannot start op");
             return None;

@@ -56,7 +56,7 @@ async fn after_sigterm_new_object_work_is_refused_and_no_unit_starts() -> anyhow
         .registry
         .open(&walgit_git::RepoId::new("o", "r")?)
         .await?;
-    let unit = match h0.begin_task("compact", Default::default()) {
+    let unit = match h0.begin_task("compact", std::collections::HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => anyhow::bail!("compact already running"),
     };

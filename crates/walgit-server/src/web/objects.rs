@@ -57,7 +57,7 @@ pub struct Remote {
 fn not_found(m: impl Into<String>) -> ApiError {
     ApiError::NotFound(m.into())
 }
-fn wal(e: walgit_wal::WalError) -> ApiError {
+fn wal(e: &walgit_wal::WalError) -> ApiError {
     ApiError::Internal(format!("remote objects: {e}"))
 }
 
@@ -122,7 +122,7 @@ impl Remote {
         self.packs
             .find(oid)
             .await
-            .map_err(wal)?
+            .map_err(|e| wal(&e))?
             .ok_or_else(|| not_found(format!("object {oid} not in the pack set")))
     }
 
@@ -168,7 +168,7 @@ impl Remote {
         &self,
         oid: &gix_hash::oid,
     ) -> Result<Option<(Kind, u64)>, ApiError> {
-        self.packs.header(oid).await.map_err(wal)
+        self.packs.header(oid).await.map_err(|e| wal(&e))
     }
 
     /// `rev-parse --verify <rev>^{commit}` without objects on disk: full or
@@ -251,10 +251,6 @@ impl Remote {
             };
             cur = e.oid;
             mode = Some(e.mode);
-            if !e.mode.is_tree() {
-                // more segments after a blob => absent
-                continue;
-            }
         }
         match mode {
             None => Ok(Some((cur, gix_object::tree::EntryKind::Tree.into()))),

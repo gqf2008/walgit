@@ -216,8 +216,7 @@ async fn start_op(
     )
     .await
     {
-        Ok(t) => Ok(t),
-        Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
+        Ok(t) | Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
         Err(walgit_server::ops::StartError::UnknownOp) => Err("unknown op".into()),
     }
 }

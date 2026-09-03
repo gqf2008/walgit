@@ -201,7 +201,7 @@ async fn push_delete_ref() -> TestResult {
 
     git_in(&src, &["push", "origin", "--delete", "topic"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(!refs.contains("refs/heads/topic"));
     Ok(())
 }
@@ -220,7 +220,7 @@ async fn dangling_head_clone_and_ls_remote() -> TestResult {
         &["push", &server.repo_url("t", "r"), "HEAD:refs/heads/other"],
     )?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/heads/other"));
     for line in refs.lines() {
         assert!(
@@ -371,7 +371,7 @@ async fn concurrent_clones_and_pushes_with_telemetry() -> TestResult {
         failures.len(),
         &failures[..failures.len().min(5)]
     );
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     for i in 0..16 {
         assert!(refs.contains(&format!("refs/heads/w{i}")));
     }
@@ -403,7 +403,7 @@ async fn push_tags() -> TestResult {
     )?;
     git_in(&src, &["push", "origin", "main", "--tags"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/tags/v1"));
     Ok(())
 }
@@ -453,7 +453,7 @@ async fn ls_remote_lists_refs() -> TestResult {
     )?;
     git_in(&src, &["push", "origin", "main"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/heads/main"));
     Ok(())
 }
@@ -615,7 +615,7 @@ async fn atomic_push_rejects_all_refs_when_one_is_non_ff() -> TestResult {
         "atomic report should mention topic: {stderr}"
     );
 
-    let refs = server.ls_remote("t", "atomic").await?;
+    let refs = server.ls_remote("t", "atomic")?;
     assert!(refs.contains(&format!("{}\trefs/heads/main", server_main.trim())));
     assert!(refs.contains(&format!("{}\trefs/heads/topic", initial_topic.trim())));
     Ok(())
@@ -661,7 +661,7 @@ async fn push_protocol_v0() -> TestResult {
         &src,
         &["-c", "protocol.version=0", "push", "origin", "main"],
     )?;
-    let refs = server.ls_remote("t", "push-v0").await?;
+    let refs = server.ls_remote("t", "push-v0")?;
     assert!(refs.contains("refs/heads/main"));
     Ok(())
 }
@@ -1743,7 +1743,7 @@ async fn push_from_a_shallow_clone() -> TestResult {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let refs = server.ls_remote("t", "shallowpush").await?;
+    let refs = server.ls_remote("t", "shallowpush")?;
     assert!(refs.contains("refs/heads/from-shallow"), "{refs}");
     Ok(())
 }
@@ -2440,7 +2440,7 @@ async fn refs_level_requests_prefetch_only_small_pack_sets() -> TestResult {
     let bounded = big
         .start_sibling_with(|c| c.wal.prefetch_max_bytes = bytesize::ByteSize::b(1))
         .await?;
-    let _ = bounded.ls_remote("t", "prefetch").await?;
+    let _ = bounded.ls_remote("t", "prefetch")?;
     let h = bounded.state.registry.open(&id).await?;
     assert!(
         !h.prefetch_wanted(),
@@ -2463,7 +2463,7 @@ async fn refs_level_requests_prefetch_only_small_pack_sets() -> TestResult {
 
     // Default bound (1 GiB): the small set is prefetched after a refs-level request.
     let eager = big.start_sibling_with(|_| {}).await?;
-    let _ = eager.ls_remote("t", "prefetch").await?;
+    let _ = eager.ls_remote("t", "prefetch")?;
     let h = eager.state.registry.open(&id).await?;
     for _ in 0..50 {
         if h.packs_ready() {
@@ -3266,7 +3266,7 @@ async fn wiped_bucket_on_leftover_cache_advertises_no_phantom_refs() -> TestResu
     )?;
     git_in(&src, &["push", "-u", "origin", "main"])?;
     let pushed = git_in(&src, &["rev-parse", "main"])?;
-    assert!(server_a.ls_remote("o", "r").await?.contains(pushed.trim()));
+    assert!(server_a.ls_remote("o", "r")?.contains(pushed.trim()));
 
     // "Process exit": the server drops; the caller-owned cache dir survives.
     drop(server_a);

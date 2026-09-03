@@ -61,7 +61,7 @@ pub async fn info_refs(
         if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
             return Ok(git_err_response(
                 &service_param,
-                &auth_help_message(st, headers, &e),
+                &auth_help_message(st, headers, e),
             ));
         }
         return Err(auth_err(e));
@@ -79,7 +79,7 @@ pub async fn info_refs(
 
     let handle = open_repo(st, &route.id, is_receive).await?;
     // Advertisements need refs only: never wait for (or require) the pack set.
-    let _guard = handle.sync_refs().await.map_err(wal_err)?;
+    let _guard = handle.sync_refs().await.map_err(|e| wal_err(&e))?;
 
     let protocol = walgit_git::pkt::Protocol::from_git_protocol_header(
         headers.get("git-protocol").and_then(|v| v.to_str().ok()),
@@ -108,7 +108,7 @@ pub async fn info_refs(
             handle
                 .local()
                 .advertise_refs_v0(service, &mut buf)
-                .map_err(git_err)?;
+                .map_err(|e| git_err(&e))?;
             let advert_bytes = buf[start..].to_vec();
             st.caches
                 .ref_advert
@@ -202,14 +202,14 @@ async fn upload_pack_v2(
 ) -> Result<Response, ApiError> {
     let (cmd, reader) = walgit_git::pkt::read_command(reader)
         .await
-        .map_err(git_err)?;
+        .map_err(|e| git_err(&e))?;
     match cmd.name.as_str() {
         "ls-refs" => {
-            let _guard = handle.sync_refs().await.map_err(wal_err)?;
+            let _guard = handle.sync_refs().await.map_err(|e| wal_err(&e))?;
             let req = walgit_git::pkt::parse_ls_refs(&cmd);
             let req = walgit_git::pkt::read_ls_refs_args(reader, req)
                 .await
-                .map_err(git_err)?;
+                .map_err(|e| git_err(&e))?;
             let args = walgit_git::LsRefsArgs {
                 ref_prefixes: req.prefixes,
                 symrefs: req.symrefs,
@@ -223,7 +223,7 @@ async fn upload_pack_v2(
                     .caches
                     .ref_advert
                     .get_v2_ls_refs(&repo_key, version.as_ref(), &args) { lines } else {
-                    let lines = handle.local().ls_refs(&args).map_err(git_err)?;
+                    let lines = handle.local().ls_refs(&args).map_err(|e| git_err(&e))?;
                     st.caches.ref_advert.insert_v2_ls_refs(
                         &repo_key,
                         version.as_ref(),
@@ -330,7 +330,7 @@ async fn upload_pack_v2(
                         "git-upload-pack",
                         &too_large_message(st, headers, route, &e),
                     ),
-                    e => return Err(wal_err(e)),
+                    e => return Err(wal_err(&e)),
                 });
             }
             let (writer, body) = write_body_pipe(256 * 1024);
@@ -360,7 +360,7 @@ async fn upload_pack_v2(
             ))
         }
         "object-info" => {
-            let _guard = handle.sync().await.map_err(wal_err)?;
+            let _guard = handle.sync().await.map_err(|e| wal_err(&e))?;
             let req = walgit_git::pkt::parse_object_info(&cmd);
             let mut sizes_buf = Vec::with_capacity(256);
             let repo = handle.local().gix();
@@ -379,14 +379,14 @@ async fn upload_pack_v2(
             ))
         }
         "bundle-uri" => {
-            let _guard = handle.sync_refs().await.map_err(wal_err)?;
+            let _guard = handle.sync_refs().await.map_err(|e| wal_err(&e))?;
             let () = walgit_git::pkt::parse_bundle_uri(&cmd);
             let base = request_base_url(st, headers);
             let lines = st
                 .bundles
                 .protocol_v2_lines(&route.id, &base)
                 .await
-                .map_err(bundle_err)?;
+                .map_err(|e| bundle_err(&e))?;
             let mut buf = Vec::with_capacity(256);
             for l in lines {
                 pktline::encode_text(&mut buf, &l);
@@ -819,7 +819,7 @@ async fn upload_pack_v0(
                 "git-upload-pack",
                 &too_large_message(st, headers, route, &e),
             ),
-            e => return Err(wal_err(e)),
+            e => return Err(wal_err(&e)),
         });
     }
     if !handle.remote_served().is_empty() {
@@ -1015,7 +1015,9 @@ pub async fn receive_pack(
     // Parse commands + capabilities first (they need no objects); pack bytes
     // follow in `pack_reader`. Knowing the capabilities before the sync lets
     // us narrate the sync on band 2 when the client speaks side-band-64k.
-    let (txn, caps, pack_reader) = walgit_git::receive::parse(reader).await.map_err(git_err)?;
+    let (txn, caps, pack_reader) = walgit_git::receive::parse(reader)
+        .await
+        .map_err(|e| git_err(&e))?;
     let pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(pack_reader);
     // Wal's verify_txn treats empty string as the zero oid (create/delete).
     // receive::parse emits the 40-zero hex; normalize to empty for both ends.
@@ -1058,7 +1060,7 @@ pub async fn receive_pack(
 
     if !caps.side_band_64k {
         // No sideband: the response is the report alone, after the work.
-        let guard = handle.sync().await.map_err(wal_err)?;
+        let guard = handle.sync().await.map_err(|e| wal_err(&e))?;
         let report = receive_pack_process(
             st,
             &handle,
@@ -1147,7 +1149,7 @@ pub async fn receive_pack(
 async fn receive_pack_process(
     st: &AppState,
     handle: &Arc<walgit_wal::RepoHandle>,
-    _guard: walgit_wal::ReadGuard<'_>,
+    guard: walgit_wal::ReadGuard<'_>,
     txn: walgit_proto::v1::RefTransaction,
     caps: walgit_git::receive::ReceiveCaps,
     pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
@@ -1235,7 +1237,7 @@ async fn receive_pack_process(
     // Release the sync read guard before publishing. `publish_push_synced`
     // reuses this request's freshness check while still syncing after CAS
     // conflicts.
-    drop(_guard);
+    drop(guard);
 
     // Writer-side peel: replicas advertise annotated tags without objects.
     local.fill_peeled(&mut txn);
@@ -1314,7 +1316,9 @@ async fn refuse_push(body: Body, headers: &HeaderMap, msg: String) -> Result<Res
         .get(axum::http::header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
     let reader = maybe_gunzip(enc, body_to_async_read(body));
-    let (txn, caps, _pack) = walgit_git::receive::parse(reader).await.map_err(git_err)?;
+    let (txn, caps, _pack) = walgit_git::receive::parse(reader)
+        .await
+        .map_err(|e| git_err(&e))?;
     Ok(receive_response(refusal_report(&caps, &txn, &msg).await))
 }
 
@@ -1395,10 +1399,14 @@ async fn parse_fetch_request(
     loop {
         let line = walgit_git::pkt::read_pkt_line(&mut reader)
             .await
-            .map_err(git_err)?;
+            .map_err(|e| git_err(&e))?;
         match line {
-            None | Some(walgit_git::pkt::PktLine::Flush | walgit_git::pkt::PktLine::Delim) => break,
-            Some(walgit_git::pkt::PktLine::ResponseEnd) => break,
+            None
+            | Some(
+                walgit_git::pkt::PktLine::Flush
+                | walgit_git::pkt::PktLine::Delim
+                | walgit_git::pkt::PktLine::ResponseEnd,
+            ) => break,
             Some(walgit_git::pkt::PktLine::Data(b)) => {
                 let s = String::from_utf8_lossy(&b);
                 let s = s.trim_end_matches('\n');
@@ -1460,12 +1468,12 @@ pub(crate) async fn open_repo(
             .registry
             .open_or_create(id, format)
             .await
-            .map_err(wal_err)?)
+            .map_err(|e| wal_err(&e))?)
     } else {
         match st.registry.open(id).await {
             Ok(h) => Ok(h),
             Err(walgit_wal::WalError::NotFound) => Err(ApiError::NotFound(id.to_string())),
-            Err(e) => Err(wal_err(e)),
+            Err(e) => Err(wal_err(&e)),
         }
     }
 }
@@ -1557,7 +1565,7 @@ pub(crate) fn client_setup(st: &AppState, base_url: &str) -> String {
 pub(crate) fn auth_help_message(
     st: &AppState,
     headers: &HeaderMap,
-    e: &crate::auth::AuthError,
+    e: crate::auth::AuthError,
 ) -> String {
     let base = request_base_url(st, headers);
     let host = base
@@ -1743,11 +1751,11 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         }
     }
 }
-fn git_err(e: walgit_git::GitError) -> ApiError {
+fn git_err(e: &walgit_git::GitError) -> ApiError {
     ApiError::Internal(format!("git: {e}"))
 }
-pub(crate) fn wal_err(e: walgit_wal::WalError) -> ApiError {
-    match &e {
+pub(crate) fn wal_err(e: &walgit_wal::WalError) -> ApiError {
+    match e {
         walgit_wal::WalError::NotFound => ApiError::NotFound(e.to_string()),
         walgit_wal::WalError::TooLarge { .. } => ApiError::ServiceUnavailable(e.to_string()),
         // A store call that timed out / was throttled: fail fast, let the
@@ -1758,6 +1766,6 @@ pub(crate) fn wal_err(e: walgit_wal::WalError) -> ApiError {
         _ => ApiError::Internal(format!("wal: {e}")),
     }
 }
-fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
+fn bundle_err(e: &walgit_bundle::BundleError) -> ApiError {
     ApiError::Internal(format!("bundle: {e}"))
 }

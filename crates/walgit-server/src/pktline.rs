@@ -6,11 +6,13 @@
 /// Maximum data payload per pkt-line (excluding the 4-byte length header).
 pub const MAX_DATA_LEN: usize = 65516;
 
+/// Hex digits for the pkt-line length header.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 /// Encode a data line into `buf`. Panics if `data` exceeds [`MAX_DATA_LEN`].
 pub fn encode_line(buf: &mut Vec<u8>, data: &[u8]) {
     assert!(data.len() <= MAX_DATA_LEN, "pkt-line too long");
     let len = data.len() + 4;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     buf.extend_from_slice(&[
         HEX[(len >> 12) & 0xf],
         HEX[(len >> 8) & 0xf],

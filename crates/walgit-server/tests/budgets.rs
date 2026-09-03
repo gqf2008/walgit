@@ -20,7 +20,7 @@ type TestResult<T = ()> = anyhow::Result<T>;
 
 /// A repo with two commits on `main` (f.txt changed) plus a diverged `topic`
 /// branch, pushed to `o/r` on `server`.
-async fn fixture(server: &Server) -> TestResult {
+fn fixture(server: &Server) -> TestResult {
     let dir = tempfile::tempdir()?.keep();
     git_in(&dir, &["init", "-q", "-b", "main"])?;
     git_in(&dir, &["config", "user.email", "t@t"])?;
@@ -47,7 +47,7 @@ async fn fixture(server: &Server) -> TestResult {
 async fn remote_sibling() -> TestResult<(Server, Server)> {
     let big = Server::start().await?;
     big.put_repo("o", "r").await?;
-    fixture(&big).await?;
+    fixture(&big)?;
     let small = big
         .start_sibling_with(|cfg| {
             cfg.cache.max_bytes = bytesize::ByteSize::b(1);

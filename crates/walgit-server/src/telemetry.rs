@@ -381,8 +381,7 @@ fn level_to_severity(level: &Level) -> &'static str {
         Level::ERROR => "ERROR",
         Level::WARN => "WARNING",
         Level::INFO => "INFO",
-        Level::DEBUG => "DEBUG",
-        Level::TRACE => "DEBUG",
+        Level::DEBUG | Level::TRACE => "DEBUG",
     }
 }
 

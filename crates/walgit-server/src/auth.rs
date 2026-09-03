@@ -586,7 +586,7 @@ impl Authenticator {
     /// Principal from a valid, unexpired session cookie (policy re-applied).
     fn authenticate_cookie(&self, headers: &HeaderMap) -> Option<Principal> {
         let (_, _, email) = self.session_claims(headers)?;
-        self.principal_for_email(email).ok()
+        self.principal_for_email(&email).ok()
     }
 
     /// Sliding sessions: a fresh cookie value when the request carries a valid
@@ -597,7 +597,7 @@ impl Authenticator {
         if unix_now()?.saturating_sub(iat) < self.session_ttl.as_secs() / 4 {
             return None;
         }
-        let principal = self.principal_for_email(email).ok()?;
+        let principal = self.principal_for_email(&email).ok()?;
         self.session_cookie_value(&principal.name)
     }
 
@@ -660,7 +660,7 @@ impl Authenticator {
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
             return Some(match self.access_token_claims(tok) {
-                Some((_, email)) => self.principal_for_email(email),
+                Some((_, email)) => self.principal_for_email(&email),
                 None => Err(AuthError::Invalid),
             });
         }
@@ -797,11 +797,11 @@ impl Authenticator {
             return Err(AuthError::Invalid);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
-        self.principal_for_email(claims.email)
+        self.principal_for_email(&claims.email)
     }
 
     /// Apply the domain/email allowlist and `write_domains` policy to a verified email.
-    fn principal_for_email(&self, email: String) -> Result<Principal, AuthError> {
+    fn principal_for_email(&self, email: &str) -> Result<Principal, AuthError> {
         let Some((_, domain)) = email.rsplit_once('@') else {
             return Err(AuthError::Invalid);
         };
@@ -817,9 +817,9 @@ impl Authenticator {
             Some(domains) => domains.iter().any(|d| d == &domain_lower),
         };
         Ok(Principal {
-            name: email.clone(),
+            name: email.to_string(),
             write,
-            admin: self.is_admin(&email),
+            admin: self.is_admin(email),
             anonymous: false,
         })
     }
@@ -845,7 +845,7 @@ struct IdClaims {
     email_verified: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AuthError {
     Invalid,
     Unauthorized,

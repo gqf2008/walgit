@@ -79,7 +79,7 @@ pub async fn list(
         .bundles
         .render_list(&route.id, &base, filter.as_deref(), fulls)
         .await
-        .map_err(bundle_err)?;
+        .map_err(|e| bundle_err(&e))?;
     match text {
         Some(t) => {
             st.caches
@@ -156,7 +156,7 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         }
     }
 }
-fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
+fn bundle_err(e: &walgit_bundle::BundleError) -> ApiError {
     ApiError::Internal(format!("bundle: {e}"))
 }
 

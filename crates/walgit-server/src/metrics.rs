@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::response::IntoResponse;
-use metrics_exporter_prometheus::PrometheusHandle;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use crate::AppState;
 
@@ -17,7 +17,6 @@ pub fn install() -> anyhow::Result<Arc<PrometheusHandle>> {
     if let Some(h) = HANDLE.get() {
         return Ok(h.clone());
     }
-    use metrics_exporter_prometheus::PrometheusBuilder;
     let rec = PrometheusBuilder::new().build_recorder();
     let handle = Arc::new(rec.handle());
     // set_global_recorder fails if already set; ignore that race — the handle is

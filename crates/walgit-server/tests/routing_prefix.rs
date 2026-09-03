@@ -169,8 +169,6 @@ fn clients_emit_prefix_form() -> TestResult {
 }
 
 fn walk_ts(dir: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let base = root().join(dir);
     fn rec(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -191,6 +189,8 @@ fn walk_ts(dir: &str) -> Vec<(String, String)> {
             }
         }
     }
+    let mut out = Vec::new();
+    let base = root().join(dir);
     rec(&base, &root(), &mut out);
     out
 }

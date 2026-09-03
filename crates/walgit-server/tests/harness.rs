@@ -244,7 +244,7 @@ impl Server {
         Ok(())
     }
 
-    pub async fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
+    pub fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
         let out = Command::new("git")
             .args(["ls-remote", &self.repo_url(owner, repo)])
             .output()?;

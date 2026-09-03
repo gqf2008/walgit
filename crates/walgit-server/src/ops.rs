@@ -331,7 +331,6 @@ async fn run(
                     state
                         .lfs_upstream
                         .secret(name)
-                        .await
                         .map_err(|e| format!("upstream token: {e}"))?,
                 ),
                 None => None,
