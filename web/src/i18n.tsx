@@ -25,29 +25,74 @@ const en = {
   // Top nav
   "nav.repos": "Repositories",
 
-  // Landing hero
-  "hero.lede": "A git server that is a single binary in front of an object store.",
-  "hero.text.a": "walgit is an implementation of the ideas in the",
-  "hero.link.origin": "git hosting architecture of Origin (Cursor)",
-  "hero.text.b": "and our friends at",
-  "hero.link.turbopuffer": "Turbopuffer",
-  "hero.text.c": "who have pioneered GCS/S3 based share-nothing infrastructure to scale.",
-  "hero.exploreApi": "Explore the API",
-  "hero.readPost": "Read “Git at any scale” ↗",
-  "home.reposByOwner": "Repositories by owner",
-
-  // Landing D1 showcase (issue #43)
-  "showcase.title": "Collaboration, without a database",
-  "showcase.lede":
-    "Issues, the board and CI on this host are derived live from signed entries stored as git refs — no database, only public rules every client applies identically.",
-  "showcase.m1.t": "An issue is an append-only chain",
-  "showcase.m1.b": "Nobody edits; everyone appends a signed entry. The state is a replay — the last matching entry wins.",
-  "showcase.m2.t": "The board exists nowhere — it is computed",
-  "showcase.m2.b": "Same refs, same rule: every client derives the board independently and arrives at byte-identical results.",
-  "showcase.m3.t": "Two runners may both run — only one counts",
-  "showcase.m3.b": "CI has no scheduler. Simultaneous claims are a legal race; one deterministic winner rule yields exactly one effective result.",
-  "showcase.illustrative": "illustrative",
-  "showcase.cta.guide": "See it live in a repository →",
+  // Home model landing (issue #55): the "/" page teaches D1's mental model in
+  // plain language with static, clearly-marked illustrations. The same story
+  // told on a repository's own live data is the collab guide page (#41).
+  "home.eyebrow": "walgit · D1 — the collaboration layer, in plain language",
+  "home.h1.a": "No database.",
+  "home.h1.b": "Only rules.",
+  "home.lede":
+    "D1 puts issues, boards and CI inside the repository itself — nothing server-side to flip through, edit or blame. Every collaboration screen is the same signed entries computed on the spot through the same public rules. Three mental models below, a “looks like a bug — isn't” cheat sheet after them, and this host's repositories at the end.",
+  "home.illus": "illustrative",
+  "home.live": "See it live in a repository →",
+  "home.m1.t": "An issue is an append-only chain of signed entries",
+  "home.m1.sub":
+    "Nobody edits an issue. Every change is one Ed25519-signed entry appended to the chain and pointed at its predecessor by parent. The current state is a replay of the whole chain: the last matching entry wins.",
+  "home.m1.demo.issue": "Add dark mode",
+  "home.m1.demo.act.open": "opened the thread",
+  "home.m1.demo.act.move": "moved the card",
+  "home.m1.demo.act.conclude": "concluded the review",
+  "home.m1.note":
+    "Why only append? The repository's only durable form is an append-only log in the object store — instances are disposable, disk is a cache. State that must survive has to look like something anyone can replay and verify: every entry verifies on its own, and the whole chain recomputes on any machine.",
+  "home.m2.t": "The board exists nowhere — it is computed",
+  "home.m2.sub":
+    "The same refs/collab/* entries, the same board definition, the same ordering rule (last activity, then id): your machine and the server each compute independently and arrive at byte-identical boards. Not cache sync — the inevitable output of a deterministic function.",
+  "home.m2.l": "your machine · CLI",
+  "home.m2.l.sub": "offline aggregation, no server involved",
+  "home.m2.r": "server · HTTP API",
+  "home.m2.r.sub": "an independent process, the same rules",
+  "home.m2.refs.a": "The only truth: ",
+  "home.m2.refs.b": "{n} signed entries + the board definition",
+  "home.m2.refs.c": ", under version control in the repository",
+  "home.m2.demo.w2": "board column glob",
+  "home.m2.demo.w3": "fill the e2e gap",
+  "home.m2.note":
+    "The mental shift: centralized systems ask you to trust the platform — GitHub says merged, so it is merged. Here you trust the rule: anyone starting from the same refs must compute the same board. The CLI/API byte comparison exists to verify exactly that property — not “that sync worked”.",
+  "home.m3.t": "Two runners may both run — only one counts",
+  "home.m3.sub":
+    "CI has no scheduler. Any runner that sees an untested commit claims it with a ci_claim entry. Simultaneous claims are a legal race: both may execute (at least once), yet one deterministic winner rule across the network admits exactly one effective result.",
+  "home.m3.fx.winner": "winner = min(ts, actor, oid)",
+  "home.m3.fx.any": "execution: at least once",
+  "home.m3.fx.once": "effective: exactly once",
+  "home.m3.fx.ttl": "claim TTL 300 s — a dead runner gets re-claimed",
+  "home.m3.note":
+    "Why allow duplicate runs? Deduplication needs a central scheduler — exactly what this design removes. The price is an occasional extra idempotent build; the gain is that any machine can donate CI capacity and every run stays auditable.",
+  "home.bugs.t": "Looks like a bug — isn't",
+  "home.bugs.lede":
+    "Decentralization turns consistency from a platform-internal implementation detail into a visible running phenomenon. Meet these four sights — check before filing a bug:",
+  "home.bug1.sight": "The same task ran twice",
+  "home.bug1.truth":
+    "A legal race. Two runners claimed in the same window and both ran; the winner rule picked the single effective result, the other is kept for audit.",
+  "home.bug2.sight": "A task is claimed, but no result appears",
+  "home.bug2.truth":
+    "The runner may be dead. Claims carry a TTL (5 minutes by default); when it expires, another runner re-claims the same attempt — nothing is lost.",
+  "home.bug3.sight": "A card's position on the board jumped",
+  "home.bug3.truth":
+    "The ordering key is (last activity, id). Two activities in the same second are ordered by id — a deterministic rule at work, not a rendering glitch.",
+  "home.bug4.sight": "A result “disappeared”",
+  "home.bug4.truth":
+    "It merely isn't effective. Every entry is still on the refs, not one missing; existence is irrevocable — effectiveness is the rule's choice.",
+  "home.cmds.t": "When in doubt — three commands",
+  "home.cmd1.what": "replay any thread: every entry carries its signature and parent link",
+  "home.cmd2.what": "the board computed offline — byte-identical to any server",
+  "home.cmd3.what": "the global summary: threads, verification, activity, CI runs",
+  "home.endnote.a": "These three commands and everything a browser shows you draw on the same source: the signed entries on refs/collab/*. ",
+  "home.browse": "Repositories on this host",
+  "home.origin.a": "walgit is built on the git hosting of ",
+  "home.origin.l1": "Origin (Cursor)",
+  "home.origin.b": " and the shared-nothing infrastructure of ",
+  "home.origin.l2": "Turbopuffer",
+  "home.origin.c": ": one binary in front of an object store, a write-ahead log instead of a database.",
 
   // Repo chrome
   "tab.code": "Code",
@@ -610,29 +655,68 @@ const zhCN: Record<I18nKey, string> = {
   // Top nav
   "nav.repos": "仓库",
 
-  // Landing hero
-  "hero.lede": "一个 git 服务器 = 单个二进制 + 一个对象存储。",
-  "hero.text.a": "walgit 实现了",
-  "hero.link.origin": "Origin（Cursor）的 git 托管架构",
-  "hero.text.b": "中的思想，以及我们的朋友",
-  "hero.link.turbopuffer": "Turbopuffer",
-  "hero.text.c": "——他们开创了基于 GCS/S3 的 shared-nothing 规模化基础设施。",
-  "hero.exploreApi": "浏览 API",
-  "hero.readPost": "阅读《Git at any scale》↗",
-  "home.reposByOwner": "按属主浏览仓库",
-
-  // Landing D1 showcase (issue #43)
-  "showcase.title": "协作，但没有数据库",
-  "showcase.lede":
-    "Issues, the board and CI on this host are derived live from signed entries stored as git refs — no database, only public rules every client applies identically.",
-  "showcase.m1.t": "议题 = 只能追加的签名条目链",
-  "showcase.m1.b": "没有人编辑；每个人追加一条签名条目。状态是重放——最后一条匹配的条目生效。",
-  "showcase.m2.t": "看板不存在于任何地方——它是算出来的",
-  "showcase.m2.b": "同样的 refs、同样的规则：每个客户端独立推导，得到字节一致的看板。",
-  "showcase.m3.t": "两个 runner 可能都跑了——但只算一个",
-  "showcase.m3.b": "CI 没有调度器。同时认领是合法竞态；一条确定性 winner 规则让恰好一个结果生效。",
-  "showcase.illustrative": "示意",
-  "showcase.cta.guide": "在真实仓库里看现场版 →",
+  // Home model landing (issue #55)
+  "home.eyebrow": "walgit · D1 去中心化协作层 · 人类版模型",
+  "home.h1.a": "没有数据库，",
+  "home.h1.b": "只有规则",
+  "home.lede":
+    "D1 把 issue、看板、CI 全部放进 git 仓库本身——没有服务器端数据库可翻、可改、可背锅。你看到的每一屏协作界面，都是同一组签名条目经过同一套公开规则、当场算出来的结果。下面是三个心智模型，接着一份「看起来像 bug」对照表，页尾是本主机上的仓库。",
+  "home.illus": "示意",
+  "home.live": "在真实仓库里看现场版 →",
+  "home.m1.t": "一个 issue，就是一串只增不改的签名条目",
+  "home.m1.sub":
+    "没有人「编辑」过 issue。每个人都在同一条链上追加一条带 Ed25519 签名的条目，用 parent 指向前一条。当前状态 = 从头重放这条链：最后一条说了算。",
+  "home.m1.demo.issue": "加深色模式",
+  "home.m1.demo.act.open": "开卡",
+  "home.m1.demo.act.move": "移动卡片",
+  "home.m1.demo.act.conclude": "结论",
+  "home.m1.note":
+    "为什么只能追加？仓库的唯一持久形态是对象桶里的只追加日志——实例随时会被销毁，磁盘只是缓存。协作状态想活下来，就必须长成「任何人都能重放验证」的样子：每条条目都能独立验签，整条链可以从任意一台机器上重新算出来。",
+  "home.m2.t": "看板不「存在」于任何地方——它是算出来的",
+  "home.m2.sub":
+    "同一组 refs/collab/*，同一份 .walgit/board.toml 列定义，同一条排序规则（last_ts 降序, id 升序）——你的笔记本和服务器各自独立计算，结果逐字节相同。这不是缓存同步，是确定性函数的必然。",
+  "home.m2.l": "你的笔记本 · CLI",
+  "home.m2.l.sub": "离线聚合，不需要服务器",
+  "home.m2.r": "服务器 · HTTP API",
+  "home.m2.r.sub": "独立进程，独立计算",
+  "home.m2.refs.a": "真相只有这一处：",
+  "home.m2.refs.b": " × {n} 条签名条目 + ",
+  "home.m2.refs.c": "（随仓库受版本管理）",
+  "home.m2.demo.w2": "看板列 glob",
+  "home.m2.demo.w3": "补 e2e",
+  "home.m2.note":
+    "中心化系统里你信任平台（GitHub 说 merged 就是 merged）；这里你信任规则——任何人从同一组 refs 出发，必然算出同一屏看板。CLI 输出和 API 响应做字节比对，验证的正是这条性质，而不是「同步成功了」。",
+  "home.m3.t": "两个 runner 都跑了，只有一个算数",
+  "home.m3.sub":
+    "CI 没有调度器。任何 runner 看到「这个提交没人测」就自己认领（写一条 ci_claim 条目）。两个 runner 同时认领是合法竞态：都会执行（至少一次），但全网络按同一条决胜规则只承认一个赢家——生效结果恰好一个。",
+  "home.m3.fx.winner": "winner = min(ts, actor, oid)",
+  "home.m3.fx.any": "执行：至少一次",
+  "home.m3.fx.once": "生效：恰好一次",
+  "home.m3.fx.ttl": "认领有效期 ttl 300s（runner 死了别人接手）",
+  "home.m3.note":
+    "为什么允许重复执行？因为去重需要一个中心调度器——而中心正是这个设计要消灭的东西。代价是偶尔多跑一次构建（幂等，无副作用）；换来的是任何一台笔记本都能当 CI 算力，挂了随时有人接管，全程可审计。",
+  "home.bugs.t": "看起来像 bug，其实不是",
+  "home.bugs.lede":
+    "去中心化把一致性从「平台藏起来的实现细节」变成「你看得见的运行现象」。见到以下四种画面，先别报 bug：",
+  "home.bug1.sight": "同一个任务被执行了两次",
+  "home.bug1.truth": "合法竞态。两个 runner 同窗口认领，都会跑；决胜规则已选出唯一生效结果，另一份仅存档。",
+  "home.bug2.sight": "任务被「认领」了却迟迟没结果",
+  "home.bug2.truth": "runner 可能死了。认领有 TTL（默认 5 分钟），到期后别的 runner 会按同一 attempt 重新认领，不会丢。",
+  "home.bug3.sight": "看板上卡片顺序「跳」了一下",
+  "home.bug3.truth": "排序键是（最后活动时间, id）。同秒内的两条活动按 id 字典序决胜——是确定性规则在生效，不是渲染抖动。",
+  "home.bug4.sight": "某个结果「不见了」",
+  "home.bug4.truth": "它没生效而已。所有条目都还在 refs 上，一条不少；「生效」是规则的选择，「存在」不可撤销。",
+  "home.cmds.t": "坏了怎么办 · 三板斧",
+  "home.cmd1.what": "重放任意线程：每条条目带签名与父链，可独立验证",
+  "home.cmd2.what": "离线算出的完整看板——与服务器逐字节一致",
+  "home.cmd3.what": "全局汇总：线程数、验签通过率、活跃度、CI 段",
+  "home.endnote.a": "这三条命令和你在浏览器里看到的一切，来源完全相同：refs/collab/* 上的签名条目。",
+  "home.browse": "本主机上的仓库",
+  "home.origin.a": "walgit 建立在 ",
+  "home.origin.l1": "Origin（Cursor）",
+  "home.origin.b": " 的 git 托管架构与 ",
+  "home.origin.l2": "Turbopuffer",
+  "home.origin.c": " 的 shared-nothing 基建之上：对象存储 + 单个二进制，用 WAL 取代数据库。",
 
   // Repo chrome
   "tab.code": "代码",
@@ -1193,29 +1277,68 @@ const zhTW: Record<I18nKey, string> = {
   // Top nav
   "nav.repos": "倉庫",
 
-  // Landing hero
-  "hero.lede": "一個 git 伺服器 = 單一執行檔 + 一個物件儲存。",
-  "hero.text.a": "walgit 實現了",
-  "hero.link.origin": "Origin（Cursor）的 git 託管架構",
-  "hero.text.b": "中的思想，以及我們的朋友",
-  "hero.link.turbopuffer": "Turbopuffer",
-  "hero.text.c": "——他們開創了基於 GCS/S3 的 shared-nothing 規模化基礎設施。",
-  "hero.exploreApi": "瀏覽 API",
-  "hero.readPost": "閱讀《Git at any scale》↗",
-  "home.reposByOwner": "按擁有者瀏覽倉庫",
-
-  // Landing D1 showcase (issue #43)
-  "showcase.title": "協作，但沒有資料庫",
-  "showcase.lede":
-    "Issues, the board and CI on this host are derived live from signed entries stored as git refs — no database, only public rules every client applies identically.",
-  "showcase.m1.t": "議題 = 只能追加的簽名條目鏈",
-  "showcase.m1.b": "沒有人編輯；每個人追加一條簽名條目。狀態是重放——最後一條匹配的條目生效。",
-  "showcase.m2.t": "看板不存在於任何地方——它是算出來的",
-  "showcase.m2.b": "同樣的 refs、同樣的規則：每個用戶端獨立推導，得到位元組一致的看板。",
-  "showcase.m3.t": "兩個 runner 可能都跑了——但只算一個",
-  "showcase.m3.b": "CI 沒有排程器。同時認領是合法競態；一條確定性 winner 規則讓恰好一個結果生效。",
-  "showcase.illustrative": "示意",
-  "showcase.cta.guide": "在真實倉庫裡看現場版 →",
+  // Home model landing (issue #55)
+  "home.eyebrow": "walgit · D1 去中心化協作層 · 人類版模型",
+  "home.h1.a": "沒有資料庫，",
+  "home.h1.b": "只有規則",
+  "home.lede":
+    "D1 把 issue、看板、CI 全部放進 git 倉庫本身——沒有伺服器端資料庫可翻、可改、可背鍋。你看到的每一螢幕協作介面，都是同一組簽名條目經過同一套公開規則、當場算出來的結果。下面是三個心智模型，接著一份「看起來像 bug」對照表，頁尾是本主機上的倉庫。",
+  "home.illus": "示意",
+  "home.live": "在真實倉庫裡看現場版 →",
+  "home.m1.t": "一個 issue，就是一串只增不改的簽名條目",
+  "home.m1.sub":
+    "沒有人「編輯」過 issue。每個人都在同一條鏈上追加一條帶 Ed25519 簽名的條目，用 parent 指向前一條。目前狀態 = 從頭重放這條鏈：最後一條說了算。",
+  "home.m1.demo.issue": "加深色模式",
+  "home.m1.demo.act.open": "開卡",
+  "home.m1.demo.act.move": "移動卡片",
+  "home.m1.demo.act.conclude": "結論",
+  "home.m1.note":
+    "為什麼只能追加？倉庫的唯一持久形態是物件儲存裡的只追加日誌——執行個體隨時會被銷毀，磁碟只是快取。協作狀態想活下來，就必須長成「任何人都能重放驗證」的樣子：每條條目都能獨立驗簽，整條鏈可以從任意一台機器上重新算出來。",
+  "home.m2.t": "看板不「存在」於任何地方——它是算出來的",
+  "home.m2.sub":
+    "同一組 refs/collab/*，同一份 .walgit/board.toml 欄定義，同一條排序規則（last_ts 降序, id 升序）——你的筆電和伺服器各自獨立計算，結果逐位元組相同。這不是快取同步，是確定性函數的必然。",
+  "home.m2.l": "你的筆電 · CLI",
+  "home.m2.l.sub": "離線聚合，不需要伺服器",
+  "home.m2.r": "伺服器 · HTTP API",
+  "home.m2.r.sub": "獨立程序，獨立計算",
+  "home.m2.refs.a": "真相只有這一處：",
+  "home.m2.refs.b": " × {n} 條簽名條目 + ",
+  "home.m2.refs.c": "（隨倉庫受版本管理）",
+  "home.m2.demo.w2": "看板欄 glob",
+  "home.m2.demo.w3": "補 e2e",
+  "home.m2.note":
+    "中心化系統裡你信任平台（GitHub 說 merged 就是 merged）；這裡你信任規則——任何人從同一組 refs 出發，必然算出同一屏看板。CLI 輸出和 API 回應做位元組比對，驗證的正是這條性質，而不是「同步成功了」。",
+  "home.m3.t": "兩個 runner 都跑了，只有一個算數",
+  "home.m3.sub":
+    "CI 沒有排程器。任何 runner 看到「這個提交沒人測」就自己認領（寫一條 ci_claim 條目）。兩個 runner 同時認領是合法競態：都會執行（至少一次），但全網路按同一條決勝規則只承認一個贏家——生效結果恰好一個。",
+  "home.m3.fx.winner": "winner = min(ts, actor, oid)",
+  "home.m3.fx.any": "執行：至少一次",
+  "home.m3.fx.once": "生效：恰好一次",
+  "home.m3.fx.ttl": "認領有效期 ttl 300s（runner 死了別人接手）",
+  "home.m3.note":
+    "為什麼允許重複執行？因為去重需要一個中心排程器——而中心正是這個設計要消滅的東西。代價是偶爾多跑一次建置（冪等，無副作用）；換來的是任何一台筆電都能當 CI 算力，掛了隨時有人接手，全程可稽核。",
+  "home.bugs.t": "看起來像 bug，其實不是",
+  "home.bugs.lede":
+    "去中心化把一致性從「平台藏起來的實作細節」變成「你看得見的運行現象」。見到以下四種畫面，先別報 bug：",
+  "home.bug1.sight": "同一個任務被執行了兩次",
+  "home.bug1.truth": "合法競態。兩個 runner 同視窗認領，都會跑；決勝規則已選出唯一生效結果，另一份僅存檔。",
+  "home.bug2.sight": "任務被「認領」了卻遲遲沒結果",
+  "home.bug2.truth": "runner 可能死了。認領有 TTL（預設 5 分鐘），到期後別的 runner 會按同一 attempt 重新認領，不會丟。",
+  "home.bug3.sight": "卡片在看板上的順序「跳」了一下",
+  "home.bug3.truth": "排序鍵是（最後活動時間, id）。同秒內的兩條活動按 id 字典序決勝——是確定性規則在生效，不是渲染抖動。",
+  "home.bug4.sight": "某個結果「不見了」",
+  "home.bug4.truth": "它沒生效而已。所有條目都還在 refs 上，一條不少；「生效」是規則的選擇，「存在」不可撤銷。",
+  "home.cmds.t": "壞了怎麼辦 · 三板斧",
+  "home.cmd1.what": "重放任意執行緒：每條條目帶簽名與父鏈，可獨立驗證",
+  "home.cmd2.what": "離線算出的完整看板——與伺服器逐位元組一致",
+  "home.cmd3.what": "全域彙總：執行緒數、驗簽通過率、活躍度、CI 段",
+  "home.endnote.a": "這三條指令和你在瀏覽器裡看到的一切，來源完全相同：refs/collab/* 上的簽名條目。",
+  "home.browse": "本主機上的倉庫",
+  "home.origin.a": "walgit 建立在 ",
+  "home.origin.l1": "Origin（Cursor）",
+  "home.origin.b": " 的 git 託管架構與 ",
+  "home.origin.l2": "Turbopuffer",
+  "home.origin.c": " 的 shared-nothing 基建之上：物件儲存 + 單一執行檔，用 WAL 取代資料庫。",
 
   // Repo chrome
   "tab.code": "程式碼",
