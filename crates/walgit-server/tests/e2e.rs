@@ -3030,6 +3030,11 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     // in the wrong one.
     // SAFETY: test-only env var, read by the publish path of this process.
     unsafe { std::env::set_var("WALGIT_TEST_PUBLISH_GAP_MS", "150") };
+    // Issue #4: dump the full refs cache + disk state the moment the write-side
+    // view diverges from the applied truth (env-gated; the reads are too costly
+    // for prod pushes). CI reds on this test then carry the mechanism.
+    // SAFETY: test-only env var, read by the publish path of this process.
+    unsafe { std::env::set_var("WALGIT_TEST_REFS_DIAG", "1") };
     let server = Server::start().await?;
     server.put_repo("t", "ryw").await?;
     let src = TestRepo::synthetic(2, 1)?;
@@ -3186,6 +3191,8 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     }
     // SAFETY: see above.
     unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
+    // SAFETY: see above.
+    unsafe { std::env::remove_var("WALGIT_TEST_REFS_DIAG") };
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
     Ok(())
 }

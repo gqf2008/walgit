@@ -365,6 +365,43 @@ pub(crate) fn is_null_oid(hex: &str) -> bool {
     hex.is_empty() || hex.bytes().all(|b| b == b'0')
 }
 
+// ---- issue #4 write-side invariant diagnostics ----
+
+/// `WALGIT_TEST_REFS_DIAG`: a locally applied, acknowledged txn must stay
+/// visible in `ref_view`. CI (`reads_after`) reds show the write side
+/// verifying old=base while the tip had moved — a committed local apply
+/// missing from the cache view. These two checks dump the full cache + disk
+/// state the moment the view diverges, so the next red carries the mechanism.
+/// Env-gated: the disk reads on the hot path would otherwise cost prod pushes.
+fn refs_diag_on() -> bool {
+    std::env::var("WALGIT_TEST_REFS_DIAG").is_ok()
+}
+
+/// Dump one `LocalRepo::refs_diag` snapshot as `REFS_DIAG` lines on stderr, so
+/// a CI e2e red carries it in the captured log.
+fn refs_diag_report(handle: &RepoHandle, tag: &str, ref_name: &str, detail: &str) {
+    let d = handle.local.refs_diag(ref_name);
+    let (cache_current, cache_data, cache_key_gen, cache_pending) = match &d.cache {
+        Some(c) => (c.current, c.data_oid.clone(), c.key_generation, c.pending_oids.clone()),
+        None => (false, String::new(), 0, Vec::new()),
+    };
+    tracing::warn!(
+        repo = %handle.id,
+        ref_name,
+        tag,
+        detail,
+        "refs cache/view divergence (WALGIT_TEST_REFS_DIAG, issue #4)"
+    );
+    eprintln!("REFS_DIAG {tag} repo={} {ref_name}: {detail}", handle.id);
+    eprintln!(
+        "REFS_DIAG   gen={} parses={} loose={} packed={} head={}",
+        d.generation, d.parses, d.loose_oid, d.packed_oid, d.head
+    );
+    eprintln!(
+        "REFS_DIAG   cache: key_gen={cache_key_gen} current={cache_current} data={cache_data} pending={cache_pending:?}"
+    );
+}
+
 /// Update the working ref map with a txn's new values.
 pub(crate) fn apply_txn_to_map(txn: &RefTransaction, refs: &mut walgit_git::RefView) {
     for u in &txn.updates {
@@ -515,6 +552,37 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let mut floor: Option<std::time::SystemTime> = *handle.last_entry_time.lock();
         for req in &batch {
             let mut per_ref = verify_txn(&req.txn, &working_refs);
+            // Issue #4 (WALGIT_TEST_REFS_DIAG): an update that is about to pass
+            // (old == working view) while the disk tip disagrees means the
+            // working view lost committed applies — dump the mechanism the
+            // moment it first shows, not only on the next CI red.
+            if refs_diag_on() {
+                for u in &req.txn.updates {
+                    if !u.new_symbolic_target.is_empty() || is_null_oid(&u.old_oid) {
+                        continue;
+                    }
+                    if working_refs.get(&u.name).as_deref() != Some(u.old_oid.as_str()) {
+                        continue; // would fail verification anyway; not the divergence
+                    }
+                    let d = handle.local.refs_diag(&u.name);
+                    let disk_tip = if d.loose_oid.is_empty() {
+                        d.packed_oid
+                    } else {
+                        d.loose_oid
+                    };
+                    if !disk_tip.is_empty() && disk_tip != u.old_oid {
+                        refs_diag_report(
+                            handle,
+                            "verify-view-vs-disk",
+                            &u.name,
+                            &format!(
+                                "verify sees old={} (would pass) but the disk tip is {}",
+                                u.old_oid, disk_tip
+                            ),
+                        );
+                    }
+                }
+            }
             if let Some(ts) = &req.created_at {
                 let t = time::to_system(ts);
                 if let Some(f) = floor
@@ -755,12 +823,41 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     if !v.valid {
                         continue;
                     }
-                    if let Err(e) = handle.local.apply_ref_txn(&req.txn, false) {
-                        tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
-                        metrics::counter!("walgit_publish_local_apply_failed_total")
-                            .increment(1);
-                        local_ok = false;
-                        break;
+                    match handle.local.apply_ref_txn(&req.txn, false) {
+                        Err(e) => {
+                            tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
+                            metrics::counter!("walgit_publish_local_apply_failed_total")
+                                .increment(1);
+                            local_ok = false;
+                            break;
+                        }
+                        Ok(()) => {
+                            // Issue #4 (WALGIT_TEST_REFS_DIAG): the apply
+                            // committed and the cache re-keyed under the same
+                            // lock — ref_view must show the new tip. A
+                            // divergence here is the lost-txn mechanism.
+                            if refs_diag_on()
+                                && let Ok(view) = handle.local.ref_view()
+                            {
+                                for u in &req.txn.updates {
+                                    if !u.new_symbolic_target.is_empty() || is_null_oid(&u.new_oid) {
+                                        continue;
+                                    }
+                                    if view.get(&u.name).as_deref() != Some(u.new_oid.as_str()) {
+                                        refs_diag_report(
+                                            handle,
+                                            "apply-not-in-view",
+                                            &u.name,
+                                            &format!(
+                                                "apply_ref_txn committed {} but ref_view shows {:?}",
+                                                u.new_oid,
+                                                view.get(&u.name)
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if local_ok && let Err(e) = handle.local.refresh_async().await {
