@@ -25,6 +25,12 @@ export function ModelLanding({ live }: { live: { owner: string; repo: string } |
           {t("home.h1.a")} <span className="model-accent">{t("home.h1.b")}</span>
         </h1>
         <p className="model-lede">{t("home.lede")}</p>
+        {/* First-screen, un-missable: the AI-agent guide (user acceptance
+            feedback — the footer was not prominent enough). */}
+        <p className="model-skill">
+          {t("home.skill.pre")}
+          <a href="/SKILL.md">SKILL.md</a>
+        </p>
         {live && (
           <div className="model-live">
             <Link to={`/${live.owner}/${live.repo}/collab/guide`} className="btn btn-primary">
@@ -147,10 +153,6 @@ export function ModelLanding({ live }: { live: { owner: string; repo: string } |
         <p className="model-endnote">
           {t("home.endnote.a")}
           {t("guide.protocol")}
-        </p>
-        <p className="model-endnote">
-          {t("home.skill.pre")}
-          <a href="/SKILL.md">SKILL.md</a>
         </p>
         <p className="model-endnote">
           {t("home.origin.a")}

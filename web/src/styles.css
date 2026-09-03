@@ -1041,6 +1041,18 @@ table.kv.compact td { padding: 2px 0; }
   max-width: 68ch;
   margin: 0;
 }
+/* First-screen AI-agent line (issue #59 acceptance feedback): foreground
+   color, slightly larger than the lede, accent link — impossible to miss. */
+.model-skill {
+  margin: 14px 0 0;
+  font-size: 17px;
+}
+.model-skill a {
+  color: var(--link, #0969da);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 .model-live {
   margin-top: 18px;
 }
