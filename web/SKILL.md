@@ -67,9 +67,29 @@ The server holds no CI logic. A runner is a client:
   rule), the others are kept for audit.
 - `walgit ci status` — every run in the checkout's collab log, aggregated.
 
+### Repository reads over HTTP (no bucket credentials)
+
+`walgit repo` also reads a **running host** — any machine, no `walgit.toml`,
+no bucket access; a host URL and (on token/oidc hosts) a bearer suffice:
+
+- Host: `--url` > `$WALGIT_URL` > `http://127.0.0.1:8080`;
+  token: `--token` > `$WALGIT_TOKEN`.
+- `walgit repo refs <owner/name> [branches|tags|all|collab]` — head summary
+  or one paged namespace.
+- `walgit repo resolve <owner/name> <rev>` — revision → oid.
+- `walgit repo tree <owner/name> <rev> [path]` / `blob … <path> [--raw]` —
+  directory listing; blob as JSON envelope or raw bytes.
+- `walgit repo commits <owner/name> [--ref --n --skip --path]` /
+  `walgit repo commit <owner/name> <sha>` — history and one commit.
+- `walgit repo overview <owner/name>` — head seq, pack set, health.
+- `walgit repo tasks <owner/name> [--follow <id>]` — list tasks, or stream
+  one task's live packets (SSE) to its terminal result.
+- Output is pretty JSON; HTTP ≥ 400 (including 401) is a diagnostic error.
+
 ### Repository management & ops
 
-- `walgit repo create|list|info` — manage repositories.
+- `walgit repo create|list|info` — manage repositories (bucket-direct:
+  needs the host config; the reads above do not).
 - `walgit repo policy` — per-repo push rules (`policy.json`).
 - `walgit repo settings` — per-repo TOML overrides (`[bundles]`,
   `[maintenance]`, `[compaction]`) published through the WAL.
