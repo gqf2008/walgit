@@ -404,6 +404,12 @@ decision in §4 — or the PR is; never "fix later".
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
 
+- **D42** **The host-wide repo index is the page route `/repos` (2026-09-03, #59/#60).** The top-nav「仓库」
+  entry lands there; `/` stays the landing page. Data comes from the existing `/api/v1/owners*` surface — no
+  new endpoints. As a single-segment static route it reserves the owner name "repos" for the SPA exactly as
+  `/api` reserves "api" (the `routing_prefix` allow-list records it); git operations for such an owner are
+  unaffected — only the single-segment owner page is shadowed.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---

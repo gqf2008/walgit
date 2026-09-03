@@ -48,6 +48,11 @@ fn allowed_route(path: &str) -> bool {
         "/services/api/owners",
         "/services/api/owners/{owner}",
         "/api",
+        // Host-wide repo index (issue #59): a page route like /api, and it
+        // reserves the owner name "repos" for the SPA the same way /api
+        // reserves "api" (D42). git operations for such an owner are
+        // unaffected — only the single-segment owner page is shadowed.
+        "/repos",
         "/{owner}",
     ];
     if allow.contains(&p) {
