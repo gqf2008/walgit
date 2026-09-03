@@ -78,6 +78,15 @@ pub struct AppState {
 
 impl AppState {
     /// Build a full `AppState` from a config + store (memory or opened backend).
+    // The constructor's body is synchronous today, but the `async` shape is
+    // the crate's public entry contract: walgit-cli (serve.rs, its e2e tests)
+    // and this crate's test harness all `AppState::new(...).await`. Dropping
+    // `async` would be a cross-crate signature change, out of scope here.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "pub cross-crate entry contract — callers await this constructor"
+    )]
     pub async fn new(
         cfg: Arc<walgit_config::Config>,
         store: DynStore,
@@ -102,7 +111,8 @@ impl AppState {
             inflight: Arc::new(middleware::Inflight::default()),
             caches: cache::ServerCaches::new(&cfg),
             metrics_handle,
-            lfs_upstream: lfs_upstream::Upstream::new(),
+            lfs_upstream: lfs_upstream::Upstream::new()
+                .map_err(|e| anyhow::anyhow!("lfs upstream client: {e}"))?,
             readiness: prewarm::Readiness::new(),
             bridge,
             follow: follow::FollowStatuses::default(),
@@ -235,6 +245,7 @@ async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
+#[allow(clippy::needless_pass_by_value, reason = "CatchPanicLayer::custom requires the boxed-panic handler signature")]
 fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     let msg = err
         .downcast_ref::<String>()
@@ -270,6 +281,8 @@ fn spawn_runtime_watchdog(
             let gap = last.elapsed();
             let inflight = inflight.get();
             let tasks_running = tasks.running_count();
+            // f64 is the metrics-gauge contract; task counts cannot approach 2^53.
+            #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; task counts ≪ 2^53")]
             ::metrics::gauge!("walgit_tasks_running").set(tasks_running as f64);
             if gap > std::time::Duration::from_millis(2500) {
                 ::metrics::counter!("walgit_runtime_stall_total").increment(1);
@@ -283,7 +296,7 @@ fn spawn_runtime_watchdog(
                     })
                     .map(|pages| pages * 4096 / (1024 * 1024));
                 tracing::warn!(
-                    gap_ms = gap.as_millis() as u64,
+                    gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
                     inflight,
                     tasks_running,
                     lock_wait_max_ms = walgit_wal::lockwait::max_wait_ms(),
@@ -332,7 +345,6 @@ pub(crate) async fn dispatch_route(
     body: Body,
     peer: Option<SocketAddr>,
 ) -> Response {
-    let mut body = Some(body);
     let sub = route.subpath.as_str();
     let result: Result<Response, ApiError> = async {
         match (&method, sub) {
@@ -342,14 +354,14 @@ pub(crate) async fn dispatch_route(
             }
             (&Method::POST, "git-upload-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::upload_pack(st, route, &headers, body.take().unwrap()).await
+                smart::upload_pack(st, route, &headers, body).await
             }
             (&Method::POST, "git-receive-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::receive_pack(st, route, &headers, body.take().unwrap()).await
+                smart::receive_pack(st, route, &headers, body).await
             }
             (&Method::POST, "info/lfs/objects/batch") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
+                let bytes = collect_body(body).await?;
                 lfs::batch(st, route, &headers, bytes).await
             }
             (&Method::GET | &Method::HEAD, s)
@@ -358,10 +370,10 @@ pub(crate) async fn dispatch_route(
                 lfs::get_object(st, route, &method, &headers, &query, peer).await
             }
             (&Method::PUT, s) if s.starts_with("info/lfs/objects/") => {
-                lfs::put_object(st, route, &headers, body.take().unwrap()).await
+                lfs::put_object(st, route, &headers, body).await
             }
             (&Method::POST, "info/lfs/verify") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
+                let bytes = collect_body(body).await?;
                 lfs::verify(st, route, &headers, bytes).await
             }
             (&Method::GET, "bundles/list") => {
@@ -380,7 +392,7 @@ pub(crate) async fn dispatch_route(
             // Admin routes reach here only through `/{o}/{r}/api[-browser]/…` (web::v1).
             (&Method::GET, "policy") => policy::http_get(st, route, &headers).await,
             (&Method::PUT, "policy") => {
-                policy::http_put(st, route, &headers, body.take().unwrap()).await
+                policy::http_put(st, route, &headers, body).await
             }
             (&Method::DELETE, "policy") => policy::http_delete(st, route, &headers).await,
             (&Method::GET, "settings") => settings::http_get(st, route, &headers).await,
@@ -392,18 +404,17 @@ pub(crate) async fn dispatch_route(
                 settings::http_describe(st, route, &headers).await
             }
             (&Method::PUT, "settings") => {
-                settings::http_put(st, route, &headers, &query, body.take().unwrap()).await
+                settings::http_put(st, route, &headers, &query, body).await
             }
             (&Method::DELETE, "settings") => settings::http_delete(st, route, &headers).await,
             (&Method::POST, "settings/validate") => {
-                settings::http_validate(st, route, &headers, body.take().unwrap()).await
+                settings::http_validate(st, route, &headers, body).await
             }
             (&Method::POST, "policy/validate") => {
-                settings::http_policy_validate(st, route, &headers, body.take().unwrap()).await
+                settings::http_policy_validate(st, route, &headers, body).await
             }
             (&Method::POST, "policy/dry-run") => {
-                settings::http_policy_dry_run(st, route, &headers, &query, body.take().unwrap())
-                    .await
+                settings::http_policy_dry_run(st, route, &headers, &query, body).await
             }
             _ => Err(ApiError::NotFound(format!("no route for {method} {sub}"))),
         }
@@ -461,7 +472,11 @@ impl TcpAccept {
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.listeners[0].local_addr()
+        // The constructor keeps 1..=2 listeners (see `accept`); empty is unreachable.
+        self.listeners
+            .first()
+            .ok_or_else(|| std::io::Error::other("TcpAccept holds no listeners"))?
+            .local_addr()
     }
 
     pub fn addrs(&self) -> Vec<std::net::SocketAddr> {
@@ -525,7 +540,7 @@ pub async fn serve(
     let addr = state.cfg.server.listen;
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());
-    bridge::spawn_sweeper(state.clone());
+    bridge::spawn_sweeper(&state);
     spawn_runtime_watchdog(state.registry.tasks().clone(), state.inflight.clone());
     let app = router(state);
     let listener = TcpAccept::bind(addr).await?;

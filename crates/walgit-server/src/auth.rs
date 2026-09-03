@@ -11,9 +11,10 @@
 //!      signed-in browser): HMAC-signed, stateless, the shape git and scripts
 //!      use; also accepted as a Basic password;
 //!   3. the **session cookie** set by the browser sign-in (`web/login.rs`).
-//!   Static `tokens` are honoured in this mode too (robots, CI).
-//!   Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
-//!   `write_domains`.
+//!
+//! Static `tokens` are honoured in this mode too (robots, CI).
+//! Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
+//! `write_domains`.
 //!
 //! An edge in front of walgit may take the client's `Authorization` for its own
 //! hop credential; it then announces `client-authorization` in
@@ -955,12 +956,12 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         if b == b'=' {
             break;
         }
-        let val = TABLE.iter().position(|&t| t == b)? as u32;
+        let val = u32::try_from(TABLE.iter().position(|&t| t == b)?).ok()?; // index < 64 = TABLE length; the cast cannot fail for a matched byte
         buf = (buf << 6) | val;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push((buf >> bits) as u8);
+            out.push(u8::try_from(buf >> bits).ok()?); // ≤ 63: buf holds at most the 6 bits just shifted in
             buf &= (1 << bits) - 1;
         }
     }

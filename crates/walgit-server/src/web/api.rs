@@ -24,7 +24,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Json, Path, Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -43,7 +43,7 @@ use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
 use crate::{AppState, auth::AuthError, cache::RefIndex, error::ApiError};
 
-const MAX_BLOB: usize = 2 * 1024 * 1024;
+const MAX_BLOB: i64 = 2 * 1024 * 1024;
 const IMMUTABLE: &str = "private, max-age=31536000, immutable";
 const SWR: &str = "private, max-age=0, stale-while-revalidate=60";
 const DEFAULT_PAGE: usize = 100;
@@ -81,7 +81,10 @@ struct Commit {
     author_email: String,
     author_date: String,
     committer: String,
-    commit_date: String,
+    /// Wire name is `commit_date` (the API contract); the field is renamed
+    /// only so it does not repeat the struct's name.
+    #[serde(rename = "commit_date")]
+    date: String,
     subject: String,
     /// The message body WITHOUT the trailer block (see `trailers`).
     body: String,
@@ -99,7 +102,7 @@ impl From<CommitMeta> for Commit {
             author_email: m.author_email,
             author_date: m.author_date,
             committer: m.committer,
-            commit_date: m.commit_date,
+            date: m.commit_date,
             subject: m.subject,
             body,
             trailers,
@@ -160,7 +163,10 @@ struct Commits {
     #[serde(rename = "ref")]
     ref_name: String,
     sha: String,
-    commits: Vec<Commit>,
+    /// Wire name is `commits` (the API contract); the field is renamed only
+    /// so it does not repeat the struct's name.
+    #[serde(rename = "commits")]
+    items: Vec<Commit>,
     more: bool,
 }
 #[derive(Serialize)]
@@ -404,7 +410,7 @@ where
                 .store()
                 .get(&shared_key(key), GetOptions::default())
                 .await
-                && let Ok(b) = walgit_store::util::collect(body, meta.size as usize).await {
+                && let Ok(b) = walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX)).await {
                     metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
                     st.caches.api_immutable.insert(key.clone(), b.clone());
                     return Ok(Rendered::json(b, IMMUTABLE, None).into_response(headers));
@@ -482,7 +488,7 @@ async fn instance_info(
     st.auth.require_read(&headers).await.map_err(auth_err)?;
     let mut r = axum::Json(crate::instance::info(&st.cfg)).into_response();
     r.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(r)
 }
 
@@ -655,7 +661,7 @@ async fn ref_list(
         )));
         let mut resp = crate::sse::sse_response(futures::stream::iter(items));
         resp.headers_mut()
-            .insert(header::CACHE_CONTROL, SWR.parse().unwrap());
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(SWR));
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))
@@ -1696,8 +1702,10 @@ async fn resolve_rest(r: &Repo, rest: &str) -> Result<Resolved, ApiError> {
     let mut cut_points: Vec<usize> = rest.match_indices('/').map(|(i, _)| i).collect();
     cut_points.push(rest.len());
     for &cut in cut_points.iter().rev() {
-        let name = &rest[..cut];
-        let path = rest[cut..].trim_start_matches('/').to_string();
+        // cut comes from match_indices('/') or rest.len(): '/' is ASCII, so
+        // every cut sits on a char boundary and split_at cannot panic.
+        let (name, path_rest) = rest.split_at(cut);
+        let path = path_rest.trim_start_matches('/').to_string();
         if let Some(sha) = r.index.branch(name) {
             return Ok(Resolved {
                 ref_name: name.to_string(),
@@ -1891,7 +1899,7 @@ fn parse_commit_record(record: &str) -> Option<Commit> {
             author_email: p.next()?.to_string(),
             author_date: p.next()?.to_string(),
             committer: p.next()?.to_string(),
-            commit_date: p.next()?.to_string(),
+            date: p.next()?.to_string(),
             subject: p.next()?.to_string(),
             body: String::new(),
             trailers: Vec::new(),
@@ -1966,8 +1974,10 @@ async fn render_tree(
         let Some(tab) = item.iter().position(|b| *b == b'\t') else {
             continue;
         };
-        let (meta, name) = item.split_at(tab);
-        let name = &name[1..];
+        // tab < item.len() (position() found the tab inside it), and the
+        // second split skips exactly that one byte.
+        let (meta, after_tab) = item.split_at(tab);
+        let (_, name) = after_tab.split_at(1);
         // `ls-tree -l` right-aligns the size with padding spaces.
         let fields: Vec<&[u8]> = meta
             .split(|b| *b == b' ')
@@ -1976,18 +1986,22 @@ async fn render_tree(
         if fields.len() < 4 {
             continue;
         }
-        let kind = String::from_utf8_lossy(fields[1]).to_string();
+        // Guarded above: `mode kind sha size` are the first four fields.
+        let [mode, kind, sha, size_field, ..] = fields.as_slice() else {
+            continue; // len >= 4 checked above; unreachable
+        };
+        let kind = String::from_utf8_lossy(kind).to_string();
         let size = if kind == "blob" {
-            String::from_utf8_lossy(fields[3]).parse().unwrap_or(-1)
+            String::from_utf8_lossy(size_field).parse().unwrap_or(-1)
         } else {
             -1
         };
         entries.push(TreeEntry {
             name: String::from_utf8_lossy(name).to_string(),
             kind,
-            mode: String::from_utf8_lossy(fields[0]).to_string(),
+            mode: String::from_utf8_lossy(mode).to_string(),
             size,
-            sha: String::from_utf8_lossy(fields[2]).to_string(),
+            sha: String::from_utf8_lossy(sha).to_string(),
         });
     }
     sort_entries(&mut entries);
@@ -2069,7 +2083,7 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
                     .await
                     .ok()
                     .flatten()
-                    .map_or(-1, |(_, s)| s as i64)
+                    .map_or(-1, |(_, s)| i64::try_from(s).unwrap_or(i64::MAX))
             } else {
                 -1
             };
@@ -2183,11 +2197,14 @@ async fn blob(
                     .kind_and_size(&target)
                     .await?
                     .ok_or_else(|| not_found("blob"))?;
-                if size as usize > MAX_BLOB {
-                    (size as i64, None)
+                // Real blob sizes are far below 2^63; the old `as i64` wrapped
+                // only for sizes no repository can reach, so saturate instead.
+                let size = i64::try_from(size).unwrap_or(i64::MAX);
+                if size > MAX_BLOB {
+                    (size, None)
                 } else {
                     let o = remote.get(&target).await?;
-                    (size as i64, Some(o.data.to_vec()))
+                    (size, Some(o.data.to_vec()))
                 }
             } else {
                 let bytes = git(
@@ -2199,9 +2216,9 @@ async fn blob(
                     ],
                 )
                 .await?;
-                (bytes.len() as i64, Some(bytes))
+                (i64::try_from(bytes.len()).unwrap_or(i64::MAX), Some(bytes))
             };
-            let is_text = size <= MAX_BLOB as i64
+            let is_text = size <= MAX_BLOB
                 && bytes
                     .as_ref()
                     .is_some_and(|b| !b.contains(&0) && std::str::from_utf8(b).is_ok());
@@ -2214,7 +2231,7 @@ async fn blob(
                     etag: (!immutable).then_some(etag),
                 });
             }
-            let b = if size > MAX_BLOB as i64 {
+            let b = if size > MAX_BLOB {
                 Blob {
                     ref_name: res.ref_name.clone(),
                     sha: res.sha.clone(),
@@ -2312,7 +2329,9 @@ async fn commits(
                 };
                 remote.reporter.notice(format!(
                     "{label} from {} (reading commits from the WAL pack set)",
-                    &res.sha[..12]
+                    // sha passed from_hex above (40/64 hex chars): byte 12 is a
+                    // char boundary.
+                    res.sha.split_at(12).0
                 ));
                 let all = remote
                     .walk(
@@ -2344,7 +2363,7 @@ async fn commits(
             let body = json_bytes(&Commits {
                 ref_name: res.ref_name.clone(),
                 sha: res.sha.clone(),
-                commits: cs,
+                items: cs,
                 more,
             });
             Ok(finish(&st2, &r, immutable, &key, &res.sha, body))
@@ -2392,7 +2411,9 @@ async fn commit_detail(
                     .map_err(|_| not_found("commit"))?;
                 remote.reporter.notice(format!(
                     "Reading commit {} from the WAL pack set",
-                    &sha[..12]
+                    // sha passed from_hex above (40/64 hex chars): byte 12 is a
+                    // char boundary.
+                    sha.split_at(12).0
                 ));
                 remote.fault_commit_diff(&oid).await?;
             }
@@ -2462,22 +2483,25 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
     String::from_utf8_lossy(bytes)
         .lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 3 || (!f[0].chars().all(|c| c.is_ascii_digit()) && f[0] != "-") {
+            // `git --numstat -M` rows are `<add>\t<del>\t<path>`.
+            let mut f = line.split('\t');
+            let (Some(add), Some(del), Some(path)) = (f.next(), f.next(), f.next()) else {
+                return None;
+            };
+            if !add.chars().all(|c| c.is_ascii_digit()) && add != "-" {
                 return None;
             }
-            let path = normalize_rename(f[2]);
             Some(Stat {
-                path,
-                additions: if f[0] == "-" {
+                path: normalize_rename(path),
+                additions: if add == "-" {
                     -1
                 } else {
-                    f[0].parse().unwrap_or(-1)
+                    add.parse().unwrap_or(-1)
                 },
-                deletions: if f[1] == "-" {
+                deletions: if del == "-" {
                     -1
                 } else {
-                    f[1].parse().unwrap_or(-1)
+                    del.parse().unwrap_or(-1)
                 },
             })
         })
@@ -2488,12 +2512,17 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
 fn normalize_rename(s: &str) -> String {
     if let (Some(open), Some(close)) = (s.find('{'), s.rfind('}'))
         && open < close {
-            let inner = &s[open + 1..close];
+            // '{' and '}' are ASCII, so open/close sit on char boundaries and
+            // open < close ≤ len - 1 bounds every split below.
+            let (before_brace, from_brace) = s.split_at(open);
+            let (_, after_open) = from_brace.split_at(1); // skip '{'
+            let (inner, after_close) = after_open.split_at(close - open - 1);
+            let (_, suffix) = after_close.split_at(1); // skip '}'
             if let Some((_, new)) = inner.split_once(" => ") {
                 let mut out = String::with_capacity(s.len());
-                out.push_str(&s[..open]);
+                out.push_str(before_brace);
                 out.push_str(new);
-                out.push_str(&s[close + 1..]);
+                out.push_str(suffix);
                 return out.replace("//", "/");
             }
         }

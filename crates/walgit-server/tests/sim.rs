@@ -566,7 +566,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         );
     }
     ensure!(
-        log.first().map_or(true, |e| e.seq > cp_seq),
+        log.first().is_none_or(|e| e.seq > cp_seq),
         "log tail starts at {} <= checkpoint {cp_seq}",
         log[0].seq
     );
@@ -862,7 +862,8 @@ impl Lcg {
         self.next() % n.max(1)
     }
     fn chance(&mut self, p: f64) -> bool {
-        (self.next() as f64 / (1u64 << 31) as f64) < p
+        // next() keeps only the top 31 bits, so the narrowing below cannot fail.
+        (f64::from(u32::try_from(self.next()).expect("next() < 2^31")) / f64::from(1u32 << 31)) < p
     }
 }
 
@@ -883,18 +884,18 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     let op_timeout = Duration::from_secs(10);
     for round in 0..per {
         for p in &mut pushers {
-            let i = rng.below(n_instances as u64) as usize;
+            let i = usize::try_from(rng.below(n_instances as u64)).expect("below(n) < n");
             let _ = p.push_once(&c.instances[i], &c.id, op_timeout).await?;
         }
         // Random crash: replace an instance (its in-flight state is gone).
         if rng.chance(0.2) {
-            let i = rng.below(n_instances as u64) as usize;
+            let i = usize::try_from(rng.below(n_instances as u64)).expect("below(n) < n");
             c.restart(i);
             c.instances[i].link.set(FaultPlan::chaos(0.04));
         }
         // Occasionally somebody checkpoints or compacts under chaos.
         if round % 4 == 3 {
-            let i = rng.below(n_instances as u64) as usize;
+            let i = usize::try_from(rng.below(n_instances as u64)).expect("below(n) < n");
             if let Ok(h) = c.instances[i].open(&c.id).await {
                 let _ = tokio::time::timeout(op_timeout, h.write_checkpoint()).await;
                 let cfg = c.instances[i].cfg.clone();
@@ -928,7 +929,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     // Liveness mode: pick a core of 2, heal it, freeze the rest in nasty states.
     let mut idx: Vec<usize> = (0..n_instances).collect();
     for k in (1..idx.len()).rev() {
-        let j = rng.below(k as u64 + 1) as usize;
+        let j = usize::try_from(rng.below(k as u64 + 1)).expect("below(n) < n");
         idx.swap(k, j);
     }
     let core = &idx[..2];
@@ -957,7 +958,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     for (k, &i) in idx[2..].iter().enumerate() {
         c.instances[i]
             .link
-            .set(frozen[(k + rng.below(4) as usize) % frozen.len()].clone());
+            .set(frozen[(k + usize::try_from(rng.below(4)).expect("below(n) < n")) % frozen.len()].clone());
     }
     // Non-core pushers keep hammering the frozen links in the background (they
     // may never interfere with the core).
@@ -1347,45 +1348,45 @@ async fn liveness_orphaned_log_segment_does_not_block_writers() -> Result<()> {
 /// disk may not poison every later attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
-    let mut c = Cluster::new(15, 1).await?;
-    let mut p = Pusher::new(0);
+    let mut cluster = Cluster::new(15, 1).await?;
+    let mut pusher = Pusher::new(0);
     for _ in 0..4 {
         ensure!(
-            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            pusher.push_once(&cluster.instances[0], &cluster.id, Duration::from_secs(10))
                 .await?
         );
     }
-    let cold = c.add_instance("cold", &|_| {});
-    c.instances[cold].link.set(
+    let cold = cluster.add_instance("cold", &|_| {});
+    cluster.instances[cold].link.set(
         FaultPlan {
             p_truncate: 1.0,
             ..Default::default()
         }
         .with_only(&[".pack", ".idx"]),
     );
-    let h = c.instances[cold].open(&c.id).await?;
+    let handle = cluster.instances[cold].open(&cluster.id).await?;
     let mut failures = 0;
     for _ in 0..3 {
-        match tokio::time::timeout(Duration::from_secs(10), h.sync_full()).await {
+        match tokio::time::timeout(Duration::from_secs(10), handle.sync_full()).await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
+            Ok(Err(err)) => {
                 failures += 1;
-                eprintln!("sync_full under truncation: {e}");
+                eprintln!("sync_full under truncation: {err}");
             }
             Err(_) => bail!("sync_full hung under truncation"),
         }
     }
     eprintln!("{failures} failed syncs under truncation (expected > 0)");
-    c.instances[cold].link.heal();
-    let t = Instant::now();
+    cluster.instances[cold].link.heal();
+    let mark = Instant::now();
     loop {
-        match tokio::time::timeout(Duration::from_secs(10), h.sync_full()).await {
+        match tokio::time::timeout(Duration::from_secs(10), handle.sync_full()).await {
             Ok(Ok(_)) => break,
-            Ok(Err(e)) => {
+            Ok(Err(err)) => {
                 ensure!(
-                    t.elapsed() < Duration::from_secs(10),
-                    "healed cold instance never syncs: {e}\n{}",
-                    c.dump_traces()
+                    mark.elapsed() < Duration::from_secs(10),
+                    "healed cold instance never syncs: {err}\n{}",
+                    cluster.dump_traces()
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1393,14 +1394,14 @@ async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
         }
     }
     // Objects really are there.
-    for a in &p.acked {
-        let id = gix_hash::ObjectId::from_hex(a.new.as_bytes())?;
-        ensure!(h.local().has_object(&id), "cold instance lacks {}", a.new);
+    for ack in &pusher.acked {
+        let id = gix_hash::ObjectId::from_hex(ack.new.as_bytes())?;
+        ensure!(handle.local().has_object(&id), "cold instance lacks {}", ack.new);
     }
     // Compaction on the healed instance works on what it downloaded.
     let out = walgit_server::ops::compact_repo(
-        &h,
-        &c.instances[cold].cfg,
+        &handle,
+        &cluster.instances[cold].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: false,
@@ -1412,7 +1413,7 @@ async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
         matches!(out, walgit_server::ops::CompactOutcome::Published { .. }),
         "{out:?}"
     );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
+    check_truth(&cluster, std::slice::from_ref(&pusher)).await?;
     Ok(())
 }
 
@@ -2036,22 +2037,22 @@ fn pack_objects(repo: &Path, checksum: &gix_hash::ObjectId) -> std::collections:
 /// Build a large-repository shape on a disk-mode host: a tier-2 base (full repack + bitmap) with its D18
 /// history pack, then several fresh pushes. Returns (base, history) checksums.
 async fn seed_base_and_history(
-    c: &Cluster,
-    i: usize,
-    p: &mut Pusher,
+    cluster: &Cluster,
+    idx: usize,
+    pusher: &mut Pusher,
     fresh: usize,
 ) -> Result<(gix_hash::ObjectId, gix_hash::ObjectId)> {
     for _ in 0..3 {
         ensure!(
-            p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+            pusher.push_once(&cluster.instances[idx], &cluster.id, Duration::from_secs(10))
                 .await?
         );
     }
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
+    let handle = cluster.instances[idx].open(&cluster.id).await?;
+    drop(handle.sync_full().await?);
     let out = walgit_server::ops::compact_repo(
-        &h,
-        &c.instances[i].cfg,
+        &handle,
+        &cluster.instances[idx].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -2069,23 +2070,23 @@ async fn seed_base_and_history(
         ),
         "{out:?}"
     );
-    drop(h.sync_full().await?);
-    let m = h.manifest();
-    let base = m
+    drop(handle.sync_full().await?);
+    let man = handle.manifest();
+    let base = man
         .packs
         .iter()
-        .find(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
-        .ok_or_else(|| anyhow!("no base: {m:?}"))?;
-    let hist = m
+        .find(|item| item.tier == 2 && item.kind != walgit_proto::v1::PackKind::History as i32)
+        .ok_or_else(|| anyhow!("no base: {man:?}"))?;
+    let hist = man
         .packs
         .iter()
-        .find(|x| x.kind == walgit_proto::v1::PackKind::History as i32)
-        .ok_or_else(|| anyhow!("no history pack: {m:?}"))?;
+        .find(|item| item.kind == walgit_proto::v1::PackKind::History as i32)
+        .ok_or_else(|| anyhow!("no history pack: {man:?}"))?;
     let base = gix_hash::ObjectId::from_hex(base.checksum.as_bytes())?;
     let hist = gix_hash::ObjectId::from_hex(hist.checksum.as_bytes())?;
     for _ in 0..fresh {
         ensure!(
-            p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+            pusher.push_once(&cluster.instances[idx], &cluster.id, Duration::from_secs(10))
                 .await?
         );
     }
@@ -2202,7 +2203,7 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
         cfg.git.history_pack = true;
     });
     let mut p = Pusher::new(0);
-    let (base1, _hist1) = seed_base_and_history(&c, i, &mut p, 2).await?;
+    let (_base1, _hist1) = seed_base_and_history(&c, i, &mut p, 2).await?;
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
     // Simulate git retaining the old base (a `.keep` git would honour — as a kept pack it is not
@@ -2273,7 +2274,9 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
         "rebuild superseded {superseded} of {} live packs",
         before.len()
     );
-    ensure!(base1 != gix_hash::ObjectId::from_hex(fulls[0].checksum.as_bytes())? || true);
+    // The parse is the real assertion (the new base's checksum must be valid hex);
+    // the old `base1 != oid || true` comparison was always true and only evaluated it.
+    gix_hash::ObjectId::from_hex(fulls[0].checksum.as_bytes())?;
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())
 }
@@ -2313,26 +2316,26 @@ async fn rebuild_attempt(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()> {
     use walgit_server::rebuild::{Phase, TEST_ABORT_AFTER};
-    let mut c = Cluster::new(33, 1).await?;
-    let i = c.add_instance("ssd", &|cfg| {
+    let mut cluster = Cluster::new(33, 1).await?;
+    let idx = cluster.add_instance("ssd", &|cfg| {
         cfg.cache.mode = walgit_config::CacheMode::Disk;
         cfg.git.history_pack = true;
         cfg.git.commit_graph = true;
     });
-    let mut p = Pusher::new(0);
+    let mut pusher = Pusher::new(0);
     for _ in 0..4 {
         ensure!(
-            p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+            pusher.push_once(&cluster.instances[idx], &cluster.id, Duration::from_secs(10))
                 .await?
         );
     }
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
+    let handle = cluster.instances[idx].open(&cluster.id).await?;
+    drop(handle.sync_full().await?);
     let before_files: std::collections::BTreeSet<String> =
-        std::fs::read_dir(h.local().path().join("objects/pack"))?
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        std::fs::read_dir(handle.local().path().join("objects/pack"))?
+            .map(|ent| ent.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-    let repo_key = c.id.to_string();
+    let repo_key = cluster.id.to_string();
     let mut repacks = 0usize;
     // Kill after each phase in turn; every attempt but the last fails by the hook.
     for phase in [
@@ -2342,8 +2345,8 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
         Phase::CommitGraph,
     ] {
         *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), phase));
-        let (out, log) = rebuild_attempt(&c, i).await;
-        repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
+        let (out, log) = rebuild_attempt(&cluster, idx).await;
+        repacks += log.iter().filter(|ln| ln.starts_with("repack done")).count();
         ensure!(
             out.is_err(),
             "attempt killed after {phase:?} should fail: {out:?}\n{}",
@@ -2351,23 +2354,23 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
         );
         // The serving copy is untouched while the rebuild is in flight.
         let now_files: std::collections::BTreeSet<String> =
-            std::fs::read_dir(h.local().path().join("objects/pack"))?
-                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            std::fs::read_dir(handle.local().path().join("objects/pack"))?
+                .map(|ent| ent.unwrap().file_name().to_string_lossy().to_string())
                 .collect();
         ensure!(
             now_files == before_files,
             "serving copy changed during the rebuild after {phase:?}: {now_files:?} vs {before_files:?}"
         );
         // "Restart": a fresh instance on the same cache dir/link name — the scratch dir on "disk" survives.
-        c.restart_keep_disk(i, &|cfg| {
+        cluster.restart_keep_disk(idx, &|cfg| {
             cfg.cache.mode = walgit_config::CacheMode::Disk;
             cfg.git.history_pack = true;
             cfg.git.commit_graph = true;
         });
     }
     *TEST_ABORT_AFTER.lock() = None;
-    let (out, log) = rebuild_attempt(&c, i).await;
-    repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
+    let (out, log) = rebuild_attempt(&cluster, idx).await;
+    repacks += log.iter().filter(|ln| ln.starts_with("repack done")).count();
     let out = out.with_context(|| log.join("\n"))?;
     ensure!(
         matches!(
@@ -2385,48 +2388,48 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
         log.join("\n")
     );
     ensure!(
-        log.iter().any(|l| l.starts_with("resuming base rebuild")),
+        log.iter().any(|ln| ln.starts_with("resuming base rebuild")),
         "{}",
         log.join("\n")
     );
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
-    let m = h.manifest();
+    let handle = cluster.instances[idx].open(&cluster.id).await?;
+    drop(handle.sync_full().await?);
+    let man = handle.manifest();
     ensure!(
-        m.packs
+        man.packs
             .iter()
-            .filter(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
+            .filter(|item| item.tier == 2 && item.kind != walgit_proto::v1::PackKind::History as i32)
             .count()
             == 1,
-        "{m:?}"
+        "{man:?}"
     );
     ensure!(
-        m.packs
+        man.packs
             .iter()
-            .filter(|x| x.kind == walgit_proto::v1::PackKind::History as i32)
+            .filter(|item| item.kind == walgit_proto::v1::PackKind::History as i32)
             .count()
             == 1,
-        "{m:?}"
+        "{man:?}"
     );
-    ensure!(m.packs.len() == 2, "{m:?}");
-    let scratch = c.instances[i].cfg.cache.dir.join("_rebuild");
+    ensure!(man.packs.len() == 2, "{man:?}");
+    let scratch = cluster.instances[idx].cfg.cache.dir.join("_rebuild");
     ensure!(
         !scratch.join("sim").exists() || std::fs::read_dir(scratch.join("sim"))?.next().is_none(),
         "scratch dir left behind"
     );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
+    check_truth(&cluster, std::slice::from_ref(&pusher)).await?;
 
     // A push between a kill and the resume: the head moved, the next attempt starts over.
     *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), Phase::Repacked));
-    let (out, log1) = rebuild_attempt(&c, i).await;
+    let (out, log1) = rebuild_attempt(&cluster, idx).await;
     ensure!(out.is_err());
-    ensure!(log1.iter().filter(|l| l.starts_with("repack done")).count() == 1);
+    ensure!(log1.iter().filter(|ln| ln.starts_with("repack done")).count() == 1);
     ensure!(
-        p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+        pusher.push_once(&cluster.instances[idx], &cluster.id, Duration::from_secs(10))
             .await?
     );
     *TEST_ABORT_AFTER.lock() = None;
-    let (out, log2) = rebuild_attempt(&c, i).await;
+    let (out, log2) = rebuild_attempt(&cluster, idx).await;
     let out = out.with_context(|| log2.join("\n"))?;
     ensure!(matches!(
         out,
@@ -2437,37 +2440,37 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
     ));
     ensure!(
         log2.iter()
-            .any(|l| l.starts_with("discarding interrupted base rebuild")),
+            .any(|ln| ln.starts_with("discarding interrupted base rebuild")),
         "{}",
         log2.join("\n")
     );
     ensure!(
-        log2.iter().filter(|l| l.starts_with("repack done")).count() == 1,
+        log2.iter().filter(|ln| ln.starts_with("repack done")).count() == 1,
         "a fresh repack after the head moved"
     );
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
-    let m = h.manifest();
+    let handle = cluster.instances[idx].open(&cluster.id).await?;
+    drop(handle.sync_full().await?);
+    let man = handle.manifest();
     ensure!(
-        m.packs.len() == 2,
-        "one base + one history pack again: {m:?}"
+        man.packs.len() == 2,
+        "one base + one history pack again: {man:?}"
     );
     // The pushed commit is in the new base (not lost to a stale scratch).
-    let base = m
+    let base = man
         .packs
         .iter()
-        .find(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
+        .find(|item| item.tier == 2 && item.kind != walgit_proto::v1::PackKind::History as i32)
         .unwrap();
     let objs = pack_objects(
-        h.local().path(),
+        handle.local().path(),
         &gix_hash::ObjectId::from_hex(base.checksum.as_bytes())?,
     );
     ensure!(
-        objs.contains(&p.tip),
+        objs.contains(&pusher.tip),
         "the in-between push's tip {} is in the new base",
-        p.tip
+        pusher.tip
     );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
+    check_truth(&cluster, std::slice::from_ref(&pusher)).await?;
     Ok(())
 }
 
@@ -2480,7 +2483,7 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
 fn push_blobby(p: &mut Pusher, kb: usize, rng: &mut Lcg) -> String {
     let mut buf = vec![0u8; kb * 1024];
     for b in &mut buf {
-        *b = rng.next() as u8;
+        *b = u8::try_from(rng.next() % 256).expect("mod 256 fits u8");
     }
     std::fs::write(p.work.path().join(format!("blob-{}.bin", p.n + 1)), &buf).unwrap();
     p.work.commit(p.n + 1, &format!("p{}", p.idx))
@@ -2495,15 +2498,15 @@ fn push_blobby(p: &mut Pusher, kb: usize, rng: &mut Lcg) -> String {
 /// the story so far and sees the outcome; downloads are not multiplied by the callers.
 async fn run_task_ownership(seed: u64) -> Result<()> {
     let mut rng = Lcg(seed);
-    let mut c = Cluster::new(seed, 1).await?;
-    let mut p = Pusher::new(0);
+    let mut cluster = Cluster::new(seed, 1).await?;
+    let mut pusher = Pusher::new(0);
     for _ in 0..4 {
-        let new = push_blobby(&mut p, 64, &mut rng);
-        let h = c.instances[0].open(&c.id).await?;
-        let pack = p
+        let new = push_blobby(&mut pusher, 64, &mut rng);
+        let handle = cluster.instances[0].open(&cluster.id).await?;
+        let pack = pusher
             .work
-            .pack(&new, (!p.tip.is_empty()).then_some(p.tip.as_str()));
-        let ingested = h
+            .pack(&new, (!pusher.tip.is_empty()).then_some(pusher.tip.as_str()));
+        let ingested = handle
             .local()
             .ingest_pack(
                 std::io::Cursor::new(pack),
@@ -2517,47 +2520,47 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
             .unwrap();
         let txn = RefTransaction {
             updates: vec![RefUpdate {
-                name: p.refname.clone(),
-                old_oid: p.tip.clone(),
+                name: pusher.refname.clone(),
+                old_oid: pusher.tip.clone(),
                 new_oid: new.clone(),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        h.publish_push(Some(ingested), txn, HashMap::new()).await?;
-        p.tip = new;
+        handle.publish_push(Some(ingested), txn, HashMap::new()).await?;
+        pusher.tip = new;
     }
-    let live_packs = c.truth_manifest().await?.packs.len();
+    let live_packs = cluster.truth_manifest().await?.packs.len();
     ensure!(live_packs >= 4);
 
     // A fresh instance whose pack reads are slow and flaky.
-    let j = c.add_instance("joiners", &|_| {});
-    c.instances[j].link.set(
+    let joiner = cluster.add_instance("joiners", &|_| {});
+    cluster.instances[joiner].link.set(
         FaultPlan {
             delay: Some((
                 Duration::from_millis(1),
                 Duration::from_millis(2 + rng.below(15)),
             )),
-            p_err_before: 0.05 + (rng.below(10) as f64) / 100.0,
+            p_err_before: 0.05 + f64::from(u32::try_from(rng.below(10)).expect("below(n) < n")) / 100.0,
             p_truncate: 0.05,
             ..Default::default()
         }
         .with_only(&["wal/"]),
     );
-    let h = c.instances[j].open(&c.id).await?;
-    let tasks = c.instances[j].registry.tasks().clone();
-    let repo = c.id.to_string();
+    let handle = cluster.instances[joiner].open(&cluster.id).await?;
+    let tasks = cluster.instances[joiner].registry.tasks().clone();
+    let repo = cluster.id.to_string();
 
     // K concurrent object-level syncs; one random caller is aborted after a random delay.
-    let k = 4 + rng.below(4) as usize;
+    let to_spawn = 4 + usize::try_from(rng.below(4)).expect("below(n) < n");
     let mut joins = Vec::new();
-    for _ in 0..k {
-        let h = h.clone();
+    for _ in 0..to_spawn {
+        let handle = handle.clone();
         joins.push(tokio::spawn(async move {
-            h.sync().await.map(drop).map_err(|e| e.to_string())
+            handle.sync().await.map(drop).map_err(|err| err.to_string())
         }));
     }
-    let victim = rng.below(k as u64) as usize;
+    let victim = usize::try_from(rng.below(to_spawn as u64)).expect("below(n) < n");
     let abort_after = Duration::from_millis(rng.below(40));
     // Watch the task registry while they run: at most one materialize task at a time.
     let watcher = {
@@ -2566,12 +2569,12 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
         tokio::spawn(async move {
             let mut max_running = 0usize;
             for _ in 0..400 {
-                let n = tasks
+                let running = tasks
                     .running(&repo)
                     .iter()
-                    .filter(|t| t.kind == "materialize")
+                    .filter(|task| task.kind == "materialize")
                     .count();
-                max_running = max_running.max(n);
+                max_running = max_running.max(running);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             max_running
@@ -2580,15 +2583,15 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
     tokio::time::sleep(abort_after).await;
     joins[victim].abort();
     let mut errors = 0usize;
-    for (i, jh) in joins.into_iter().enumerate() {
+    for (idx, jh) in joins.into_iter().enumerate() {
         match tokio::time::timeout(Duration::from_secs(30), jh).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(_))) => errors += 1,
-            Ok(Err(e)) if e.is_cancelled() && i == victim => errors += 1,
-            Ok(Err(e)) => bail!("caller {i} panicked: {e}"),
+            Ok(Err(err)) if err.is_cancelled() && idx == victim => errors += 1,
+            Ok(Err(err)) => bail!("caller {idx} panicked: {err}"),
             Err(_) => bail!(
-                "caller {i} hung 30 s: a task lock was never released\n{}",
-                c.dump_traces()
+                "caller {idx} hung 30 s: a task lock was never released\n{}",
+                cluster.dump_traces()
             ),
         }
     }
@@ -2599,27 +2602,27 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
     );
 
     // Afterwards: nothing stuck, and a healed caller completes (or had completed).
-    c.instances[j].link.heal();
-    tokio::time::timeout(Duration::from_secs(30), h.sync())
+    cluster.instances[joiner].link.heal();
+    tokio::time::timeout(Duration::from_secs(30), handle.sync())
         .await
-        .map_err(|_| anyhow!("sync hung after the chaos\n{}", c.dump_traces()))??;
-    ensure!(h.packs_ready(), "packs not ready after a healthy sync");
+        .map_err(|_| anyhow!("sync hung after the chaos\n{}", cluster.dump_traces()))??;
+    ensure!(handle.packs_ready(), "packs not ready after a healthy sync");
     ensure!(
         tasks.running(&repo).is_empty(),
         "a task is still marked running: {:?}",
         tasks.running(&repo)
     );
     let recent = tasks.recent(&repo);
-    let materializes: Vec<_> = recent.iter().filter(|t| t.kind == "materialize").collect();
+    let materializes: Vec<_> = recent.iter().filter(|task| task.kind == "materialize").collect();
     ensure!(!materializes.is_empty());
     // Every start beyond the first is accounted for by a failure or the abort — never a duplicate.
     ensure!(
         materializes.len() <= 1 + errors + 1,
-        "{} materialize tasks for {k} callers with {errors} failures:\n{:?}",
+        "{} materialize tasks for {to_spawn} callers with {errors} failures:\n{:?}",
         materializes.len(),
         materializes
             .iter()
-            .map(|t| (&t.id, &t.summary))
+            .map(|task| (&task.id, &task.summary))
             .collect::<Vec<_>>()
     );
     // A late joiner attaches to the finished task and gets the replay + outcome.
@@ -2627,7 +2630,7 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
     // injected retryable error (or was the aborted victim) there may
     // legitimately be no success at all — assert the failure propagated
     // instead; the heal below still converges.
-    if let Some(last_ok) = materializes.iter().find(|t| t.ok == Some(true)) {
+    if let Some(last_ok) = materializes.iter().find(|task| task.ok == Some(true)) {
         let state = tasks
             .get(&last_ok.id)
             .ok_or_else(|| anyhow!("task state gone"))?;
@@ -2639,7 +2642,7 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
         );
     } else {
         ensure!(
-            materializes.iter().all(|t| t.ok == Some(false)),
+            materializes.iter().all(|task| task.ok == Some(false)),
             "mixed task outcomes without a success: {materializes:?}"
         );
         let state = tasks
@@ -2653,14 +2656,20 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
         );
     }
     // Downloads: every attempt downloads each pack at most once (+ idx); no N-fold traffic.
-    let ops = c.instances[j].link.stats().ops.load(Ordering::Relaxed) as usize;
+    let ops = cluster.instances[joiner]
+        .link
+        .stats()
+        .ops
+        .load(Ordering::Relaxed)
+        .try_into()
+        .unwrap_or(usize::MAX);
     let attempts = materializes.len();
-    let budget = attempts * (live_packs * 4 + 6) + k * 3 + 20;
+    let budget = attempts * (live_packs * 4 + 6) + to_spawn * 3 + 20;
     ensure!(
         ops <= budget,
         "{ops} store requests for {attempts} materialize attempt(s) over {live_packs} packs (budget {budget})"
     );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
+    check_truth(&cluster, std::slice::from_ref(&pusher)).await?;
     Ok(())
 }
 
@@ -2776,7 +2785,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut refs_latencies = Vec::new();
     let mut total_evicted = 0usize;
     for step in 0..30u64 {
-        let r = 1 + rng.below(3) as usize; // repos 1..3
+        let r = 1 + usize::try_from(rng.below(3)).expect("below(n) < n"); // repos 1..3
         let id = &ids[r];
         let h = front.registry.open(id).await?;
         match rng.below(3) {

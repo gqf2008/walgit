@@ -206,7 +206,7 @@ pub async fn batch(
     let mut resp = (StatusCode::OK, json).into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        "application/vnd.git-lfs+json".parse().unwrap(),
+        axum::http::HeaderValue::from_static("application/vnd.git-lfs+json"),
     );
     Ok(resp)
 }
@@ -241,7 +241,7 @@ pub async fn get_object(
             .find_map(|kv| kv.strip_prefix("size="))
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
-        return read_through(st, &cfg, upstream, store, oid, size, key, method).await;
+        return read_through(st, &cfg, upstream, store, oid, size, method).await;
     }
     match crate::static_object::serve(
         &store,
@@ -277,7 +277,6 @@ async fn read_through(
     store: walgit_store::Prefixed,
     oid: &str,
     size: u64,
-    key: String,
     method: &axum::http::Method,
 ) -> Result<Response, ApiError> {
     let found = st
@@ -292,12 +291,15 @@ async fn read_through(
         return Err(ApiError::NotFound("object not found".into()));
     };
     if *method == axum::http::Method::HEAD {
-        return Ok(Response::builder()
+        // Static content type and a decimal Content-Length from the batch
+        // response: the builder cannot fail.
+        let resp = Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_LENGTH, obj.size)
             .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
             .body(Body::empty())
-            .unwrap());
+            .map_err(|e| ApiError::Internal(format!("lfs HEAD response: {e}")))?;
+        return Ok(resp);
     }
     let (len, mut upstream_body) = st
         .lfs_upstream
@@ -314,7 +316,9 @@ async fn read_through(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let expected_oid = oid.to_string();
     let expected_len = len;
-    let repo_key = key.clone();
+    // The store key is a pure function of the oid (same one the caller used
+    // for the exists() probe), so it is recomputed here rather than passed.
+    let repo_key = keys::lfs_key(oid);
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(8);
     tokio::spawn(async move {
         use futures::StreamExt;
@@ -374,13 +378,15 @@ async fn read_through(
         let _ = tokio::fs::remove_file(&spool_path).await;
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Ok(Response::builder()
+    // Static headers and a stream body: the builder cannot fail.
+    let resp = Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_LENGTH, len)
         .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
-        .unwrap())
+        .map_err(|e| ApiError::Internal(format!("lfs read-through response: {e}")))?;
+    Ok(resp)
 }
 
 /// `PUT /{repo}/info/lfs/objects/{oid}` — stream upload, verify size + sha256.
@@ -425,8 +431,10 @@ pub async fn put_object(
         if n > max {
             return Err(ApiError::PayloadTooLarge);
         }
-        hasher.update(&buf[..k]);
-        file.write_all(&buf[..k])
+        // `k` ≤ buf.len() by the AsyncRead contract: the split cannot panic.
+        let (used, _) = buf.split_at(k);
+        hasher.update(used);
+        file.write_all(used)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
     }

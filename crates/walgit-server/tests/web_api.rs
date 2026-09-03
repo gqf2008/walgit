@@ -143,53 +143,53 @@ async fn conformance(
     );
 
     // refs: O(1) head only, ETag + 304
-    let (st, text, h) = get_h(server, "/o/r/api/refs", &[]).await?;
+    let (st, text, hdrs) = get_h(server, "/o/r/api/refs", &[]).await?;
     assert_eq!(st, 200);
     let refs: Value = serde_json::from_str(&text)?;
     assert_eq!(refs["head"]["name"], "main");
     assert_eq!(refs["head"]["sha"], head);
-    let etag = hdr(&h, "etag");
+    let etag = hdr(&hdrs, "etag");
     assert_eq!(etag, format!("\"{head}\""));
-    assert!(hdr(&h, "cache-control").contains("stale-while-revalidate"));
+    assert!(hdr(&hdrs, "cache-control").contains("stale-while-revalidate"));
     let (st, _, _) = get_h(server, "/o/r/api/refs", &[("If-None-Match", &etag)]).await?;
     assert_eq!(st, 304);
     // ref lists: paged, sorted, filtered
-    let p = json(server, "/o/r/api/refs/branches?n=1").await?;
-    assert_eq!(p["refs"][0]["name"], "feature/x");
-    assert_eq!(p["more"], true);
-    let p = json(server, "/o/r/api/refs/branches?after=feature/x&n=5").await?;
-    assert_eq!(p["refs"][0]["name"], "main");
-    assert_eq!(p["refs"][0]["sha"], head);
-    assert_eq!(p["more"], false);
-    let p = json(server, "/o/r/api/refs/branches?q=AIN").await?;
-    assert_eq!(p["refs"].as_array().unwrap().len(), 1);
-    let p = json(server, "/o/r/api/refs/branches?prefix=feature").await?;
-    assert_eq!(p["refs"][0]["name"], "feature/x");
-    let p = json(server, "/o/r/api/refs/tags").await?;
-    let tags = p["refs"].as_array().unwrap();
+    let pg = json(server, "/o/r/api/refs/branches?n=1").await?;
+    assert_eq!(pg["refs"][0]["name"], "feature/x");
+    assert_eq!(pg["more"], true);
+    let pg = json(server, "/o/r/api/refs/branches?after=feature/x&n=5").await?;
+    assert_eq!(pg["refs"][0]["name"], "main");
+    assert_eq!(pg["refs"][0]["sha"], head);
+    assert_eq!(pg["more"], false);
+    let pg = json(server, "/o/r/api/refs/branches?q=AIN").await?;
+    assert_eq!(pg["refs"].as_array().unwrap().len(), 1);
+    let pg = json(server, "/o/r/api/refs/branches?prefix=feature").await?;
+    assert_eq!(pg["refs"][0]["name"], "feature/x");
+    let pg = json(server, "/o/r/api/refs/tags").await?;
+    let tags = pg["refs"].as_array().unwrap();
     assert_eq!(tags.len(), 2);
-    let v1 = tags.iter().find(|t| t["name"] == "v1.0").unwrap();
+    let v1 = tags.iter().find(|tag| tag["name"] == "v1.0").unwrap();
     assert_eq!(v1["sha"], v1_peeled, "annotated tag sha must be peeled");
     assert_eq!(get(server, "/o/r/api/refs/nope").await?.0, 404);
     // SSE form
-    let (st, body, h) = get_h(
+    let (st, body, hdrs) = get_h(
         server,
         "/o/r/api/refs/tags",
         &[("Accept", "text/event-stream")],
     )
     .await?;
     assert_eq!(st, 200);
-    assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
+    assert!(hdr(&hdrs, "content-type").starts_with("text/event-stream"));
     assert!(body.contains("event: ref\n") && body.contains("event: done\ndata: {\"more\":false}"));
 
     // any-namespace refs (D1 collab): full-name listing, namespace filter,
     // exact lookup, pagination, SSE
-    let p = json(server, "/o/r/api/refs/all").await?;
-    let names: Vec<String> = p["refs"]
+    let pg = json(server, "/o/r/api/refs/all").await?;
+    let names: Vec<String> = pg["refs"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["name"].as_str().unwrap().to_string())
+        .map(|row| row["name"].as_str().unwrap().to_string())
         .collect();
     for expect in [
         "refs/heads/main",
@@ -203,35 +203,35 @@ async fn conformance(
         );
     }
     assert!(
-        names.windows(2).all(|w| w[0] < w[1]),
+        names.windows(2).all(|pair| pair[0] < pair[1]),
         "refs/all must be byte-sorted: {names:?}"
     );
-    let p = json(server, "/o/r/api/refs/all?prefix=refs/collab").await?;
-    assert_eq!(p["refs"].as_array().unwrap().len(), 1);
-    let p = json(server, "/o/r/api/refs/all?n=2").await?;
-    assert_eq!(p["refs"].as_array().unwrap().len(), 2);
-    assert_eq!(p["more"], true);
-    let p = json(server, "/o/r/api/refs/collab").await?;
-    assert_eq!(p["refs"][0]["name"], "refs/collab/inbox/alice/1");
-    assert_eq!(p["refs"][0]["sha"], head);
+    let pg = json(server, "/o/r/api/refs/all?prefix=refs/collab").await?;
+    assert_eq!(pg["refs"].as_array().unwrap().len(), 1);
+    let pg = json(server, "/o/r/api/refs/all?n=2").await?;
+    assert_eq!(pg["refs"].as_array().unwrap().len(), 2);
+    assert_eq!(pg["more"], true);
+    let pg = json(server, "/o/r/api/refs/collab").await?;
+    assert_eq!(pg["refs"][0]["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(pg["refs"][0]["sha"], head);
     assert_eq!(
         json(server, "/o/r/api/refs/collab?q=INBOX").await?["refs"][0]["name"],
         "refs/collab/inbox/alice/1"
     );
-    let r = json(server, "/o/r/api/refs/name/refs/collab/inbox/alice/1").await?;
-    assert_eq!(r["name"], "refs/collab/inbox/alice/1");
-    assert_eq!(r["sha"], head);
-    let r = json(server, "/o/r/api/refs/name/refs/heads/main").await?;
-    assert_eq!(r["sha"], head);
+    let row = json(server, "/o/r/api/refs/name/refs/collab/inbox/alice/1").await?;
+    assert_eq!(row["name"], "refs/collab/inbox/alice/1");
+    assert_eq!(row["sha"], head);
+    let row = json(server, "/o/r/api/refs/name/refs/heads/main").await?;
+    assert_eq!(row["sha"], head);
     assert_eq!(get(server, "/o/r/api/refs/name/refs/nope").await?.0, 404);
-    let (st, body, h) = get_h(
+    let (st, body, hdrs) = get_h(
         server,
         "/o/r/api/refs/collab",
         &[("Accept", "text/event-stream")],
     )
     .await?;
     assert_eq!(st, 200);
-    assert!(hdr(&h, "content-type").starts_with("text/event-stream"));
+    assert!(hdr(&hdrs, "content-type").starts_with("text/event-stream"));
     assert!(body.contains("event: ref\n") && body.contains("event: done\n"));
 
     // merge-base (D1 review primitive): local git and remote reader agree
@@ -256,18 +256,18 @@ async fn conformance(
     );
 
     // diff (D1 review primitive): name-status / stat / patch, local + remote
-    let d = json(
+    let diff = json(
         server,
         "/o/r/api/diff?from=feature/x&to=main&format=name-status",
     )
     .await?;
-    assert_eq!(d["format"], "name-status");
-    assert_eq!(d["from"].as_str().unwrap().len(), 40);
-    assert_eq!(d["to"].as_str().unwrap().len(), 40);
-    let ch = d["changes"].as_array().unwrap();
+    assert_eq!(diff["format"], "name-status");
+    assert_eq!(diff["from"].as_str().unwrap().len(), 40);
+    assert_eq!(diff["to"].as_str().unwrap().len(), 40);
+    let ch = diff["changes"].as_array().unwrap();
     assert!(
         ch.iter()
-            .any(|c| c["status"] == "M" && c["path"] == "src/inner/x.txt"),
+            .any(|change| change["status"] == "M" && change["path"] == "src/inner/x.txt"),
         "second on main modified x.txt: {ch:?}"
     );
     let st = json(server, "/o/r/api/diff?from=feature/x&to=main&format=stat").await?;
@@ -277,12 +277,12 @@ async fn conformance(
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["path"] == "src/inner/x.txt"),
+            .any(|srow| srow["path"] == "src/inner/x.txt"),
         "stat lists x.txt"
     );
-    let p = json(server, "/o/r/api/diff?from=feature/x&to=main").await?;
-    assert_eq!(p["format"], "patch", "default format is patch");
-    assert!(p["patch"].as_str().unwrap().contains("diff --git"));
+    let pg = json(server, "/o/r/api/diff?from=feature/x&to=main").await?;
+    assert_eq!(pg["format"], "patch", "default format is patch");
+    assert!(pg["patch"].as_str().unwrap().contains("diff --git"));
     let same = json(server, "/o/r/api/diff?from=main&to=main&format=name-status").await?;
     assert_eq!(same["changes"].as_array().unwrap().len(), 0);
     assert_eq!(
@@ -294,10 +294,10 @@ async fn conformance(
     assert_eq!(get(server, "/o/r/api/diff?from=nope&to=main").await?.0, 404);
 
     // blame (D1 review primitive): porcelain parsed, local + remote agree
-    let b = json(server, "/o/r/api/blame/main/src/inner/x.txt").await?;
-    assert_eq!(b["path"], "src/inner/x.txt");
-    assert_eq!(b["sha"].as_str().unwrap().len(), 40);
-    let lines = b["blame"].as_array().unwrap();
+    let bl = json(server, "/o/r/api/blame/main/src/inner/x.txt").await?;
+    assert_eq!(bl["path"], "src/inner/x.txt");
+    assert_eq!(bl["sha"].as_str().unwrap().len(), 40);
+    let lines = bl["blame"].as_array().unwrap();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["line"], 1);
     assert_eq!(lines[0]["text"], "xx", "main's x.txt content");
@@ -340,7 +340,7 @@ async fn conformance(
     let ct = resp
         .headers()
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|hv| hv.to_str().ok())
         .unwrap_or("")
         .to_string();
     assert!(ct.starts_with("application/gzip"), "ct: {ct}");
@@ -362,7 +362,7 @@ async fn conformance(
     let ct = resp
         .headers()
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|hv| hv.to_str().ok())
         .unwrap_or("")
         .to_string();
     assert!(ct.starts_with("application/zip"), "ct: {ct}");
@@ -375,41 +375,41 @@ async fn conformance(
     assert_eq!(get(server, "/o/r/api/archive/nope").await?.0, 404);
 
     // resolve
-    let (st, text, h) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
+    let (st, text, hdrs) = get_h(server, "/o/r/api/resolve/feature/x/dir", &[]).await?;
     assert_eq!(st, 200);
-    let r: Value = serde_json::from_str(&text)?;
-    assert_eq!(r["ref"], "feature/x");
-    assert_eq!(r["sha"], feature);
-    assert_eq!(r["path"], "dir");
-    assert_eq!(r["kind"], "branch");
-    assert_eq!(hdr(&h, "etag"), format!("\"{feature}\""));
-    let r = json(server, "/o/r/api/resolve/v1.0").await?;
-    assert_eq!(r["kind"], "tag");
-    assert_eq!(r["sha"], v1_peeled);
-    let r = json(server, &format!("/o/r/api/resolve/{}/src", &head[..8])).await?;
-    assert_eq!(r["kind"], "commit");
-    assert_eq!(r["sha"], head);
-    assert_eq!(r["path"], "src");
-    let r = json(server, "/o/r/api/resolve/").await?;
-    assert_eq!(r["ref"], "main");
+    let row: Value = serde_json::from_str(&text)?;
+    assert_eq!(row["ref"], "feature/x");
+    assert_eq!(row["sha"], feature);
+    assert_eq!(row["path"], "dir");
+    assert_eq!(row["kind"], "branch");
+    assert_eq!(hdr(&hdrs, "etag"), format!("\"{feature}\""));
+    let row = json(server, "/o/r/api/resolve/v1.0").await?;
+    assert_eq!(row["kind"], "tag");
+    assert_eq!(row["sha"], v1_peeled);
+    let row = json(server, &format!("/o/r/api/resolve/{}/src", &head[..8])).await?;
+    assert_eq!(row["kind"], "commit");
+    assert_eq!(row["sha"], head);
+    assert_eq!(row["path"], "src");
+    let row = json(server, "/o/r/api/resolve/").await?;
+    assert_eq!(row["ref"], "main");
     let (st, _, ct) = get(server, "/o/r/api/resolve/nope/x").await?;
     assert_eq!(st, 404);
     assert!(!ct.unwrap_or_default().contains("json"));
 
     // tree root
-    let (st, text, h) = get_h(server, "/o/r/api/tree/main", &[]).await?;
+    let (st, text, hdrs) = get_h(server, "/o/r/api/tree/main", &[]).await?;
     assert_eq!(st, 200);
     let tree: Value = serde_json::from_str(&text)?;
     assert_eq!(tree["ref"], "main");
     assert_eq!(tree["sha"], head);
     assert_eq!(tree["path"], "");
-    assert!(hdr(&h, "cache-control").contains("stale-while-revalidate"));
-    assert_eq!(hdr(&h, "etag"), format!("\"{head}\""));
+    assert!(hdr(&hdrs, "cache-control").contains("stale-while-revalidate"));
+    assert_eq!(hdr(&hdrs, "etag"), format!("\"{head}\""));
     let names: Vec<&str> = tree["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| e["name"].as_str().unwrap())
+        .map(|ent| ent["name"].as_str().unwrap())
         .collect();
     assert_eq!(
         names,
@@ -434,14 +434,14 @@ async fn conformance(
     assert_eq!(tree["commit"]["sha"].as_str().unwrap().len(), 40);
 
     // longest-ref rule: feature/x + path dir
-    let t = json(server, "/o/r/api/tree/feature/x/dir").await?;
-    assert_eq!(t["ref"], "feature/x");
-    assert_eq!(t["path"], "dir");
-    assert_eq!(t["entries"][0]["name"], "f.txt");
+    let treev = json(server, "/o/r/api/tree/feature/x/dir").await?;
+    assert_eq!(treev["ref"], "feature/x");
+    assert_eq!(treev["path"], "dir");
+    assert_eq!(treev["entries"][0]["name"], "f.txt");
     // subtree commit = newest commit touching the path
-    let t = json(server, "/o/r/api/tree/main/src/inner").await?;
-    assert_eq!(t["entries"][0]["name"], "x.txt");
-    assert_eq!(t["commit"]["subject"], "second on main");
+    let treev = json(server, "/o/r/api/tree/main/src/inner").await?;
+    assert_eq!(treev["entries"][0]["name"], "x.txt");
+    assert_eq!(treev["commit"]["subject"], "second on main");
     // blob path as tree -> 404 plain text
     let (st, body, ct) = get(server, "/o/r/api/tree/main/README.md").await?;
     assert_eq!(st, 404);
@@ -450,48 +450,48 @@ async fn conformance(
         "404 must be plain text: {body}"
     );
     // sha as ref -> immutable
-    let (st, text, h) = get_h(server, &format!("/o/r/api/tree/{feature}"), &[]).await?;
+    let (st, text, hdrs) = get_h(server, &format!("/o/r/api/tree/{feature}"), &[]).await?;
     assert_eq!(st, 200);
-    let t: Value = serde_json::from_str(&text)?;
-    assert_eq!(t["ref"], feature);
-    assert_eq!(t["sha"], feature);
-    assert!(hdr(&h, "cache-control").contains("immutable"));
+    let treev: Value = serde_json::from_str(&text)?;
+    assert_eq!(treev["ref"], feature);
+    assert_eq!(treev["sha"], feature);
+    assert!(hdr(&hdrs, "cache-control").contains("immutable"));
     // second hit served from the immutable LRU
     let (st, text2, _) = get_h(server, &format!("/o/r/api/tree/{feature}"), &[]).await?;
     assert_eq!(st, 200);
     assert_eq!(text, text2);
 
     // blob
-    let b = json(server, "/o/r/api/blob/main/README.md").await?;
-    assert_eq!(b["name"], "README.md");
-    assert_eq!(b["path"], "README.md");
-    assert_eq!(b["contents"], "# Title\n\nhello\n");
+    let bl = json(server, "/o/r/api/blob/main/README.md").await?;
+    assert_eq!(bl["name"], "README.md");
+    assert_eq!(bl["path"], "README.md");
+    assert_eq!(bl["contents"], "# Title\n\nhello\n");
     let (st, raw, ct) = get(server, "/o/r/api/blob/main/README.md?raw").await?;
     assert_eq!(st, 200);
     assert!(ct.unwrap_or_default().starts_with("text/plain"));
     assert_eq!(raw, "# Title\n\nhello\n");
-    let b = json(server, "/o/r/api/blob/main/bin.dat").await?;
-    assert_eq!(b["binary"], true);
-    assert!(b.get("contents").is_none());
-    let b = json(server, "/o/r/api/blob/main/big.txt").await?;
-    assert_eq!(b["too_large"], true);
-    assert_eq!(b["size"], 2 * 1024 * 1024 + 1);
+    let bl = json(server, "/o/r/api/blob/main/bin.dat").await?;
+    assert_eq!(bl["binary"], true);
+    assert!(bl.get("contents").is_none());
+    let bl = json(server, "/o/r/api/blob/main/big.txt").await?;
+    assert_eq!(bl["too_large"], true);
+    assert_eq!(bl["size"], 2 * 1024 * 1024 + 1);
     assert_eq!(get(server, "/o/r/api/blob/main/nope.txt").await?.0, 404);
 
     // commits + pagination
-    let c = json(server, "/o/r/api/commits?ref=main&path=&skip=0").await?;
-    assert_eq!(c["ref"], "main");
-    assert_eq!(c["sha"], head);
-    let (_, _, h) = get_h(
+    let cl = json(server, "/o/r/api/commits?ref=main&path=&skip=0").await?;
+    assert_eq!(cl["ref"], "main");
+    assert_eq!(cl["sha"], head);
+    let (_, _, hdrs) = get_h(
         server,
         &format!("/o/r/api/commits?ref={head}&path=&skip=0"),
         &[],
     )
     .await?;
-    assert!(hdr(&h, "cache-control").contains("immutable"));
-    let commits = c["commits"].as_array().unwrap();
+    assert!(hdr(&hdrs, "cache-control").contains("immutable"));
+    let commits = cl["commits"].as_array().unwrap();
     assert_eq!(commits.len(), 35);
-    assert_eq!(c["more"], true);
+    assert_eq!(cl["more"], true);
     assert_eq!(commits[0]["sha"], head);
     assert!(commits[0]["parents"].is_array());
     let c2 = json(server, "/o/r/api/commits?ref=main&skip=35&n=50").await?;
@@ -501,54 +501,54 @@ async fn conformance(
         .trim()
         .parse()?;
     assert_eq!(total, expected);
-    let c = json(server, "/o/r/api/commits?ref=main&path=src/inner/x.txt").await?;
-    let subjects: Vec<&str> = c["commits"]
+    let cl = json(server, "/o/r/api/commits?ref=main&path=src/inner/x.txt").await?;
+    let subjects: Vec<&str> = cl["commits"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|x| x["subject"].as_str().unwrap())
+        .map(|subj| subj["subject"].as_str().unwrap())
         .collect();
     assert_eq!(subjects, vec!["second on main", "initial"]);
-    let first = &c["commits"][1];
+    let first = &cl["commits"][1];
     assert_eq!(first["body"], "body line");
     assert_eq!(first["parents"], serde_json::json!([]));
     assert!(first["author_date"].as_str().unwrap().contains('T'));
     assert_eq!(get(server, "/o/r/api/commits?ref=nope").await?.0, 404);
 
     // commit detail: rename + merge (first-parent)
-    let d = json(server, &format!("/o/r/api/commit/{feature}")).await?;
-    assert_eq!(d["commit"]["sha"], feature);
-    let paths: Vec<&str> = d["stats"]
+    let cmt = json(server, &format!("/o/r/api/commit/{feature}")).await?;
+    assert_eq!(cmt["commit"]["sha"], feature);
+    let paths: Vec<&str> = cmt["stats"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|s| s["path"].as_str().unwrap())
+        .map(|srow| srow["path"].as_str().unwrap())
         .collect();
     assert!(
         paths.contains(&"src/app.rs"),
         "renamed file appears once with new path: {paths:?}"
     );
     assert!(!paths.contains(&"src/main.rs"));
-    assert!(d["patch"].as_str().unwrap().contains("diff --git a/"));
-    let m = json(server, &format!("/o/r/api/commit/{head}")).await?;
+    assert!(cmt["patch"].as_str().unwrap().contains("diff --git a/"));
+    let mg = json(server, &format!("/o/r/api/commit/{head}")).await?;
     // HEAD is a filler empty commit; find the merge commit instead.
-    assert_eq!(m["stats"], serde_json::json!([]));
+    assert_eq!(mg["stats"], serde_json::json!([]));
     let merge = git_in(src, &["rev-parse", "main~40"])?.trim().to_string();
-    let m = json(server, &format!("/o/r/api/commit/{merge}")).await?;
-    assert_eq!(m["commit"]["parents"].as_array().unwrap().len(), 2);
+    let mg = json(server, &format!("/o/r/api/commit/{merge}")).await?;
+    assert_eq!(mg["commit"]["parents"].as_array().unwrap().len(), 2);
     assert!(
-        !m["stats"].as_array().unwrap().is_empty(),
+        !mg["stats"].as_array().unwrap().is_empty(),
         "merge diffed against first parent must have stats"
     );
-    assert!(m["patch"].as_str().unwrap().contains("diff --git"));
-    assert!(!m["patch"].as_str().unwrap().contains("diff --cc"));
+    assert!(mg["patch"].as_str().unwrap().contains("diff --git"));
+    assert!(!mg["patch"].as_str().unwrap().contains("diff --cc"));
     // short sha and 404
-    let d = json(server, &format!("/o/r/api/commit/{}", &feature[..10])).await?;
-    assert_eq!(d["commit"]["sha"], feature);
-    let (_, _, h) = get_h(server, &format!("/o/r/api/commit/{}", &feature[..10]), &[]).await?;
-    assert_eq!(hdr(&h, "etag"), format!("\"{feature}\""));
-    let (_, _, h) = get_h(server, &format!("/o/r/api/commit/{feature}"), &[]).await?;
-    assert!(hdr(&h, "cache-control").contains("immutable"));
+    let cmt = json(server, &format!("/o/r/api/commit/{}", &feature[..10])).await?;
+    assert_eq!(cmt["commit"]["sha"], feature);
+    let (_, _, hdrs) = get_h(server, &format!("/o/r/api/commit/{}", &feature[..10]), &[]).await?;
+    assert_eq!(hdr(&hdrs, "etag"), format!("\"{feature}\""));
+    let (_, _, hdrs) = get_h(server, &format!("/o/r/api/commit/{feature}"), &[]).await?;
+    assert!(hdr(&hdrs, "cache-control").contains("immutable"));
     let (st, _, ct) = get(server, "/o/r/api/commit/deadbeef").await?;
     assert_eq!(st, 404);
     assert!(!ct.unwrap_or_default().contains("json"));

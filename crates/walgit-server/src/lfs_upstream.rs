@@ -72,20 +72,15 @@ pub struct Upstream {
     client: reqwest::Client,
 }
 
-impl Default for Upstream {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Upstream {
-    pub fn new() -> Self {
-        Self {
+    /// `Err` when the HTTP client cannot be built (TLS backend init); the
+    /// caller turns that into a startup failure.
+    pub fn new() -> Result<Self, reqwest::Error> {
+        Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client"),
-        }
+                .build()?,
+        })
     }
 
     /// Ask the upstream which of `objects` it can serve (`operation=download`).
@@ -110,7 +105,7 @@ impl Upstream {
         match result {
             Ok(m) => m,
             Err(error) => {
-                tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "lfs upstream batch failed; treating as absent");
+                tracing::warn!(%error, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "lfs upstream batch failed; treating as absent");
                 HashMap::new()
             }
         }
@@ -156,16 +151,18 @@ impl Upstream {
             let Some(dl) = o.actions.and_then(|a| a.download) else {
                 continue;
             };
-            if !asked.contains_key(o.oid.as_str()) {
+            // Only objects the client asked for are relayed; `asked` carries
+            // the href's `?size=` fallback for an upstream that omits the size.
+            let Some(asked_size) = asked.get(o.oid.as_str()).copied() else {
                 continue;
-            }
+            };
             out.insert(
                 o.oid.clone(),
                 UpstreamObject {
                     size: if o.size > 0 {
                         o.size
                     } else {
-                        asked[o.oid.as_str()]
+                        asked_size
                     },
                     oid: o.oid,
                     href: dl.href,

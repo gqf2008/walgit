@@ -174,20 +174,22 @@ pub(crate) struct WebhookSink {
 }
 
 impl WebhookSink {
-    pub fn new(url: String, secret: Option<String>) -> Self {
-        WebhookSink {
+    pub fn new(url: String, secret: Option<String>) -> Result<Self, reqwest::Error> {
+        Ok(WebhookSink {
             url,
             secret: secret.map(std::string::String::into_bytes),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
-        }
+                .build()?,
+        })
     }
 
     /// `sha256=<hex>` over `body` with the shared secret.
     pub fn signature(secret: &[u8], body: &[u8]) -> String {
         use hmac::{Hmac, Mac};
+        // HMAC accepts any key length: new_from_slice cannot fail for
+        // Hmac<Sha256>, so the error branch is unreachable.
+        #[allow(clippy::expect_used, reason = "Hmac<Sha256> accepts any key length; new_from_slice is infallible here")]
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("hmac key");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))

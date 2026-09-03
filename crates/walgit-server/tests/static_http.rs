@@ -216,7 +216,10 @@ async fn ui_assets_etag_304_and_precompressed() -> Result<()> {
     // same ETag across encodings (the encoding is negotiated, not a new entity).
     let asset = html
         .split('"')
-        .find(|p| p.starts_with("/_ui/assets/") && p.ends_with(".js"))
+        .find(|p| {
+            p.starts_with("/_ui/assets/")
+                && p.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("js"))
+        })
         .expect("asset reference")
         .to_string();
     let url = format!("{}{}", server.base_url, asset);

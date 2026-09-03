@@ -21,8 +21,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-type TestResult = anyhow::Result<()>;
-
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -91,7 +89,7 @@ fn route_literals(src: &str) -> Vec<(usize, String)> {
 }
 
 #[test]
-fn repo_scoped_routes_start_with_owner_repo() -> TestResult {
+fn repo_scoped_routes_start_with_owner_repo() {
     let files = [
         "crates/walgit-server/src/lib.rs",
         "crates/walgit-server/src/web/api.rs",
@@ -111,7 +109,6 @@ fn repo_scoped_routes_start_with_owner_repo() -> TestResult {
         "repo-scoped routes must start with /{{owner}}/{{repo}} (or be on the D26 allow-list):\n{}",
         bad.join("\n")
     );
-    Ok(())
 }
 
 fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
@@ -140,7 +137,7 @@ fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
 }
 
 #[test]
-fn clients_emit_prefix_form() -> TestResult {
+fn clients_emit_prefix_form() {
     let mut hits = Vec::new();
     hits.extend(forbidden_client_hits(
         &read("web/src/api.ts"),
@@ -165,7 +162,6 @@ fn clients_emit_prefix_form() -> TestResult {
         "UI/SDK/setup must not emit lane-first repo URLs (/api/v1/repos, /api-browser/v1/repos, /services/api/{{o}}/{{r}}):\n{}",
         hits.join("\n")
     );
-    Ok(())
 }
 
 fn walk_ts(dir: &str) -> Vec<(String, String)> {
@@ -180,7 +176,8 @@ fn walk_ts(dir: &str) -> Vec<(String, String)> {
             let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if !(name.ends_with(".ts") || name.ends_with(".tsx")) {
+            let ext = name.rsplit('.').next().unwrap_or("");
+            if !(ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx")) {
                 continue;
             }
             let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();

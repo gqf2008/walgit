@@ -145,8 +145,11 @@ pub async fn start(
     state: Arc<AppState>,
     id: RepoId,
     op: &str,
-    params: HashMap<String, String>,
+    params: HashMap<String, String, impl std::hash::BuildHasher>,
 ) -> Result<Arc<walgit_wal::tasks::TaskState>, StartError> {
+    // `walgit_wal::tasks::begin_task` takes the concrete default-hasher map;
+    // fold any caller hasher into it up front.
+    let params: HashMap<String, String> = params.into_iter().collect();
     let spec = spec(op).ok_or(StartError::UnknownOp)?;
     let handle = state
         .registry
@@ -273,9 +276,11 @@ async fn run(
                 )
                 .await
                 .map_err(|e| format!("writing fsck.pb: {e}"))?;
+            // f64 is the metrics-gauge contract; missing-object counts are ≪ 2^53.
+            #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; missing-object counts ≪ 2^53")]
             metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string())
                 .set(missing.len() as f64);
-            tracing::info!(repo = %id, seq, missing = missing.len(), problems = report.problems, elapsed_ms = t0.elapsed().as_millis() as u64, "fsck recorded");
+            tracing::info!(repo = %id, seq, missing = missing.len(), problems = report.problems, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "fsck recorded");
             let summary = if report.ok {
                 format!(
                     "fsck clean ({lines} lines, {:.0}s)",
@@ -319,7 +324,7 @@ async fn run(
                     serde_json::json!({"missing": 0}),
                 ));
             }
-            if fsck.missing_total as usize > fsck.missing.len() {
+            if usize::try_from(fsck.missing_total).unwrap_or(usize::MAX) > fsck.missing.len() {
                 log(format!(
                     "fsck listed {} of {} missing objects; repairing those, the next fsck finds the rest",
                     fsck.missing.len(),
@@ -376,7 +381,7 @@ async fn run(
                 .map_err(|e| format!("writing fsck.pb: {e}"))?;
             metrics::counter!("walgit_repair_objects_total", "repo" => id.to_string())
                 .increment(pack.objects);
-            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, %upstream, elapsed_ms = t0.elapsed().as_millis() as u64, "repair published");
+            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, %upstream, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "repair published");
             Ok((
                 format!(
                     "repaired {} object(s) ({} bytes) from upstream at seq {seq}",
@@ -409,7 +414,7 @@ async fn run(
                 .annotate_pack(&checksum, Some(rev), None, None)
                 .await
                 .map_err(|e| format!("rev-index publish: {e}"))?;
-            tracing::info!(repo = %id, pack = %checksum, bytes, elapsed_ms = t0.elapsed().as_millis() as u64, "rev index published");
+            tracing::info!(repo = %id, pack = %checksum, bytes, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "rev index published");
             Ok((
                 format!("pack-{checksum}.rev ({bytes} bytes) published"),
                 serde_json::json!({"pack": checksum, "bytes": bytes}),

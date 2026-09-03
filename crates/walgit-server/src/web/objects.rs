@@ -537,8 +537,9 @@ impl Remote {
             }
         }
         self.reporter.notice(format!(
+            // oid hex is ASCII (40/64 chars): byte 12 is on a char boundary.
             "Reading the trees and blobs changed by {}",
-            &c.id.to_hex().to_string()[..12]
+            c.id.to_hex().to_string().split_at(12).0
         ));
         self.fault_tree_pairs(stack).await?;
         Ok(c)
@@ -630,7 +631,11 @@ impl Remote {
                     };
                     match ord {
                         std::cmp::Ordering::Equal => {
-                            let (x, y) = (&ea[i], &eb[j]);
+                            // Equal is produced above only when both get() calls
+                            // were Some, so both lookups succeed here.
+                            let (Some(x), Some(y)) = (ea.get(i), eb.get(j)) else {
+                                break;
+                            };
                             i += 1;
                             j += 1;
                             if x.oid == y.oid && x.mode == y.mode {
@@ -661,7 +666,8 @@ impl Remote {
                             }
                         }
                         std::cmp::Ordering::Less => {
-                            let x = &ea[i];
+                            // Less above implies ea.get(i) was Some.
+                            let Some(x) = ea.get(i) else { break };
                             i += 1;
                             if x.mode.is_tree() {
                                 stack.push((Some(x.oid), None));
@@ -670,7 +676,8 @@ impl Remote {
                             }
                         }
                         std::cmp::Ordering::Greater => {
-                            let y = &eb[j];
+                            // Greater above implies eb.get(j) was Some.
+                            let Some(y) = eb.get(j) else { break };
                             j += 1;
                             if y.mode.is_tree() {
                                 stack.push((None, Some(y.oid)));
@@ -915,7 +922,8 @@ impl Remote {
 /// git's tree entry ordering: names compared as if trees had a trailing '/'.
 fn tree_cmp(a: &[u8], a_tree: bool, b: &[u8], b_tree: bool) -> std::cmp::Ordering {
     let n = a.len().min(b.len());
-    match a[..n].cmp(&b[..n]) {
+    // n ≤ both lengths by the min(), so the splits cannot panic.
+    match a.split_at(n).0.cmp(b.split_at(n).0) {
         std::cmp::Ordering::Equal => {}
         o => return o,
     }

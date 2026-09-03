@@ -70,6 +70,7 @@ async fn expect_503(small: &Server, path: &str) -> TestResult {
     Ok(())
 }
 
+#[allow(unsafe_code)] // SAFETY: the set_var below is the process-scoped knob this test controls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_base_budget_503() -> TestResult {
     // SAFETY: process-scoped test knob; budgets.rs runs as its own test binary
@@ -79,6 +80,7 @@ async fn merge_base_budget_503() -> TestResult {
     expect_503(&small, "/o/r/api/merge-base?from=main&to=topic").await
 }
 
+#[allow(unsafe_code)] // SAFETY: the set_var below is the process-scoped knob this test controls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diff_budget_503() -> TestResult {
     // SAFETY: see merge_base_budget_503.
@@ -91,6 +93,7 @@ async fn diff_budget_503() -> TestResult {
     .await
 }
 
+#[allow(unsafe_code)] // SAFETY: the set_var below is the process-scoped knob this test controls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blame_budget_503() -> TestResult {
     // SAFETY: see merge_base_budget_503.
@@ -99,6 +102,7 @@ async fn blame_budget_503() -> TestResult {
     expect_503(&small, "/o/r/api/blame/main/f.txt").await
 }
 
+#[allow(unsafe_code)] // SAFETY: the set_var below is the process-scoped knob this test controls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn archive_budget_503() -> TestResult {
     // SAFETY: see merge_base_budget_503.

@@ -170,7 +170,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
         let repo = id.to_string();
         match fetched {
             Ok((false, tips, have)) => {
-                debug!(repo = %id, %upstream, elapsed_ms = t0.elapsed().as_millis() as u64, "follow: in sync");
+                debug!(repo = %id, %upstream, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "follow: in sync");
                 state.follow.set(
                     &repo,
                     "in-sync",
@@ -233,7 +233,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
             Err(e) => {
                 report.failed += 1;
                 metrics::counter!("walgit_follow_rounds_total", "repo" => id.to_string(), "outcome" => "fetch-failed").increment(1);
-                warn!(repo = %id, %upstream, error = format!("{e:#}"), elapsed_ms = t0.elapsed().as_millis() as u64, "follow: fetch from upstream failed");
+                warn!(repo = %id, %upstream, error = format!("{e:#}"), elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "follow: fetch from upstream failed");
                 state.follow.set(
                     &repo,
                     "failed",
@@ -447,7 +447,7 @@ pub(crate) async fn op(
     }
     metrics::counter!("walgit_follow_rounds_total", "repo" => id.to_string(), "outcome" => "published").increment(1);
     metrics::counter!("walgit_follow_refs_total", "repo" => id.to_string()).increment(published);
-    info!(repo = %id, seq = res.seq, refs = published, refused = refused.len(), %upstream, elapsed_ms = t0.elapsed().as_millis() as u64, "follow published");
+    info!(repo = %id, seq = res.seq, refs = published, refused = refused.len(), %upstream, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "follow published");
     let summary = format!(
         "{published} ref(s) from upstream published at seq {} in {:.1}s{}",
         res.seq,
@@ -505,6 +505,9 @@ fn short(oid: &str) -> &str {
     if oid.is_empty() {
         "(none)"
     } else {
-        &oid[..oid.len().min(12)]
+        // oids are ASCII hex, so the truncation index is always on a char
+        // boundary and split_at cannot panic.
+        let (s, _) = oid.split_at(oid.len().min(12));
+        s
     }
 }

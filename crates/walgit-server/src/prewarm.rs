@@ -67,8 +67,8 @@ pub fn spawn(state: Arc<AppState>) {
                 let _p = sem.acquire().await;
                 let t = Instant::now();
                 match warm(&st, &r).await {
-                    Ok(summary) => tracing::info!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm: {summary}"),
-                    Err(e) => tracing::warn!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm failed: {e}"),
+                    Ok(summary) => tracing::info!(repo = %r, elapsed_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "prewarm: {summary}"),
+                    Err(e) => tracing::warn!(repo = %r, elapsed_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "prewarm failed: {e}"),
                 }
                 st.readiness.pending.fetch_sub(1, Ordering::AcqRel);
             }));
@@ -144,8 +144,10 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         if let (Some(sha), walgit_wal::ObjectAccess::Remote(packs)) = (head_sha.as_deref(), &access)
             && let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
                 reporter.notice(format!(
+                    // sha passed from_hex above (40/64 hex chars), so byte 12
+                    // is on a char boundary and split_at cannot panic.
                     "Reading the root tree of {} from the pack set",
-                    &sha[..12]
+                    sha.split_at(12).0
                 ));
                 let remote = crate::web::objects::Remote::new(
                     packs.clone(),

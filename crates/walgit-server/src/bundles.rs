@@ -3,7 +3,7 @@
 //! strong `ETag` = store version, immutable caching, Range/If-Range,
 //! If-None-Match, HEAD — `static_object`).
 
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
@@ -96,11 +96,11 @@ fn render_bundle_list_response(text: String) -> Response {
     let h = resp.headers_mut();
     h.insert(
         axum::http::header::CONTENT_TYPE,
-        "text/plain; charset=utf-8".parse().unwrap(),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     h.insert(
         axum::http::header::CACHE_CONTROL,
-        "no-cache".parse().unwrap(),
+        HeaderValue::from_static("no-cache"),
     );
     resp
 }
@@ -182,12 +182,14 @@ pub async fn compose_full_from_base(
     // The base is the tier-2 pack that is not a derived history pack (D18:
     // `compact --base` publishes both at tier 2; the weekly composes the base).
     let bases = walgit_wal::base_packs(&manifest);
-    anyhow::ensure!(
-        bases.len() == 1,
-        "compose needs exactly one tier-2 base pack (found {}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first",
-        bases.len()
-    );
-    let base = bases[0].clone();
+    let n = bases.len();
+    // Exactly one element, taken by value: 0 and 2+ bases are the same error.
+    let mut bases = bases.into_iter();
+    let (Some(base), None) = (bases.next(), bases.next()) else {
+        anyhow::bail!(
+            "compose needs exactly one tier-2 base pack (found {n}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first"
+        );
+    };
     let seq = base.seq;
     let store = handle.store();
     // Refs at the base's seq: the checkpoint there when one exists (the rebuild checkpoints right
@@ -229,7 +231,8 @@ pub async fn compose_full_from_base(
             .filter(|p| p.kind == walgit_proto::v1::PackKind::History as i32 && p.derived_from == base.checksum)
             .max_by_key(|p| p.seq)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", &base.checksum[..12]))?,
+            // Pack checksums are ASCII hex (40 chars): byte 12 is a char boundary.
+            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", base.checksum.split_at(12).0))?,
         None => base.clone(),
     };
     let pack_path = handle
