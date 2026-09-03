@@ -37,6 +37,7 @@ async fn repo_http_reads_round_trip() -> Result<()> {
     run(
         RepoAction::Refs {
             repo: "t/cli".into(),
+            kind: None,
             conn: conn.clone(),
         },
         &cfg,
@@ -147,6 +148,7 @@ async fn repo_http_reads_round_trip() -> Result<()> {
         run(
             RepoAction::Refs {
                 repo: "t/ghost".into(),
+                kind: None,
                 conn,
             },
             &cfg,
@@ -188,6 +190,7 @@ async fn repo_http_reads_carry_the_bearer_and_surface_401() -> Result<()> {
     let result = run(
         RepoAction::Refs {
             repo: "t/tok".into(),
+            kind: None,
             conn: bare,
         },
         &cfg,
@@ -203,6 +206,7 @@ async fn repo_http_reads_carry_the_bearer_and_surface_401() -> Result<()> {
     run(
         RepoAction::Refs {
             repo: "t/tok".into(),
+            kind: None,
             conn: authed,
         },
         &cfg,

@@ -308,11 +308,14 @@ pub enum RepoAction {
         #[command(subcommand)]
         action: SettingsAction,
     },
-    /// Every ref of a repository, over HTTP from a running host (issue #61:
-    /// reads need no bucket credentials — a host URL and a bearer suffice).
+    /// Refs of a repository over HTTP: no kind prints the head summary;
+    /// a kind (`branches`, `tags`, `all`, `collab`) lists that namespace
+    /// (paged server-side, O(refs) never on the request path).
     Refs {
         /// `owner/name`.
         repo: String,
+        /// `branches`, `tags`, `all` or `collab` (default: the head summary).
+        kind: Option<String>,
         #[command(flatten)]
         conn: Conn,
     },
@@ -593,7 +596,15 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("another rustls crypto provider was already installed"))?;
 
-    let cfg = load_config(config);
+    let cfg = if is_host_read(&command) && !config.exists() {
+        // The `walgit repo` HTTP reads (issue #61) speak to a running host
+        // and never touch the bucket or the cache — they owe nothing to a
+        // config file. Everything else keeps the fail-closed rule above:
+        // a typo'd --config must not open a default bucket.
+        Config::default()
+    } else {
+        load_config(config)
+    };
     tracing_init(&cfg);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -601,6 +612,25 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .build()?;
 
     rt.block_on(async move { dispatch(command, cfg).await })
+}
+
+/// True only for the `walgit repo` HTTP reads (issue #61): commands that talk
+/// to a running host and never open the bucket or the cache, so a missing
+/// config file must not stop them.
+fn is_host_read(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Repo {
+            action: RepoAction::Refs { .. }
+                | RepoAction::Resolve { .. }
+                | RepoAction::Tree { .. }
+                | RepoAction::Blob { .. }
+                | RepoAction::Commits { .. }
+                | RepoAction::Commit { .. }
+                | RepoAction::Overview { .. }
+                | RepoAction::Tasks { .. }
+        }
+    )
 }
 
 async fn dispatch(command: Command, cfg: Config) -> Result<()> {

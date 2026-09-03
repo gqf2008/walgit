@@ -271,7 +271,13 @@ mod http {
 
     pub async fn run(action: RepoAction) -> Result<()> {
         match action {
-            RepoAction::Refs { repo, conn } => print_json(&conn, &api_path(&repo, "/refs")?).await,
+            RepoAction::Refs { repo, kind, conn } => match kind.as_deref() {
+                None => print_json(&conn, &api_path(&repo, "/refs")?).await,
+                Some(k @ ("branches" | "tags" | "all" | "collab")) => {
+                    print_json(&conn, &api_path(&repo, &format!("/refs/{k}"))?).await
+                }
+                Some(other) => bail!("unknown ref kind `{other}` (expected branches, tags, all or collab)"),
+            },
             RepoAction::Resolve { repo, rev, conn } => {
                 print_json(
                     &conn,
