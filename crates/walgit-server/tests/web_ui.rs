@@ -25,6 +25,7 @@ async fn page_routes_serve_index_without_cache() -> Result<()> {
         .await?;
     for path in [
         "/",
+        "/repos",
         "/owner",
         "/owner/repo",
         "/owner/repo/tree/main/src/lib.rs",

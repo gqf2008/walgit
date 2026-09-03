@@ -58,6 +58,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/services/setup.json", get(setup_json))
         // "API" docs page (SPA route); `/api/v1` is the JSON discovery document (D20).
         .route("/api", get(index_route))
+        // Host-wide repo index (top-nav「仓库」, issue #59); direct open and
+        // refresh must serve index.html like every other page route.
+        .route("/repos", get(index_route))
         .route("/{owner}", get(index_route))
         .route(
             "/{owner}/{repo}",

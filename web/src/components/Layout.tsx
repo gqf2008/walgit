@@ -24,7 +24,12 @@ export function Layout() {
           walgit
         </Link>
         <nav className="topnav">
-          <NavLink to="/" end className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
+          {/* 「仓库」is the host-wide repo index (/repos); `/` itself is the
+              landing page, so the label must not point there (issue #59). */}
+          <NavLink
+            to="/repos"
+            className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}
+          >
             {t("nav.repos")}
           </NavLink>
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>

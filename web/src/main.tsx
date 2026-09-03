@@ -4,6 +4,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
 import { Repos } from "./pages/Repos";
+import { ReposIndex } from "./pages/ReposIndex";
 import { RepoLayout } from "./pages/RepoLayout";
 import { TreePage } from "./pages/TreePage";
 import { CommitsPage } from "./pages/CommitsPage";
@@ -32,6 +33,7 @@ createRoot(document.getElementById("root")!).render(
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Home />} />
+          <Route path="repos" element={<ReposIndex />} />
           <Route path="api" element={<ApiPage />} />
           <Route path=":owner" element={<Repos />} />
           <Route path=":owner/:repo" element={<RepoLayout />}>
