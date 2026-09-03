@@ -32,7 +32,7 @@ const en = {
   "home.h1.a": "No database.",
   "home.h1.b": "Only rules.",
   "home.lede":
-    "D1 puts issues, boards and CI inside the repository itself — nothing server-side to flip through, edit or blame. Every collaboration screen is the same signed entries computed on the spot through the same public rules. Three mental models below, a “looks like a bug — isn't” cheat sheet after them, and this host's repositories at the end.",
+    "D1 puts issues, boards and CI inside the repository itself — nothing server-side to flip through, edit or blame. Every collaboration screen is the same signed entries computed on the spot through the same public rules. Three mental models below and a “looks like a bug — isn't” cheat sheet after them; the top-nav「Repositories」lists this host.",
   "home.illus": "illustrative",
   "home.live": "See it live in a repository →",
   "home.m1.t": "An issue is an append-only chain of signed entries",
@@ -87,12 +87,12 @@ const en = {
   "home.cmd2.what": "the board computed offline — byte-identical to any server",
   "home.cmd3.what": "the global summary: threads, verification, activity, CI runs",
   "home.endnote.a": "These three commands and everything a browser shows you draw on the same source: the signed entries on refs/collab/*. ",
-  "home.browse": "Repositories on this host",
   "home.origin.a": "walgit is built on the git hosting of ",
   "home.origin.l1": "Origin (Cursor)",
   "home.origin.b": " and the shared-nothing infrastructure of ",
   "home.origin.l2": "Turbopuffer",
   "home.origin.c": ": one binary in front of an object store, a write-ahead log instead of a database.",
+  "home.skill.pre": "Building an AI agent on this host? Point it at ",
 
   // Repo chrome
   "tab.code": "Code",
@@ -663,7 +663,7 @@ const zhCN: Record<I18nKey, string> = {
   "home.h1.a": "没有数据库，",
   "home.h1.b": "只有规则",
   "home.lede":
-    "D1 把 issue、看板、CI 全部放进 git 仓库本身——没有服务器端数据库可翻、可改、可背锅。你看到的每一屏协作界面，都是同一组签名条目经过同一套公开规则、当场算出来的结果。下面是三个心智模型，接着一份「看起来像 bug」对照表，页尾是本主机上的仓库。",
+    "D1 把 issue、看板、CI 全部放进 git 仓库本身——没有服务器端数据库可翻、可改、可背锅。你看到的每一屏协作界面，都是同一组签名条目经过同一套公开规则、当场算出来的结果。下面是三个心智模型，接着一份「看起来像 bug」对照表；本主机的仓库看顶部菜单「仓库」。",
   "home.illus": "示意",
   "home.live": "在真实仓库里看现场版 →",
   "home.m1.t": "一个 issue，就是一串只增不改的签名条目",
@@ -714,12 +714,12 @@ const zhCN: Record<I18nKey, string> = {
   "home.cmd2.what": "离线算出的完整看板——与服务器逐字节一致",
   "home.cmd3.what": "全局汇总：线程数、验签通过率、活跃度、CI 段",
   "home.endnote.a": "这三条命令和你在浏览器里看到的一切，来源完全相同：refs/collab/* 上的签名条目。",
-  "home.browse": "本主机上的仓库",
   "home.origin.a": "walgit 建立在 ",
   "home.origin.l1": "Origin（Cursor）",
   "home.origin.b": " 的 git 托管架构与 ",
   "home.origin.l2": "Turbopuffer",
   "home.origin.c": " 的 shared-nothing 基建之上：对象存储 + 单个二进制，用 WAL 取代数据库。",
+  "home.skill.pre": "要在这台主机上构建 AI 代理？让它读 ",
 
   // Repo chrome
   "tab.code": "代码",
@@ -1288,7 +1288,7 @@ const zhTW: Record<I18nKey, string> = {
   "home.h1.a": "沒有資料庫，",
   "home.h1.b": "只有規則",
   "home.lede":
-    "D1 把 issue、看板、CI 全部放進 git 倉庫本身——沒有伺服器端資料庫可翻、可改、可背鍋。你看到的每一螢幕協作介面，都是同一組簽名條目經過同一套公開規則、當場算出來的結果。下面是三個心智模型，接著一份「看起來像 bug」對照表，頁尾是本主機上的倉庫。",
+    "D1 把 issue、看板、CI 全部放進 git 倉庫本身——沒有伺服器端資料庫可翻、可改、可背鍋。你看到的每一螢幕協作介面，都是同一組簽名條目經過同一套公開規則、當場算出來的結果。下面是三個心智模型，接著一份「看起來像 bug」對照表；本主機的倉庫看頂部選單「倉庫」。",
   "home.illus": "示意",
   "home.live": "在真實倉庫裡看現場版 →",
   "home.m1.t": "一個 issue，就是一串只增不改的簽名條目",
@@ -1339,12 +1339,12 @@ const zhTW: Record<I18nKey, string> = {
   "home.cmd2.what": "離線算出的完整看板——與伺服器逐位元組一致",
   "home.cmd3.what": "全域彙總：執行緒數、驗簽通過率、活躍度、CI 段",
   "home.endnote.a": "這三條指令和你在瀏覽器裡看到的一切，來源完全相同：refs/collab/* 上的簽名條目。",
-  "home.browse": "本主機上的倉庫",
   "home.origin.a": "walgit 建立在 ",
   "home.origin.l1": "Origin（Cursor）",
   "home.origin.b": " 的 git 託管架構與 ",
   "home.origin.l2": "Turbopuffer",
   "home.origin.c": " 的 shared-nothing 基建之上：物件儲存 + 單一執行檔，用 WAL 取代資料庫。",
+  "home.skill.pre": "要在這台主機上建構 AI 代理？讓它讀 ",
 
   // Repo chrome
   "tab.code": "程式碼",

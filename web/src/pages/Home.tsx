@@ -1,4 +1,3 @@
-import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useData } from "../data";
 import { Box } from "../components/Layout";
@@ -8,14 +7,14 @@ import { useI18n } from "../i18n";
 
 /**
  * The site root "/" (issue #55): the D1 model landing — “No database. Only
- * rules.” — followed by this host's repositories. The model is taught in
- * static, marked-illustrative form here (the root has no repository context);
- * when the host has repositories, the landing links into the first one's
- * live-data collab guide (#41). An empty host shows the install slate
- * instead — there is nothing to explain yet.
+ * rules.” The model is taught in static, marked-illustrative form here (the
+ * root has no repository context); when the host has repositories, the
+ * landing links into the first one's live-data collab guide (#41). The
+ * host-wide repository index is the top-nav「仓库」entry at /repos (issue
+ * #59) — the landing does not repeat it. An empty host shows the install
+ * slate instead — there is nothing to explain yet.
  */
 export function Home() {
-  const { t } = useI18n();
   const owners = useData("owners", api.owners);
   const firstOwner = owners[0] ?? null;
   const repos = useData(firstOwner ? `repos:${firstOwner}` : "repos:none", () =>
@@ -25,25 +24,7 @@ export function Home() {
   if (owners.length === 0) {
     return <BlankSlate />;
   }
-  return (
-    <>
-      <ModelLanding live={live} />
-      <section id="repos" className="model-wrap" aria-labelledby="repos-title">
-        <h2 id="repos-title" className="model-browse">{t("home.browse")}</h2>
-        <Box>
-          <ul className="list">
-            {owners.map((o) => (
-              <li key={o}>
-                <Link to={`/${o}`} className="strong">
-                  {o}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </Box>
-      </section>
-    </>
-  );
+  return <ModelLanding live={live} />;
 }
 
 /** First repo: install.sh (this host:port) sets helper + proactiveAuth + origin. */
