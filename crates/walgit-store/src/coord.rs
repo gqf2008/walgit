@@ -133,9 +133,9 @@ where
     T: prost::Message + Default,
 {
     match store.get_if_changed(key, known).await {
-        Err(StoreError::NotFound { .. }) => Ok(None),
+        // Absent and unmodified both mean "nothing new to read".
+        Err(StoreError::NotFound { .. }) | Ok(None) => Ok(None),
         Err(e) => Err(CoordError::Store(e)),
-        Ok(None) => Ok(None),
         Ok(Some((meta, bytes))) => {
             let msg = T::decode(bytes)?;
             Ok(Some((meta, msg)))
@@ -420,9 +420,9 @@ mod tests {
 
     #[tokio::test]
     async fn cas_update_convergence_64_incrementers() {
+        const N: u32 = 64;
         let store = dyn_store();
         let key = "counter.pb";
-        const N: u32 = 64;
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -463,9 +463,9 @@ mod tests {
 
     #[tokio::test]
     async fn lease_exclusivity_32_concurrent() {
+        const N: u32 = 32;
         let store = dyn_store();
         let key = "leases/excl.pb";
-        const N: u32 = 32;
 
         let mut handles = Vec::new();
         for i in 0..N {

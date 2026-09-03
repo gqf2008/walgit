@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
@@ -40,9 +42,6 @@ pub fn file_stream(
     chunk: usize,
 ) -> ByteStream {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    return async_stream_file(path, range, chunk)
-        .map(|r| r.map_err(StoreError::other))
-        .boxed();
 
     fn async_stream_file(
         path: std::path::PathBuf,
@@ -122,6 +121,10 @@ pub fn file_stream(
         },
         Done,
     }
+
+    async_stream_file(path, range, chunk)
+        .map(|r| r.map_err(StoreError::other))
+        .boxed()
 }
 
 /// Exponential backoff with full jitter. `attempt` starts at 0.
@@ -269,7 +272,9 @@ pub fn encode_path(key: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

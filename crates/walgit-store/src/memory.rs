@@ -151,8 +151,7 @@ impl ObjectStore for MemoryStore {
         let mut g = self.objects.lock();
         let current = g.get(key).map(|(v, _)| v.clone());
         match (&opts.mode, &current) {
-            (PutMode::Overwrite, _) => {}
-            (PutMode::Create, None) => {}
+            (PutMode::Overwrite, _) | (PutMode::Create, None) => {}
             (PutMode::Create, Some(v)) => {
                 return Err(StoreError::PreconditionFailed {
                     key: key.into(),

@@ -558,6 +558,8 @@ impl ObjectStore for Prefixed {
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
+        use futures::StreamExt;
+
         let full_prefix = self.full(prefix);
         let _span = (!self.inner.is_prefixed()).then(|| {
             tracing::debug_span!(
@@ -567,7 +569,6 @@ impl ObjectStore for Prefixed {
             )
             .entered()
         });
-        use futures::StreamExt;
         let this = self.clone();
         let start_after = start_after.map(|s| self.full(s));
         Box::pin(
@@ -634,7 +635,7 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
         walgit_config::StoreBackend::S3 => {
             #[cfg(feature = "s3")]
             {
-                Arc::new(s3::S3Store::new(&cfg.store).await?)
+                Arc::new(s3::S3Store::new(&cfg.store)?)
             }
             #[cfg(not(feature = "s3"))]
             {

@@ -6,6 +6,8 @@
 //! `read_offset` / `read_limit`. Streaming uploads use `send_buffered` for
 //! non-seekable sources and `send_unbuffered` for seekable ones (Bytes).
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -362,16 +364,16 @@ impl BulkHttp {
         range: Option<std::ops::Range<u64>>,
         if_generation_match: Option<i64>,
     ) -> Result<(u64, Option<i64>, ByteStream)> {
-        let (size, generation, first) = self.open(key, range.clone(), if_generation_match).await?;
-        let end = range.as_ref().map_or(size, |r| r.end);
-        let start = range.as_ref().map_or(0, |r| r.start);
-        let this = self.clone();
-        let key_owned = key.to_owned();
         struct St {
             inner: ByteStream,
             pos: u64,
             attempts: u32,
         }
+        let (size, generation, first) = self.open(key, range.clone(), if_generation_match).await?;
+        let end = range.as_ref().map_or(size, |r| r.end);
+        let start = range.as_ref().map_or(0, |r| r.start);
+        let this = self.clone();
+        let key_owned = key.to_owned();
         let st = St {
             inner: first,
             pos: start,
@@ -444,7 +446,7 @@ impl BulkHttp {
     pub(crate) fn for_tests(endpoint: String, bucket: String) -> Self {
         BulkHttp {
             clients: vec![reqwest::Client::new()],
-            next: Default::default(),
+            next: std::sync::Arc::default(),
             creds: None,
             bucket,
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
@@ -1060,10 +1062,7 @@ fn unfold_response(
     let stream = futures::stream::unfold(
         (Some(resp), key, permit),
         |(mut resp, key, permit)| async move {
-            let r = match resp.as_mut() {
-                Some(r) => r,
-                None => return None,
-            };
+            let r = resp.as_mut()?;
             match tokio::time::timeout(READ_CHUNK_DEADLINE, r.next()).await {
                 Ok(Some(Ok(bytes))) => Some((Ok(bytes), (resp, key, permit))),
                 Ok(Some(Err(e))) => Some((Err(StoreError::other(e)), (resp, key, permit))),
@@ -1206,7 +1205,7 @@ mod tests {
 
     #[test]
     fn gen_version_formats_decimal() {
-        assert_eq!(gen_version(1234567890).as_str(), "1234567890");
+        assert_eq!(gen_version(1_234_567_890).as_str(), "1234567890");
         assert_eq!(gen_version(0).as_str(), "0");
         assert_eq!(gen_version(-1).as_str(), "-1");
     }
@@ -1445,7 +1444,9 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

@@ -565,6 +565,8 @@ async fn test_list(store: &DynStore, base: &str) {
 
 /// 8 MiB streamed put/get roundtrip with checksum.
 async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
+    use sha1::{Digest, Sha1};
+
     let _ = store.delete(key, None).await;
 
     // 8 MiB of pseudo-random but deterministic data.
@@ -581,7 +583,6 @@ async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
     let data = Bytes::from(data);
 
     // Checksum (SHA-1).
-    use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(&data);
     let expected_checksum = hasher.finalize();
@@ -677,7 +678,7 @@ async fn memory_contract() {
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
-    let endpoint = if let Ok(v) = std::env::var("WALGIT_TEST_S3_ENDPOINT") { v } else {
+    let Ok(endpoint) = std::env::var("WALGIT_TEST_S3_ENDPOINT") else {
         eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
         return;
     };
@@ -706,9 +707,7 @@ async fn s3_contract() {
         ..Default::default()
     };
 
-    let store = walgit_store::s3::S3Store::new(&cfg)
-        .await
-        .expect("S3Store::new");
+    let store = walgit_store::s3::S3Store::new(&cfg).expect("S3Store::new");
     let store: DynStore = Arc::new(store);
 
     run_contract(store.clone(), &prefix).await;
@@ -730,7 +729,7 @@ async fn s3_contract() {
 #[cfg(feature = "gcs")]
 #[tokio::test]
 async fn gcs_contract() {
-    let bucket = if let Ok(v) = std::env::var("WALGIT_TEST_GCS_BUCKET") { v } else {
+    let Ok(bucket) = std::env::var("WALGIT_TEST_GCS_BUCKET") else {
         eprintln!("skipping gcs_contract: WALGIT_TEST_GCS_BUCKET not set");
         return;
     };
@@ -780,6 +779,7 @@ async fn gcs_contract() {
 /// stay under 2 s. `WALGIT_TEST_GCS_BUCKET=walgit-store WALGIT_TEST_GCS_BIG_KEY=<key under prefix>`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_control_plane_not_starved_by_bulk() {
+    const CHUNK: u64 = 32 * 1024 * 1024;
     let (Ok(bucket), Ok(big_key)) = (
         std::env::var("WALGIT_TEST_GCS_BUCKET"),
         std::env::var("WALGIT_TEST_GCS_BIG_KEY"),
@@ -824,7 +824,6 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         .await;
     eprintln!("baseline probe {:?}", t.elapsed());
     let total = (1u64 << 30).min(size);
-    const CHUNK: u64 = 32 * 1024 * 1024;
     let bulk = {
         let store = store.clone();
         let big_key = big_key.clone();
@@ -853,7 +852,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
                                     .unwrap()
                                     .len()
                             }
-                            _ => 0,
+                            GetResult::NotModified { .. } => 0,
                         }
                     }
                 })

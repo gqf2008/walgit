@@ -565,7 +565,7 @@ impl FaultStore {
                         body: truncate_stream(body, at, msg),
                     })
                 }
-                r => Ok(r),
+                res @ GetResult::NotModified { .. } => Ok(res),
             },
             Decision::Proceed | Decision::ErrAfter | Decision::CasFail => {
                 self.inner.get(key, opts).await
