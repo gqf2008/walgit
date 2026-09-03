@@ -55,6 +55,19 @@ fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
 /// The only `unsafe` in the seam lives in these OS probes; each block carries a
 /// `// SAFETY:` line directly above it (clippy's `undocumented_unsafe_blocks`
 /// wants the comment to touch the block, so the allow sits on the function).
+/// `libc::fsblkcnt_t` (statvfs `f_blocks`/`f_bavail`) is u64 on Linux and the
+/// BSDs but u32 on Apple: `u64::from` is the natural widening there and a
+/// clippy `useless_conversion` where the field is already u64 — and `as u64`
+/// would be a `cast_lossless` on Apple — so each family converts its own way.
+#[cfg(all(unix, target_vendor = "apple"))]
+fn fsblk(u: libc::fsblkcnt_t) -> u64 {
+    u64::from(u)
+}
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn fsblk(u: libc::fsblkcnt_t) -> u64 {
+    u
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
@@ -69,8 +82,8 @@ fn capacity_impl(path: &Path) -> Option<(u64, u64)> {
     if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
         return None;
     }
-    let total = u64::from(st.f_blocks) * st.f_frsize as u64;
-    let avail = u64::from(st.f_bavail) * st.f_frsize as u64;
+    let total = fsblk(st.f_blocks) * st.f_frsize as u64;
+    let avail = fsblk(st.f_bavail) * st.f_frsize as u64;
     Some((avail, total))
 }
 
