@@ -129,13 +129,11 @@ impl Server {
             "auto" => cfg.git.upload_pack_engine = walgit_config::UploadPackEngine::Auto,
             _ => cfg.git.upload_pack_engine = walgit_config::UploadPackEngine::Git,
         }
-        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS") {
-            if let Ok(ms) = ms.parse::<u64>() {
-                if let Some(s) = Arc::get_mut(&mut store) {
+        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+                && let Some(s) = Arc::get_mut(&mut store) {
                     s.latency = Some(std::time::Duration::from_millis(ms));
                 }
-            }
-        }
 
         tweak(&mut cfg);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -177,16 +175,14 @@ impl Server {
         })
     }
 
-    /// Two instances sharing one MemoryStore, different cache dirs.
+    /// Two instances sharing one `MemoryStore`, different cache dirs.
     pub async fn start_pair() -> Result<(Self, Self)> {
         let mut store = MemoryStore::shared();
-        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS") {
-            if let Ok(ms) = ms.parse::<u64>() {
-                if let Some(s) = Arc::get_mut(&mut store) {
+        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+                && let Some(s) = Arc::get_mut(&mut store) {
                     s.latency = Some(std::time::Duration::from_millis(ms));
                 }
-            }
-        }
         let a = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
         let b = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
         Ok((a, b))
@@ -237,7 +233,7 @@ impl Server {
     pub async fn registry_has_packs(&self, owner: &str, repo: &str) -> bool {
         let id = walgit_git::RepoId::new(owner, repo).unwrap();
         match self.registry.open(&id).await {
-            Ok(h) => h.packs_ready() && !h.local().packs().map(|p| p.is_empty()).unwrap_or(true),
+            Ok(h) => h.packs_ready() && !h.local().packs().map_or(true, |p| p.is_empty()),
             Err(_) => false,
         }
     }
@@ -248,7 +244,7 @@ impl Server {
         Ok(())
     }
 
-    pub async fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
+    pub fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
         let out = Command::new("git")
             .args(["ls-remote", &self.repo_url(owner, repo)])
             .output()?;
@@ -401,13 +397,11 @@ pub fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Ou
         .stderr(Stdio::piped())
         .output()
         .expect("run upstream git");
-    if !up.status.success() {
-        panic!(
-            "git {first:?} failed: {} — stderr: {}",
-            up.status,
-            String::from_utf8_lossy(&up.stderr)
-        );
-    }
+    assert!(up.status.success(), 
+        "git {first:?} failed: {} — stderr: {}",
+        up.status,
+        String::from_utf8_lossy(&up.stderr)
+    );
 
     let mut down = Command::new("git")
         .args(second)
@@ -423,12 +417,10 @@ pub fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Ou
         let _ = stdin.write_all(&up.stdout);
     }
     let out = down.wait_with_output().expect("wait downstream git");
-    if !out.status.success() {
-        panic!(
-            "git {second:?} failed: {} — stderr: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert!(out.status.success(), 
+        "git {second:?} failed: {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     out
 }

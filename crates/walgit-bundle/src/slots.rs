@@ -65,8 +65,7 @@ pub struct SlotPlan {
 
 pub fn epoch(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 pub fn from_epoch(s: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(s)
@@ -145,9 +144,7 @@ pub fn base_for_slot<'a>(
     slot: u64,
 ) -> Option<&'a BundleEntry> {
     entries_of(list, strategy)
-        .into_iter()
-        .filter(|b| b.creation_token <= slot)
-        .last()
+        .into_iter().rfind(|b| b.creation_token <= slot)
 }
 
 /// The base bundle of an incremental at `slot`, **up the chain**: the newest
@@ -204,9 +201,7 @@ pub fn base_for_incremental<'a>(
         return base;
     }
     let own = entries_of(list, &strat.name)
-        .into_iter()
-        .filter(|b| b.creation_token < at)
-        .last();
+        .into_iter().rfind(|b| b.creation_token < at);
     // `>=`: at a tie (Sunday's daily and the weekly fire at the same instant, so their tips are the
     // same objects) the chain continues through its own link. A fresh clone has the weekly's objects
     // and therefore that link's prerequisites; a stale client walks daily → daily straight across
@@ -249,7 +244,7 @@ fn chain_up<'a>(cfg: &'a BundlesConfig, base: &'a str) -> Vec<&'a str> {
 /// What the planner knows about the repository and this host.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanContext {
-    /// Earliest WAL state (created_at of the first entry / checkpoint); slots
+    /// Earliest WAL state (`created_at` of the first entry / checkpoint); slots
     /// before it are `Unavailable`. None = unknown → never unavailable.
     pub first_state: Option<SystemTime>,
     /// Whether this host can cut a **full** bundle for the repo (a compose of
@@ -291,7 +286,7 @@ pub fn plan_with(
     let mut rows = Vec::new();
     for strat in &cfg.strategy {
         let built = entries_of(list, &strat.name);
-        let (anchor_excl, _): (SystemTime, ()) = match strat.kind {
+        let (anchor_excl, ()): (SystemTime, ()) = match strat.kind {
             BundleKind::Full => match built.last() {
                 // Newest built full: everything after it is a candidate.
                 Some(b) => (from_epoch(b.creation_token), ()),
@@ -322,8 +317,7 @@ pub fn plan_with(
                             .iter()
                             .rev()
                             .nth(1)
-                            .map(|prev| prev.creation_token)
-                            .unwrap_or(b.creation_token);
+                            .map_or(b.creation_token, |prev| prev.creation_token);
                         (from_epoch(oldest_relevant), ())
                     }
                     _ => {
@@ -376,8 +370,7 @@ pub fn plan_with(
             let unavailable = !first_full
                 && ctx
                     .first_state
-                    .map(|t| from_epoch(slot) < t)
-                    .unwrap_or(false);
+                    .is_some_and(|t| from_epoch(slot) < t);
             let skipped = list.skipped.iter().find(|k| {
                 k.strategy == strat.name
                     && k.slot == slot
@@ -402,7 +395,6 @@ pub fn plan_with(
                             .unwrap_or("full bundles need the base pack locally (ssd host)")
                             .into(),
                     ),
-                    BundleKind::Full => SlotStatus::Missing,
                     BundleKind::Incremental if base_id.is_none() => {
                         SlotStatus::Blocked("no base bundle at or before this slot".into())
                     }
@@ -411,7 +403,8 @@ pub fn plan_with(
                             .unwrap_or("the serving copy does not fit this host")
                             .into(),
                     ),
-                    BundleKind::Incremental => SlotStatus::Missing,
+                    // Guards above missed: nothing rules the slot out, it just has not been cut.
+                    BundleKind::Full | BundleKind::Incremental => SlotStatus::Missing,
                 },
             };
             rows.push(SlotPlan {
@@ -452,8 +445,7 @@ pub fn chain_window(cfg: &BundlesConfig, strat: &BundleStrategy) -> usize {
         return usize::MAX;
     };
     slots_between(strat, b1, b2)
-        .map(|v| v.len())
-        .unwrap_or(usize::MAX)
+        .map_or(usize::MAX, |v| v.len())
 }
 
 /// How many bundles of an incremental strategy stay listed: the newest, and the one
@@ -525,15 +517,14 @@ pub fn retain(cfg: &BundlesConfig, list: &mut BundleList) -> Vec<String> {
                 let base_newest = strat
                     .base
                     .as_deref()
-                    .map(|n| {
+                    .map_or(0, |n| {
                         entries_of(list, n)
                             .into_iter()
                             .filter(|b| keep.contains(&b.id) && group_of(b) == g)
                             .map(|b| b.creation_token)
                             .max()
                             .unwrap_or(0)
-                    })
-                    .unwrap_or(0);
+                    });
                 // Oldest first so a link's base (the previous link) is decided before it. The first
                 // link of a group may point at a pruned link of the previous group (Monday on Sunday's
                 // daily): its prerequisites are the group's full's tips, so it stays while the full does.
@@ -597,7 +588,7 @@ mod tests {
     /// The D21 shape (every incremental on its base): what the two-newest tests below pin.
     fn cfg() -> BundlesConfig {
         let mut c = BundlesConfig::default();
-        for s in c.strategy.iter_mut() {
+        for s in &mut c.strategy {
             s.chain = false;
         }
         c
@@ -951,15 +942,13 @@ mod tests {
             .push(entry("hourly", h2, &format!("hourly-{h1}")));
         let pruned = retain(&c, &mut list);
         let mut kept: Vec<&str> = list.bundles.iter().map(|b| b.id.as_str()).collect();
-        kept.sort();
-        let mut want = vec![
-            format!("weekly-{w1}"),
+        kept.sort_unstable();
+        let mut want = [format!("weekly-{w1}"),
             format!("daily-{}", ds[0]),
             format!("daily-{}", ds[1]),
             format!("daily-{}", ds[2]),
             format!("hourly-{h1}"),
-            format!("hourly-{h2}"),
-        ];
+            format!("hourly-{h2}")];
         want.sort();
         assert_eq!(kept, want.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(

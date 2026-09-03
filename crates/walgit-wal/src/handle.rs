@@ -1,4 +1,4 @@
-//! RepoHandle: per-repository state, sync, publish, checkpoint.
+//! `RepoHandle`: per-repository state, sync, publish, checkpoint.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -266,11 +266,10 @@ impl RepoHandle {
             return Ok((guard, ObjectAccess::Local));
         }
         // Remote: reuse the reader for this manifest revision, else (re)open.
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision {
                 return Ok((guard, ObjectAccess::Remote(r)));
             }
-        }
         let remote = self.open_remote(&manifest).await?;
         Ok((guard, ObjectAccess::Remote(remote)))
     }
@@ -644,33 +643,30 @@ impl RepoHandle {
         // The whole materialization runs on the bulk runtime (own threads):
         // nothing in it can stall this runtime's request workers.
         let arc = self.self_arc.get().cloned();
-        let res = match arc {
-            Some(arc) => {
-                let m = manifest.clone();
-                let task_span = task.as_ref().map(|t| t.span());
-                crate::sync::on_bulk_runtime(async move {
-                    let work = async {
-                        crate::sync::reconcile_packs(&arc, &m, level).await?;
-                        arc.local.refresh_async().await?;
-                        Ok::<(), WalError>(())
-                    };
-                    match task_span {
-                        Some(sp) => work.instrument(sp).await,
-                        None => work.await,
-                    }
-                })
-                .await
-            }
-            None => {
-                let res = async {
-                    crate::sync::reconcile_packs(self, &manifest, level).await?;
-                    self.local.refresh_async().await?;
+        let res = if let Some(arc) = arc {
+            let m = manifest.clone();
+            let task_span = task.as_ref().map(super::tasks::TaskHandle::span);
+            crate::sync::on_bulk_runtime(async move {
+                let work = async {
+                    crate::sync::reconcile_packs(&arc, &m, level).await?;
+                    arc.local.refresh_async().await?;
                     Ok::<(), WalError>(())
                 };
-                match &task {
-                    Some(t) => res.instrument(t.span()).await,
-                    None => res.await,
+                match task_span {
+                    Some(sp) => work.instrument(sp).await,
+                    None => work.await,
                 }
+            })
+            .await
+        } else {
+            let res = async {
+                crate::sync::reconcile_packs(self, &manifest, level).await?;
+                self.local.refresh_async().await?;
+                Ok::<(), WalError>(())
+            };
+            match &task {
+                Some(t) => res.instrument(t.span()).await,
+                None => res.await,
             }
         };
         *self.active_reporter.lock() = None;
@@ -775,11 +771,10 @@ impl RepoHandle {
     /// `remote-index` task while opening.
     pub async fn remote_reader(&self) -> Result<Arc<RemotePacks>, WalError> {
         let manifest = self.manifest();
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision {
                 return Ok(r);
             }
-        }
         self.open_remote(&manifest).await
     }
 
@@ -856,14 +851,13 @@ impl RepoHandle {
     fn has_linked_packs(&self) -> bool {
         self.local
             .packs()
-            .map(|ps| {
+            .is_ok_and(|ps| {
                 ps.iter()
                     .any(|p| self.local.pack_path(&p.checksum).is_symlink())
             })
-            .unwrap_or(false)
     }
 
-    /// Internal serving sync (no read guard). Used by publish/checkpoint/read_log.
+    /// Internal serving sync (no read guard). Used by `publish/checkpoint/read_log`.
     pub(crate) async fn sync_impl(&self) -> Result<(), WalError> {
         self.sync_impl_level(SyncLevel::Serve).await
     }
@@ -1039,16 +1033,15 @@ impl RepoHandle {
     /// (never a failure on a read path).
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
         let settings = self.settings();
-        let rev = settings.as_ref().map(|s| s.revision).unwrap_or(0);
+        let rev = settings.as_ref().map_or(0, |s| s.revision);
         if rev == 0 {
             return self.cfg.clone();
         }
-        if let Some((r, c)) = self.effective.lock().as_ref() {
-            if *r == rev {
+        if let Some((r, c)) = self.effective.lock().as_ref()
+            && *r == rev {
                 return c.clone();
             }
-        }
-        let toml = settings.as_ref().map(|s| s.toml.as_str()).unwrap_or("");
+        let toml = settings.as_ref().map_or("", |s| s.toml.as_str());
         let cfg = match self.cfg.with_settings(toml) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -1261,7 +1254,7 @@ impl RepoHandle {
         crate::log_reader::refs_at_seq(self, seq).await
     }
 
-    /// Read log entries [from_seq, to_seq].
+    /// Read log entries [`from_seq`, `to_seq`].
     pub async fn read_log(
         &self,
         from_seq: u64,

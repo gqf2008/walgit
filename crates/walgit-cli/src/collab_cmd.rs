@@ -1236,13 +1236,13 @@ mod tests {
     fn report_projects_ci_runs_not_board_cards() {
         // §8.3: a pure-CI thread is no board card, but the report's CI section
         // (Report.runs) still finds it — the SPA guide and `collab report` read it.
+        const RUN: &str = "ci-0123456789abcdef";
+        const TS: i64 = 1_700_000_000;
         let (sk, pk) = keypair();
         let mut principals = HashMap::new();
         principals.insert("ci-runner-a".to_string(), pk.clone());
         principals.insert("ci-runner-b".to_string(), pk.clone());
 
-        const RUN: &str = "ci-0123456789abcdef";
-        const TS: i64 = 1_700_000_000;
         let mut ca = entry(
             RUN,
             "ci_claim",

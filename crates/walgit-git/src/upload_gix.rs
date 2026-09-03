@@ -28,6 +28,7 @@
 //! (`PackCopyAndBaseObjects`); loose (faulted) objects are compressed fresh.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use futures::future::BoxFuture;
 use gix_object::{Find, FindHeader, Kind as ObjKind};
@@ -72,7 +73,7 @@ fn blocking_section<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Write one section line, wrapped in a band-1 frame when the client asked
-/// for `sideband-all` (flush/delim stay raw, as in git's packet_writer).
+/// for `sideband-all` (flush/delim stay raw, as in git's `packet_writer`).
 fn line(buf: &mut Vec<u8>, data: &[u8], sideband_all: bool) {
     if sideband_all {
         let mut framed = Vec::with_capacity(data.len() + 1);
@@ -207,10 +208,11 @@ impl LocalRepo {
     ) -> Result<UploadPackStats, GitError> {
         let mut header = String::from("# v2 git bundle\n");
         for p in prerequisites {
-            header.push_str(&format!("-{} \n", p.to_hex()));
+            // The trailing space is the (empty) comment field of the bundle format.
+            let _ = writeln!(header, "-{} ", p.to_hex());
         }
         for (name, oid) in refs {
-            header.push_str(&format!("{} {name}\n", oid.to_hex()));
+            let _ = writeln!(header, "{} {name}", oid.to_hex());
         }
         header.push('\n');
         out.write_all(header.as_bytes())
@@ -282,8 +284,7 @@ impl LocalRepo {
         let filter = req
             .filter
             .as_deref()
-            .map(parse_filter)
-            .unwrap_or(PackFilter::None);
+            .map_or(PackFilter::None, parse_filter);
         let has_filter = req.filter.is_some();
         let mut rounds = 0usize;
         let (set, commits, diffed) = loop {
@@ -291,7 +292,7 @@ impl LocalRepo {
             // seconds on big ranges: never on an async worker (D19).
             let attempt = blocking_section(|| {
                 let repo = self.gix();
-                enumerate(&repo, &req, &common_haves, &filter, faulter)
+                enumerate(&repo, req, common_haves, &filter, faulter)
             })?;
             match attempt {
                 Enumerated::Done {
@@ -429,7 +430,7 @@ impl LocalRepo {
         sink.progress(&format!("Total {num_objects} objects, {bytes} bytes\n"))
             .await;
         Ok(UploadPackStats {
-            objects: num_objects as u64,
+            objects: u64::from(num_objects),
             bytes,
         })
     }
@@ -456,7 +457,7 @@ impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
             }
             PackOut::Sideband { .. } => {}
             PackOut::Raw(_) => {
-                tracing::debug!(target: "walgit_git::upload_gix", "{}", text.trim_end())
+                tracing::debug!(target: "walgit_git::upload_gix", "{}", text.trim_end());
             }
         }
     }
@@ -494,7 +495,7 @@ struct ChanWriter {
 impl ChanWriter {
     fn flush_all(&mut self) -> Result<(), GitError> {
         if !self.buf.is_empty() {
-            let chunk = std::mem::replace(&mut self.buf, Vec::new());
+            let chunk = std::mem::take(&mut self.buf);
             self.tx.blocking_send(chunk).map_err(|_| {
                 GitError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -568,7 +569,7 @@ fn generate_pack_streaming(
     let thread_limit = if small {
         Some(1)
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).ok()
+        std::thread::available_parallelism().map(std::num::NonZero::get).ok()
     };
     let chunk_size = if small { 64 } else { 256 };
     let interrupt = std::sync::atomic::AtomicBool::new(false);
@@ -609,14 +610,14 @@ fn generate_pack_streaming(
         },
     );
     let entries_in_order = gix_features::parallel::InOrderIter::from(entries);
-    let mut pack_iter = FromEntriesIter::new(
+    let pack_iter = FromEntriesIter::new(
         entries_in_order,
         out,
         num_entries,
         PackVersion::V2,
         object_hash,
     );
-    while let Some(result) = pack_iter.next() {
+    for result in pack_iter {
         result.map_err(ge)?;
     }
     Ok(num_entries)
@@ -793,19 +794,16 @@ fn enumerate(
             let mut parent_trees: Vec<Old> = Vec::with_capacity(parent_ids.len());
             let mut deferred = false;
             for p in &parent_ids {
-                match repo.objects.try_find(p, &mut buf).map_err(GitError::Gix)? {
-                    Some(obj) => {
-                        match gix_object::CommitRefIter::from_bytes(obj.data, kind).tree_id() {
-                            Ok(t) => parent_trees.push(Old::Tree(t)),
-                            Err(e) => return Err(ge(e)),
-                        }
+                if let Some(obj) = repo.objects.try_find(p, &mut buf).map_err(GitError::Gix)? {
+                    match gix_object::CommitRefIter::from_bytes(obj.data, kind).tree_id() {
+                        Ok(t) => parent_trees.push(Old::Tree(t)),
+                        Err(e) => return Err(ge(e)),
                     }
-                    None => {
-                        // Parent commit not local (base): fault it, diff this
-                        // commit on the retry.
-                        missing.push(*p);
-                        deferred = true;
-                    }
+                } else {
+                    // Parent commit not local (base): fault it, diff this
+                    // commit on the retry.
+                    missing.push(*p);
+                    deferred = true;
                 }
             }
             if deferred {
@@ -835,8 +833,8 @@ fn enumerate(
     }
 
     // include-tag: annotated tags whose target is in the set.
-    if req.include_tag {
-        if let Ok(snap) = crate::read_refs(repo.path()) {
+    if req.include_tag
+        && let Ok(snap) = crate::read_refs(repo.path()) {
             for r in &snap.refs {
                 let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) else {
                     continue;
@@ -844,18 +842,14 @@ fn enumerate(
                 if set.contains(&tag_oid) {
                     continue;
                 }
-                if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf) {
-                    if obj.kind == ObjKind::Tag {
-                        if let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind) {
-                            if set.contains(&tag.target()) {
+                if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf)
+                    && obj.kind == ObjKind::Tag
+                        && let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind)
+                            && set.contains(&tag.target()) {
                                 set.insert(tag_oid);
                             }
-                        }
-                    }
-                }
             }
         }
-    }
     Ok(Enumerated::Done {
         set,
         commits,
@@ -923,14 +917,11 @@ fn diff_tree_new_objects(
     for o in olds {
         match o {
             Old::Absent => old_maps.push(HashMap::new()),
-            Old::Tree(oid) => match tree_entries(repo, oid, buf)? {
-                Some(entries) => {
-                    old_maps.push(entries.into_iter().map(|(m, n, o)| (n, (m, o))).collect())
-                }
-                None => {
-                    missing.push(*oid);
-                    deferred = true;
-                }
+            Old::Tree(oid) => if let Some(entries) = tree_entries(repo, oid, buf)? {
+                old_maps.push(entries.into_iter().map(|(m, n, o)| (n, (m, o))).collect());
+            } else {
+                missing.push(*oid);
+                deferred = true;
             },
         }
     }
@@ -953,12 +944,11 @@ fn diff_tree_new_objects(
             continue;
         }
         if mode.is_tree() {
-            if let PackFilter::Tree(max) = filter {
-                if depth + 1 > *max {
+            if let PackFilter::Tree(max) = filter
+                && depth + 1 > *max {
                     set.insert(oid);
                     continue;
                 }
-            }
             if set.insert(oid) {
                 let sub_olds: Vec<Old> = old_maps
                     .iter()
@@ -973,11 +963,10 @@ fn diff_tree_new_objects(
             match filter {
                 PackFilter::BlobNone => continue,
                 PackFilter::BlobLimit(limit) => {
-                    if let Ok(Some(h)) = repo.objects.try_header(&oid) {
-                        if h.size > *limit {
+                    if let Ok(Some(h)) = repo.objects.try_header(&oid)
+                        && h.size > *limit {
                             continue;
                         }
-                    }
                 }
                 _ => {}
             }
@@ -1016,6 +1005,7 @@ mod frozen_source_tests {
     /// out whatever now lives at that id, or nothing.
     #[test]
     fn locations_survive_a_midx_rewrite_under_the_frozen_source() {
+        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         git(dir, &["init", "-q", "--bare"]);
@@ -1032,7 +1022,6 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
                 c.stdin
                     .take()
                     .unwrap()
@@ -1052,7 +1041,6 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
             c.stdin
                 .take()
                 .unwrap()
@@ -1121,7 +1109,6 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
                 c.stdin
                     .take()
                     .unwrap()
@@ -1140,7 +1127,6 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
             c.stdin
                 .take()
                 .unwrap()

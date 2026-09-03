@@ -90,7 +90,7 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
         body,
         batches: AtomicUsize::new(0),
         downloads: AtomicUsize::new(0),
-        base: Default::default(),
+        base: std::sync::Mutex::default(),
     });
     let app = Router::new()
         .route("/lfs/objects/batch", post(mock_batch))
@@ -98,7 +98,7 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
-    *mock.base.lock().unwrap() = base.clone();
+    (*mock.base.lock().unwrap()).clone_from(&base);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Ok((mock, base))
 }

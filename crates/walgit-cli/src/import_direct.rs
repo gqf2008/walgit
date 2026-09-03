@@ -153,10 +153,7 @@ pub struct ImportMarker {
 }
 
 fn entry_to_hex(e: &BundleEntry) -> String {
-    e.encode_to_vec()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(e.encode_to_vec())
 }
 fn entry_from_hex(s: &str) -> Option<BundleEntry> {
     let bytes: Option<Vec<u8>> = (0..s.len() / 2)
@@ -437,8 +434,8 @@ pub async fn run_with_store(
                 repo: repo_key.clone(),
                 tips_hash: tips.clone(),
                 base_manifest_version: current_version.clone(),
-                base_head_seq: base_manifest.as_ref().map(|m| m.head_seq).unwrap_or(0),
-                seq: base_manifest.as_ref().map(|m| m.head_seq).unwrap_or(0) + 1,
+                base_head_seq: base_manifest.as_ref().map_or(0, |m| m.head_seq),
+                seq: base_manifest.as_ref().map_or(0, |m| m.head_seq) + 1,
                 phase: ImportPhase::Started,
                 uploaded: Vec::new(),
                 history_pack: None,
@@ -522,35 +519,32 @@ pub async fn run_with_store(
                         .map(|p| p.pack)
                 })
             });
-        let hp = match reuse {
-            Some(pack) => {
-                let v = scan_packs(&dir)?;
-                let hp = v
-                    .into_iter()
-                    .find(|p| p.pack == pack)
-                    .context("history pack vanished")?;
-                println!(
-                    "history pack {} reused from {}",
-                    hp.checksum,
-                    hp.pack.display()
-                );
-                hp
-            }
-            None => {
-                let t = Instant::now();
-                std::fs::create_dir_all(&dir)?;
-                let hp = build_history_pack(&git_dir, &dir, &packs[0].checksum)?;
-                println!(
-                    "history pack {}: {} bytes, {} objects (commits + trees) in {:.1}s -> {}",
-                    hp.checksum,
-                    hp.pack_size,
-                    hp.object_count,
-                    t.elapsed().as_secs_f64(),
-                    hp.pack.display()
-                );
-                report.built_history_pack = true;
-                hp
-            }
+        let hp = if let Some(pack) = reuse {
+            let v = scan_packs(&dir)?;
+            let hp = v
+                .into_iter()
+                .find(|p| p.pack == pack)
+                .context("history pack vanished")?;
+            println!(
+                "history pack {} reused from {}",
+                hp.checksum,
+                hp.pack.display()
+            );
+            hp
+        } else {
+            let t = Instant::now();
+            std::fs::create_dir_all(&dir)?;
+            let hp = build_history_pack(&git_dir, &dir, &packs[0].checksum)?;
+            println!(
+                "history pack {}: {} bytes, {} objects (commits + trees) in {:.1}s -> {}",
+                hp.checksum,
+                hp.pack_size,
+                hp.object_count,
+                t.elapsed().as_secs_f64(),
+                hp.pack.display()
+            );
+            report.built_history_pack = true;
+            hp
         };
         marker.history_pack = Some(hp.pack.clone());
         packs.push(hp);
@@ -646,7 +640,7 @@ pub async fn run_with_store(
             async move {
                 st.head(&key)
                     .await
-                    .map(|m| m.map(|m| m.size == size).unwrap_or(false))
+                    .map(|m| m.is_some_and(|m| m.size == size))
             }
         }))
         .await;
@@ -743,18 +737,12 @@ pub async fn run_with_store(
     let mut bundle_key = String::new();
     let mut bundle_entry: Option<BundleEntry> = marker.bundle.as_deref().and_then(entry_from_hex);
     if opts.bundle && bundle_entry.is_none() {
-        if object_packs != 1 {
-            eprintln!(
-                "--bundle needs exactly one object pack (got {object_packs}); skipping bundle"
-            );
-        } else {
+        if object_packs == 1 {
             let strategy = opts.bundle_strategy.clone().unwrap_or_else(|| {
                 cfg.bundles
                     .strategy
                     .iter()
-                    .find(|s| s.kind == walgit_config::BundleKind::Full)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "import".to_string())
+                    .find(|s| s.kind == walgit_config::BundleKind::Full).map_or_else(|| "import".to_string(), |s| s.name.clone())
             });
             let p0 = &packs[0];
             match walgit_bundle::ops::compose_full(
@@ -785,6 +773,10 @@ pub async fn run_with_store(
                 }
                 Err(e) => eprintln!("bundle publish failed (import continues): {e:#}"),
             }
+        } else {
+            eprintln!(
+                "--bundle needs exactly one object pack (got {object_packs}); skipping bundle"
+            );
         }
     }
     if let Some(e) = &bundle_entry {
@@ -838,7 +830,7 @@ pub async fn run_with_store(
         packs: pack_refs,
         updated_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
-        revision: base_manifest.as_ref().map(|m| m.revision).unwrap_or(0) + 1,
+        revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,
         settings: None,
     };
     let mode = match base_version {
@@ -858,7 +850,7 @@ pub async fn run_with_store(
             println!(
                 "published {} at seq {} (manifest {})",
                 id, seq, meta.version
-            )
+            );
         }
         Err(StoreError::PreconditionFailed { .. }) => {
             bail!(
@@ -906,9 +898,7 @@ pub async fn run_with_store(
 // ---- helpers -------------------------------------------------------------------
 
 fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "local".into())
+    std::fs::read_to_string("/etc/hostname").map_or_else(|_| "local".into(), |s| s.trim().to_string())
 }
 
 fn count_loose(git_dir: &Path) -> u64 {
@@ -1172,7 +1162,7 @@ fn idx_object_count(idx: &Path) -> Result<u64> {
     f.seek(SeekFrom::Start(8 + 255 * 4))?;
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
-    Ok(u32::from_be_bytes(b) as u64)
+    Ok(u64::from(u32::from_be_bytes(b)))
 }
 
 /// Git bundle header for `snap` (HEAD + refs/heads/* + refs/tags/*), no prerequisites.
@@ -1202,7 +1192,7 @@ where
             .await
         {
             Ok(meta) => return Ok((meta.version, new_list)),
-            Err(StoreError::PreconditionFailed { .. }) => continue,
+            Err(StoreError::PreconditionFailed { .. }) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -1278,7 +1268,7 @@ mod tests {
         let ahead = git(&src, &["rev-parse", "HEAD"]);
 
         assert!(
-            verify_refs_in_packs(&packs, &[main_tip.clone()], true)
+            verify_refs_in_packs(&packs, std::slice::from_ref(&main_tip), true)
                 .unwrap()
                 .is_empty()
         );
@@ -1328,7 +1318,7 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert!(
-            verify_refs_in_packs(&packs, &[tip.clone()], false)
+            verify_refs_in_packs(&packs, std::slice::from_ref(&tip), false)
                 .unwrap()
                 .is_empty(),
             "tip is there"
@@ -1535,7 +1525,7 @@ mod resume_tests {
         let mut expected = 0usize;
         for p in &m.packs {
             expected +=
-                2 + p.has_rev as usize + p.has_bitmap as usize + p.has_commit_graph as usize;
+                2 + usize::from(p.has_rev) + usize::from(p.has_bitmap) + usize::from(p.has_commit_graph);
         }
         assert_eq!(
             total_uploaded, expected,

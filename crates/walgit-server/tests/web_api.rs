@@ -31,7 +31,7 @@ async fn get(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let text = resp.text().await?;
     Ok((status, text, ct))
 }
@@ -823,12 +823,27 @@ async fn merge_base_unrelated_histories() -> TestResult {
     Ok(())
 }
 
+/// `remote_blame_rename_boundary_over_tree_budget_is_503` shrinks
+/// `WALGIT_TEST_BLAME_TREE_BUDGET` through the process-global env, and
+/// `remote_blame_follows_exact_renames`'s concurrent request reads that same
+/// knob; a rename-tree fault landing inside the knob's window would spuriously
+/// 503. Serialize the two on this lock: the knob test holds it from
+/// `set_var` to `remove_var`, the rename test for its whole run.
+///
+/// The guard is deliberately held across awaits — this is a test-serialization
+/// barrier, not a resource lock, so `clippy::await_holding_lock` is allowed on
+/// the two tests below.
+static BLAME_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Remote blame follows renames (issue #13): git blame's rename detection
 /// reads the old path's tree in the parent, so the walk faults the boundary
 /// parent's whole tree skeleton and continues along the exact content
 /// predecessor. Local and remote must then agree byte-for-byte.
+#[allow(clippy::await_holding_lock)] // serialization barrier, see BLAME_ENV_LOCK
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_blame_follows_exact_renames() -> TestResult {
+    // Held across every await so the sibling knob test cannot interleave.
+    let _env_lock = BLAME_ENV_LOCK.lock();
     let big = Server::start().await?;
     big.put_repo("o", "r").await?;
     fixture(&big)?;
@@ -856,7 +871,11 @@ async fn remote_blame_follows_exact_renames() -> TestResult {
 // The knob is environment-read at request time (the WALGIT_TEST_* pattern),
 // and `std::env::set_var` is unsafe in this edition; contained to this test.
 #[allow(unsafe_code)]
+#[allow(clippy::await_holding_lock)] // serialization barrier, see BLAME_ENV_LOCK
 async fn remote_blame_rename_boundary_over_tree_budget_is_503() -> TestResult {
+    // Held from before `set_var` until after `remove_var` so the sibling
+    // rename-following test never reads the shrunk knob mid-request.
+    let _env_lock = BLAME_ENV_LOCK.lock();
     let big = Server::start().await?;
     big.put_repo("o", "r").await?;
     fixture(&big)?;
@@ -865,11 +884,11 @@ async fn remote_blame_rename_boundary_over_tree_budget_is_503() -> TestResult {
             cfg.cache.max_bytes = bytesize::ByteSize::b(1);
         })
         .await?;
-    // SAFETY: single-threaded test setup phase; the sibling reads the knob
-    // when the request walks the rename boundary.
+    // SAFETY: the knob's only readers in this process are the two blame tests,
+    // serialized on BLAME_ENV_LOCK; other env access is the WALGIT_TEST_* norm.
     unsafe { std::env::set_var("WALGIT_TEST_BLAME_TREE_BUDGET", "1") };
     let (st, body, _) = get(&small, "/o/r/api/blame/main/src/app.rs").await?;
-    // SAFETY: restore before further awaits so other tests see no knob.
+    // SAFETY: restoring under the same lock, before the guard drops.
     unsafe { std::env::remove_var("WALGIT_TEST_BLAME_TREE_BUDGET") };
     assert_eq!(
         st, 503,

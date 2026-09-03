@@ -17,6 +17,7 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 type TestResult = anyhow::Result<()>;
 use harness::{Server, TestRepo, git_in};
+use std::sync::Arc;
 use std::time::Duration;
 
 type Captured = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
@@ -24,7 +25,7 @@ type Captured = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 /// The webhook sink's target: records every event it receives (the bus as
 /// the test sees it).
 async fn webhook() -> (String, Captured) {
-    let captured: Captured = Default::default();
+    let captured: Captured = Arc::default();
     let app = axum::Router::new().route(
         "/events",
         axum::routing::post({

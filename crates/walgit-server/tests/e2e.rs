@@ -201,7 +201,7 @@ async fn push_delete_ref() -> TestResult {
 
     git_in(&src, &["push", "origin", "--delete", "topic"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(!refs.contains("refs/heads/topic"));
     Ok(())
 }
@@ -220,7 +220,7 @@ async fn dangling_head_clone_and_ls_remote() -> TestResult {
         &["push", &server.repo_url("t", "r"), "HEAD:refs/heads/other"],
     )?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/heads/other"));
     for line in refs.lines() {
         assert!(
@@ -371,7 +371,7 @@ async fn concurrent_clones_and_pushes_with_telemetry() -> TestResult {
         failures.len(),
         &failures[..failures.len().min(5)]
     );
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     for i in 0..16 {
         assert!(refs.contains(&format!("refs/heads/w{i}")));
     }
@@ -403,7 +403,7 @@ async fn push_tags() -> TestResult {
     )?;
     git_in(&src, &["push", "origin", "main", "--tags"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/tags/v1"));
     Ok(())
 }
@@ -453,7 +453,7 @@ async fn ls_remote_lists_refs() -> TestResult {
     )?;
     git_in(&src, &["push", "origin", "main"])?;
 
-    let refs = server.ls_remote("t", "r").await?;
+    let refs = server.ls_remote("t", "r")?;
     assert!(refs.contains("refs/heads/main"));
     Ok(())
 }
@@ -615,7 +615,7 @@ async fn atomic_push_rejects_all_refs_when_one_is_non_ff() -> TestResult {
         "atomic report should mention topic: {stderr}"
     );
 
-    let refs = server.ls_remote("t", "atomic").await?;
+    let refs = server.ls_remote("t", "atomic")?;
     assert!(refs.contains(&format!("{}\trefs/heads/main", server_main.trim())));
     assert!(refs.contains(&format!("{}\trefs/heads/topic", initial_topic.trim())));
     Ok(())
@@ -661,7 +661,7 @@ async fn push_protocol_v0() -> TestResult {
         &src,
         &["-c", "protocol.version=0", "push", "origin", "main"],
     )?;
-    let refs = server.ls_remote("t", "push-v0").await?;
+    let refs = server.ls_remote("t", "push-v0")?;
     assert!(refs.contains("refs/heads/main"));
     Ok(())
 }
@@ -991,8 +991,7 @@ fn git_lfs_present() -> bool {
     Command::new("git")
         .args(["lfs", "version"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn git_supports_sha256() -> bool {
@@ -1007,8 +1006,7 @@ fn git_supports_sha256() -> bool {
             dir.path().to_str().unwrap(),
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// A front whose `cache.max_bytes` cannot hold a repository's pack set must
@@ -1745,7 +1743,7 @@ async fn push_from_a_shallow_clone() -> TestResult {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let refs = server.ls_remote("t", "shallowpush").await?;
+    let refs = server.ls_remote("t", "shallowpush")?;
     assert!(refs.contains("refs/heads/from-shallow"), "{refs}");
     Ok(())
 }
@@ -1824,7 +1822,7 @@ fn real_git_path() -> anyhow::Result<String> {
         let out = std::process::Command::new("sh")
             .args(["-c", "command -v git"])
             .output()?;
-        return Ok(String::from_utf8(out.stdout)?.trim().to_string());
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
     #[cfg(windows)]
     {
@@ -1845,7 +1843,7 @@ fn real_git_path() -> anyhow::Result<String> {
 /// `multi-pack-index` and forwards everything else to the real git.
 ///
 /// Unix: a shebang script with the executable bit set. Windows: a `git.exe`
-/// built on the fly with rustc — CreateProcess resolves only `.exe` for a
+/// built on the fly with rustc — `CreateProcess` resolves only `.exe` for a
 /// bare name, so neither a script nor a `.bat` can shadow `git` there. The
 /// real git's path is embedded at compile time via `REAL_GIT`, resolved
 /// *before* the shim lands in PATH (so `where git` still finds the real one).
@@ -2056,7 +2054,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
 
 /// Materialization runs on its own runtime: even an unknown *blocking* call
 /// inside the install path (simulated by `WALGIT_TEST_BLOCK_INSTALL_MS`, a
-/// synchronous sleep in reconcile_packs) must not stall request workers —
+/// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
@@ -2442,7 +2440,7 @@ async fn refs_level_requests_prefetch_only_small_pack_sets() -> TestResult {
     let bounded = big
         .start_sibling_with(|c| c.wal.prefetch_max_bytes = bytesize::ByteSize::b(1))
         .await?;
-    let _ = bounded.ls_remote("t", "prefetch").await?;
+    let _ = bounded.ls_remote("t", "prefetch")?;
     let h = bounded.state.registry.open(&id).await?;
     assert!(
         !h.prefetch_wanted(),
@@ -2465,7 +2463,7 @@ async fn refs_level_requests_prefetch_only_small_pack_sets() -> TestResult {
 
     // Default bound (1 GiB): the small set is prefetched after a refs-level request.
     let eager = big.start_sibling_with(|_| {}).await?;
-    let _ = eager.ls_remote("t", "prefetch").await?;
+    let _ = eager.ls_remote("t", "prefetch")?;
     let h = eager.state.registry.open(&id).await?;
     for _ in 0..50 {
         if h.packs_ready() {
@@ -2886,8 +2884,7 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
     std::fs::write(
         &helper,
         format!(
-            "#!/bin/sh\necho \"$1\" >> {log}\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=fresh\\n\\n' ;; esac\n",
-            log = log_spec
+            "#!/bin/sh\necho \"$1\" >> {log_spec}\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=fresh\\n\\n' ;; esac\n"
         ),
     )?;
     #[cfg(unix)]
@@ -3269,7 +3266,7 @@ async fn wiped_bucket_on_leftover_cache_advertises_no_phantom_refs() -> TestResu
     )?;
     git_in(&src, &["push", "-u", "origin", "main"])?;
     let pushed = git_in(&src, &["rev-parse", "main"])?;
-    assert!(server_a.ls_remote("o", "r").await?.contains(pushed.trim()));
+    assert!(server_a.ls_remote("o", "r")?.contains(pushed.trim()));
 
     // "Process exit": the server drops; the caller-owned cache dir survives.
     drop(server_a);

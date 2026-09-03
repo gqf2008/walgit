@@ -115,7 +115,7 @@ pub async fn parse<R: AsyncRead + Unpin>(
             };
             return Ok((txn, caps, PrefixedReader::new(Vec::new(), r)));
         }
-        Some(PktLine::Delim) | Some(PktLine::ResponseEnd) => {
+        Some(PktLine::Delim | PktLine::ResponseEnd) => {
             return Err(GitError::Protocol(
                 "unexpected delim before commands".into(),
             ));
@@ -134,8 +134,7 @@ pub async fn parse<R: AsyncRead + Unpin>(
     loop {
         let line = pkt::read_pkt_line(&mut r).await?;
         match line {
-            None | Some(PktLine::Flush) => break,
-            Some(PktLine::Delim) | Some(PktLine::ResponseEnd) => break,
+            None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
                 caps.shallow
                     .push(String::from_utf8_lossy(&b[8..]).trim().to_string());
@@ -152,8 +151,7 @@ pub async fn parse<R: AsyncRead + Unpin>(
         loop {
             let line = pkt::read_pkt_line(&mut r).await?;
             match line {
-                None | Some(PktLine::Flush) => break,
-                Some(PktLine::Delim) | Some(PktLine::ResponseEnd) => break,
+                None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
                 Some(PktLine::Data(b)) => {
                     push_options.push(
                         String::from_utf8_lossy(&b)
@@ -203,7 +201,7 @@ fn parse_command_line(b: &[u8]) -> Result<(walgit_proto::v1::RefUpdate, String),
 }
 
 fn apply_caps(caps: &mut ReceiveCaps, s: &str) {
-    for tok in s.split(|c: char| c == ' ' || c == '\n') {
+    for tok in s.split([' ', '\n']) {
         let tok = tok.trim();
         if tok.is_empty() {
             continue;
@@ -218,7 +216,7 @@ fn apply_caps(caps: &mut ReceiveCaps, s: &str) {
             "ofs-delta" => caps.ofs_delta = true,
             _ if tok.starts_with("agent=") => caps.agent = Some(tok[6..].to_string()),
             _ if tok.starts_with("object-format=") => {
-                caps.object_format = Some(tok[14..].to_string())
+                caps.object_format = Some(tok[14..].to_string());
             }
             _ => {}
         }
@@ -298,7 +296,7 @@ pub async fn report_status<W: AsyncWrite + Unpin>(
 
 /// Convenience: build a [`RefTransaction`] from a ref snapshot diff is not
 /// provided; callers construct transactions directly. This helper converts a
-/// [`RefSnapshotData`] into a transaction that creates all refs (old_oid =
+/// [`RefSnapshotData`] into a transaction that creates all refs (`old_oid` =
 /// zero), useful for materializing a checkpoint.
 pub fn txn_from_snapshot(snap: &RefSnapshotData) -> walgit_proto::v1::RefTransaction {
     let mut updates: Vec<walgit_proto::v1::RefUpdate> = snap

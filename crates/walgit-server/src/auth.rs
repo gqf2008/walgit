@@ -3,7 +3,7 @@
 //!
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
-//! * **`oidc`** — any OpenID Connect issuer. Three credentials are accepted:
+//! * **`oidc`** — any `OpenID` Connect issuer. Three credentials are accepted:
 //!   1. an **ID token** from the issuer in `Authorization: Bearer` (RS256/ES256,
 //!      signature against the issuer's JWKS, `iss`, `exp`, `aud` ∈ `audiences` ∪
 //!      {`oauth_client_id`}, `email_verified`), for CLIs that can mint one;
@@ -586,7 +586,7 @@ impl Authenticator {
     /// Principal from a valid, unexpired session cookie (policy re-applied).
     fn authenticate_cookie(&self, headers: &HeaderMap) -> Option<Principal> {
         let (_, _, email) = self.session_claims(headers)?;
-        self.principal_for_email(email).ok()
+        self.principal_for_email(&email).ok()
     }
 
     /// Sliding sessions: a fresh cookie value when the request carries a valid
@@ -597,7 +597,7 @@ impl Authenticator {
         if unix_now()?.saturating_sub(iat) < self.session_ttl.as_secs() / 4 {
             return None;
         }
-        let principal = self.principal_for_email(email).ok()?;
+        let principal = self.principal_for_email(&email).ok()?;
         self.session_cookie_value(&principal.name)
     }
 
@@ -660,7 +660,7 @@ impl Authenticator {
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
             return Some(match self.access_token_claims(tok) {
-                Some((_, email)) => self.principal_for_email(email),
+                Some((_, email)) => self.principal_for_email(&email),
                 None => Err(AuthError::Invalid),
             });
         }
@@ -797,11 +797,11 @@ impl Authenticator {
             return Err(AuthError::Invalid);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
-        self.principal_for_email(claims.email)
+        self.principal_for_email(&claims.email)
     }
 
     /// Apply the domain/email allowlist and `write_domains` policy to a verified email.
-    fn principal_for_email(&self, email: String) -> Result<Principal, AuthError> {
+    fn principal_for_email(&self, email: &str) -> Result<Principal, AuthError> {
         let Some((_, domain)) = email.rsplit_once('@') else {
             return Err(AuthError::Invalid);
         };
@@ -817,9 +817,9 @@ impl Authenticator {
             Some(domains) => domains.iter().any(|d| d == &domain_lower),
         };
         Ok(Principal {
-            name: email.clone(),
+            name: email.to_string(),
             write,
-            admin: self.is_admin(&email),
+            admin: self.is_admin(email),
             anonymous: false,
         })
     }
@@ -845,7 +845,7 @@ struct IdClaims {
     email_verified: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AuthError {
     Invalid,
     Unauthorized,
@@ -921,7 +921,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 /// Value of cookie `name` from the `Cookie` header(s).
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    for h in headers.get_all(axum::http::header::COOKIE).iter() {
+    for h in &headers.get_all(axum::http::header::COOKIE) {
         let Ok(s) = h.to_str() else { continue };
         for part in s.split(';') {
             let part = part.trim();
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     // gitleaks:allow — fixed test fixture; never loaded outside this module's OIDC verifier tests.
-    const PRIVATE_KEY: &[u8] = br#"-----BEGIN PRIVATE KEY-----
+    const PRIVATE_KEY: &[u8] = br"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
 7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
 IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
@@ -1077,7 +1077,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
 3wc9h4G8BBCtWN2TN/LsGZdB
 -----END PRIVATE KEY-----
-"#;
+";
     const MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
     const EXPONENT: &str = "AQAB";
 
@@ -1431,7 +1431,7 @@ mod session_tests {
         assert!(unix_now().unwrap().abs_diff(iat) <= 2);
         assert_eq!(
             walgit_config::Config::default().server.auth.session_ttl,
-            Duration::from_secs(30 * 86400)
+            Duration::from_hours(720)
         );
     }
 

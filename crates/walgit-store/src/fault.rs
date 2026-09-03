@@ -109,7 +109,7 @@ impl FaultPlan {
         }
     }
     pub fn with_only(mut self, keys: &[&str]) -> Self {
-        self.only_keys = Some(keys.iter().map(|s| s.to_string()).collect());
+        self.only_keys = Some(keys.iter().map(std::string::ToString::to_string).collect());
         self
     }
 }
@@ -543,6 +543,37 @@ pub async fn truth_bytes(store: &DynStore, key: &str) -> Result<Option<Bytes>> {
     Ok(store.get_bytes(key).await?.map(|(_, b)| b))
 }
 
+impl FaultStore {
+    async fn get_inner(&self, key: &str, opts: GetOptions, conditional: bool) -> Result<GetResult> {
+        match self.decide("get", key, false, conditional, true).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("get", key, "before")),
+            Decision::Denied => Err(StoreError::NotFound { key: key.into() }),
+            Decision::Stale => Ok(GetResult::NotModified {
+                version: opts.if_none_match.clone().unwrap(),
+            }),
+            Decision::Truncate(at) => match self.inner.get(key, opts).await? {
+                GetResult::Object { meta, body } => {
+                    let size = meta.size as usize;
+                    let at = if size == 0 { 0 } else { at % size };
+                    let msg = format!(
+                        "fault-store[{}]: injected truncation of {key} at {at}/{size}",
+                        self.name
+                    );
+                    Ok(GetResult::Object {
+                        meta,
+                        body: truncate_stream(body, at, msg),
+                    })
+                }
+                res @ GetResult::NotModified { .. } => Ok(res),
+            },
+            Decision::Proceed | Decision::ErrAfter | Decision::CasFail => {
+                self.inner.get(key, opts).await
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,36 +640,5 @@ mod tests {
         link.set(FaultPlan::black_hole());
         let r = tokio::time::timeout(Duration::from_millis(50), link.head("k")).await;
         assert!(r.is_err());
-    }
-}
-
-impl FaultStore {
-    async fn get_inner(&self, key: &str, opts: GetOptions, conditional: bool) -> Result<GetResult> {
-        match self.decide("get", key, false, conditional, true).await {
-            Decision::Hang => hang_forever().await,
-            Decision::ErrBefore => Err(self.retryable("get", key, "before")),
-            Decision::Denied => Err(StoreError::NotFound { key: key.into() }),
-            Decision::Stale => Ok(GetResult::NotModified {
-                version: opts.if_none_match.clone().unwrap(),
-            }),
-            Decision::Truncate(at) => match self.inner.get(key, opts).await? {
-                GetResult::Object { meta, body } => {
-                    let size = meta.size as usize;
-                    let at = if size == 0 { 0 } else { at % size };
-                    let msg = format!(
-                        "fault-store[{}]: injected truncation of {key} at {at}/{size}",
-                        self.name
-                    );
-                    Ok(GetResult::Object {
-                        meta,
-                        body: truncate_stream(body, at, msg),
-                    })
-                }
-                r => Ok(r),
-            },
-            Decision::Proceed | Decision::ErrAfter | Decision::CasFail => {
-                self.inner.get(key, opts).await
-            }
-        }
     }
 }

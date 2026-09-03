@@ -86,7 +86,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         .parse()
         .map_err(|e: walgit_git::GitError| e.to_string())?;
     let handle = st.registry.open(&id).await.map_err(|e| e.to_string())?;
-    let task = match handle.begin_task("prewarm", Default::default()) {
+    let task = match handle.begin_task("prewarm", std::collections::HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => return Ok("already warming".into()),
     };
@@ -142,8 +142,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
             .find(|r| r.name == head.head_target)
             .map(|r| r.oid.clone());
         if let (Some(sha), walgit_wal::ObjectAccess::Remote(packs)) = (head_sha.as_deref(), &access)
-        {
-            if let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
+            && let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
                 reporter.notice(format!(
                     "Reading the root tree of {} from the pack set",
                     &sha[..12]
@@ -156,7 +155,6 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
                 let (_c, tree, _m) = remote.fault_path(&oid, "").await.map_err(|e| e.message())?;
                 let _ = remote.tree_entries(&tree).await;
             }
-        }
         Ok(format!("warm: {mode}"))
     }
     .instrument(span)

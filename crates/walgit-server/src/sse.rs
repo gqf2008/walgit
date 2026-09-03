@@ -106,14 +106,13 @@ impl Rendered {
             etag,
         }
     }
-    /// Plain HTTP response (honours `If-None-Match` when an ETag is set).
+    /// Plain HTTP response (honours `If-None-Match` when an `ETag` is set).
     pub fn into_response(self, req: &HeaderMap) -> Response {
         if let Some(etag) = &self.etag {
             let hit = req
                 .get(header::IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
-                .unwrap_or(false);
+                .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
             if hit {
                 let mut r = StatusCode::NOT_MODIFIED.into_response();
                 r.headers_mut().insert(header::ETAG, etag.parse().unwrap());
@@ -155,7 +154,7 @@ where
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,
                 }
             }
@@ -229,13 +228,13 @@ pub fn task_stream(state: std::sync::Arc<walgit_wal::tasks::TaskState>) -> Respo
             tokio::select! {
                 r = live.recv() => match r {
                     Ok(p) => { if tx.send(progress_packet(&p)).await.is_err() { return; } }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,
                 },
                 _ = done.changed() => {
                     if *done.borrow() { break; }
                 }
-                _ = tokio::time::sleep(KEEPALIVE) => {
+                () = tokio::time::sleep(KEEPALIVE) => {
                     if tx.send(Bytes::from_static(b": keepalive\n\n")).await.is_err() { return; }
                 }
             }

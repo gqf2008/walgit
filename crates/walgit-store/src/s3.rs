@@ -7,29 +7,29 @@
 //!
 //! ## Version tokens
 //!
-//! S3 ETags are used as opaque `Version` strings. Quotes are stripped
+//! S3 `ETags` are used as opaque `Version` strings. Quotes are stripped
 //! consistently on read and never stored. For non-multipart uploads the
-//! ETag is the MD5 of the content; for multipart uploads it is a compound
+//! `ETag` is the MD5 of the content; for multipart uploads it is a compound
 //! hash. Callers never parse the token — equality comparison suffices.
 //!
 //! ## Conditional PUT
 //!
 //! `PutMode::Create`    → `If-None-Match: *`  (object must not exist).
-//! `PutMode::Update(v)` → `If-Match: <etag>`  (CAS on current ETag).
+//! `PutMode::Update(v)` → `If-Match: <etag>`  (CAS on current `ETag`).
 //! On failure the SDK returns a `PreconditionFailed` service error; we fill
 //! `current` via a follow-up HEAD when the SDK doesn't include it.
 //!
 //! ## Conditional DELETE
 //!
-//! S3 has no native conditional delete. We emulate via HEAD (read ETag) +
+//! S3 has no native conditional delete. We emulate via HEAD (read `ETag`) +
 //! compare + DELETE, documenting the inherent check-then-act race: a
 //! concurrent writer could replace the object between HEAD and DELETE.
 //! Acceptable for walgit's lease-guarded semantics.
 //!
 //! ## Multipart upload
 //!
-//! Objects above `cfg.multipart_threshold` use CreateMultipartUpload +
-//! UploadPart + CompleteMultipartUpload. CreateMultipartUpload does NOT
+//! Objects above `cfg.multipart_threshold` use `CreateMultipartUpload` +
+//! `UploadPart` + `CompleteMultipartUpload`. `CreateMultipartUpload` does NOT
 //! support `If-None-Match`/`If-Match` in the S3 API, so multipart is only
 //! used for `PutMode::Overwrite`. For walgit's immutable pack objects
 //! (`PutMode::Create`) we use single-shot PUT when the object is large,
@@ -73,7 +73,7 @@ impl S3Store {
     /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
     /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
     /// `AWS_SESSION_TOKEN` when present.
-    pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
             anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
         })?;
@@ -190,7 +190,7 @@ impl S3Store {
             404 => Err(StoreError::NotFound { key: key.into() }),
             412 => Err(StoreError::PreconditionFailed {
                 key: key.into(),
-                current: etag.map(|e| Version::new(e)),
+                current: etag.map(Version::new),
             }),
             s if s >= 500 || s == 429 => {
                 Err(StoreError::Retryable(anyhow::anyhow!("s3 get status {s}")))
@@ -233,19 +233,19 @@ async fn body_to_s3(body: PutBody) -> Result<(S3ByteStream, u64)> {
 
 // ---- error classification ----------------------------------------------
 
-/// Extract the error code string from an SdkError's service error metadata.
+/// Extract the error code string from an `SdkError`'s service error metadata.
 fn err_code<E>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str>
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata,
 {
-    err.as_service_error().map(|e| e.meta().code()).flatten()
+    err.as_service_error().and_then(|e| e.meta().code())
 }
 
 fn classify_put_error(
     key: &str,
-    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 ) -> StoreError {
-    let code = err_code(&err).unwrap_or("");
+    let code = err_code(err).unwrap_or("");
     match code {
         "PreconditionFailed" | "ConditionalRequestConflict" => StoreError::PreconditionFailed {
             key: key.into(),
@@ -256,7 +256,7 @@ fn classify_put_error(
 }
 
 fn classify_list_error(
-    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
 ) -> StoreError {
     StoreError::Other(anyhow::anyhow!("s3 list error: {err}"))
 }
@@ -348,13 +348,12 @@ impl ObjectStore for S3Store {
                 })
             }
             Err(e) => {
-                let mut err = classify_put_error(key, e);
+                let mut err = classify_put_error(key, &e);
                 // Fill `current` via HEAD if we got a PreconditionFailed.
-                if let StoreError::PreconditionFailed { current: c, .. } = &mut err {
-                    if c.is_none() {
+                if let StoreError::PreconditionFailed { current: c, .. } = &mut err
+                    && c.is_none() {
                         *c = self.head(key).await.ok().flatten().map(|m| m.version);
                     }
-                }
                 Err(err)
             }
         }
@@ -415,7 +414,7 @@ impl ObjectStore for S3Store {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let prefix = prefix.to_owned();
-        let start_after = start_after.map(|s| s.to_owned());
+        let start_after = start_after.map(std::borrow::ToOwned::to_owned);
 
         Box::pin(futures::stream::unfold(
             ListState {
@@ -470,14 +469,14 @@ impl ObjectStore for S3Store {
                         state.continuation_token = resp
                             .is_truncated()
                             .unwrap_or(false)
-                            .then(|| resp.next_continuation_token().map(|s| s.to_owned()))
+                            .then(|| resp.next_continuation_token().map(std::borrow::ToOwned::to_owned))
                             .flatten();
                         state.buffer = items.into_iter();
 
                         let item = state.buffer.next();
                         item.map(|i| (i, state))
                     }
-                    Err(err) => Some((Err(classify_list_error(err)), state)),
+                    Err(err) => Some((Err(classify_list_error(&err)), state)),
                 }
             },
         ))
@@ -497,7 +496,7 @@ impl ObjectStore for S3Store {
             if let Some(ct) = &continuation_token {
                 builder = builder.continuation_token(ct);
             }
-            let resp = builder.send().await.map_err(classify_list_error)?;
+            let resp = builder.send().await.map_err(|e| classify_list_error(&e))?;
             out.extend(
                 resp.common_prefixes()
                     .iter()
@@ -506,7 +505,7 @@ impl ObjectStore for S3Store {
             continuation_token = resp
                 .is_truncated()
                 .unwrap_or(false)
-                .then(|| resp.next_continuation_token().map(|s| s.to_owned()))
+                .then(|| resp.next_continuation_token().map(std::borrow::ToOwned::to_owned))
                 .flatten();
             if continuation_token.is_none() {
                 break;
@@ -764,6 +763,8 @@ impl S3Store {
         len: u64,
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
+        use tokio::io::AsyncReadExt;
+
         let mut create = self
             .client
             .create_multipart_upload()
@@ -791,7 +792,6 @@ impl S3Store {
         let mut uploaded_parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
         let mut remaining = len;
 
-        use tokio::io::AsyncReadExt;
         let mut reader = body.into_async_read();
 
         while remaining > 0 {

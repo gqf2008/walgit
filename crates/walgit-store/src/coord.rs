@@ -133,9 +133,9 @@ where
     T: prost::Message + Default,
 {
     match store.get_if_changed(key, known).await {
-        Err(StoreError::NotFound { .. }) => Ok(None),
+        // Absent and unmodified both mean "nothing new to read".
+        Err(StoreError::NotFound { .. }) | Ok(None) => Ok(None),
         Err(e) => Err(CoordError::Store(e)),
-        Ok(None) => Ok(None),
         Ok(Some((meta, bytes))) => {
             let msg = T::decode(bytes)?;
             Ok(Some((meta, msg)))
@@ -226,9 +226,8 @@ impl LeaseGuard {
             .delete(&self.key, Some(self.version.clone()))
             .await
         {
-            Ok(())
-            | Err(StoreError::PreconditionFailed { .. })
-            | Err(StoreError::NotFound { .. }) => Ok(()),
+            Ok(()) |
+Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Ok(()),
             Err(e) => Err(CoordError::Store(e)),
         }
     }
@@ -327,8 +326,7 @@ pub async fn try_acquire(
             let expires_at = existing
                 .expires_at
                 .as_ref()
-                .map(time::to_system)
-                .unwrap_or(UNIX_EPOCH);
+                .map_or(UNIX_EPOCH, time::to_system);
             if now >= expires_at + LEASE_SKEW_TOLERANCE {
                 let epoch = existing.epoch + 1;
                 let lease = make_lease(holder, purpose, now, ttl, epoch);
@@ -422,9 +420,9 @@ mod tests {
 
     #[tokio::test]
     async fn cas_update_convergence_64_incrementers() {
+        const N: u32 = 64;
         let store = dyn_store();
         let key = "counter.pb";
-        const N: u32 = 64;
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -465,9 +463,9 @@ mod tests {
 
     #[tokio::test]
     async fn lease_exclusivity_32_concurrent() {
+        const N: u32 = 32;
         let store = dyn_store();
         let key = "leases/excl.pb";
-        const N: u32 = 32;
 
         let mut handles = Vec::new();
         for i in 0..N {

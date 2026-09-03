@@ -141,7 +141,7 @@ impl Upstream {
             .header("Content-Type", "application/vnd.git-lfs+json")
             .json(&body);
         if let Some(secret) = token_env {
-            let token = self.secret(secret).await?;
+            let token = self.secret(secret)?;
             let basic =
                 base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
             req = req.header("Authorization", format!("Basic {basic}"));
@@ -211,7 +211,7 @@ impl Upstream {
     }
 
     /// The upstream token: the value of the environment variable `upstream.token_env` names.
-    pub async fn secret(&self, env_name: &str) -> anyhow::Result<String> {
+    pub fn secret(&self, env_name: &str) -> anyhow::Result<String> {
         let v = std::env::var(env_name).map_err(|_| {
             anyhow::anyhow!("upstream.token_env {env_name:?} is not set in this host's environment")
         })?;

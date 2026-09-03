@@ -13,6 +13,7 @@
 //! credential helper that reads it from the environment — never argv.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -121,8 +122,12 @@ pub async fn fetch_refs(
         let mut input = String::new();
         for r in refs {
             match have.get(r) {
-                Some(oid) => input.push_str(&format!("update {} {oid}\n", follow_ref(r))),
-                None => input.push_str(&format!("delete {}\n", follow_ref(r))),
+                Some(oid) => {
+                    let _ = writeln!(input, "update {} {oid}", follow_ref(r));
+                }
+                None => {
+                    let _ = writeln!(input, "delete {}", follow_ref(r));
+                }
             }
         }
         let mut child = git(&["update-ref", "--stdin"])

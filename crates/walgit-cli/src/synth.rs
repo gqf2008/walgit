@@ -10,15 +10,16 @@
 //!   **m** — 2 000 commits, 5 000 files, binary blobs, 20 branches, 50 tags
 //!   **l** — 50 000 commits, 50 000 files
 
+use std::fmt::Write as _;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
 use crate::SynthSize;
 
-/// (commits, files, branches, tags, binary_blobs)
+/// (commits, files, branches, tags, `binary_blobs`)
 fn size_params(
     size: SynthSize,
     commits: Option<u64>,
@@ -32,8 +33,8 @@ fn size_params(
     (commits.unwrap_or(c), files.unwrap_or(f), br, tg, bin)
 }
 
-pub async fn run(
-    out: PathBuf,
+pub fn run(
+    out: &Path,
     size: SynthSize,
     commits: Option<u64>,
     files: Option<u64>,
@@ -42,16 +43,16 @@ pub async fn run(
     let (n_commits, n_files, n_branches, n_tags, binary) = size_params(size, commits, files);
     let seed = seed.unwrap_or(42);
 
-    if out.exists() && std::fs::read_dir(&out)?.next().is_some() {
+    if out.exists() && std::fs::read_dir(out)?.next().is_some() {
         bail!("output directory {} is not empty", out.display());
     }
-    std::fs::create_dir_all(&out)?;
+    std::fs::create_dir_all(out)?;
 
     // git init
     let _git_dir = out.join(".git");
     let status = Command::new("git")
         .args(["init", "--quiet"])
-        .current_dir(&out)
+        .current_dir(out)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -70,7 +71,7 @@ pub async fn run(
     ] {
         Command::new("git")
             .args(["config", key, val])
-            .current_dir(&out)
+            .current_dir(out)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
@@ -90,7 +91,7 @@ pub async fn run(
     // Pipe the stream to `git fast-import`.
     let mut child = Command::new("git")
         .args(["fast-import", "--quiet", "--done"])
-        .current_dir(&out)
+        .current_dir(out)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -105,13 +106,13 @@ pub async fn run(
 
     let status = child.wait().context("waiting for git fast-import")?;
     if !status.success() {
-        bail!("git fast-import failed (exit {})", status);
+        bail!("git fast-import failed (exit {status})");
     }
 
     // Checkout the main branch so it's a working tree.
     Command::new("git")
         .args(["checkout", "-f", "main"])
-        .current_dir(&out)
+        .current_dir(out)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
@@ -119,7 +120,7 @@ pub async fn run(
     // Verify with git fsck.
     let fsck = Command::new("git")
         .args(["fsck", "--full", "--strict"])
-        .current_dir(&out)
+        .current_dir(out)
         .output()
         .context("running git fsck")?;
     if !fsck.status.success() {
@@ -132,12 +133,11 @@ pub async fn run(
     // Print the HEAD commit for verification.
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(&out)
+        .current_dir(out)
         .output()?;
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     println!(
-        "synth OK: {} commits, {} files, HEAD={}",
-        n_commits, n_files, head
+        "synth OK: {n_commits} commits, {n_files} files, HEAD={head}"
     );
 
     Ok(())
@@ -160,7 +160,7 @@ impl Rng {
         x ^= x << 25;
         x ^= x >> 27;
         self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     /// [0, n)
     fn below(&mut self, n: u64) -> u64 {
@@ -262,7 +262,7 @@ fn generate_stream(
         let commit_mark = next_mark;
         next_mark += 1;
 
-        let ts = 1262304000 + commit_num * 60; // 2020-01-01 + 1min per commit
+        let ts = 1_262_304_000 + commit_num * 60; // 2020-01-01 + 1min per commit
         let ts_str = format!("{ts} +0000");
 
         w.write_str(&format!("commit {main}\n"));
@@ -330,7 +330,7 @@ fn message_for(n: u64) -> String {
 fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) -> (String, Vec<u8>) {
     // Distribute files across directories: dir_0/, dir_1/, ...
     let dir = file_idx / 100;
-    let is_binary = binary && (file_idx % 13 == 0);
+    let is_binary = binary && file_idx.is_multiple_of(13);
     let ext = if is_binary { "bin" } else { "txt" };
     let path = format!("src/dir_{dir}/file_{file_idx:05}.{ext}");
 
@@ -345,10 +345,11 @@ fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) ->
         let lines = 3 + (rng.next_u64() % 20) as usize;
         let mut s = String::with_capacity(lines * 40);
         for i in 0..lines {
-            s.push_str(&format!(
-                "line {i} of file {file_idx} at commit {commit_num}: {:016x}\n",
+            let _ = writeln!(
+                s,
+                "line {i} of file {file_idx} at commit {commit_num}: {:016x}",
                 rng.next_u64()
-            ));
+            );
         }
         s.into_bytes()
     };
@@ -415,20 +416,16 @@ mod tests {
         assert!(text.contains("blob\nmark :"));
     }
 
-    #[tokio::test]
-    async fn synth_s_produces_valid_repo() {
+    #[test]
+    fn synth_s_produces_valid_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("repo");
-        run(out.clone(), SynthSize::S, None, None, Some(999))
-            .await
-            .unwrap();
+        run(&out, SynthSize::S, None, None, Some(999)).unwrap();
 
         // Same seed → same HEAD.
         let tmp2 = tempfile::tempdir().unwrap();
         let out2 = tmp2.path().join("repo");
-        run(out2, SynthSize::S, None, None, Some(999))
-            .await
-            .unwrap();
+        run(&out2, SynthSize::S, None, None, Some(999)).unwrap();
 
         let head1 = git_head(&out).unwrap();
         let head2 = git_head2(&tmp2).unwrap();

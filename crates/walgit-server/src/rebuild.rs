@@ -352,7 +352,7 @@ pub async fn rebuild_base(
         if let Some(p) = already
             && p.tier == 2
             && (p.has_bitmap || info.history_of.is_some())
-            && supersedes_left.as_ref().is_none_or(|s| s.is_empty())
+            && supersedes_left.as_ref().is_none_or(std::vec::Vec::is_empty)
         {
             log(format!(
                 "pack {hex} is already live as tier 2: not re-published"

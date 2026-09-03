@@ -175,9 +175,9 @@ impl RemotePacks {
         if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().to_string();
-                if let Some(stem) = name.strip_suffix(".idx") {
-                    if !live.contains(stem) {
-                        if let Err(err) = tokio::fs::remove_file(e.path()).await {
+                if let Some(stem) = name.strip_suffix(".idx")
+                    && !live.contains(stem)
+                        && let Err(err) = tokio::fs::remove_file(e.path()).await {
                             // On Windows a delete of a still-mapped index fails
                             // (ACCESS_DENIED / USER_MAPPED_FILE) while the previous
                             // RemotePacks or an in-flight request holds it; it is
@@ -190,8 +190,6 @@ impl RemotePacks {
                                 "stale pack index kept: delete deferred to the next refresh"
                             );
                         }
-                    }
-                }
             }
         }
         // An index the Serve level already installed (linked/local base) is
@@ -206,11 +204,10 @@ impl RemotePacks {
                 .join("objects")
                 .join("pack")
                 .join(format!("pack-{}.idx", p.checksum));
-            if installed.is_file() {
-                if std::fs::hard_link(&installed, &dest).is_err() {
+            if installed.is_file()
+                && std::fs::hard_link(&installed, &dest).is_err() {
                     let _ = std::fs::copy(&installed, &dest);
                 }
-            }
         }
         let done = Arc::new(AtomicU64::new(0));
         let missing: Vec<&PackRef> = manifest
@@ -285,7 +282,7 @@ impl RemotePacks {
             let size = if p.pack_size > 0 {
                 p.pack_size
             } else {
-                store.head(&key).await?.map(|m| m.size).unwrap_or(0)
+                store.head(&key).await?.map_or(0, |m| m.size)
             };
             packs.push(RemotePack {
                 checksum: p.checksum.clone(),
@@ -327,7 +324,7 @@ impl RemotePacks {
         self.packs.iter().map(|p| p.checksum.as_str()).collect()
     }
     pub fn total_objects(&self) -> u64 {
-        self.packs.iter().map(|p| p.idx.num_objects() as u64).sum()
+        self.packs.iter().map(|p| u64::from(p.idx.num_objects())).sum()
     }
 
     /// Locate an object: (pack index, pack offset).
@@ -626,7 +623,7 @@ fn varint(d: &[u8], mut i: usize) -> Result<(u64, usize), &'static str> {
     loop {
         let b = *d.get(i).ok_or("delta header truncated")?;
         i += 1;
-        v |= ((b & 0x7f) as u64) << shift;
+        v |= u64::from(b & 0x7f) << shift;
         shift += 7;
         if b & 0x80 == 0 {
             return Ok((v, i));
@@ -660,7 +657,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
             let mut nb = |shift: u32| -> Result<u64, &'static str> {
                 let b = *delta.get(i).ok_or("delta copy truncated")?;
                 i += 1;
-                Ok((b as u64) << shift)
+                Ok(u64::from(b) << shift)
             };
             if cmd & 0x01 != 0 {
                 ofs |= nb(0)?;
@@ -718,23 +715,6 @@ pub fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", U[i])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn delta_roundtrip_insert_and_copy() {
-        let base = b"hello world, this is the base object";
-        // header: base size, result size; then copy 0..5 from base, insert "!!", copy 5..12
-        let mut d = vec![base.len() as u8, 5 + 2 + 7];
-        d.extend([0x90, 5]); // copy ofs=0 (no ofs bytes), size=5 (0x10 flag)
-        d.extend([2, b'!', b'!']);
-        d.extend([0x91, 5, 7]); // copy ofs=5 size=7
-        let out = apply_delta(base, &d).unwrap();
-        assert_eq!(out, b"hello!! world,");
     }
 }
 
@@ -813,5 +793,22 @@ impl walgit_git::ObjectFaulter for Faulter {
             }
             .instrument(span),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_roundtrip_insert_and_copy() {
+        let base = b"hello world, this is the base object";
+        // header: base size, result size; then copy 0..5 from base, insert "!!", copy 5..12
+        let mut d = vec![base.len() as u8, 5 + 2 + 7];
+        d.extend([0x90, 5]); // copy ofs=0 (no ofs bytes), size=5 (0x10 flag)
+        d.extend([2, b'!', b'!']);
+        d.extend([0x91, 5, 7]); // copy ofs=5 size=7
+        let out = apply_delta(base, &d).unwrap();
+        assert_eq!(out, b"hello!! world,");
     }
 }

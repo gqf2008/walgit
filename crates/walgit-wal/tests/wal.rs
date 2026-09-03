@@ -10,7 +10,7 @@
 // #[test] fns are not covered by allow-*-in-tests, so each test target opts out.
 //! Integration tests for walgit-wal.
 //!
-//! Uses MemoryStore + real LocalRepo tempdir + upstream git to create
+//! Uses `MemoryStore` + real `LocalRepo` tempdir + upstream git to create
 //! objects/packs.
 
 use std::collections::HashMap;
@@ -43,13 +43,11 @@ fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output
         .stderr(Stdio::piped())
         .output()
         .expect("run upstream git");
-    if !up.status.success() {
-        panic!(
-            "git {first:?} failed: {} — stderr: {}",
-            up.status,
-            String::from_utf8_lossy(&up.stderr)
-        );
-    }
+    assert!(up.status.success(), 
+        "git {first:?} failed: {} — stderr: {}",
+        up.status,
+        String::from_utf8_lossy(&up.stderr)
+    );
 
     let mut down = Command::new("git")
         .args(second)
@@ -65,13 +63,11 @@ fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output
         let _ = stdin.write_all(&up.stdout);
     }
     let out = down.wait_with_output().expect("wait downstream git");
-    if !out.status.success() {
-        panic!(
-            "git {second:?} failed: {} — stderr: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert!(out.status.success(), 
+        "git {second:?} failed: {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     out
 }
 
@@ -916,7 +912,7 @@ async fn test_orphan_log_invisible_and_cleaned() {
         .store()
         .put(
             &orphan_key,
-            bytes::Bytes::from(orphan_bytes).into(),
+            orphan_bytes.into(),
             walgit_store::PutMode::Create.into(),
         )
         .await
@@ -1630,7 +1626,7 @@ async fn test_serve_level_remote_serves_base_without_mount() {
     assert_eq!(stats.objects, 3, "{stats:?}");
     let (faulted, rounds) = faulter.stats();
     assert!(
-        faulted >= 1 && faulted <= 3,
+        (1..=3).contains(&faulted),
         "faulted {faulted} (parent commit + root tree)"
     );
     assert!(rounds <= 3);
@@ -2036,7 +2032,7 @@ async fn test_history_pack_keeps_tree_walks_local() {
 
 /// A long-lived read guard (a clone streaming for minutes) plus a pack
 /// removal that wants the write lock must not block new refs-level syncs:
-/// a queued writer on a tokio RwLock stalls every new reader (prod: info/refs
+/// a queued writer on a tokio `RwLock` stalls every new reader (prod: info/refs
 /// waited 60–680 s behind one 24-minute clone). Removal is try-only now.
 #[tokio::test]
 async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
