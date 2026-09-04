@@ -9,8 +9,7 @@
 //! 服务控制:macOS shell 到 walgit-ensure(screen 保活);Windows/Linux
 //!          部署目录下的 walgit(.exe) 分离进程 + pidfile。
 //! 健康检查:内置裸 HTTP(loopback),零额外依赖。
-//! 打开 Web UI:优先把已开的 walgit 页面窗口激活到前台(wmctrl /
-//!      PowerShell AppActivate,按窗口标题匹配),找不到才新开页面。
+//! 打开 Web UI:直接开新页面(三平台一致)。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -280,33 +279,9 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
 
 // ---------- 打开 Web UI(不重复开页) ----------
 
-/// 已有浏览器在运行时:优先把标题含 walgit 的窗口激活到前台(wmctrl /
-/// PowerShell AppActivate);失败也只激活浏览器,绝不在有浏览器运行时新开页。
+/// 打开 Web UI:直接开新页面(三平台一致)。
 fn open_web() {
-    #[allow(unused_variables)]
-    let page_title = "walgit";
-    #[cfg(target_os = "linux")]
-    {
-        // wmctrl -a <串>:激活标题含该串的窗口(需 wmctrl;没有则跳过)
-        let (code, _) = sh(&format!(
-            "command -v wmctrl >/dev/null && wmctrl -a '{page_title}'"
-        ));
-        if code == 0 {
-            log_line("web: activated existing window (wmctrl)");
-            return;
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let (code, _) = sh(&format!(
-            "powershell -NoProfile -Command \"(New-Object -ComObject WScript.Shell).AppActivate('{page_title}')\""
-        ));
-        if code == 0 {
-            log_line("web: activated existing window (AppActivate)");
-            return;
-        }
-    }
-    log_line("web: opening new page");
+    log_line("web: opening page");
     let url = "http://127.0.0.1:8081/";
     #[cfg(target_os = "macos")]
     sh(&format!("open '{url}'"));
