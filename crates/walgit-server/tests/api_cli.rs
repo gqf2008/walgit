@@ -102,7 +102,8 @@ async fn repo_http_reads_round_trip() -> Result<()> {
     )
     .await?;
 
-    // commits / commit / overview / tasks.
+    // commits / commit / merge-base / diff / blame / ref-by-name / archive /
+    // ops / owners — the rest of the repo-scoped read surface.
     run(
         RepoAction::Commits {
             repo: "t/cli".into(),
@@ -119,15 +120,96 @@ async fn repo_http_reads_round_trip() -> Result<()> {
     run(
         RepoAction::Commit {
             repo: "t/cli".into(),
-            sha,
+            sha: sha.clone(),
             conn: conn.clone(),
         },
         &cfg,
     )
     .await?;
     run(
+        RepoAction::MergeBase {
+            repo: "t/cli".into(),
+            from: "main".into(),
+            to: "main".into(),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Diff {
+            repo: "t/cli".into(),
+            from: sha.clone(),
+            to: "main".into(),
+            format: None,
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Blame {
+            repo: "t/cli".into(),
+            rev: "main".into(),
+            path: "f0_0.txt".into(),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Ref {
+            repo: "t/cli".into(),
+            name: "refs/heads/main".into(),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    let archive = tempfile::tempdir()?;
+    let archive_file = archive.path().join("a.tar.gz");
+    run(
+        RepoAction::Archive {
+            repo: "t/cli".into(),
+            rev: "main".into(),
+            format: None,
+            out: Some(archive_file.clone()),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    assert!(
+        std::fs::metadata(&archive_file)?.len() > 0,
+        "the archive carries bytes"
+    );
+    run(
         RepoAction::Overview {
             repo: "t/cli".into(),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Ops {
+            repo: "t/cli".into(),
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Owners {
+            owner: None,
+            conn: conn.clone(),
+        },
+        &cfg,
+    )
+    .await?;
+    run(
+        RepoAction::Owners {
+            owner: Some("t".into()),
             conn: conn.clone(),
         },
         &cfg,

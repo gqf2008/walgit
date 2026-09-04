@@ -319,6 +319,96 @@ pub enum RepoAction {
         #[command(flatten)]
         conn: Conn,
     },
+    /// One ref by its full name, over HTTP (`refs/heads/main`).
+    Ref {
+        /// `owner/name`.
+        repo: String,
+        /// Full ref name.
+        name: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The merge base of two revisions, over HTTP (`null` = unrelated).
+    MergeBase {
+        /// `owner/name`.
+        repo: String,
+        /// The `from` revision.
+        from: String,
+        /// The `to` revision.
+        to: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The diff of two revisions, over HTTP (default format: `patch`).
+    Diff {
+        /// `owner/name`.
+        repo: String,
+        /// The `from` revision.
+        from: String,
+        /// The `to` revision.
+        to: String,
+        /// Response format as the API defines it (default: `patch`).
+        #[arg(long)]
+        format: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Line-by-line authorship of one file, over HTTP.
+    Blame {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to blame at.
+        rev: String,
+        /// Path inside the tree.
+        path: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Download a revision as an archive (`tar.gz` by default): `--out FILE`
+    /// writes the bytes, default streams them to stdout.
+    Archive {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to archive.
+        rev: String,
+        /// Archive format as the API defines it (default: `tar.gz`).
+        #[arg(long)]
+        format: Option<String>,
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The operations this host can run on the repository, over HTTP.
+    Ops {
+        /// `owner/name`.
+        repo: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Start one named operation (`walgit repo ops` lists them) and follow
+    /// its live packet stream to the terminal result. Repeatable
+    /// `--arg k=v` pairs travel as query parameters.
+    OpStart {
+        /// `owner/name`.
+        repo: String,
+        /// Operation name.
+        op: String,
+        /// Operation parameter, `k=v` (repeatable).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Host-level discovery over HTTP: no argument lists the owners, an
+    /// argument lists that owner's repositories.
+    Owners {
+        /// An owner (default: list every owner).
+        owner: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// Resolve a revision to an oid over HTTP.
     Resolve {
         /// `owner/name`.
@@ -622,6 +712,14 @@ fn is_host_read(command: &Command) -> bool {
         command,
         Command::Repo {
             action: RepoAction::Refs { .. }
+                | RepoAction::Ref { .. }
+                | RepoAction::MergeBase { .. }
+                | RepoAction::Diff { .. }
+                | RepoAction::Blame { .. }
+                | RepoAction::Archive { .. }
+                | RepoAction::Ops { .. }
+                | RepoAction::OpStart { .. }
+                | RepoAction::Owners { .. }
                 | RepoAction::Resolve { .. }
                 | RepoAction::Tree { .. }
                 | RepoAction::Blob { .. }

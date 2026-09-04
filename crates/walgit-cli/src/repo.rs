@@ -18,6 +18,14 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
     // bucket credentials, no local cache dir. Everything else stays
     // store-direct (the maintaining-host shape).
     if let RepoAction::Refs { .. }
+    | RepoAction::Ref { .. }
+    | RepoAction::MergeBase { .. }
+    | RepoAction::Diff { .. }
+    | RepoAction::Blame { .. }
+    | RepoAction::Archive { .. }
+    | RepoAction::Ops { .. }
+    | RepoAction::OpStart { .. }
+    | RepoAction::Owners { .. }
     | RepoAction::Resolve { .. }
     | RepoAction::Tree { .. }
     | RepoAction::Blob { .. }
@@ -109,6 +117,14 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
         // Host-backed reads never reach here: `repo::run` routes them to
         // `http::run` before the store is opened.
         RepoAction::Refs { .. }
+        | RepoAction::Ref { .. }
+        | RepoAction::MergeBase { .. }
+        | RepoAction::Diff { .. }
+        | RepoAction::Blame { .. }
+        | RepoAction::Archive { .. }
+        | RepoAction::Ops { .. }
+        | RepoAction::OpStart { .. }
+        | RepoAction::Owners { .. }
         | RepoAction::Resolve { .. }
         | RepoAction::Tree { .. }
         | RepoAction::Blob { .. }
@@ -242,6 +258,12 @@ mod http {
         let path = api_path(repo, &format!("/tasks/{}", enc(id, false)))?;
         let url = format!("{}{}", base(conn), path);
         let resp = request(conn, &url, true).await?;
+        drain_sse(resp).await
+    }
+
+    /// Read an SSE packet stream, pretty-printing each event; a terminal
+    /// `error` event fails, `result` ends the stream cleanly.
+    async fn drain_sse(resp: reqwest::Response) -> Result<()> {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         loop {
@@ -276,7 +298,9 @@ mod http {
                 Some(k @ ("branches" | "tags" | "all" | "collab")) => {
                     print_json(&conn, &api_path(&repo, &format!("/refs/{k}"))?).await
                 }
-                Some(other) => bail!("unknown ref kind `{other}` (expected branches, tags, all or collab)"),
+                Some(other) => {
+                    bail!("unknown ref kind `{other}` (expected branches, tags, all or collab)")
+                }
             },
             RepoAction::Resolve { repo, rev, conn } => {
                 print_json(
@@ -353,6 +377,112 @@ mod http {
             RepoAction::Tasks { repo, follow, conn } => match follow {
                 Some(id) => follow_task(&conn, &repo, &id).await,
                 None => print_json(&conn, &api_path(&repo, "/tasks")?).await,
+            },
+            RepoAction::Ref { repo, name, conn } => {
+                print_json(
+                    &conn,
+                    &api_path(&repo, &format!("/refs/name/{}", enc(&name, true)))?,
+                )
+                .await
+            }
+            RepoAction::MergeBase {
+                repo,
+                from,
+                to,
+                conn,
+            } => {
+                let suffix = format!(
+                    "/merge-base?from={}&to={}",
+                    enc(&from, true),
+                    enc(&to, true)
+                );
+                print_json(&conn, &api_path(&repo, &suffix)?).await
+            }
+            RepoAction::Diff {
+                repo,
+                from,
+                to,
+                format,
+                conn,
+            } => {
+                let mut suffix = format!("/diff?from={}&to={}", enc(&from, true), enc(&to, true));
+                if let Some(f) = format {
+                    let _ = write!(suffix, "&format={}", enc(&f, true));
+                }
+                print_json(&conn, &api_path(&repo, &suffix)?).await
+            }
+            RepoAction::Blame {
+                repo,
+                rev,
+                path,
+                conn,
+            } => {
+                let suffix = format!("/blame/{}/{}", enc(&rev, false), enc(&path, true));
+                print_json(&conn, &api_path(&repo, &suffix)?).await
+            }
+            RepoAction::Archive {
+                repo,
+                rev,
+                format,
+                out,
+                conn,
+            } => {
+                let mut suffix = format!("/archive/{}", enc(&rev, false));
+                if let Some(f) = format {
+                    let _ = write!(suffix, "?format={}", enc(&f, true));
+                }
+                let url = format!("{}{}", base(&conn), api_path(&repo, &suffix)?);
+                let bytes = request(&conn, &url, false).await?.bytes().await?;
+                match out {
+                    Some(file) => std::fs::write(file, &bytes)?,
+                    None => std::io::stdout().write_all(&bytes)?,
+                }
+                Ok(())
+            }
+            RepoAction::Ops { repo, conn } => print_json(&conn, &api_path(&repo, "/ops")?).await,
+            RepoAction::OpStart {
+                repo,
+                op,
+                args,
+                conn,
+            } => {
+                let mut suffix = format!("/ops/{}", enc(&op, false));
+                for (i, a) in args.iter().enumerate() {
+                    let (k, v) = a
+                        .split_once('=')
+                        .ok_or_else(|| anyhow::anyhow!("--arg must be `k=v`, got `{a}`"))?;
+                    let _ = write!(
+                        suffix,
+                        "{}{}={}",
+                        if i == 0 { '?' } else { '&' },
+                        enc(k, true),
+                        enc(v, true)
+                    );
+                }
+                let url = format!("{}{}", base(&conn), api_path(&repo, &suffix)?);
+                let resp = request(&conn, &url, true).await?;
+                // Ops answer like tasks: SSE packets, or plain JSON when fast.
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                if content_type.contains("text/event-stream") {
+                    drain_sse(resp).await
+                } else {
+                    let body = resp.text().await?;
+                    let v: Value = serde_json::from_str(&body)
+                        .map_err(|e| anyhow::anyhow!("{url} returned non-JSON: {e}\n{body}"))?;
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    Ok(())
+                }
+            }
+            RepoAction::Owners { owner, conn } => match owner {
+                None => print_json(&conn, "/api/v1/owners").await,
+                Some(o) => {
+                    print_json(&conn, &format!("/api/v1/owners/{}/repos", enc(&o, false))).await
+                }
             },
             // repo::run filters the store-backed actions out before calling
             // here; an anyhow message instead of a panic keeps the binary
