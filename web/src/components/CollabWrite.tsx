@@ -83,9 +83,13 @@ export function CollabWriteBox({ full, id, parent, onPosted }: CollabWriteProps)
           : kind === "comment"
             ? { text }
             : kind === "review"
-              ? { decision }
+              ? text.trim() !== ""
+                ? { decision, note: text }
+                : { decision }
               : kind === "status"
-                ? { status }
+                ? text.trim() !== ""
+                  ? { status, note: text }
+                  : { status }
                 : { message: text };
       const refs = kind === "patch" ? { base, head } : undefined;
       const entry = await api.collabBuildEntry(full, {
