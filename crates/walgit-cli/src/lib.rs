@@ -21,7 +21,7 @@ mod compact;
 mod import;
 mod import_direct;
 mod mirror;
-mod repo;
+pub mod repo;
 mod serve;
 #[cfg(test)]
 mod testutil;
@@ -270,8 +270,18 @@ enum BundleAction {
     },
 }
 
+#[derive(Clone, clap::Args)]
+pub struct Conn {
+    /// Host base URL (default: `$WALGIT_URL` or `http://127.0.0.1:8080`).
+    #[arg(long, env = "WALGIT_URL")]
+    pub url: Option<String>,
+    /// Bearer token (default: `$WALGIT_TOKEN`).
+    #[arg(long, env = "WALGIT_TOKEN")]
+    pub token: Option<String>,
+}
+
 #[derive(Subcommand)]
-enum RepoAction {
+pub enum RepoAction {
     /// Create a new repository.
     Create {
         /// `owner/name`.
@@ -298,10 +308,192 @@ enum RepoAction {
         #[command(subcommand)]
         action: SettingsAction,
     },
+    /// Refs of a repository over HTTP: no kind prints the head summary;
+    /// a kind (`branches`, `tags`, `all`, `collab`) lists that namespace
+    /// (paged server-side, O(refs) never on the request path).
+    Refs {
+        /// `owner/name`.
+        repo: String,
+        /// `branches`, `tags`, `all` or `collab` (default: the head summary).
+        kind: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One ref by its full name, over HTTP (`refs/heads/main`).
+    Ref {
+        /// `owner/name`.
+        repo: String,
+        /// Full ref name.
+        name: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The merge base of two revisions, over HTTP (`null` = unrelated).
+    MergeBase {
+        /// `owner/name`.
+        repo: String,
+        /// The `from` revision.
+        from: String,
+        /// The `to` revision.
+        to: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The diff of two revisions, over HTTP (default format: `patch`).
+    Diff {
+        /// `owner/name`.
+        repo: String,
+        /// The `from` revision.
+        from: String,
+        /// The `to` revision.
+        to: String,
+        /// Response format as the API defines it (default: `patch`).
+        #[arg(long)]
+        format: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Line-by-line authorship of one file, over HTTP.
+    Blame {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to blame at.
+        rev: String,
+        /// Path inside the tree.
+        path: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Download a revision as an archive (`tar.gz` by default): `--out FILE`
+    /// writes the bytes, default streams them to stdout.
+    Archive {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to archive.
+        rev: String,
+        /// Archive format as the API defines it (default: `tar.gz`).
+        #[arg(long)]
+        format: Option<String>,
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// The operations this host can run on the repository, over HTTP.
+    Ops {
+        /// `owner/name`.
+        repo: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Start one named operation (`walgit repo ops` lists them) and follow
+    /// its live packet stream to the terminal result. Repeatable
+    /// `--arg k=v` pairs travel as query parameters.
+    OpStart {
+        /// `owner/name`.
+        repo: String,
+        /// Operation name.
+        op: String,
+        /// Operation parameter, `k=v` (repeatable).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Host-level discovery over HTTP: no argument lists the owners, an
+    /// argument lists that owner's repositories.
+    Owners {
+        /// An owner (default: list every owner).
+        owner: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Resolve a revision to an oid over HTTP.
+    Resolve {
+        /// `owner/name`.
+        repo: String,
+        /// Revision (branch, sha, `HEAD`).
+        rev: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One directory of the tree, over HTTP.
+    Tree {
+        /// `owner/name`.
+        repo: String,
+        /// Revision to look at.
+        rev: String,
+        /// Path inside the tree (default: the root).
+        #[arg(default_value = "")]
+        path: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One blob: `--raw` prints the bytes, default prints the JSON envelope.
+    Blob {
+        /// `owner/name`.
+        repo: String,
+        /// Revision the path is looked at.
+        rev: String,
+        /// Path inside the tree.
+        path: String,
+        /// Print the raw bytes instead of the JSON envelope.
+        #[arg(long)]
+        raw: bool,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Recent commits of a ref, over HTTP.
+    Commits {
+        /// `owner/name`.
+        repo: String,
+        /// Ref or revision (default: HEAD).
+        #[arg(long = "ref")]
+        ref_: Option<String>,
+        /// Page size (1..=200, default 35).
+        #[arg(long)]
+        n: Option<u32>,
+        /// Skip this many commits.
+        #[arg(long)]
+        skip: Option<u32>,
+        /// Only commits touching this path.
+        #[arg(long)]
+        path: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// One commit with its diff stat, over HTTP.
+    Commit {
+        /// `owner/name`.
+        repo: String,
+        /// Commit sha.
+        sha: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Repository overview (head seq, pack set, health), over HTTP.
+    Overview {
+        /// `owner/name`.
+        repo: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// List the repository's tasks, or `--follow <id>` to stream one task's
+    /// live packet log (notice/progress/terminal result|error) over SSE.
+    Tasks {
+        /// `owner/name`.
+        repo: String,
+        /// Stream this task's packets instead of listing tasks.
+        #[arg(long)]
+        follow: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
+    },
 }
 
 #[derive(Subcommand)]
-enum SettingsAction {
+pub enum SettingsAction {
     /// Print the settings document (and revision/author), or "(none)".
     Show {
         /// `owner/name`.
@@ -334,7 +526,7 @@ enum SettingsAction {
 }
 
 #[derive(Subcommand)]
-enum PolicyAction {
+pub enum PolicyAction {
     /// Print the policy (empty document if none is set).
     Get {
         /// `owner/name`.
@@ -494,7 +686,15 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("another rustls crypto provider was already installed"))?;
 
-    let cfg = load_config(config);
+    let cfg = if is_host_read(&command) && !config.exists() {
+        // The `walgit repo` HTTP reads (issue #61) speak to a running host
+        // and never touch the bucket or the cache — they owe nothing to a
+        // config file. Everything else keeps the fail-closed rule above:
+        // a typo'd --config must not open a default bucket.
+        Config::default()
+    } else {
+        load_config(config)
+    };
     tracing_init(&cfg);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -502,6 +702,33 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .build()?;
 
     rt.block_on(async move { dispatch(command, cfg).await })
+}
+
+/// True only for the `walgit repo` HTTP reads (issue #61): commands that talk
+/// to a running host and never open the bucket or the cache, so a missing
+/// config file must not stop them.
+fn is_host_read(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Repo {
+            action: RepoAction::Refs { .. }
+                | RepoAction::Ref { .. }
+                | RepoAction::MergeBase { .. }
+                | RepoAction::Diff { .. }
+                | RepoAction::Blame { .. }
+                | RepoAction::Archive { .. }
+                | RepoAction::Ops { .. }
+                | RepoAction::OpStart { .. }
+                | RepoAction::Owners { .. }
+                | RepoAction::Resolve { .. }
+                | RepoAction::Tree { .. }
+                | RepoAction::Blob { .. }
+                | RepoAction::Commits { .. }
+                | RepoAction::Commit { .. }
+                | RepoAction::Overview { .. }
+                | RepoAction::Tasks { .. }
+        }
+    )
 }
 
 async fn dispatch(command: Command, cfg: Config) -> Result<()> {

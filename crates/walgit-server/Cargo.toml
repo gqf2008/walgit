@@ -73,6 +73,8 @@ libc.workspace = true
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 ed25519-dalek.workspace = true
+# The `walgit repo` HTTP-read commands run against the harness server.
+walgit-cli = { path = "../walgit-cli" }
 
 # The windows ACL read-back assertion in src/tls.rs's tests.
 [target.'cfg(windows)'.dev-dependencies]
