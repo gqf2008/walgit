@@ -78,9 +78,14 @@ fn exe_name() -> &'static str {
 }
 
 fn log_line(s: &str) {
+    let dir = deploy_dir();
+    // home 缺失时退化为相对路径——宁可丢日志也不在 CWD/System32 下建杂散目录
+    if dir.as_os_str().is_empty() {
+        return;
+    }
     // 部署目录首次运行可能不存在:建出来,否则日志被 OpenOptions 静默丢弃。
-    let _ = std::fs::create_dir_all(deploy_dir());
-    let path = deploy_dir().join("tray.log");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tray.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{s}]");
     }
@@ -115,6 +120,8 @@ fn version_of(body: &str) -> String {
 
 // ---------- shell ----------
 
+// POSIX sh:macOS 的 walgit-ensure / open / xdg-open / kill 仍走字符串(真 sh
+// 认单引号);Windows 一律走 run() 的 argv 直传,不过 shell。
 #[cfg(not(target_os = "windows"))]
 fn sh(cmd: &str) -> (i32, String) {
     match std::process::Command::new("sh").arg("-lc").arg(cmd).output() {
@@ -127,9 +134,28 @@ fn sh(cmd: &str) -> (i32, String) {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn sh(cmd: &str) -> (i32, String) {
-    match std::process::Command::new("cmd").args(["/C", cmd]).output() {
+/// 起子进程的统一入口:argv 直传,**不拼 shell 字符串**——Rust std 会给含
+/// 空格/引号的参数做 MSVCRT 式转义,而 cmd 的 /C 只剥最外层一对引号,两者
+/// 规则互不兼容:嵌套引号全灭(`start "" "x"` 挂起、`set "VAR=v"&&` 变垃圾
+/// 变量),cmd 又从不认单引号(`git -C 'x'` fatal)。Windows 侧加
+/// CREATE_NO_WINDOW:GUI 进程每 spawn 一个控制台程序(cmd/git/taskkill)
+/// 不带它就闪一次黑窗。环境变量经 .env() 传,不经 `set`。
+fn run(dir: Option<&std::path::Path>, program: &str, args: &[&str], envs: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
         Ok(o) => (
             o.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&o.stdout).to_string()
@@ -210,11 +236,21 @@ fn service_stop() -> Result<(), String> {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .ok_or_else(|| "no pidfile".to_string())?;
-        let (code, out) = if cfg!(target_os = "windows") {
-            sh(&format!("taskkill /PID {pid} /T /F"))
-        } else {
-            sh(&format!("kill {pid}"))
+        // 双过滤:PID 与映像名同时匹配才杀——裸 /PID 会撞上 pid 复用误杀
+        // 无关进程树(pidfile 在服务崩溃后就是陈旧的)。
+        #[cfg(target_os = "windows")]
+        let (code, out) = {
+            let pid_filter = format!("PID eq {pid}");
+            let name_filter = format!("IMAGENAME eq {}", exe_name());
+            run(
+                None,
+                "taskkill",
+                &["/F", "/T", "/FI", &pid_filter, "/FI", &name_filter],
+                &[],
+            )
         };
+        #[cfg(not(target_os = "windows"))]
+        let (code, out) = sh(&format!("kill {pid}"));
         if code == 0 {
             Ok(())
         } else {
@@ -224,14 +260,15 @@ fn service_stop() -> Result<(), String> {
 }
 
 /// 升级管线(仅由用户点击触发):fetch → ff-merge → 构建 → 备份 → 停 → 换 → 起 → 验证。
+/// 换装阶段任何一步失败都走同一条回滚路径(还原备份 → 重启服务),并把回滚
+/// 本身的结果如实写进错误串——不谎报「已回滚」。
 fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
     let repo = repo_dir();
-    let repo_s = repo.to_string_lossy().to_string();
     let bin = deploy_dir().join(exe_name());
 
     report("对齐 main…".into());
-    sh(&format!("git -C '{repo_s}' fetch origin main"));
-    let (mc, mout) = sh(&format!("cd '{repo_s}' && git merge --ff-only origin/main"));
+    let _ = run(Some(&repo), "git", &["fetch", "origin", "main"], &[]);
+    let (mc, mout) = run(Some(&repo), "git", &["merge", "--ff-only", "origin/main"], &[]);
     if mc != 0 {
         log_line(&format!(
             "upgrade: ff-merge FAILED {}",
@@ -241,15 +278,12 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
     }
 
     report("构建中…".into());
-    #[cfg(target_os = "windows")]
-    let (bc, bout) = sh(&format!(
-        // `set "VAR=val"&&`:带引号的 set 才不会把 && 前的空格并进值里
-        "cd /d {repo_s} && set \"RUSTUP_TOOLCHAIN=1.98.0\"&& cargo build --release -p walgit-cli"
-    ));
-    #[cfg(not(target_os = "windows"))]
-    let (bc, bout) = sh(&format!(
-        "cd '{repo_s}' && RUSTUP_TOOLCHAIN=1.98.0 cargo build --release -p walgit-cli"
-    ));
+    let (bc, bout) = run(
+        Some(&repo),
+        "cargo",
+        &["build", "--release", "-p", "walgit-cli"],
+        &[("RUSTUP_TOOLCHAIN", "1.98.0")],
+    );
     if bc != 0 {
         log_line(&format!(
             "upgrade: build FAILED {}",
@@ -257,43 +291,60 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
         ));
         return Err("cargo 构建失败,旧版本继续运行".into());
     }
-    let (_, sha_out) = sh(&format!("cd '{repo_s}' && git rev-parse --short=7 HEAD"));
+    let (_, sha_out) = run(Some(&repo), "git", &["rev-parse", "--short=7", "HEAD"], &[]);
     let sha = sha_out.trim().to_string();
 
     report("换装中…".into());
     let bak = deploy_dir().join("walgit.bak-tray");
     let _ = std::fs::copy(&bin, &bak);
     let _ = service_stop();
-    std::fs::copy(repo.join("target/release").join(exe_name()), &bin)
-        .map_err(|e| format!("copy binary: {e}"))?;
-    service_start()?;
+    let swap = std::fs::copy(repo.join("target/release").join(exe_name()), &bin)
+        .map_err(|e| format!("copy binary: {e}"))
+        .and_then(|_| service_start());
 
-    for _ in 0..15 {
-        if let Some(h) = healthz() {
-            if h.contains(&sha) {
-                log_line(&format!("upgrade: success {sha}"));
-                return Ok(sha);
+    // 健康验证:换装成功才等;15 秒内 /healthz 报出本次 sha 即成功。
+    let healthy = swap.is_ok()
+        && (0..15).any(|_| {
+            let ok = healthz().is_some_and(|h| h.contains(&sha));
+            if !ok {
+                std::thread::sleep(Duration::from_secs(1));
             }
-        }
-        std::thread::sleep(Duration::from_secs(1));
+            ok
+        });
+    if healthy {
+        log_line(&format!("upgrade: success {sha}"));
+        return Ok(sha);
     }
-    log_line("upgrade: health FAIL — rollback");
-    let _ = std::fs::copy(&bak, &bin);
+
+    // 回滚:无论换装死在哪一步,还原备份并尽力重启服务,结果如实报告。
+    let restore = std::fs::copy(&bak, &bin).map_err(|e| format!("restore backup: {e}"));
     let _ = service_stop();
-    let _ = service_start();
-    Err("健康检查未过,已回滚旧版本".into())
+    let restart = service_start();
+    let why = swap.err().unwrap_or_else(|| "健康检查未过".into());
+    log_line(&format!(
+        "upgrade: {why} — rollback restore={restore:?} restart={restart:?}"
+    ));
+    Err(match (restore.is_ok(), restart.is_ok()) {
+        (true, true) => format!("{why},已回滚旧版本并重启"),
+        (true, false) => format!("{why},备份已还原但服务重启失败(托盘菜单「启动服务」重试)"),
+        _ => format!("{why},回滚失败——备份损坏,请重装或手动处理 {}", bak.display()),
+    })
 }
 
 // ---------- 打开 Web UI(不重复开页) ----------
 
-/// 打开 Web UI:直接开新页面(三平台一致)。
+/// 打开 Web UI:直接开新页面(三平台一致)。Windows 用 explorer(GUI 进程,
+/// spawn 立即返回、无控制台、不经 shell——cmd 的 start 经 Rust 参数转义后
+/// 引号全灭,实测会挂起事件循环线程 2 分钟以上)。
 fn open_web() {
     log_line("web: opening page");
     let url = "http://127.0.0.1:8081/";
     #[cfg(target_os = "macos")]
     sh(&format!("open '{url}'"));
     #[cfg(target_os = "windows")]
-    sh(&format!("start \"\" \"{url}\"")); // "" 是占位标题;cmd 不认单引号
+    {
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     sh(&format!("xdg-open '{url}'"));
 }
@@ -400,6 +451,7 @@ struct MenuHandles {
     status: MenuItem,
     toggle: MenuItem,
     upgrade: MenuItem,
+    quit: MenuItem,
 }
 
 struct App {
@@ -473,6 +525,9 @@ impl App {
         h.upgrade.set_enabled(
             self.busy == 0 && self.state != ST_CHECKING && self.state != ST_INSTALLING,
         );
+        // 升级中禁用退出:此刻 exit 会把升级线程杀在 停→换→起 之间,
+        // 服务留下停机且再无托盘可救。
+        h.quit.set_enabled(self.busy != 2);
     }
 }
 
@@ -495,7 +550,13 @@ impl ApplicationHandler<Msg> for App {
                     // 版本串从 healthz 取——轮询线程已带;此处只做占位
                 }
             }
-            Msg::UpdateState(s) => self.state = s,
+            // 升级进行中(busy==2)不接受状态翻转:30 分钟检测线程可能在
+            // 一次超长 cargo build 中把「升级中…」翻回「⬆️ 可升级」。
+            Msg::UpdateState(s) => {
+                if self.busy != 2 {
+                    self.state = s;
+                }
+            }
             Msg::Available(sha) => self.available_sha = sha,
             Msg::Note(n) => self.note = n,
             Msg::Busy(b) => self.busy = b,
@@ -533,12 +594,10 @@ impl ApplicationHandler<Msg> for App {
                         self.rebuild_menu();
                         std::thread::spawn(move || {
                             let repo = repo_dir();
-                            let repo_s = repo.to_string_lossy().to_string();
-                            sh(&format!("git -C '{repo_s}' fetch origin main"));
-                            let (c1, lout) =
-                                sh(&format!("cd '{repo_s}' && git rev-parse HEAD"));
+                            let _ = run(Some(&repo), "git", &["fetch", "origin", "main"], &[]);
+                            let (c1, lout) = run(Some(&repo), "git", &["rev-parse", "HEAD"], &[]);
                             let (c2, rout) =
-                                sh(&format!("cd '{repo_s}' && git rev-parse origin/main"));
+                                run(Some(&repo), "git", &["rev-parse", "origin/main"], &[]);
                             let local = lout.trim().to_string();
                             let remote = rout.trim().to_string();
                             if c1 != 0 || c2 != 0 || local.is_empty() || remote.is_empty() {
@@ -589,7 +648,8 @@ impl ApplicationHandler<Msg> for App {
 
 // ---------- 单实例(Windows) ----------
 
-/// 命名互斥:已有托盘实例在跑则 false。句柄故意泄漏——进程生命周期即持有期。
+/// 命名互斥:已有托盘实例在跑则 false;创建失败(h==0,资源耗尽等)不阻断
+/// 启动——没有单实例保护好过托盘起不来。句柄故意泄漏:进程生命周期即持有期。
 #[cfg(target_os = "windows")]
 fn single_instance_ok() -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -601,7 +661,13 @@ fn single_instance_ok() -> bool {
         .collect();
     unsafe {
         let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        h != 0 && GetLastError() != ERROR_ALREADY_EXISTS
+        // GetLastError 须紧跟 CreateMutexW 取,中间不能夹会改写它的调用
+        let err = GetLastError();
+        if h == 0 {
+            log_line(&format!("single-instance mutex FAILED: os error {err}"));
+            return true;
+        }
+        err != ERROR_ALREADY_EXISTS
     }
 }
 
@@ -612,8 +678,13 @@ fn main() {
         log_line("second instance — exiting");
         return;
     }
-    // GUI 子系统下 panic 无控制台可见,落进 tray.log。
-    std::panic::set_hook(Box::new(|info| log_line(&format!("panic: {info}"))));
+    // GUI 子系统下 panic 无控制台可见,落进 tray.log;链回默认 hook,
+    // debug 构建的控制台输出与 RUST_BACKTRACE 照旧。
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log_line(&format!("panic: {info}"));
+        prev_hook(info);
+    }));
     log_line("tray-rs launched");
 
     // 安装器自启标记(Windows 安装器勾选「开机自动启动」时写):自启的托盘
@@ -659,6 +730,7 @@ fn main() {
             status,
             toggle,
             upgrade,
+            quit,
         }),
         proxy: Some(proxy.clone()),
         running: healthz().is_some(),
@@ -692,10 +764,10 @@ fn main() {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(30));
             loop {
-                let repo = repo_dir().to_string_lossy().to_string();
-                sh(&format!("git -C '{repo}' fetch origin main"));
-                let (c1, lout) = sh(&format!("cd '{repo}' && git rev-parse HEAD"));
-                let (c2, rout) = sh(&format!("cd '{repo}' && git rev-parse origin/main"));
+                let repo = repo_dir();
+                let _ = run(Some(&repo), "git", &["fetch", "origin", "main"], &[]);
+                let (c1, lout) = run(Some(&repo), "git", &["rev-parse", "HEAD"], &[]);
+                let (c2, rout) = run(Some(&repo), "git", &["rev-parse", "origin/main"], &[]);
                 let local = lout.trim().to_string();
                 let remote = rout.trim().to_string();
                 if c1 == 0 && c2 == 0 && !local.is_empty() && !remote.is_empty() {

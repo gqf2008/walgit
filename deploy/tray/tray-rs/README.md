@@ -40,8 +40,10 @@ Linux 走 appindicator。macOS/Windows 无额外系统依赖。
   或设置 → 个性化 → 任务栏 → 通知区域,设为始终显示。
 - 产物在本目录 `target/release/`——`.cargo/config.toml` 钉住了
   target-dir,不会被仓库根的 cargo 配置重定向到 `walgit/target/`。
-- 「打开 Web UI」用 `start "" <url>`(cmd 只认双引号,`''` 会当文件名
-  弹「找不到文件」错误框)。
+- **子进程不经 shell**:Windows 上 git/cargo/taskkill 一律 argv 直传
+  (`Command::args`,无引号拼装),且带 `CREATE_NO_WINDOW`(GUI 进程 spawn
+  控制台程序不带它就闪黑窗);「打开 Web UI」用 `explorer <url>`——cmd 的
+  `start` 经 Rust 参数转义后嵌套引号全灭,实测挂起事件循环 2 分钟以上。
 
 ## 约定
 
