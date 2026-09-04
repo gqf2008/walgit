@@ -1,0 +1,19 @@
+[package]
+name = "walgit-tray"
+version = "0.1.0"
+edition = "2021"
+description = "walgit 服务托盘(macOS / Windows / Linux)"
+
+[dependencies]
+tray-icon = "0.14"
+winit = "0.30"
+
+[profile.release]
+opt-level = "z"
+strip = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# 独立 crate:不加入 walgit workspace(根 Cargo.toml),自建 target/lock。
+[workspace]
