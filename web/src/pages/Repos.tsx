@@ -11,7 +11,7 @@ export function Repos() {
   return (
     <>
       <h1 className="page-title">
-        <Link to="/">{t("repos.title")}</Link> <span className="muted">/</span> {owner}
+        <Link to="/repos">{t("repos.title")}</Link> <span className="muted">/</span> {owner}
       </h1>
       <Box>
         {repos.length === 0 && (
