@@ -69,22 +69,37 @@ The server holds no CI logic. A runner is a client:
 
 ### Repository reads over HTTP (no bucket credentials)
 
-`walgit repo` also reads a **running host** — any machine, no `walgit.toml`,
-no bucket access; a host URL and (on token/oidc hosts) a bearer suffice:
+`walgit repo` reads a **running host** — any machine, no `walgit.toml`, no
+bucket access; a host URL and (on token/oidc hosts) a bearer suffice:
 
 - Host: `--url` > `$WALGIT_URL` > `http://127.0.0.1:8080`;
   token: `--token` > `$WALGIT_TOKEN`.
+- Discovery: `walgit repo owners` (every owner) / `walgit repo owners <owner>`
+  (that owner's repositories).
 - `walgit repo refs <owner/name> [branches|tags|all|collab]` — head summary
-  or one paged namespace.
+  or one paged namespace; `walgit repo ref <owner/name> <full-ref-name>` —
+  one ref by name.
 - `walgit repo resolve <owner/name> <rev>` — revision → oid.
 - `walgit repo tree <owner/name> <rev> [path]` / `blob … <path> [--raw]` —
   directory listing; blob as JSON envelope or raw bytes.
 - `walgit repo commits <owner/name> [--ref --n --skip --path]` /
   `walgit repo commit <owner/name> <sha>` — history and one commit.
+- `walgit repo merge-base <owner/name> <from> <to>` (`null` = unrelated) /
+  `walgit repo diff <owner/name> <from> <to> [--format]`.
+- `walgit repo blame <owner/name> <rev> <path>`.
+- `walgit repo archive <owner/name> <rev> [--format] [--out FILE]` — the
+  revision as an archive (default `tar.gz`; `--out` writes a file, default
+  streams bytes to stdout).
 - `walgit repo overview <owner/name>` — head seq, pack set, health.
-- `walgit repo tasks <owner/name> [--follow <id>]` — list tasks, or stream
-  one task's live packets (SSE) to its terminal result.
+- `walgit repo tasks <owner/name> [--follow <id>]` / `walgit repo ops
+  <owner/name>` / `walgit repo op-start <owner/name> <op> [--arg k=v]` —
+  task list, the available operations, and starting one with its live
+  packet stream followed to the terminal result.
 - Output is pretty JSON; HTTP ≥ 400 (including 401) is a diagnostic error.
+  This covers the whole repository read + operations surface; what stays
+  HTTP-only is the browser/SDK lane and the admin writes (`settings`/
+  `policy` PUT/DELETE — the CLI's own `repo settings|policy` commands are
+  the bucket-direct maintainer form).
 
 ### Repository management & ops
 
