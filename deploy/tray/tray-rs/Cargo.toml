@@ -15,5 +15,9 @@ strip = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# 单实例命名互斥(仅 Windows 用;版本对齐 tray-icon 传递依赖,不引入新树)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 # 独立 crate:不加入 walgit workspace(根 Cargo.toml),自建 target/lock。
 [workspace]

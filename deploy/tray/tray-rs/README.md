@@ -31,6 +31,18 @@ Linux 走 appindicator。macOS/Windows 无额外系统依赖。
   `%USERPROFILE%\walgit` 放 `walgit.exe` + `walgit.toml`
 - Linux:同 Windows 形态(`~/walgit/`),桌面环境需支持 appindicator
 
+### Windows 说明(issue #68 修复后的行为)
+
+- **release 产物是 GUI 子系统**:双击无控制台黑窗,静默驻留托盘
+  (debug 构建保留控制台,便于排查;panic 均落 `tray.log`)。
+- **单实例**:命名互斥,双击多次第二个实例静默退出,不叠图标。
+- **托盘图标默认可能藏在通知区溢出**(`^` 折叠面板):把它拖到任务栏,
+  或设置 → 个性化 → 任务栏 → 通知区域,设为始终显示。
+- 产物在本目录 `target/release/`——`.cargo/config.toml` 钉住了
+  target-dir,不会被仓库根的 cargo 配置重定向到 `walgit/target/`。
+- 「打开 Web UI」用 `start "" <url>`(cmd 只认双引号,`''` 会当文件名
+  弹「找不到文件」错误框)。
+
 ## 约定
 
 - 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`)

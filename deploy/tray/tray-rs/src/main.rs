@@ -11,6 +11,10 @@
 //! 健康检查:内置裸 HTTP(loopback),零额外依赖。
 //! 打开 Web UI:直接开新页面(三平台一致)。
 
+// Windows release 不带控制台:双击静默驻留托盘(debug 构建保留控制台便于排查)。
+// 注意 start 引号:cmd 只认双引号,`start "" "url"` 的 "" 是占位标题。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -74,6 +78,8 @@ fn exe_name() -> &'static str {
 }
 
 fn log_line(s: &str) {
+    // 部署目录首次运行可能不存在:建出来,否则日志被 OpenOptions 静默丢弃。
+    let _ = std::fs::create_dir_all(deploy_dir());
     let path = deploy_dir().join("tray.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{s}]");
@@ -237,7 +243,8 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
     report("构建中…".into());
     #[cfg(target_os = "windows")]
     let (bc, bout) = sh(&format!(
-        "cd /d {repo_s} && set RUSTUP_TOOLCHAIN=1.98.0 && cargo build --release -p walgit-cli"
+        // `set "VAR=val"&&`:带引号的 set 才不会把 && 前的空格并进值里
+        "cd /d {repo_s} && set \"RUSTUP_TOOLCHAIN=1.98.0\"&& cargo build --release -p walgit-cli"
     ));
     #[cfg(not(target_os = "windows"))]
     let (bc, bout) = sh(&format!(
@@ -286,7 +293,7 @@ fn open_web() {
     #[cfg(target_os = "macos")]
     sh(&format!("open '{url}'"));
     #[cfg(target_os = "windows")]
-    sh(&format!("start '' '{url}'"));
+    sh(&format!("start \"\" \"{url}\"")); // "" 是占位标题;cmd 不认单引号
     #[cfg(all(unix, not(target_os = "macos")))]
     sh(&format!("xdg-open '{url}'"));
 }
@@ -580,7 +587,33 @@ impl ApplicationHandler<Msg> for App {
     }
 }
 
+// ---------- 单实例(Windows) ----------
+
+/// 命名互斥:已有托盘实例在跑则 false。句柄故意泄漏——进程生命周期即持有期。
+#[cfg(target_os = "windows")]
+fn single_instance_ok() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = std::ffi::OsStr::new("Local\\walgit-tray")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        h != 0 && GetLastError() != ERROR_ALREADY_EXISTS
+    }
+}
+
 fn main() {
+    // 单实例:双击多次不叠图标、不留幽灵进程。
+    #[cfg(target_os = "windows")]
+    if !single_instance_ok() {
+        log_line("second instance — exiting");
+        return;
+    }
+    // GUI 子系统下 panic 无控制台可见,落进 tray.log。
+    std::panic::set_hook(Box::new(|info| log_line(&format!("panic: {info}"))));
     log_line("tray-rs launched");
     let event_loop = EventLoop::<Msg>::with_user_event().build().unwrap();
     let proxy = Arc::new(event_loop.create_proxy());
