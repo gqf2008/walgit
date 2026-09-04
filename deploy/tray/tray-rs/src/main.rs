@@ -615,6 +615,14 @@ fn main() {
     // GUI 子系统下 panic 无控制台可见,落进 tray.log。
     std::panic::set_hook(Box::new(|info| log_line(&format!("panic: {info}"))));
     log_line("tray-rs launched");
+
+    // 安装器自启标记(Windows 安装器勾选「开机自动启动」时写):自启的托盘
+    // 把服务一并拉起——勾选框承诺的是「部署开机可用」,不是只把托盘拉起来。
+    // 仅在服务未运行时尝试一次;失败不重试,留给菜单「启动服务」。
+    if deploy_dir().join("service.autostart").exists() && healthz().is_none() {
+        log_line("autostart marker: starting service");
+        let _ = service_start();
+    }
     let event_loop = EventLoop::<Msg>::with_user_event().build().unwrap();
     let proxy = Arc::new(event_loop.create_proxy());
 
@@ -670,31 +678,41 @@ fn main() {
         let _ = poll_proxy.send_event(Msg::Status(up));
         std::thread::sleep(Duration::from_secs(5));
     });
-    // 自动检测线程(启动 30 秒一次,此后每 30 分钟;静默,失败不打扰)
-    let detect_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(30));
-        loop {
-            let repo = repo_dir().to_string_lossy().to_string();
-            sh(&format!("git -C '{repo}' fetch origin main"));
-            let (c1, lout) = sh(&format!("cd '{repo}' && git rev-parse HEAD"));
-            let (c2, rout) = sh(&format!("cd '{repo}' && git rev-parse origin/main"));
-            let local = lout.trim().to_string();
-            let remote = rout.trim().to_string();
-            if c1 == 0 && c2 == 0 && !local.is_empty() && !remote.is_empty() {
-                if local != remote {
-                    let _ = detect_proxy.send_event(Msg::UpdateState(ST_AVAILABLE));
-                    let _ = detect_proxy.send_event(Msg::Available(
-                        remote[..7.min(remote.len())].to_string(),
-                    ));
+    // 自动检测线程(启动 30 秒一次,此后每 30 分钟;静默,失败不打扰)。
+    // 本机没有源码仓库(安装器部署的机器)就整条停用:检测/升级都依赖
+    // WALGIT_REPO 指向的 checkout + rustup/cargo,没有它只会每 30 分钟
+    // 往 tray.log 写一条 skip 噪音。升级走新 setup.exe。
+    if !repo_dir().exists() {
+        log_line(&format!(
+            "detect: no repo at {} — update checks disabled (set WALGIT_REPO to enable)",
+            repo_dir().display()
+        ));
+    } else {
+        let detect_proxy = event_loop.create_proxy();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            loop {
+                let repo = repo_dir().to_string_lossy().to_string();
+                sh(&format!("git -C '{repo}' fetch origin main"));
+                let (c1, lout) = sh(&format!("cd '{repo}' && git rev-parse HEAD"));
+                let (c2, rout) = sh(&format!("cd '{repo}' && git rev-parse origin/main"));
+                let local = lout.trim().to_string();
+                let remote = rout.trim().to_string();
+                if c1 == 0 && c2 == 0 && !local.is_empty() && !remote.is_empty() {
+                    if local != remote {
+                        let _ = detect_proxy.send_event(Msg::UpdateState(ST_AVAILABLE));
+                        let _ = detect_proxy.send_event(Msg::Available(
+                            remote[..7.min(remote.len())].to_string(),
+                        ));
+                    }
+                    log_line(&format!("detect: local={:.7} remote={:.7}", local, remote));
+                } else {
+                    log_line("detect: skip (git failed)");
                 }
-                log_line(&format!("detect: local={:.7} remote={:.7}", local, remote));
-            } else {
-                log_line("detect: skip (git failed)");
+                std::thread::sleep(Duration::from_secs(1800));
             }
-            std::thread::sleep(Duration::from_secs(1800));
-        }
-    });
+        });
+    }
 
     event_loop.run_app(&mut app).unwrap();
 }
