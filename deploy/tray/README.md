@@ -17,7 +17,7 @@
   `版本 <sha> · 检查更新…` → `正在检查更新…` → `已是最新 ✓(点击重查)`
   → `⬆️ 升级到新版本 <新sha>(当前 <sha>)`(点击才升级)
   → `升级中… · 对齐 main/构建中/换装中` → 成功回「已是最新」/ 失败提示重查
-- **打开 Web UI**:优先激活已开的 walgit 页面/窗口,绝不重复开页
+- **打开 Web UI**:直接打开页面(三平台一致)
 - **退出托盘(服务保持运行)**
 
 ## 升级语义
@@ -56,6 +56,4 @@ cd deploy/tray/tray-rs && cargo build --release
 # 产物 target/release/walgit-tray(.exe),放到部署目录运行即可
 ```
 
-Linux 需要 `libgtk-3-dev`(tray-icon 走 appindicator)。Windows/Linux 上
-「聚焦已开页面」按窗口标题匹配(`walgit`),Linux 需 `wmctrl`、Windows 用
-PowerShell AppActivate;失败时退化为直接打开页面。
+Linux 需要 `libgtk-3-dev`(tray-icon 走 appindicator)。

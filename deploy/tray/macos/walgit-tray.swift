@@ -1,5 +1,6 @@
 // walgit-tray — macOS 菜单栏托盘,管理本机 walgit 服务
 // 功能:启停(walgit-ensure)、新版本自动检测(每 30 分钟 fetch 比对,
+//      打开 Web UI = 直接开页面,与其他平台一致;
 //      发现新版本仅在菜单/通知里提示,由用户点击后才升级:
 //      ff-merge main → cargo 构建 → 热换 → 健康验证,失败回滚)、
 //      退出(仅退出托盘,服务不受影响)。
@@ -68,8 +69,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var updateState = UpdateState.idle
     var availableSha = ""
     var busyNote = ""
-    var deniedBrowsers = Set<String>()
-    var lastReopenOpen = Date.distantPast
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.regular)   // Dock 驻留 + 菜单栏双驻留
@@ -125,13 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 点击 Dock 图标 = 打开 Web UI
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            let now = Date()
-            if now.timeIntervalSince(lastReopenOpen) > 3 {
-                lastReopenOpen = now
-                openWeb()
-            }
-        }
+        if !flag { openWeb() }   // 点击 Dock = 直接打开 Web UI(与菜单一致)
         return true
     }
 
@@ -279,119 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func openWeb() { openWebFocused() }
-
-    /// 打开 Web UI:先在「默认浏览器 + 所有运行中的浏览器」里找 8081 的
-    /// 已开标签并激活(原页面必须显示,绝不另开新页);全都没有才新开。
-    /// 打开 Web UI:先在「默认浏览器 + 所有运行中的浏览器」里找 8081 的
-    /// 已开标签并激活(原页面必须显示,绝不另开新页);全都没有才新开。
-    func openWebFocused() {
-        DispatchQueue.global().async { [weak self] in
-            guard let self else { return }
-            let target = ":8081"
-
-            // 候选次序:系统默认浏览器(open 当初就开在它那里)→ 运行中的
-            // 浏览器进程(动态匹配,不靠固定名单)→ 常用名单兜底。
-            var candidates: [String] = []
-            if let def = self.defaultBrowserName() { candidates.append(def) }
-            for app in NSWorkspace.shared.runningApplications
-            where app.activationPolicy == .regular {
-                if let name = app.localizedName { candidates.append(name) }
-            }
-            candidates.append(contentsOf: ["Google Chrome", "Microsoft Edge", "Safari", "Arc", "Brave Browser"])
-            let keys = ["chrome", "chromium", "edge", "brave", "arc", "vivaldi",
-                        "opera", "safari", "dia", "comet", "quark", "sigma", "browser"]
-            var ordered: [String] = []
-            for c in candidates where !c.isEmpty {
-                let lc = c.lowercased()
-                if keys.contains(where: { lc.contains($0) }), !ordered.contains(c) {
-                    ordered.append(c)
-                }
-            }
-
-            var sawRunningBrowser: String?
-            for browser in ordered {
-                if deniedBrowsers.contains(browser) { continue }
-                let (rc, isRunning) = sh(
-                    "osascript -e 'application \"\(browser)\" is running' 2>&1")
-                guard rc == 0,
-                      isRunning.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
-                else { continue }
-                sawRunningBrowser = sawRunningBrowser ?? browser
-
-                // Edge 等 Chromium 系存在无标签壳窗,「every tab」会 -1728:
-                // 每窗独立 try + count 容错。
-                let safari = browser.lowercased() == "safari"
-                let focus: String = safari
-                    ? "set current tab of w to tab i of w"
-                    : "set active tab index of w to i"
-                let script = """
-                on run argv
-                  set target to item 1 of argv
-                  set found to "none"
-                  tell application "\(browser)"
-                    repeat with w in windows
-                      try
-                        set n to count of tabs of w
-                        repeat with i from 1 to n
-                          if URL of tab i of w contains target then
-                            \(focus)
-                            set index of w to 1
-                            activate
-                            return "found"
-                          end if
-                        end repeat
-                      end try
-                    end repeat
-                  end tell
-                  return found
-                end run
-                """
-                let tmp = NSTemporaryDirectory() + "walgit-focus.applescript"
-                try? script.write(toFile: tmp, atomically: true, encoding: .utf8)
-                let (oc, oout) = sh("osascript '\(tmp)' '\(target)' 2>&1")
-                if oc == 0, oout.contains("found") {
-                    logLine("web: focused existing tab in \(browser)")
-                    return
-                }
-                if oout.contains("Not authorized") || oout.contains("(-1743)")
-                    || oout.contains("not allowed") {
-                    deniedBrowsers.insert(browser)
-                    logLine("web: automation denied for \(browser) — 本会话跳过")
-                } else {
-                    logLine("web: no matching tab in \(browser) (\(oout.suffix(80)))")
-                }
-            }
-
-            // 终局:默认浏览器还在运行 ⇒ 页面大概率就在它里面,只激活、绝不新开;
-            // 真的一个浏览器都没开 ⇒ 才新开页面。
-            if let def = defaultBrowserName() {
-                let (rc, isRunning) = sh(
-                    "osascript -e 'application \"\(def)\" is running' 2>&1")
-                if rc == 0,
-                   isRunning.trimmingCharacters(in: .whitespacesAndNewlines) == "true" {
-                    logLine("web: focus failed but default browser (\(def)) running — activate only")
-                    _ = sh("osascript -e 'tell application \"\(def)\" to activate' 2>&1")
-                    return
-                }
-            }
-            if let b = sawRunningBrowser {
-                logLine("web: focus failed, activate \(b) only")
-                _ = sh("osascript -e 'tell application \"\(b)\" to activate' 2>&1")
-                return
-            }
-            logLine("web: no browser running, opening new page")
-            DispatchQueue.main.async { NSWorkspace.shared.open(webURL) }
-        }
-    }
-
-    /// 系统默认浏览器(http handler)的名字,如 "Google Chrome"。
-    func defaultBrowserName() -> String? {
-        guard let url = URL(string: "http://example.com"),
-              let appURL = NSWorkspace.shared.urlForApplication(toOpen: url)
-        else { return nil }
-        return appURL.lastPathComponent.replacingOccurrences(of: ".app", with: "")
-    }
+    @objc func openWeb() { NSWorkspace.shared.open(webURL) }
 
     @objc func checkUpdateNow() {
         updateState = .checking; refreshButton()
