@@ -33,7 +33,8 @@ Linux 走 appindicator。macOS/Windows 无额外系统依赖。
 
 ## 约定
 
-- 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`)
+- 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`;release 的
+  `walgit-setup-<tag>-x64.exe` 安装器——`deploy/windows/`——会装好全套)
 - 源码仓库:`$WALGIT_REPO`,默认 `/Volumes/Workspace/GitHub/walgit`
 - 服务地址:`http://127.0.0.1:8081`(healthz)
 - 日志:`~/walgit/tray.log`

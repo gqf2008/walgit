@@ -1,6 +1,9 @@
 target/
 *.orig
 
+# Windows installer build output (deploy/windows/installer.iss via ISCC)
+deploy/windows/Output/
+
 # local secrets / environment — never in the repo
 .env
 .env.*

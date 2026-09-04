@@ -46,6 +46,21 @@ jobs:
         shell: bash
       - name: Build release binary
         run: cargo build --release --bin walgit --bin walgit-server
+      - name: Build the tray app (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev && cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
+      - name: Build the tray app (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
+      - name: Build the Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # ISCC is preinstalled on windows runners (PATH via choco shim); the
+          # absolute path is the fallback. Version from the tag (v0.1.0 → 0.1.0).
+          iscc="$(command -v ISCC.exe || echo '/c/Program Files (x86)/Inno Setup 6/ISCC.exe')"
+          tag="${GITHUB_REF#refs/tags/}"
+          "$iscc" "-DMyAppVersion=${tag#v}" deploy/windows/installer.iss
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -53,6 +68,8 @@ jobs:
           path: |
             target/release/walgit${{ runner.os == 'Windows' && '.exe' || '' }}
             target/release/walgit-server${{ runner.os == 'Windows' && '.exe' || '' }}
+            target/release/walgit-tray${{ runner.os == 'Windows' && '.exe' || '' }}
+            ${{ runner.os == 'Windows' && 'deploy/windows/Output/walgit-setup-*.exe' || '' }}
 
   release:
     name: Publish release
