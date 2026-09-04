@@ -58,6 +58,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/services/setup.json", get(setup_json))
         // "API" docs page (SPA route); `/api/v1` is the JSON discovery document (D20).
         .route("/api", get(index_route))
+        // Host-wide repo index (top-nav「仓库」, issue #59); direct open and
+        // refresh must serve index.html like every other page route.
+        .route("/repos", get(index_route))
         .route("/{owner}", get(index_route))
         .route(
             "/{owner}/{repo}",
@@ -244,6 +247,44 @@ pub async fn sdk_asset(req: Request<Body>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `GET|HEAD /SKILL.md` — the AI-agent collaboration guide (D42), the
+/// repository source `web/SKILL.md` served verbatim. Data-free, open like
+/// the SDK: an agent must be able to read it before any session exists.
+/// (axum's `get` route answers HEAD itself, body stripped.)
+pub async fn skill_md(headers: HeaderMap) -> Response {
+    const SKILL: &str = include_str!("../../../../web/SKILL.md");
+    // Strong ETag over the compiled-in bytes: a deploy that changes the text
+    // changes the tag, agents revalidate for free.
+    let etag = format!("\"{:016x}\"", fnv1a64(SKILL.as_bytes()));
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::ETAG, etag.as_str()),
+        ],
+        SKILL,
+    )
+        .into_response()
+}
+
+/// FNV-1a 64 over the bytes — a stable, dependency-free `ETag` for one file.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 /// `GET|HEAD /_ui/{path}` — embedded build output.

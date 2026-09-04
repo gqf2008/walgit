@@ -48,6 +48,15 @@ fn allowed_route(path: &str) -> bool {
         "/services/api/owners",
         "/services/api/owners/{owner}",
         "/api",
+        // Host-wide repo index (issue #59): a page route like /api, and it
+        // reserves the owner name "repos" for the SPA the same way /api
+        // reserves "api" (D42). git operations for such an owner are
+        // unaffected — only the single-segment owner page is shadowed.
+        "/repos",
+        // AI-agent collaboration guide (D42): data-free doc served verbatim,
+        // open like /repos.js; reserves the owner name "SKILL.md" (dot is a
+        // legal owner character) the same way.
+        "/SKILL.md",
         "/{owner}",
     ];
     if allow.contains(&p) {

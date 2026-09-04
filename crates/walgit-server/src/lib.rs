@@ -172,6 +172,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // `<script>` tag on another site before any session exists (D20).
         .route("/repos.js", get(web::ui::sdk_asset))
         .route("/repos.mjs", get(web::ui::sdk_asset))
+        // SKILL.md is the AI-agent collaboration guide (D42): static doc, no
+        // data — open like the SDK so an agent can fetch it before any auth.
+        .route("/SKILL.md", get(web::ui::skill_md))
         // `/services/public/*` is the one open area: data-free routes only, never a
         // bearer, never repo data — today exactly the installer, everything else 404.
         .merge(web::ui::public_router(state.clone()).with_state(()))
