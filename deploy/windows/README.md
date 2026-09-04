@@ -1,8 +1,9 @@
 # walgit Windows 安装程序(deploy/windows)
 
 一个 `setup.exe` 装完即有:walgit 服务二进制 + 系统托盘 + 初始配置。
-Inno Setup 6 脚本(`installer.iss`),CI 在 `release.yml` 的 windows leg 打包,
-release 附件名 `walgit-setup-<tag>-x64.exe`。
+Inno Setup 脚本(`installer.iss`),CI 在 `release.yml` 的 windows leg 打包,
+release 附件名 `walgit-setup-<version>-x64.exe`(version = tag 去掉 `v`,
+如 tag `v0.1.0` → `walgit-setup-0.1.0-x64.exe`)。
 
 ## 装了什么
 
@@ -27,15 +28,19 @@ release 附件名 `walgit-setup-<tag>-x64.exe`。
 
 ## 本机构建
 
-需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)(`ISCC` 在 PATH;
-GitHub Actions windows runner 已预装)。在仓库根:
+需要 [Inno Setup **6.4+**](https://jrsoftware.org/isinfo.php)(`ISCC` 在 PATH;
+脚本用 `x64compatible` 架构值,随库中文语言包为 UTF-8 无 BOM,均需 6.3+,
+isl 自述面向 6.4;GitHub Actions windows runner 已预装)。在仓库根:
 
 ```powershell
 cargo build --release --bin walgit
-cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
+cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Cargo.toml
 ISCC -DMyAppVersion=0.1.0 deploy\windows\installer.iss
 # 产物 deploy/windows/Output/walgit-setup-0.1.0-x64.exe
 ```
 
 版本号 CI 以 tag 覆盖(`-DMyAppVersion=<tag 去掉 v>`),本地缺省
 `0.0.0-dev`。构建产物目录 `deploy/windows/Output/` 已 gitignore。
+
+> 不要「以管理员身份运行」安装器:目录按安装进程的 `%USERPROFILE%` 解析,
+> 提权运行会装进管理员的 profile,当前用户的托盘将找不到部署目录。

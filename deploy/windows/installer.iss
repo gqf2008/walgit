@@ -1,11 +1,6 @@
 ; deploy/windows/installer.iss — walgit Windows 安装程序(Inno Setup 6)。
-;
-; 构建(仓库根,先备好二进制):
-;   cargo build --release --bin walgit
-;   cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
-;   ISCC -DMyAppVersion=0.1.0 deploy\windows\installer.iss
-; 产物:deploy/windows/Output/walgit-setup-<version>-x64.exe
-; CI(release.yml 的 windows leg)以 tag 传版本。形态见 deploy/windows/README.md。
+; 构建方法与产物名见 deploy/windows/README.md(唯一出处);CI(release.yml
+; 的 windows leg)以 tag 去掉 v 传 -DMyAppVersion。
 
 #ifndef MyAppVersion
 #define MyAppVersion "0.0.0-dev"
@@ -27,9 +22,9 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+DefaultGroupName=walgit
 Compression=lzma2/max
-SolidCompression=yes
-; 托盘/服务是我们自己 taskkill 的(见 [Code]),不要弹重启管理器提示
+; 两个大 exe 的载荷,SolidCompression 无尺寸收益只有编译耗时
 CloseApplications=no
 OutputDir=Output
 OutputBaseFilename=walgit-setup-{#MyAppVersion}-x64
@@ -45,14 +40,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 chinesesimplified.AutoStartTask=开机自动启动 walgit 托盘(&A)
 english.AutoStartTask=Start the walgit tray at logon (&A)
-chinesesimplified.DesktopIconTask=创建桌面快捷方式(&D)
-english.DesktopIconTask=Create a desktop shortcut (&D)
 chinesesimplified.LaunchTray=启动 walgit 托盘(服务请在托盘菜单「启动服务」)
 english.LaunchTray=Launch the walgit tray (start the service from its menu)
 
 [Tasks]
 Name: "autostart"; Description: "{cm:AutoStartTask}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "desktopicon"; Description: "{cm:DesktopIconTask}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "..\..\target\release\walgit.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -72,29 +65,56 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchTray}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-procedure KillRunning(const exe: String);
+procedure StopWalgit;
 var
   ResultCode: Integer;
+  // AnsiString:LoadStringFromFile 的 var 参数是这个类型(Unicode string 会
+  // 编译期 Type mismatch);pid 内容是 ASCII 数字,无损。
+  pidbuf: AnsiString;
+  pid: String;
 begin
-  // 正在运行的托盘/服务会锁住要替换的 exe;静默结束,失败忽略(多半本就没在跑)
-  Exec(ExpandConstant('{cmd}'), '/C taskkill /IM "' + exe + '" /T /F', '', SW_HIDE,
-    ewWaitUntilTerminated, ResultCode);
+  // 换文件前结束部署目录自己的实例:
+  // 1) 服务优先按 pidfile + 映像名**双过滤**精确杀——裸 /PID 会撞上 pid
+  //    复用误杀无关进程(taskkill /FI 要求 PID 与 IMAGENAME 同时匹配);
+  // 2) 清扫只按可执行文件路径圈定 {app} 下的 walgit / walgit-tray,
+  //    不碰机器上其他同名进程(dev 构建、另一份部署)。
+  // 失败一律忽略——多半本就没在跑。
+  if LoadStringFromFile(ExpandConstant('{app}\walgit.pid'), pidbuf) then
+  begin
+    pid := Trim(pidbuf);
+    if pid <> '' then
+      Exec(ExpandConstant('{cmd}'),
+        '/C taskkill /F /T /FI "PID eq ' + pid + '" /FI "IMAGENAME eq walgit.exe"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    DeleteFile(ExpandConstant('{app}\walgit.pid'));
+  end;
+  // 托盘升级管线留的备份:安装器换装后它已无意义,留着会在托盘某次升级
+  // 健康检查失败时被回滚逻辑盖回旧版本——删。
+  DeleteFile(ExpandConstant('{app}\walgit.bak-tray'));
+  Exec(ExpandConstant('{cmd}'),
+    '/C powershell -NoProfile -Command "Get-Process walgit,walgit-tray -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ''' +
+    ExpandConstant('{app}') + '\*'' } | Stop-Process -Force"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
-  begin
-    KillRunning('walgit-tray.exe');
-    KillRunning('walgit.exe');
-  end;
+    StopWalgit;
+  if CurStep = ssPostInstall then
+    // 自启勾选承诺的是「部署开机可用」,不是只把托盘拉起来:写标记文件,
+    // 托盘启动时发现它 + 服务未运行,就把服务一并拉起(tray-rs 读它)。
+    if WizardIsTaskSelected('autostart') then
+      SaveStringToFile(ExpandConstant('{app}\service.autostart'), '', False)
+    else
+      DeleteFile(ExpandConstant('{app}\service.autostart'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
-    KillRunning('walgit-tray.exe');
-    KillRunning('walgit.exe');
+    StopWalgit;
+    DeleteFile(ExpandConstant('{app}\service.autostart'));
   end;
 end;

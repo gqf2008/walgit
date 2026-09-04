@@ -33,7 +33,7 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
 - 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`),内含
   `walgit(.exe)` + `walgit.toml`;macOS 另需 `walgit-ensure`(安装器/
   技能包提供);Windows 可直接装 release 附件
-  `walgit-setup-<tag>-x64.exe`(`deploy/windows/`,含托盘与本体)
+  `walgit-setup-<version>-x64.exe`(`deploy/windows/`,含托盘与本体)
 - 服务地址:`http://127.0.0.1:8081`
 - 源码仓库:环境变量 `WALGIT_REPO`,默认 `/Volumes/Workspace/GitHub/walgit`
 - 日志:`<部署目录>/tray.log`
@@ -57,4 +57,5 @@ cd deploy/tray/tray-rs && cargo build --release
 # 产物 target/release/walgit-tray(.exe),放到部署目录运行即可
 ```
 
-Linux 需要 `libgtk-3-dev`(tray-icon 走 appindicator)。
+Linux 需要 `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev`
+(tray-icon 走 appindicator,默认 feature 引 libxdo)。

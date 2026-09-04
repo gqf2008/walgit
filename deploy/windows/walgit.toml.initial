@@ -2,8 +2,9 @@
 #
 # 对象存储:S3/R2 配置向导落地(issue #70)之前,手工把 [store] 换成真实桶
 # (Cloudflare R2 示例在下方注释),然后在托盘菜单「停止服务 / 启动服务」
-# 重启生效。全部键与默认值见仓库 walgit.example.toml;校验:
-#   walgit config check walgit.toml
+# 重启生效。全部键与默认值见仓库 walgit.example.toml;校验(配置路径走全局
+# --config 旗标,不收位置参数):在部署目录直接 `walgit config check`,
+# 或 `walgit --config <本文件路径> config check`。
 
 [server]
 # 托盘按 8081 轮询 /healthz 并打开 Web UI —— 改端口要同时改托盘。

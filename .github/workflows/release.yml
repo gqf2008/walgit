@@ -25,13 +25,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install protoc
+      - name: Install protoc (and the tray's GTK dev libs on linux)
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then choco install protoc -y --no-progress; else sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then choco install protoc -y --no-progress; else sudo apt-get update && sudo apt-get install -y protobuf-compiler libgtk-3-dev libayatana-appindicator3-dev libxdo-dev; fi
         shell: bash
       - name: Install the stable Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustup show && cargo --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          # tray-rs is its own workspace (own Cargo.lock) but its build lands in
+          # the root target/ (repo .cargo/config.toml target-dir, cwd-based
+          # discovery) — key the cache on both locks or the tray deps rebuild cold.
+          workspaces: |
+            .
+            deploy/tray/tray-rs -> target
       - uses: taiki-e/install-action@v2
         with:
           tool: just
@@ -46,18 +53,20 @@ jobs:
         shell: bash
       - name: Build release binary
         run: cargo build --release --bin walgit --bin walgit-server
-      - name: Build the tray app (linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-3-dev && cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
-      - name: Build the tray app (windows)
-        if: runner.os == 'Windows'
-        run: cargo build --release --manifest-path deploy/tray/tray-rs/Cargo.toml
+      # --target-dir pins the tray exe into the root target/ regardless of how
+      # cargo resolves the nested workspace's own [workspace]/.cargo config —
+      # the same dir the upload globs and installer.iss expect.
+      - name: Build the tray app
+        run: cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Cargo.toml
       - name: Build the Windows installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # ISCC is preinstalled on windows runners (PATH via choco shim); the
-          # absolute path is the fallback. Version from the tag (v0.1.0 → 0.1.0).
+          # ISCC is preinstalled on windows runners; provision it if a future
+          # image drops it. Version from the tag (v0.1.0 → 0.1.0).
+          if ! command -v ISCC.exe && [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup -y --no-progress
+          fi
           iscc="$(command -v ISCC.exe || echo '/c/Program Files (x86)/Inno Setup 6/ISCC.exe')"
           tag="${GITHUB_REF#refs/tags/}"
           "$iscc" "-DMyAppVersion=${tag#v}" deploy/windows/installer.iss
@@ -69,7 +78,16 @@ jobs:
             target/release/walgit${{ runner.os == 'Windows' && '.exe' || '' }}
             target/release/walgit-server${{ runner.os == 'Windows' && '.exe' || '' }}
             target/release/walgit-tray${{ runner.os == 'Windows' && '.exe' || '' }}
-            ${{ runner.os == 'Windows' && 'deploy/windows/Output/walgit-setup-*.exe' || '' }}
+      # The installer rides a SEPARATE artifact: upload-artifact roots an artifact
+      # at the least-common-ancestor of its paths, so mixing target/release with
+      # deploy/windows/Output would re-root at the workspace root and hand
+      # `gh release create artifacts/*` directories instead of files.
+      - name: Upload the Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: walgit-windows-installer
+          path: deploy/windows/Output/walgit-setup-*.exe
 
   release:
     name: Publish release
