@@ -196,7 +196,7 @@ enum Command {
         /// Source repository URL (auth: whatever your git config does for it).
         #[arg(long)]
         from: String,
-        /// Destination repository URL on a walgit host (auth: a bearer token, see --identity).
+        /// Destination repository URL (auth: `--identity token|gcloud|gce` bearer, or `--identity git` for machine git credentials).
         #[arg(long)]
         to: String,
         /// Local bare repository used as the buffer (created if missing; needs disk for the repo).
