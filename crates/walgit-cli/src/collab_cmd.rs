@@ -23,6 +23,7 @@ use walgit_wal::collab::{
 // ---- CLI commands --------------------------------------------------------------
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI 参数枚举,进程一次构建,无热路径
 pub enum CollabAction {
     /// List distinct thread ids found in `refs/collab/inbox/*`.
     Ls {
@@ -47,6 +48,7 @@ pub enum CollabAction {
     },
     /// Construct + sign + deliver a collab entry (§4.2). Writes the inbox ref
     /// locally; `--push <remote>` additionally pushes it to a walgit server.
+    #[allow(clippy::large_enum_variant)] // CLI 参数结构,进程一次构建,无热路径
     Entry {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -399,14 +401,23 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
         .with_context(|| format!("--body must be JSON: {}", args.body))?;
     // Structured cross-thread references (issue #75 ③): validated against the
     // collab state at aggregation time (thread view reports broken oids).
+    let obj = body.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("--body must be a JSON object to attach related/depends-on")
+    })?;
     if !args.related.is_empty() {
-        body["related"] = serde_json::Value::Array(
-            args.related.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        obj.insert(
+            "related".into(),
+            serde_json::Value::Array(
+                args.related.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+            ),
         );
     }
     if !args.depends_on.is_empty() {
-        body["depends_on"] = serde_json::Value::Array(
-            args.depends_on.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        obj.insert(
+            "depends_on".into(),
+            serde_json::Value::Array(
+                args.depends_on.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+            ),
         );
     }
     // Attachments (issue #75 ④): `{filename, sha256, content_b64}` — the
@@ -433,7 +444,7 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
                 "content_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
             }));
         }
-        body["attachments"] = serde_json::Value::Array(attachments);
+        obj.insert("attachments".into(), serde_json::Value::Array(attachments));
     }
     let mut entry = Entry {
         version: 1,
@@ -1440,12 +1451,13 @@ mod entry_refs_tests {
     use super::*;
     use sha2::Digest;
 
-    /// --related/--depends-on 注入后,body 里的数组可供聚合端 referenced_oids 读取。
+    /// `--related` / `--depends-on` 注入后,body 里的数组可供聚合端
+    /// `referenced_oids` 读取。
     #[test]
     fn refs_injection_lands_in_body() {
         let mut body = serde_json::json!({"title": "x"});
-        let related = vec!["aaa".to_string()];
-        let depends_on = vec!["bbb".to_string()];
+        let related = ["aaa".to_string()];
+        let depends_on = ["bbb".to_string()];
         body["related"] = serde_json::Value::Array(
             related.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
         );
@@ -1458,7 +1470,7 @@ mod entry_refs_tests {
         assert_eq!(refs, vec!["aaa", "bbb"]);
     }
 
-    /// --attach:嵌入 {filename, sha256, content_b64},digest 与内容一致,
+    /// `--attach`:嵌入 `{filename, sha256, content_b64}`,digest 与内容一致,
     /// 读取方可复算验真(issue #75 ④ 验收)。
     #[test]
     fn attachment_digest_roundtrip() {
