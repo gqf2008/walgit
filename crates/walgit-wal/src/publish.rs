@@ -807,6 +807,35 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             // every waiter is answered `ok`. A failed apply leaves the version unadvertised, so the next
             // sync sees a change and replays the entry — the copy repairs itself. (Answering an error
             // here produced a durable push that git reported as failed — "0 winners", commit fetchable.)
+            // Issue #4 P1 instrumentation: a committed batch prints exactly
+            // which refs moved to which tips at which seqs. Three runs in a
+            // row (issue #4 comments) showed 213 publishes per ~30 pushes with
+            // ZERO write-side invariant violations — this line makes each
+            // committed batch's ref moves directly observable next to the
+            // reader's DIAG seen[] trace.
+            if refs_diag_on() {
+                let tips: Vec<String> = verified
+                    .iter()
+                    .zip(batch.iter())
+                    .filter(|(v, _)| v.valid)
+                    .flat_map(|(v, req)| {
+                        req.txn.updates.iter().map(move |u| {
+                            format!(
+                                "{}:{}->{}",
+                                u.name,
+                                if u.old_oid.is_empty() { "∅" } else { &u.old_oid[..7.min(u.old_oid.len())] },
+                                &u.new_oid[..7.min(u.new_oid.len())]
+                            )
+                        })
+                    })
+                    .collect();
+                eprintln!(
+                    "DIAG-COMMIT repo={} seq={first_seq}..={last_seq} commits=[{}]",
+                    handle.id,
+                    tips.join(", ")
+                );
+            }
+
             let mut local_ok = true;
             {
                 let _sync_guard = crate::lockwait::timed(
