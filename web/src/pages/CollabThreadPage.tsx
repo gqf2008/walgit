@@ -8,6 +8,7 @@ import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { CollabWriteBox } from "../components/CollabWrite";
 import { useI18n, kindLabel, type TFunc } from "../i18n";
+import { Markdown } from "../components/Markdown";
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -156,6 +157,14 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
   const kind = e.entry.kind;
   const body = e.entry.body as Record<string, unknown>;
   const ciConclusion = kind === "ci_result" ? String(body.conclusion ?? "") : "";
+  // 对话正文：兼容 CLI（issue body.body / review·merge_result body.note / patch
+  // body.message）与 Web 写入口（issue·comment body.text / patch body.message）。
+  // 除纯机器条目外都渲染 Markdown，让线程页可见 agent/人写的实际内容。
+  const proseKinds = new Set(["issue", "comment", "review", "status", "patch"]);
+  const prose = proseKinds.has(kind)
+    ? [body.text, body.body, body.note, body.message, body.summary]
+        .find((v): v is string => typeof v === "string" && v.trim() !== "") ?? ""
+    : "";
   const title =
     kind === "issue" ? String(body.title ?? t("entry.issue.untitled"))
     : kind === "review" ? String(body.decision ?? "comment")
@@ -181,6 +190,7 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
             <span style={{ marginLeft: 8, color: ciColor(ciConclusion) }}>● {ciConclusion}</span>
           )}
         </div>
+        {prose && <Markdown source={prose} />}
         {kind === "ci_result" && (
           <div className="mono muted">
             {t("entry.result.meta", {
