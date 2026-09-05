@@ -173,7 +173,10 @@ pub fn referenced_oids(body: &serde_json::Value) -> Vec<String> {
 
 /// The referenced oids missing from `known` (the set of all collab entry oids
 /// in the repository). Empty = every reference resolves.
-pub fn broken_refs(referenced: &[String], known: &std::collections::HashSet<String>) -> Vec<String> {
+pub fn broken_refs<S: std::hash::BuildHasher>(
+    referenced: &[String],
+    known: &std::collections::HashSet<String, S>,
+) -> Vec<String> {
     referenced
         .iter()
         .filter(|o| !known.contains(*o))
