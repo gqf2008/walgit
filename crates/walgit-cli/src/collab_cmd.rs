@@ -395,11 +395,46 @@ struct EntryArgs {
 
 fn run_entry(args: &EntryArgs) -> Result<()> {
     ref_segment("entry.actor", &args.actor)?;
-    let body: serde_json::Value = serde_json::from_str(&args.body)
+    let mut body: serde_json::Value = serde_json::from_str(&args.body)
         .with_context(|| format!("--body must be JSON: {}", args.body))?;
-    crate::collab::inject_refs(&mut body.clone(), &args.related, &args.depends_on)?;
-    let mut body = body;
-    crate::collab::inject_attachments(&mut body, &args.attach)?;
+    // Structured cross-thread references (issue #75 ③): validated against the
+    // collab state at aggregation time (thread view reports broken oids).
+    if !args.related.is_empty() {
+        body["related"] = serde_json::Value::Array(
+            args.related.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        );
+    }
+    if !args.depends_on.is_empty() {
+        body["depends_on"] = serde_json::Value::Array(
+            args.depends_on.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        );
+    }
+    // Attachments (issue #75 ④): `{filename, sha256, content_b64}` — the
+    // thread is self-contained and the reader verifies the digest.
+    if !args.attach.is_empty() {
+        use base64::Engine;
+        use sha2::Digest;
+        const MAX_ATTACH_BYTES: u64 = 64 * 1024;
+        let mut attachments = Vec::new();
+        for path in &args.attach {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("--attach {}: read failed", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= MAX_ATTACH_BYTES,
+                "--attach {}: {} bytes exceeds the {} KiB per-file cap",
+                path.display(),
+                bytes.len(),
+                MAX_ATTACH_BYTES / 1024
+            );
+            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+            attachments.push(serde_json::json!({
+                "filename": path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                "sha256": digest,
+                "content_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }));
+        }
+        body["attachments"] = serde_json::Value::Array(attachments);
+    }
     let mut entry = Entry {
         version: 1,
         kind: args.kind.clone(),
