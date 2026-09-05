@@ -235,6 +235,23 @@ async fn upload_pack_v2(
                     );
                     lines
                 };
+            // Issue #4 P1 instrumentation: what this ls-refs answer shows vs
+            // the manifest version it was keyed on. Readers' DIAG seen[] +
+            // these lines = the full read picture of a red.
+            if std::env::var("WALGIT_TEST_REFS_DIAG").is_ok() {
+                let tips: Vec<String> = lines
+                    .iter()
+                    .filter(|l| l.render(&args).contains("refs/heads/"))
+                    .map(|l| l.render(&args))
+                    .collect();
+                eprintln!(
+                    "DIAG-ADVERT repo={} ver={:?} cached={} refs=[{}]",
+                    route.id,
+                    version.as_ref().map(walgit_store::Version::as_str),
+                    st.caches.ref_advert.get_v2_ls_refs(&repo_key, version.as_ref(), &args).is_some(),
+                    tips.join(" | ")
+                );
+            }
             let mut buf = Vec::with_capacity(1024);
             for line in &lines {
                 pktline::encode_text(&mut buf, &line.render(&args));
