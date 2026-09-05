@@ -227,8 +227,10 @@ jobs:
             const pr = context.payload.pull_request;
             // PRs from forks get a read-only GITHUB_TOKEN: commenting would 403
             // and turn this job red. The in-repo worktree flow is the norm; for
-            // fork PRs, just skip the comment.
-            if (pr.head.repo.full_name !== context.repo.full_name) {
+            // fork PRs, just skip the comment. Compare repo IDs: `context.repo`
+            // has no `full_name` (only {owner, repo}), so a full_name compare is
+            // `undefined`-based and skips EVERY PR (#74); IDs also survive renames.
+            if (pr.head.repo.id !== pr.base.repo.id) {
               console.log('PR from a fork; read-only token — skipping the summary comment');
               return;
             }
