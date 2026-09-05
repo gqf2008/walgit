@@ -3017,6 +3017,102 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
     Ok(())
 }
 
+/// Issue #79: a credential-less write request is a real 401 that **offers
+/// `Basic`** — git holds credentials (URL userinfo, helpers) but only sends
+/// them after a 401 challenge; a 403 made a fresh `git push` give up on every
+/// token-mode deployment that had not run the installer. The Basic password is
+/// interpreted as the token itself (§1.3); an authenticated identity that
+/// merely lacks write keeps its 403 (retry cannot help).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bare_push_gets_a_basic_challenge_and_then_sends_url_userinfo() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "dev@example.com".into(),
+                token: "dev".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "ro@example.com".into(),
+                token: "ro".into(),
+                token_env: None,
+                write: false,
+                admin: false,
+            },
+        ];
+    })
+    .await?;
+    let c = reqwest::Client::new();
+
+    // Credential-less write advertisement: 401, and the challenge leads with Basic.
+    let r = c
+        .get(format!(
+            "{}/t/chal.git/info/refs?service=git-receive-pack",
+            server.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 401, "{}", r.status());
+    let www = r
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        www.to_ascii_lowercase().starts_with("basic"),
+        "WWW-Authenticate: {www}"
+    );
+
+    // Authenticated but write-less: a real 403, not a challenge.
+    let r = c
+        .get(format!(
+            "{}/t/chal.git/info/refs?service=git-receive-pack",
+            server.base_url
+        ))
+        .header("Authorization", "Bearer ro")
+        .send()
+        .await?;
+    assert_eq!(r.status(), 403, "{}", r.status());
+
+    // The round trip: a push whose URL carries userinfo sends NOTHING until
+    // the 401, then retries with Basic and succeeds — no extraHeader, no
+    // helpers (cleared), no proactiveAuth: only the challenge moves git.
+    let r = c
+        .put(format!("{}/t/chal.git", server.base_url))
+        .header("Authorization", "Bearer dev")
+        .send()
+        .await?;
+    assert!(r.status().is_success(), "create repo: {}", r.status());
+    let src = TestRepo::synthetic(2, 1)?;
+    let authed = server
+        .repo_url("t", "chal")
+        .replacen("http://", "http://dev:dev@", 1);
+    git_in(&src, &["remote", "add", "origin", &authed])?;
+    git_in(&src, &["-c", "credential.helper=", "push", "-q", "origin", "main"])?;
+    let remote_tip = git_in(
+        &src,
+        &[
+            "-c",
+            "http.extraHeader=Authorization: Bearer dev",
+            "ls-remote",
+            "-q",
+            "origin",
+            "refs/heads/main",
+        ],
+    )?;
+    let local_tip = git_in(&src, &["rev-parse", "HEAD"])?;
+    assert_eq!(
+        remote_tip.split_whitespace().next().unwrap_or_default(),
+        local_tip.trim(),
+        "the challenged push landed"
+    );
+    Ok(())
+}
+
 /// Read-your-writes on one instance, under contention: while N clients race pushes to one branch
 /// and a reader spins on `ls-remote`, every read after a push's `ok` must show that push's tip —
 /// the advertisement caches are keyed by the manifest version, and a publish that advertised the
