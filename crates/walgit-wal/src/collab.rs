@@ -158,6 +158,29 @@ pub fn sign_entry(entry: &mut Entry, key: &SigningKey) -> String {
 
 /// One issue/thread: entries referencing the same `id`, topologically ordered
 /// by the `parent` chain (deterministic: ts as the tie-break).
+/// Structured cross-thread references (issue #75 ③): the entry-body fields
+/// `related` / `depends_on` carry arrays of entry oids. Extracted here so the
+/// thread view and the write path agree on the exact convention.
+pub fn referenced_oids(body: &serde_json::Value) -> Vec<String> {
+    ["related", "depends_on"]
+        .iter()
+        .filter_map(|k| body.get(k))
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The referenced oids missing from `known` (the set of all collab entry oids
+/// in the repository). Empty = every reference resolves.
+pub fn broken_refs(referenced: &[String], known: &std::collections::HashSet<String>) -> Vec<String> {
+    referenced
+        .iter()
+        .filter(|o| !known.contains(*o))
+        .cloned()
+        .collect()
+}
+
 pub fn thread<'a>(entries: &[&'a EntryRef]) -> Vec<&'a EntryRef> {
     let by_oid: HashMap<&str, &EntryRef> = entries
         .iter()

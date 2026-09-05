@@ -74,6 +74,16 @@ pub enum CollabAction {
         /// Ed25519 signing key: 32 raw bytes as hex.
         #[arg(long)]
         key: PathBuf,
+        /// Entry oid this entry relates to (repeatable; issue #75 ③).
+        #[arg(long = "related")]
+        related: Vec<String>,
+        /// Entry oid this entry depends on (repeatable; issue #75 ③).
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        /// File to attach: `{filename, sha256, content_b64}` embedded in the
+        /// body (repeatable; issue #75 ④). Hard cap 64 KiB per file.
+        #[arg(long = "attach")]
+        attach: Vec<PathBuf>,
     },
     /// First-use registration of a principal's public key at
     /// `refs/collab/meta/principals/<principal>` (D1 §5).
@@ -191,6 +201,9 @@ pub fn run(action: CollabAction) -> Result<()> {
             base,
             head,
             key,
+            related,
+            depends_on,
+            attach,
         } => run_entry(&EntryArgs {
             repo,
             push,
@@ -202,6 +215,9 @@ pub fn run(action: CollabAction) -> Result<()> {
             base,
             head,
             key,
+            related,
+            depends_on,
+            attach,
         })?,
         CollabAction::PrincipalRegister {
             repo,
@@ -368,12 +384,22 @@ struct EntryArgs {
     base: Option<String>,
     head: Option<String>,
     key: std::path::PathBuf,
+    /// Entry oids this entry relates to (`--related`, repeatable).
+    related: Vec<String>,
+    /// Entry oids this entry depends on (`--depends-on`, repeatable).
+    depends_on: Vec<String>,
+    /// Files to attach: sha256 + base64 content embedded in `body.attachments`
+    /// (`--attach`, repeatable; issue #75 ④).
+    attach: Vec<std::path::PathBuf>,
 }
 
 fn run_entry(args: &EntryArgs) -> Result<()> {
     ref_segment("entry.actor", &args.actor)?;
     let body: serde_json::Value = serde_json::from_str(&args.body)
         .with_context(|| format!("--body must be JSON: {}", args.body))?;
+    crate::collab::inject_refs(&mut body.clone(), &args.related, &args.depends_on)?;
+    let mut body = body;
+    crate::collab::inject_attachments(&mut body, &args.attach)?;
     let mut entry = Entry {
         version: 1,
         kind: args.kind.clone(),
@@ -1371,5 +1397,42 @@ mod tests {
             "an approval smuggled into another inbox does not count"
         );
         assert_eq!(pr.unverified.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod entry_refs_tests {
+    use super::*;
+    use sha2::Digest;
+
+    /// --related/--depends-on 注入后,body 里的数组可供聚合端 referenced_oids 读取。
+    #[test]
+    fn refs_injection_lands_in_body() {
+        let mut body = serde_json::json!({"title": "x"});
+        let related = vec!["aaa".to_string()];
+        let depends_on = vec!["bbb".to_string()];
+        body["related"] = serde_json::Value::Array(
+            related.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        );
+        body["depends_on"] = serde_json::Value::Array(
+            depends_on.iter().map(|o| serde_json::Value::String(o.clone())).collect(),
+        );
+        assert_eq!(body["related"][0], "aaa");
+        assert_eq!(body["depends_on"][0], "bbb");
+        let refs = walgit_wal::collab::referenced_oids(&body);
+        assert_eq!(refs, vec!["aaa", "bbb"]);
+    }
+
+    /// --attach:嵌入 {filename, sha256, content_b64},digest 与内容一致,
+    /// 读取方可复算验真(issue #75 ④ 验收)。
+    #[test]
+    fn attachment_digest_roundtrip() {
+        let content = b"attachment bytes";
+        let digest = format!("{:x}", sha2::Sha256::digest(content));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(content);
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        let digest2 = format!("{:x}", sha2::Sha256::digest(&decoded));
+        assert_eq!(digest, digest2);
+        assert_eq!(decoded, content);
     }
 }
