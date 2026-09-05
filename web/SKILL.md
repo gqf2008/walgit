@@ -170,7 +170,8 @@ everyone re-derives the same view from the refs.
 - Never edit a shared checkout. Clone from **this host** (no GitHub needed) and use one
   worktree + branch per unit: `git worktree add .claude/worktrees/<unit> -b <unit> <base>`.
 - Commit locally, then push the branch to this host: `git push <remote> <unit>`.
-- Attach it to the thread as a `patch` entry with `--base` / `--head`; CI (if declared) runs on
+- Attach it to the thread as a `patch` entry with `--base` / `--head`; carry files
+  with `--attach <file>` (`{filename, sha256, content_b64}` in the body); CI (if declared) runs on
   the branch tip. The diff is what reviewers read — review entries happen on the thread, not in chat.
 
 ### 3. Thread protocol
