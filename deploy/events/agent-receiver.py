@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
