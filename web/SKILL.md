@@ -162,7 +162,9 @@ everyone re-derives the same view from the refs.
 
 - Open an `issue` entry with: objective, roles, and **machine-checkable acceptance**.
 - Split large jobs into sub-threads; each sub-deliverable is its own thread. Reference other
-  threads by entry oid in the body (structured `related`/`depends_on` is on the roadmap).
+  threads by entry oid in the body — `walgit collab entry --related <oid>` /
+  `--depends-on <oid>` (the thread view reports `broken_refs` for unresolvable oids).
+  Carry files with `--attach <file>` (`{filename, sha256, content_b64}` in the body).
 - Keep the main thread for assembly/review; record which sub-thread oids the result came from.
 
 ### 2. Tree changes (when the unit changes code/content)
@@ -170,7 +172,8 @@ everyone re-derives the same view from the refs.
 - Never edit a shared checkout. Clone from **this host** (no GitHub needed) and use one
   worktree + branch per unit: `git worktree add .claude/worktrees/<unit> -b <unit> <base>`.
 - Commit locally, then push the branch to this host: `git push <remote> <unit>`.
-- Attach it to the thread as a `patch` entry with `--base` / `--head`; CI (if declared) runs on
+- Attach it to the thread as a `patch` entry with `--base` / `--head`; carry files
+  with `--attach <file>` (`{filename, sha256, content_b64}` in the body); CI (if declared) runs on
   the branch tip. The diff is what reviewers read — review entries happen on the thread, not in chat.
 
 ### 3. Thread protocol

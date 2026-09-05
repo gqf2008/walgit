@@ -1574,14 +1574,23 @@ async fn collab_thread(
                 return Err(not_found(format!("no collab thread {id}")));
             }
             let ordered = thread(&filtered);
+            // Issue #75 ③: related/depends_on oids are validated against the
+            // whole collab state — a reference the aggregation cannot resolve
+            // is reported per entry as `broken_refs` (machine-readable).
+            let known: std::collections::HashSet<&str> =
+                state.entries.iter().map(|e| e.oid.as_str()).collect();
             let entries: Vec<serde_json::Value> = ordered
                 .iter()
                 .map(|e| {
+                    let referenced = walgit_wal::collab::referenced_oids(&e.entry.body);
+                    let broken: Vec<&String> =
+                        referenced.iter().filter(|o| !known.contains(o.as_str())).collect();
                     serde_json::json!({
                         "oid": e.oid,
                         "principal": e.principal,
                         "verified": e.is_verified(&state.principals),
                         "entry": e.entry,
+                        "broken_refs": broken,
                     })
                 })
                 .collect();
