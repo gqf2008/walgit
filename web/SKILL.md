@@ -143,6 +143,76 @@ bucket access; a host URL and (on token/oidc hosts) a bearer suffice:
 - Batch + basic transfer under `/{owner}/{repo}.git/info/lfs`; objects are
   sha256-addressed, immutable.
 
+## Agent collaboration standard (normative)
+
+Any job that needs more than one agent — code, content, research, ops — runs on this host
+as **signed threads on `refs/collab/*`**. Agents never collaborate out-of-band (no private
+chat, no shared scratch files as the source of truth): the thread is the only shared memory,
+everyone re-derives the same view from the refs.
+
+### 0. Identity
+
+- One principal per agent, one Ed25519 key (`32` raw bytes as hex, keep at
+  `~/.walgit/keys/<name>.ed25519`). Register once per repository:
+  `walgit collab principal-register --repo <checkout> --principal <you> --key <keyfile> --push origin`.
+- Write only your own inbox (`refs/collab/inbox/<you>/*`). Never borrow another principal's
+  key. Read-side verification marks `actor != inbox` entries unverified — treat them as untrusted.
+
+### 1. Work unit = one thread
+
+- Open an `issue` entry with: objective, roles, and **machine-checkable acceptance**.
+- Split large jobs into sub-threads; each sub-deliverable is its own thread. Reference other
+  threads by entry oid in the body (structured `related`/`depends_on` is on the roadmap).
+- Keep the main thread for assembly/review; record which sub-thread oids the result came from.
+
+### 2. Tree changes (when the unit changes code/content)
+
+- Never edit a shared checkout. Clone from **this host** (no GitHub needed) and use one
+  worktree + branch per unit: `git worktree add .claude/worktrees/<unit> -b <unit> <base>`.
+- Commit locally, then push the branch to this host: `git push <remote> <unit>`.
+- Attach it to the thread as a `patch` entry with `--base` / `--head`; CI (if declared) runs on
+  the branch tip. The diff is what reviewers read — review entries happen on the thread, not in chat.
+
+### 3. Thread protocol
+
+- **Read before write.** Fetch the thread (and repo refs) first; append with the latest entry
+  oid as `--parent`. Never answer from memory/cache.
+- Express state with kinds, not prose: `status` (`in-progress` / `needs-review` / `done`),
+  `review` (`approve` / `request_changes` + note), `merge_result` (`merged: true` + oid),
+  `comment` for claims/progress/questions.
+- Every meaningful step is an entry: claim, progress, result, question.
+
+### 4. Review
+
+- An independent agent (or human) reviews the diff/artifacts and posts **full findings** in the
+  `review` entry — location, problem, suggestion — not a one-line conclusion.
+- `request_changes` → the implementer fixes on the branch and replies on the thread mapping each
+  point to what changed → reviewer re-reviews → `approve` only when satisfied.
+- Treat "approve with no evidence" as noise; verification claims must be reproducible.
+
+### 5. Merge & archive
+
+- walgit alone is a complete collaboration platform; **GitHub (or any other host) is optional** and
+  is only a mirror when a project already keeps one.
+- After approval: merge locally (fast-forward preferred), push the result to this host. Push the
+  same refs to a GitHub mirror only for projects that are dual-homed (walgit = fact source,
+  GitHub = backup/public mirror) — never as a requirement of walgit itself.
+- Write `merge_result` `{"merged": true, "oid": "<sha>"}` and a `status` `done` on the thread.
+- Archive human-facing artifacts as files in the repository (reports under `docs/`), not only in
+  thread bodies.
+
+### 6. CI (optional)
+
+- Declare tasks in `.walgit/ci.toml` **in the tested commit**; a runner
+  (`walgit ci run --once`) claims, executes, and signs results back. Green before merge.
+
+### 7. Discipline
+
+- Prefer machine-readable fields over prose; keep one logical change per patch.
+- Don't rewrite pushed branch history without saying so; never write to another inbox; never
+  trust unverified entries (wait for registration or verification).
+- Honor per-repo policy when set: it gates *who may write*; signatures gate *who signed*.
+
 ## Rules of thumb
 
 - `404` is a cheap probe answer — probe keys, don't list.

@@ -22,8 +22,9 @@
 cargo build --release        # 产物 target/release/walgit-tray(.exe)
 ```
 
-依赖:Rust(含 std);Linux 需要 gtk3 开发库(`libgtk-3-dev`)——tray-icon 在
-Linux 走 appindicator。macOS/Windows 无额外系统依赖。
+依赖:Rust(含 std);Linux 需要 gtk3 + appindicator + xdo 开发库
+(`libgtk-3-dev libayatana-appindicator3-dev libxdo-dev`)——tray-icon 在
+Linux 走 appindicator,默认 feature 引 libxdo。macOS/Windows 无额外系统依赖。
 
 - macOS:产物可直接运行;若要打包成 .app(LSUIElement,登录项可见),
   参考 `~/walgit/tray`(Swift 版)的 bundle 结构
@@ -47,7 +48,8 @@ Linux 走 appindicator。macOS/Windows 无额外系统依赖。
 
 ## 约定
 
-- 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`)
+- 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`;release 的
+  `walgit-setup-<version>-x64.exe` 安装器——`deploy/windows/`——会装好全套)
 - 源码仓库:`$WALGIT_REPO`,默认 `/Volumes/Workspace/GitHub/walgit`
 - 服务地址:`http://127.0.0.1:8081`(healthz)
 - 日志:`~/walgit/tray.log`
