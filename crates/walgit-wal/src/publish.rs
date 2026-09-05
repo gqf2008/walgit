@@ -819,12 +819,16 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     .zip(batch.iter())
                     .filter(|(v, _)| v.valid)
                     .flat_map(|(v, req)| {
+                        let _ = v;
                         req.txn.updates.iter().map(move |u| {
+                            let short = |oid: &str| {
+                                oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
+                            };
                             format!(
                                 "{}:{}->{}",
                                 u.name,
-                                if u.old_oid.is_empty() { "∅" } else { &u.old_oid[..7.min(u.old_oid.len())] },
-                                &u.new_oid[..7.min(u.new_oid.len())]
+                                if u.old_oid.is_empty() { "∅".to_string() } else { short(&u.old_oid) },
+                                short(&u.new_oid)
                             )
                         })
                     })
