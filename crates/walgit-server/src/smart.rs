@@ -247,7 +247,7 @@ async fn upload_pack_v2(
                 eprintln!(
                     "DIAG-ADVERT repo={} ver={:?} cached={} refs=[{}]",
                     route.id,
-                    version.as_ref().map(|v| v.as_str()),
+                    version.as_ref().map(walgit_store::Version::as_str),
                     st.caches.ref_advert.get_v2_ls_refs(&repo_key, version.as_ref(), &args).is_some(),
                     tips.join(" | ")
                 );
