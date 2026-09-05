@@ -32,6 +32,20 @@ Linux 走 appindicator,默认 feature 引 libxdo。macOS/Windows 无额外系统
   `%USERPROFILE%\walgit` 放 `walgit.exe` + `walgit.toml`
 - Linux:同 Windows 形态(`~/walgit/`),桌面环境需支持 appindicator
 
+### Windows 说明(issue #68 修复后的行为)
+
+- **release 产物是 GUI 子系统**:双击无控制台黑窗,静默驻留托盘
+  (debug 构建保留控制台,便于排查;panic 均落 `tray.log`)。
+- **单实例**:命名互斥,双击多次第二个实例静默退出,不叠图标。
+- **托盘图标默认可能藏在通知区溢出**(`^` 折叠面板):把它拖到任务栏,
+  或设置 → 个性化 → 任务栏 → 通知区域,设为始终显示。
+- 产物在本目录 `target/release/`——`.cargo/config.toml` 钉住了
+  target-dir,不会被仓库根的 cargo 配置重定向到 `walgit/target/`。
+- **子进程不经 shell**:Windows 上 git/cargo/taskkill 一律 argv 直传
+  (`Command::args`,无引号拼装),且带 `CREATE_NO_WINDOW`(GUI 进程 spawn
+  控制台程序不带它就闪黑窗);「打开 Web UI」用 `explorer <url>`——cmd 的
+  `start` 经 Rust 参数转义后嵌套引号全灭,实测挂起事件循环 2 分钟以上。
+
 ## 约定
 
 - 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`;release 的

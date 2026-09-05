@@ -1,0 +1,6 @@
+# 钉住本地 target-dir:从仓库内构建时 cargo 会向上继承仓库根的
+# .cargo/config.toml(build.target-dir = "target"),把本 crate 的产物
+# 重定向到 walgit/target/release——README 承诺的 tray-rs/target/release
+# 落空,用户按文档找不到 exe。就近配置覆盖远配置,产物回到本地。
+[build]
+target-dir = "target"

@@ -2069,6 +2069,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "tray-icon",
+ "windows-sys 0.52.0",
  "winit",
 ]
 

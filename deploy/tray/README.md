@@ -54,8 +54,10 @@ cd deploy/tray/macos && ./build.sh     # 产物 ~/Applications/walgit-tray.app
 
 ```bash
 cd deploy/tray/tray-rs && cargo build --release
-# 产物 target/release/walgit-tray(.exe),放到部署目录运行即可
+# 产物 tray-rs/target/release/walgit-tray(.exe),放到部署目录运行即可
 ```
 
 Linux 需要 `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev`
-(tray-icon 走 appindicator,默认 feature 引 libxdo)。
+(tray-icon 走 appindicator,默认 feature 引 libxdo)。Windows 上 release
+产物为 GUI 子系统(无控制台)、单实例、首次运行自动创建部署目录并写
+`tray.log`;细节见 `tray-rs/README.md` 的「Windows 说明」。
