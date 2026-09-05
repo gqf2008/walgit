@@ -1052,7 +1052,8 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     let bad_status = resp.status();
     assert_eq!(bad_status, 403, "actor != principal refused");
 
-    // No credential -> 401.
+    // No credential -> 401 (a challenge: the client may still authenticate;
+    // issue #79 — a 403 here made git and API clients give up).
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "entry": entry }))
@@ -1060,7 +1061,7 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
         .await?;
     assert_eq!(
         resp.status(),
-        403,
+        401,
         "unauthenticated refused (token mode, no credential)"
     );
     Ok(())

@@ -710,6 +710,14 @@ impl Authenticator {
         let p = self.authenticate(headers).await?;
         if p.write {
             Ok(p)
+        } else if p.anonymous {
+            // Credential-less (anonymous only ever arises without a presented
+            // credential in token/oidc modes): challenge, don't forbid — git
+            // waits for a 401 before sending credentials it already holds
+            // (URL userinfo, helpers); a 403 makes a fresh `git push` give up
+            // (§1.3, issue #79). An authenticated identity that merely lacks
+            // write stays a real 403.
+            Err(AuthError::Unauthorized)
         } else {
             Err(AuthError::Forbidden)
         }
