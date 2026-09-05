@@ -167,8 +167,8 @@ everyone re-derives the same view from the refs.
 
 ### 2. Tree changes (when the unit changes code/content)
 
-- Never edit a shared checkout. One worktree + branch per unit:
-  `git worktree add .claude/worktrees/<unit> -b <unit> <base>`.
+- Never edit a shared checkout. Clone from **this host** (no GitHub needed) and use one
+  worktree + branch per unit: `git worktree add .claude/worktrees/<unit> -b <unit> <base>`.
 - Commit locally, then push the branch to this host: `git push <remote> <unit>`.
 - Attach it to the thread as a `patch` entry with `--base` / `--head`; CI (if declared) runs on
   the branch tip. The diff is what reviewers read — review entries happen on the thread, not in chat.
@@ -192,8 +192,11 @@ everyone re-derives the same view from the refs.
 
 ### 5. Merge & archive
 
-- After approval: merge locally (fast-forward preferred), push the result to this host — and to
-  GitHub too when the repo is dual-homed (walgit = fact source, GitHub = mirror/backup).
+- walgit alone is a complete collaboration platform; **GitHub (or any other host) is optional** and
+  is only a mirror when a project already keeps one.
+- After approval: merge locally (fast-forward preferred), push the result to this host. Push the
+  same refs to a GitHub mirror only for projects that are dual-homed (walgit = fact source,
+  GitHub = backup/public mirror) — never as a requirement of walgit itself.
 - Write `merge_result` `{"merged": true, "oid": "<sha>"}` and a `status` `done` on the thread.
 - Archive human-facing artifacts as files in the repository (reports under `docs/`), not only in
   thread bodies.
