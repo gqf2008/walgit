@@ -119,3 +119,7 @@ sweep_interval = "5m"
 2. Dedup on `(repo, _walgit.seq, ref_name)` (or on `X-Walgit-Delivery` per batch).
 3. Order by `_walgit.seq` within a repo; do not assume order across repos.
 4. On a gap alert from the bridge, backfill from `walgit wal ls <repo> --from <seq>`.
+
+A runnable reference consumer lives at [`deploy/events/agent-receiver.py`](../deploy/events/agent-receiver.py)
+(stdlib-only: signature check, batch dedup, JSONL append) with enablement and
+at-least-once / backfill recipes in [`deploy/events/README.md`](../deploy/events/README.md).
