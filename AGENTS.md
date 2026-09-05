@@ -43,6 +43,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
 | `deploy/tray/` | The tray apps for a local deployment (macOS Swift + cross-platform Rust): start/stop, update detection, click-to-upgrade; see its README. |
+| `deploy/windows/` | The Windows installer (Inno Setup): per-user install to `%USERPROFILE%\walgit` (binary + tray + initial config), autostart; built into releases by `release.yml`. |
 | `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
 
 ---

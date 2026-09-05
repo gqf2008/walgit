@@ -1,0 +1,30 @@
+# %USERPROFILE%\walgit\walgit.toml — Windows 安装器生成的初始配置。
+#
+# 对象存储:S3/R2 配置向导落地(issue #70)之前,手工把 [store] 换成真实桶
+# (Cloudflare R2 示例在下方注释),然后在托盘菜单「停止服务 / 启动服务」
+# 重启生效。全部键与默认值见仓库 walgit.example.toml;校验(配置路径走全局
+# --config 旗标,不收位置参数):在部署目录直接 `walgit config check`,
+# 或 `walgit --config <本文件路径> config check`。
+
+[server]
+# 托盘按 8081 轮询 /healthz 并打开 Web UI —— 改端口要同时改托盘。
+listen = "127.0.0.1:8081"
+auto_create_on_push = true     # git push 到不存在的仓库即创建
+roles = []                     # 空 = 全部角色:serve / maintain / events
+
+[server.auth]
+# 本机回环部署:无凭据,anon 拥有全部权限(非 loopback 监听时此模式被拒绝)。
+mode = "none"
+
+[store]
+# !! 内存后端:数据不落盘,服务重启即丢 —— 只为装完先跑起来看 Web UI。
+# 尽快换成真实桶,形如(Cloudflare R2):
+#   backend = "s3"
+#   bucket = "your-bucket"
+#   [store.s3]
+#   endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+#   region = "auto"
+#   access_key_env = "AWS_ACCESS_KEY_ID"
+#   secret_key_env = "AWS_SECRET_ACCESS_KEY"
+#   force_path_style = true
+backend = "memory"
