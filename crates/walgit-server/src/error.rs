@@ -64,13 +64,16 @@ impl IntoResponse for ApiError {
         }
         let mut resp = (status, msg).into_response();
         // RFC 6750: a 401 from a Bearer-protected resource MUST include
-        // WWW-Authenticate. Auth failures (JWKS) surface as 401/503.
-        // RFC 6750: Bearer only. Never offer Basic: browsers would show a
-        // password dialog and there is no password-based way in.
+        // WWW-Authenticate. `Basic` first: git holds credentials (URL userinfo,
+        // helpers) but only sends them after a 401 that offers Basic — a
+        // Bearer-only challenge leaves libcurl without a scheme it implements
+        // (issue #79); the Basic password is interpreted as the token itself.
+        // The browser SPA lane is a different code path (`web::require_auth`,
+        // Bearer-only there — fetch never prompts, but navigations would).
         if self.status() == StatusCode::UNAUTHORIZED {
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Bearer realm=\"walgit\""),
+                axum::http::HeaderValue::from_static("Basic realm=\"walgit\", Bearer realm=\"walgit\""),
             );
         }
         // 503s are transient by contract (placement refusal during a fallback,
