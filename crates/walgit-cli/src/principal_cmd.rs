@@ -2,7 +2,7 @@
 //! register / list / revoke / rotate against `/api/v1/principals` (D1 §5
 //! cross-repo extension). HTTP-only, no bucket access.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -98,7 +98,7 @@ fn optional_bearer(token: Option<&str>) -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
-async fn put(url: &str, principal: &str, key: &PathBuf, token: Option<&str>, verb: &str) -> Result<()> {
+async fn put(url: &str, principal: &str, key: &Path, token: Option<&str>, verb: &str) -> Result<()> {
     ref_segment("principal", principal)?;
     let token = required_bearer(token)?;
     let sk = read_signing_key(key)?;

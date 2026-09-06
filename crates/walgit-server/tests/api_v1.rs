@@ -543,6 +543,25 @@ async fn repository_delete_requires_admin() -> TestResult {
     Ok(())
 }
 
+async fn call(
+    server: &Server,
+    method: reqwest::Method,
+    path: &str,
+    auth: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<reqwest::StatusCode> {
+    let mut r = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .request(method, format!("{}{path}", server.base_url))
+        .header("Accept", "application/json")
+        .header("Authorization", auth);
+    if let Some(b) = body {
+        r = r.json(&b);
+    }
+    Ok(r.send().await?.status())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_principal_registry_self_only_and_verifiable() -> TestResult {
     let server = Server::start_with_tweak(|c| {
@@ -566,25 +585,6 @@ async fn host_principal_registry_self_only_and_verifiable() -> TestResult {
         ];
     })
     .await?;
-
-    async fn call(
-        server: &Server,
-        method: reqwest::Method,
-        path: &str,
-        auth: &str,
-        body: Option<serde_json::Value>,
-    ) -> anyhow::Result<reqwest::StatusCode> {
-        let mut r = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?
-            .request(method, format!("{}{path}", server.base_url))
-            .header("Accept", "application/json")
-            .header("Authorization", auth);
-        if let Some(b) = body {
-            r = r.json(&b);
-        }
-        Ok(r.send().await?.status())
-    }
 
     let alice = "Bearer alice-token";
     let bob = "Bearer bob-token";

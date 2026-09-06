@@ -622,7 +622,7 @@ fn host_root(remote: &str) -> Result<String> {
         .split_once("://")
         .with_context(|| format!("remote URL {remote:?} has no scheme"))?;
     let slash = rest.find('/').unwrap_or(rest.len());
-    Ok(format!("{scheme}://{}", &rest[..slash]))
+    Ok(format!("{scheme}://{}", rest.get(..slash).unwrap_or(rest)))
 }
 
 fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Result<()> {
