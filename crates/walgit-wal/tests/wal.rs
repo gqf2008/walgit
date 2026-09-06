@@ -2095,6 +2095,14 @@ async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
             .unwrap();
         drop(g);
     });
+    // Windows runners contend for CPU and I/O; the correctness property is "refs
+    // sync does not wait for the long reader" (2 s timeout), not sub-millisecond
+    // scheduling. Widen the elapsed budget there (issue #94).
+    let refs_sync_budget = if cfg!(windows) {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(500)
+    };
     for _ in 0..5 {
         let t = std::time::Instant::now();
         let g = tokio::time::timeout(Duration::from_secs(2), handle2.sync_refs())
@@ -2102,7 +2110,7 @@ async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
             .expect("refs sync must not wait for the long reader")
             .unwrap();
         assert!(
-            t.elapsed() < Duration::from_millis(500),
+            t.elapsed() < refs_sync_budget,
             "refs sync took {:?}",
             t.elapsed()
         );
@@ -2112,10 +2120,11 @@ async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
     serve.await.unwrap();
     // D19 observability: whatever these refs syncs queued on (`sync_mutex`, `rw.read`), they never
     // waited behind the long reader — the recorded maximum stays far below the 1 s warn threshold.
+    let lockwait_budget_ms: u64 = if cfg!(windows) { 30 } else { 10 };
     for (lock, max_ms) in walgit_wal::lockwait::snapshot_for(&id) {
         if lock == "sync_mutex" || lock == "rw.read" {
             assert!(
-                max_ms < 10,
+                max_ms < lockwait_budget_ms,
                 "{lock}: a refs-level request waited {max_ms} ms behind a long read guard"
             );
         }

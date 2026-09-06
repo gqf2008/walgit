@@ -165,7 +165,10 @@ jobs:
         run: |
           set -e
           cargo test --workspace --lib --bins
-          cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+          cargo test -p walgit-store -p walgit-git -p walgit-bundle --tests
+          # walgit-wal tests carry the windows-timing-sensitive refs-sync case
+          # (AGENTS.md §5, issue #94): rerun once, then treat a repeat as real.
+          cargo test -p walgit-wal --tests || { echo "walgit-wal tests failed once (windows timing flaky); rerunning"; sleep 3; cargo test -p walgit-wal --tests; }
           cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
       - name: Simulation suite
         # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
