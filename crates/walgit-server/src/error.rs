@@ -116,3 +116,32 @@ impl From<walgit_store::StoreError> for ApiError {
         }
     }
 }
+
+/// The one auth-error mapping (web lane). `Unauthorized` here is the
+/// Bearer-only challenge; the git lane (smart HTTP, LFS, bundle downloads)
+/// wraps it with [`ApiError::git_lane`] for the Basic-first challenge.
+impl From<crate::auth::AuthError> for ApiError {
+    fn from(e: crate::auth::AuthError) -> Self {
+        match e {
+            crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+                ApiError::Unauthorized
+            }
+            crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+            crate::auth::AuthError::Unavailable => {
+                ApiError::ServiceUnavailable("auth provider unavailable".into())
+            }
+        }
+    }
+}
+
+impl ApiError {
+    /// The git lane's variant of a web-lane error: `Unauthorized` becomes
+    /// `UnauthorizedGit` — the Basic-first challenge git needs (§1.3, #79/#91).
+    #[must_use]
+    pub fn git_lane(self) -> Self {
+        match self {
+            ApiError::Unauthorized => ApiError::UnauthorizedGit,
+            other => other,
+        }
+    }
+}

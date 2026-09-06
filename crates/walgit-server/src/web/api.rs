@@ -41,7 +41,7 @@ use walgit_wal::{
 
 use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
-use crate::{AppState, auth::AuthError, cache::RefIndex, error::ApiError};
+use crate::{AppState, cache::RefIndex, error::ApiError};
 
 const MAX_BLOB: i64 = 2 * 1024 * 1024;
 const IMMUTABLE: &str = "private, max-age=31536000, immutable";
@@ -239,14 +239,6 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Route prefixes of the repo-scoped JSON API (D27): one per lane, both
 /// *after* the repository prefix. No lane-first forms, no aliases (banner).
 pub const REPO_API_BASES: [&str; 2] = ["/{owner}/{repo}/api", "/{owner}/{repo}/api-browser"];
-
-pub(crate) fn auth_err(e: AuthError) -> ApiError {
-    match e {
-        AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
-        AuthError::Forbidden => ApiError::Forbidden,
-        AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
-    }
-}
 fn not_found(msg: impl Into<String>) -> ApiError {
     ApiError::NotFound(msg.into())
 }
@@ -316,7 +308,10 @@ async fn open(
     owner: &str,
     name: &str,
 ) -> Result<Arc<RepoHandle>, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+    st.auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let id = walgit_git::RepoId::new(owner, name).map_err(|_| not_found("repository"))?;
     st.registry.open(&id).await.map_err(|e| match e {
         walgit_wal::WalError::NotFound => not_found("repository"),
@@ -485,7 +480,10 @@ async fn instance_info(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    st.auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let mut r = axum::Json(crate::instance::info(&st.cfg)).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -498,7 +496,10 @@ pub(crate) async fn owners(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    st.auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos.into_iter().map(|r| r.owner().to_string()).collect();
     out.sort();
@@ -510,7 +511,10 @@ pub(crate) async fn owner_repos(
     headers: HeaderMap,
     Path(owner): Path<String>,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    st.auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos
         .into_iter()
@@ -1192,7 +1196,11 @@ async fn collab_entries(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(body): Json<CollabPost>,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_write(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let handle = open(&st, &headers, &owner, &repo_name).await?;
     let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
     let entry = body.entry;
@@ -1397,7 +1405,11 @@ async fn collab_principal(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(body): Json<CollabPrincipalPost>,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_write(&headers)
+        .await
+        .map_err(ApiError::from)?;
     if !principal.anonymous && body.principal != principal.name {
         return Err(ApiError::Forbidden);
     }

@@ -83,7 +83,11 @@ pub async fn batch(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
@@ -225,7 +229,11 @@ pub async fn get_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
@@ -401,7 +409,11 @@ pub async fn put_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
@@ -469,7 +481,11 @@ pub async fn verify(
     let body: BatchObject = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
     require_lfs_oid(&body.oid)?;
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(&body.oid);
@@ -516,18 +532,6 @@ fn base_url(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> String {
         crate::smart::request_base_url(st, headers),
         route.id
     )
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::UnauthorizedGit
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 fn store_err(e: walgit_store::StoreError) -> ApiError {
     e.into()

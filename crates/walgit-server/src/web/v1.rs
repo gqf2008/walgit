@@ -271,7 +271,7 @@ async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
             r
         }
         Ok(_) => ApiError::Unauthorized.into_response(),
-        Err(e) => crate::web::api::auth_err(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -288,7 +288,7 @@ async fn authenticate(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             r
         }
-        Err(e) => crate::web::api::auth_err(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 

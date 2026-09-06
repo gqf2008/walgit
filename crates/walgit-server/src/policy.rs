@@ -666,7 +666,11 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     ensure_repo(st, route).await?;
     let policy = load(&st.store, &route.id).await.map_err(store_err)?;
     let body = serde_json::to_vec_pretty(&policy)
@@ -688,7 +692,11 @@ pub async fn http_put(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_admin(headers)
+        .await
+        .map_err(ApiError::from)?;
     ensure_repo(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let policy = parse_bytes(&bytes).map_err(store_err)?;
@@ -703,7 +711,11 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_admin(headers)
+        .await
+        .map_err(ApiError::from)?;
     ensure_repo(st, route).await?;
     clear(&st.store, &route.id).await.map_err(store_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
@@ -717,18 +729,6 @@ async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
             ApiError::Internal(format!("wal: {e}"))
         }
     })
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 
 fn store_err(e: StoreError) -> ApiError {

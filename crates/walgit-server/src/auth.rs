@@ -711,12 +711,10 @@ impl Authenticator {
         if p.write {
             Ok(p)
         } else if p.anonymous {
-            // Credential-less (anonymous only ever arises without a presented
-            // credential in token/oidc modes): challenge, don't forbid — git
-            // waits for a 401 before sending credentials it already holds
-            // (URL userinfo, helpers); a 403 makes a fresh `git push` give up
-            // (§1.3, issue #79). An authenticated identity that merely lacks
-            // write stays a real 403.
+            // Anonymous here == no credential presented. A missing credential
+            // challenges; an authenticated identity that merely lacks write
+            // stays a real 403. (The why — git's Basic-only retry — is §1.3's
+            // to tell, issue #79.)
             Err(AuthError::Unauthorized)
         } else {
             Err(AuthError::Forbidden)
@@ -728,6 +726,11 @@ impl Authenticator {
         let p = self.authenticate(headers).await?;
         if p.admin {
             Ok(p)
+        } else if p.anonymous {
+            // Same shape as `require_write` (§1.3): a missing credential is a
+            // challenge (401 — the client may still authenticate); an
+            // authenticated identity that is not an admin stays a real 403.
+            Err(AuthError::Unauthorized)
         } else {
             Err(AuthError::Forbidden)
         }

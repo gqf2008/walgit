@@ -628,7 +628,11 @@ async fn overview(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
+    state
+        .auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let handle = state.registry.open(&id).await.map_err(|e| wal_err(&e))?;
@@ -1097,7 +1101,11 @@ async fn ops_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
+    state
+        .auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let body = OpsInfo {
@@ -1132,7 +1140,11 @@ async fn ops_start(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = state.auth.require_write(&headers).await.map_err(auth_err)?;
+    let principal = state
+        .auth
+        .require_write(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     // Make sure the repo exists before spawning anything.
@@ -1156,7 +1168,11 @@ async fn tasks_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
+    state
+        .auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let tasks = state.registry.tasks();
@@ -1183,7 +1199,11 @@ async fn task_stream(
     AxumPath((owner, repo, task_id)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
+    state
+        .auth
+        .require_read(&headers)
+        .await
+        .map_err(ApiError::from)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let task = state
@@ -1351,17 +1371,5 @@ fn wal_err(error: &walgit_wal::WalError) -> ApiError {
     match error {
         walgit_wal::WalError::NotFound => ApiError::NotFound("repository not found".into()),
         other => ApiError::Internal(format!("wal: {other}")),
-    }
-}
-
-fn auth_err(error: crate::auth::AuthError) -> ApiError {
-    match error {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
     }
 }
