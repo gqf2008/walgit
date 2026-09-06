@@ -623,8 +623,13 @@ export class ReposClient {
         }
       }, 300);
       // A user mid-IdP sign-in must not hang the awaiting fetch forever: cap
-      // the dance (the popup stays — a later `signIn()` re-attaches to it).
-      const overall = setTimeout(() => finish(false), 60_000);
+      // the dance. Probe before ruling failure — the popup may have landed the
+      // session already (its success postMessage loses the race to this cap),
+      // and a probe is authoritative; the popup stays either way (a later
+      // `signIn()` re-attaches to the same named window).
+      const overall = setTimeout(() => {
+        this.probe().then(finish, () => finish(false));
+      }, 60_000);
     });
   }
 

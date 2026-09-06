@@ -235,7 +235,7 @@ jobs:
             // renames. A deleted fork's `pr.head.repo` is null (`?.id` →
             // undefined ≠ base id) — a deleted fork still counts as a fork.
             const author = pr.user?.login ?? '';
-            if (author === 'dependabot[bot]' || author === 'app/dependabot') {
+            if (author === 'dependabot[bot]') {
               console.log(`PR by ${author}; read-only token — skipping the summary comment`);
               return;
             }
