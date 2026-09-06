@@ -421,6 +421,20 @@ decision in §4 — or the PR is; never "fix later".
   records them); git operations for such owners are unaffected — only the single-segment owner page is
   shadowed.
 
+- **D43** **The first-run setup wizard (2026-09-06, #70).** A `memory` store without
+  `[store] memory_backend_intentional = true` means "unconfigured" (the installer's initial config ships exactly
+  that shape): the instance enters **setup state** — loopback-listen only (refused at startup otherwise,
+  fail-closed like §1.3), serving just `/setup` (a client route of the SPA shell), its `/_ui/*` assets,
+  `/api/v1/setup/*` (data-free, open like `/_auth/*`; answers 404 once configured), `/healthz`/`/readyz` and a
+  `/` → `/setup` redirect; everything else is 503 with a pointer. The wizard (① S3/R2 or GCS + bucket, ② test
+  connection — a HEAD probe of the bucket, ③ first admin token) writes back into the running `walgit.toml`
+  through `toml_edit` — comments and unrelated structure survive — after validating the composed file as a
+  whole. S3 credentials persist as literals (`[store.s3] access_key`/`secret_key`, take precedence over the
+  `*_env` names; 0600 the file); GCS rides ADC. After save the CLI serve path exits 75 and the tray's watcher
+  (its supervisor) respawns — bounded (5 consecutive 75-exits stop the loop); without a supervisor the wizard
+  says so. `InstanceInfo.store_backend` (`memory` | `s3` | `gcs`) is the shared runtime-warning judgement for
+  #73. The bundled SPA page lives outside the authed `Layout`.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---
