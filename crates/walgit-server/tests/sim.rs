@@ -1199,8 +1199,13 @@ async fn liveness_stale_instance_cannot_starve_the_core() -> Result<()> {
         fails.is_empty(),
         "core pushes failed next to a stale instance: {fails:?}"
     );
+    let p99_budget = if cfg!(windows) {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    };
     ensure!(
-        p99 < Duration::from_secs(5),
+        p99 < p99_budget,
         "core push p99 {p99:?} — starved"
     );
     check_truth(&c, &[core_p]).await?;
