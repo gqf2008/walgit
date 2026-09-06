@@ -1229,7 +1229,7 @@ async fn collab_entries(
     if entry.get("kind").and_then(|v| v.as_str()) == Some("status")
         && entry.get("body").and_then(|b| b.get("status")).and_then(|v| v.as_str()) == Some("done")
     {
-        let state = collab_load(&r).await?;
+        let state = collab_load(&st, &r).await?;
         let thread_refs: Vec<&walgit_wal::collab::EntryRef> = state
             .entries
             .iter()
