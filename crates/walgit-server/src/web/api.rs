@@ -1210,6 +1210,24 @@ async fn collab_entries(
             "actor {actor:?} is not a refname-safe segment"
         )));
     }
+    // Transition 门禁 (issue #75 ①, 方案 A):status=done 需前置 needs-review
+    // + verified approve review;其余流转自由。非法流转 400 机器可读错误。
+    if entry.get("kind").and_then(|v| v.as_str()) == Some("status")
+        && entry.get("body").and_then(|b| b.get("status")).and_then(|v| v.as_str()) == Some("done")
+    {
+        let state = collab_load(&r).await?;
+        let thread_refs: Vec<&walgit_wal::collab::EntryRef> = state
+            .entries
+            .iter()
+            .filter(|e| e.entry.id == entry.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        if let Err(e) = walgit_wal::collab::validate_status_transition(
+            &thread_refs,
+            &state.principals,
+        ) {
+            return Err(ApiError::BadRequest(e));
+        }
+    }
     let content = serde_json::to_vec(&entry).map_err(internal)?;
     let ref_name = format!("refs/collab/inbox/{actor}/{}", uuid::Uuid::new_v4());
     let (oid, seq) =
