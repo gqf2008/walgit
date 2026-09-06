@@ -4,12 +4,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Subcommand;
 use serde_json::json;
 
-use crate::collab_cmd::read_signing_key;
+use crate::collab_cmd::{read_signing_key, ref_segment};
 
 #[derive(Subcommand)]
 pub enum PrincipalAction {
@@ -92,9 +92,7 @@ fn bearer(token: Option<&str>) -> Result<String> {
 }
 
 fn put(url: &str, principal: &str, key: &PathBuf, token: Option<&str>, verb: &str) -> Result<()> {
-    if !refname_safe(principal) {
-        bail!("principal {principal:?} is not a refname-safe segment");
-    }
+    ref_segment("principal", principal)?;
     let token = bearer(token)?;
     let sk = read_signing_key(key)?;
     let public_key = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
@@ -120,14 +118,18 @@ fn put(url: &str, principal: &str, key: &PathBuf, token: Option<&str>, verb: &st
 }
 
 fn list(url: &str, token: Option<&str>) -> Result<()> {
-    let token = bearer(token)?;
+    let token = token
+        .map(str::to_string)
+        .or_else(|| std::env::var("WALGIT_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty());
     let out = tokio::runtime::Handle::current().block_on(async move {
-        let resp = reqwest::Client::new()
+        let mut req = reqwest::Client::new()
             .get(format!("{url}/api/v1/principals"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .context("GET host principals")?;
+            .header("Accept", "application/json");
+        if let Some(t) = &token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.context("GET host principals")?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         anyhow::ensure!(
@@ -141,6 +143,7 @@ fn list(url: &str, token: Option<&str>) -> Result<()> {
 }
 
 fn revoke(url: &str, principal: &str, token: Option<&str>) -> Result<()> {
+    ref_segment("principal", principal)?;
     let token = bearer(token)?;
     tokio::runtime::Handle::current().block_on(async move {
         let resp = reqwest::Client::new()
@@ -161,12 +164,3 @@ fn revoke(url: &str, principal: &str, token: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// D1 principal syntax: `[A-Za-z0-9][A-Za-z0-9._@-]*`.
-fn refname_safe(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
-}

@@ -560,8 +560,36 @@ fn run_principal_fetch(repo: &Path, remote: &str, token: Option<&str>) -> Result
         })
         .context("fetching host principals")?;
     let map: HashMap<String, String> = serde_json::from_str(&body)?;
+
+    // Purge cached principals that the host no longer lists (revoked/rotated
+    // away) — otherwise the offline cache would keep trusting a revoked key.
+    let existing = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/walgit/principals",
+        ])
+        .output()
+        .context("git for-each-ref refs/walgit/principals")?;
+    anyhow::ensure!(
+        existing.status.success(),
+        "git for-each-ref failed: {}",
+        String::from_utf8_lossy(&existing.stderr).trim()
+    );
+    for name in String::from_utf8_lossy(&existing.stdout).lines() {
+        let Some(principal) = name.strip_prefix("refs/walgit/principals/") else {
+            continue;
+        };
+        if !map.contains_key(principal) {
+            git_update_ref(repo, name, None)?;
+        }
+    }
+
     let mut n = 0;
     for (principal, public_key) in map {
+        ref_segment("principal", &principal)?;
         let content = serde_json::to_string_pretty(&serde_json::json!({
             "version": 1,
             "principal": principal,
@@ -1150,7 +1178,10 @@ impl CollabReader {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&blob)
                 && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
             {
-                map.insert(principal.to_string(), k.to_string());
+                // for-each-ref iterates refs/collab/* before refs/walgit/*, so
+                // or_insert keeps the repo-local key authoritative (matches the
+                // server's `principals.entry(..).or_insert(..)`).
+                map.entry(principal.to_string()).or_insert_with(|| k.to_string());
             }
         }
         Ok(map)
@@ -1594,5 +1625,48 @@ mod host_root_tests {
     #[test]
     fn rejects_schemeless() {
         assert!(host_root("walgit.localhost:8081/o/r.git").is_err());
+    }
+}
+
+#[cfg(test)]
+mod principal_cache_tests {
+    use super::*;
+
+    #[test]
+    fn principals_repo_local_overrides_host_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+
+        let local_oid = git_write_blob(
+            repo,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "principal": "p",
+                "public_key": "LOCAL",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let host_oid = git_write_blob(
+            repo,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "principal": "p",
+                "public_key": "HOST",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        git_update_ref(repo, "refs/collab/meta/principals/p", Some(&local_oid)).unwrap();
+        git_update_ref(repo, "refs/walgit/principals/p", Some(&host_oid)).unwrap();
+
+        let map = CollabReader::new(repo).principals().unwrap();
+        assert_eq!(map.get("p").map(String::as_str), Some("LOCAL"));
     }
 }
