@@ -18,17 +18,20 @@
 """
 
 import argparse
-import os
 import hashlib
 import hmac
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 args = None
 seen_deliveries: set[str] = set()
+# ThreadingHTTPServer serves each request on its own thread: the dedup
+# check-then-add and save_seen's truncate-and-rewrite can otherwise interleave.
+seen_lock = threading.Lock()
 
 
 def load_seen(path: Path) -> None:
@@ -78,28 +81,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.end_headers()
             return
-        if delivery and delivery in seen_deliveries:
-            sys.stdout.write(f"dup {delivery} — acked, not re-appended\n")
-            self.send_response(200)
-            self.end_headers()
-            return
-
+        # One critical section per delivery: dedup check → append → record.
+        # Order matters for at-least-once (append before record: a crash after
+        # the append re-delivers, the dedup then acks it), so the lock spans
+        # the whole sequence — check-then-add alone would still let two
+        # concurrent same-delivery threads both append.
         try:
-            events = json.loads(body)
-            if not isinstance(events, list):
-                events = [events]
-            with open(args.out, "a") as f:
-                for ev in events:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            with seen_lock:
+                if delivery and delivery in seen_deliveries:
+                    sys.stdout.write(f"dup {delivery} — acked, not re-appended\n")
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+                events = json.loads(body)
+                if not isinstance(events, list):
+                    events = [events]
+                with open(args.out, "a") as f:
+                    for ev in events:
+                        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                if delivery:
+                    seen_deliveries.add(delivery)
+                    save_seen(Path(args.state))
         except (json.JSONDecodeError, OSError) as e:
             sys.stderr.write(f"store failed: {e} — 500 so the bridge retries\n")
             self.send_response(500)
             self.end_headers()
             return
-
-        if delivery:
-            seen_deliveries.add(delivery)
-            save_seen(Path(args.state))
         sys.stdout.write(f"batch {delivery[:12]}: {len(events)} event(s) appended\n")
         self.send_response(200)
         self.end_headers()
@@ -116,7 +123,18 @@ def main() -> None:
     ap.add_argument("--path", default="/walgit")
     ap.add_argument("--out", default=str(home / "events.jsonl"))
     ap.add_argument("--state", default=str(home / ".events-seen"))
+    ap.add_argument("--require-signature", action="store_true",
+                    help="refuse to start when WALGIT_EVENTS_SECRET is unset (default: warn once and accept unsigned)")
     args = ap.parse_args()
+
+    if not os.environ.get("WALGIT_EVENTS_SECRET"):
+        if args.require_signature:
+            sys.stderr.write("WALGIT_EVENTS_SECRET unset with --require-signature — refusing to start\n")
+            sys.exit(2)
+        sys.stderr.write(
+            "warning: WALGIT_EVENTS_SECRET unset — accepting unsigned deliveries; "
+            "set it or pass --require-signature to fail closed\n"
+        )
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     load_seen(Path(args.state))
