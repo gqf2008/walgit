@@ -121,10 +121,32 @@ http {
             proxy_cache_lock on;
         }
         location @need_signin {
-            # Browsers: go sign in and come back. Everyone else: a real 401 (git erases a dead token on it).
+            # Browsers (Accept: text/html) navigate: go sign in and come back.
             if ($http_accept ~* "text/html") { return 302 /_auth/login?next=$request_uri; }
-            add_header WWW-Authenticate 'Bearer realm="walgit"' always;
-            return 401;
+            # Everyone else (git, curl, the SDK's fetch): proxy to the app and
+            # surface its own 401 verbatim — the challenge is channel-correct
+            # there (git/LFS/bundles: Basic first, §1.3/#79; browser lanes:
+            # Bearer only, #91). An edge-composed challenge is exactly how #79
+            # came back behind this edge. Body-less: the app's auth check
+            # precedes any body handling, and re-transferring a refused push
+            # (pack bytes to a credential-less client's 401) would double edge
+            # egress for nothing. A request inside the auth_request
+            # negative-cache window (5s) is a hard failure here (400, no
+            # auto-retry: git resends credentials on a 401, never on a 400);
+            # a manual retry after the cache expiry succeeds.
+            # Principal stays cleared like every other proxied hop: this path
+            # answers unauthenticated traffic, and the app honours
+            # X-Walgit-Principal only from trusted forwarders.
+            proxy_pass http://walgit;
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Walgit-Capabilities "client-authorization";
+            proxy_set_header X-Walgit-Authorization $client_auth;
+            proxy_set_header X-Walgit-Principal "";
+            proxy_set_header Connection "";
         }
 
         # ---- open routes: health, the installer, the SDK, sign-in ---------------------

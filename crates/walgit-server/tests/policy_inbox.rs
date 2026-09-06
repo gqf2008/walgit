@@ -84,8 +84,7 @@ fn push_inbox(src: &TestRepo, server: &Server, actor: &str, name: &str, token: &
     if !ok {
         return (false, String::new());
     }
-    // URL userinfo form (issue #79): the push starts credential-less, gets the
-    // 401 + Basic challenge, then git sends the userinfo (password = token).
+    // URL userinfo form — the #79 challenge flow (§1.3); password = token.
     let out = Command::new("git")
         .current_dir(&src.dir)
         .env(
@@ -94,9 +93,7 @@ fn push_inbox(src: &TestRepo, server: &Server, actor: &str, name: &str, token: &
         )
         .args([
             "push",
-            &server
-                .repo_url("t", "secured")
-                .replacen("http://", &format!("http://git:{token}@"), 1),
+            &server.repo_url_with_userinfo("t", "secured", "git", token),
             &format!("HEAD:{ref_name}"),
         ])
         .output();

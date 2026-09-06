@@ -64,7 +64,7 @@ pub async fn info_refs(
                 &auth_help_message(st, headers, e),
             ));
         }
-        return Err(auth_err(e));
+        return Err(ApiError::from(e).git_lane());
     }
     if is_receive
         && let Some(msg) = push_url_must_be_git(st, route, headers) {
@@ -175,7 +175,10 @@ pub async fn upload_pack(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+    st.auth
+        .require_read(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
 
     let handle = open_repo(st, &route.id, false).await?;
 
@@ -931,7 +934,11 @@ pub async fn receive_pack(
     headers: &HeaderMap,
     mut body: Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(|e| ApiError::from(e).git_lane())?;
     if let Some(msg) = push_url_must_be_git(st, route, headers) {
         return refuse_push(body, headers, msg).await;
     }
@@ -1804,18 +1811,6 @@ fn git_err_response(service: &str, msg: &str) -> Response {
         no_cache_headers(),
         buf,
     )
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::UnauthorizedGit
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 fn git_err(e: &walgit_git::GitError) -> ApiError {
     ApiError::Internal(format!("git: {e}"))

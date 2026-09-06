@@ -228,12 +228,21 @@ jobs:
               : `**需处理**:${red} 个 job 真实失败`;
             const body = `## CI 摘要(agent 可读)\n${lines.join('\n')}\n\n${verdict}\n\n<!-- ci-summary -->`;
             const pr = context.payload.pull_request;
-            // PRs from forks get a read-only GITHUB_TOKEN: commenting would 403
-            // and turn this job red. The in-repo worktree flow is the norm; for
-            // fork PRs, just skip the comment. Compare repo IDs: `context.repo`
+            // Read-only tokens make commenting 403 and turn this job red — skip
+            // the comment for the two shapes that have one. (a) Dependabot
+            // builds its branches inside the base repo (it passes any fork
+            // check) but its workflow GITHUB_TOKEN is read-only; the PR author
+            // is the stable marker. (b) Forks: compare repo IDs — `context.repo`
             // has no `full_name` (only {owner, repo}), so a full_name compare is
-            // `undefined`-based and skips EVERY PR (#74); IDs also survive renames.
-            if (pr.head.repo.id !== pr.base.repo.id) {
+            // `undefined`-based and skips EVERY PR (#74); IDs also survive
+            // renames. A deleted fork's `pr.head.repo` is null (`?.id` →
+            // undefined ≠ base id) — a deleted fork still counts as a fork.
+            const author = pr.user?.login ?? '';
+            if (author === 'dependabot[bot]') {
+              console.log(`PR by ${author}; read-only token — skipping the summary comment`);
+              return;
+            }
+            if (pr.head.repo?.id !== pr.base.repo?.id) {
               console.log('PR from a fork; read-only token — skipping the summary comment');
               return;
             }

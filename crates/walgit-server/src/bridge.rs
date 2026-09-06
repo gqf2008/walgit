@@ -330,7 +330,11 @@ pub async fn http_notify(
 ) -> Result<axum::response::Response, crate::error::ApiError> {
     use crate::error::ApiError;
     use axum::response::IntoResponse;
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let Some(bridge) = &st.bridge else {
         return Err(ApiError::NotFound(
             "events bridge is not enabled here".into(),
@@ -355,19 +359,6 @@ pub async fn http_notify(
         }
     }
     Ok(axum::Json(reports).into_response())
-}
-
-fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
-    use crate::error::ApiError;
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 
 /// `events.sweep_interval` timer (0 = off).

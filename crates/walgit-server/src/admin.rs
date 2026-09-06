@@ -16,7 +16,11 @@ pub async fn create(
     headers: &HeaderMap,
     query: &str,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _principal = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(ApiError::from)?;
     let format = match query
         .split('&')
         .find_map(|part| part.strip_prefix("object_format="))
@@ -45,7 +49,11 @@ pub async fn delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let _principal = st
+        .auth
+        .require_admin(headers)
+        .await
+        .map_err(ApiError::from)?;
     st.registry
         .delete(&route.id)
         .await
@@ -55,7 +63,11 @@ pub async fn delete(
 
 /// `GET /` — list repos as text/plain, one `owner/name` per line.
 pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let repos = st.registry.list().await.map_err(|e| wal_err(&e))?;
     let body = repos
         .into_iter()
@@ -71,18 +83,6 @@ pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, 
         body,
     )
         .into_response())
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 fn wal_err(e: &walgit_wal::WalError) -> ApiError {
     match e {

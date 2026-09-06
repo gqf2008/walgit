@@ -192,6 +192,31 @@ impl Server {
         format!("{}/{owner}/{repo}.git", self.base_url)
     }
 
+    /// `repo_url` with HTTP userinfo, percent-encoded — the form a push URL
+    /// carries when the test drives the challenge flow: git starts
+    /// credential-less, the 401 that offers Basic makes it send the userinfo
+    /// (password = the token; §1.3 / issue #79).
+    pub fn repo_url_with_userinfo(
+        &self,
+        owner: &str,
+        repo: &str,
+        user: &str,
+        pass: &str,
+    ) -> String {
+        let enc = |s: &str| {
+            s.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        };
+        self.repo_url(owner, repo)
+            .replacen("://", &format!("://{}:{}@", enc(user), enc(pass)), 1)
+    }
+
     pub async fn put_repo(&self, owner: &str, repo: &str) -> Result<()> {
         let url = format!("{}/{owner}/{repo}", self.base_url);
         let resp = reqwest::Client::new().put(&url).send().await?;

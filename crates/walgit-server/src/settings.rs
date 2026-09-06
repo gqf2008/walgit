@@ -19,15 +19,6 @@ use serde_json::json;
 use crate::error::ApiError;
 use crate::{AppState, RepoRoute};
 
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        _ => ApiError::Forbidden,
-    }
-}
-
 async fn open(st: &AppState, route: &RepoRoute) -> Result<Arc<walgit_wal::RepoHandle>, ApiError> {
     st.registry.open(&route.id).await.map_err(|e| {
         if matches!(e, walgit_wal::WalError::NotFound) {
@@ -48,7 +39,11 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -72,7 +67,11 @@ pub async fn http_effective(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -100,7 +99,11 @@ pub async fn http_history(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -133,7 +136,11 @@ pub async fn http_put(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_admin(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     if bytes.len() > walgit_config::SETTINGS_MAX_BYTES {
@@ -155,7 +162,11 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_admin(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     publish(&h, "", &principal.name, "clear").await
 }
@@ -252,7 +263,11 @@ pub async fn http_describe(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -420,7 +435,11 @@ pub async fn http_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let text = std::str::from_utf8(&bytes)
@@ -459,7 +478,11 @@ pub async fn http_policy_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let _ = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let out = match crate::policy::parse_document(&bytes) {
@@ -483,7 +506,11 @@ pub async fn http_policy_dry_run(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await

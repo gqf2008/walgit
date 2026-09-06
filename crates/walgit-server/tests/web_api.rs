@@ -1052,11 +1052,8 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     let bad_status = resp.status();
     assert_eq!(bad_status, 403, "actor != principal refused");
 
-    // No credential -> 401 (a challenge: the client may still authenticate;
-    // issue #79 — a 403 here made git and API clients give up). The web lane's
-    // challenge is Bearer-only: a `Basic` challenge pops a native password
-    // dialog on the SDK sign-in popup's navigation (and on credentialed
-    // fetch/XHR) — `Basic` must never reach a browser-reachable surface.
+    // No credential -> 401 challenge (§1.3 tells the why); the web lane is
+    // Bearer-only — `Basic` must never reach a browser-reachable surface (#91).
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "entry": entry }))
@@ -1094,6 +1091,107 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     assert!(
         www.starts_with("bearer") && !www.contains("basic"),
         "v1 lane is Bearer-only, got WWW-Authenticate: {www}"
+    );
+    Ok(())
+}
+
+/// §1.3 / #93: an anonymous (credential-less) call to an admin surface
+/// (settings, policy) is a challenge — 401, Bearer-only (web lane) — not a
+/// 403 the client cannot act on; an authenticated non-admin identity keeps
+/// its real 403 (a retry cannot help).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_surfaces_challenge_anonymous_and_forbid_non_admin() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "adm@example.com".into(),
+                token: "adm".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+            walgit_config::StaticToken {
+                principal: "dev@example.com".into(),
+                token: "dev".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{}/t/adm", server.base_url))
+        .bearer_auth("adm")
+        .send()
+        .await?;
+    assert!(
+        resp.status().is_success() || resp.status() == reqwest::StatusCode::CONFLICT,
+        "create repo: {}",
+        resp.status()
+    );
+    let policy_body = r#"{"version":1,"groups":[],"rules":[]}"#;
+
+    // Anonymous (no credential) on both admin surfaces: 401, Bearer-only.
+    for (url, body) in [
+        (
+            format!("{}/t/adm/api/settings?message=x", server.base_url),
+            "[bundles]\n".to_string(),
+        ),
+        (
+            format!("{}/t/adm/api/policy", server.base_url),
+            policy_body.to_string(),
+        ),
+    ] {
+        let resp = client.put(&url).body(body).send().await?;
+        assert_eq!(resp.status(), 401, "{url}: {}", resp.status());
+        let www = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            www.starts_with("bearer") && !www.contains("basic"),
+            "{url}: admin surface challenges Bearer-only, got {www}"
+        );
+    }
+
+    // Authenticated non-admin: a real 403 on both.
+    for url in [
+        format!("{}/t/adm/api/settings?message=x", server.base_url),
+        format!("{}/t/adm/api/policy", server.base_url),
+    ] {
+        let resp = client
+            .put(&url)
+            .bearer_auth("dev")
+            .body("[bundles]\n")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 403, "{url}: {}", resp.status());
+    }
+
+    // Admin: through.
+    let resp = client
+        .put(format!("{}/t/adm/api/settings?message=x", server.base_url))
+        .bearer_auth("adm")
+        .body("[bundles]\n")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await?);
+    let resp = client
+        .put(format!("{}/t/adm/api/policy", server.base_url))
+        .bearer_auth("adm")
+        .body(policy_body)
+        .send()
+        .await?;
+    assert!(
+        resp.status() == 200 || resp.status() == 204,
+        "{}",
+        resp.status()
     );
     Ok(())
 }

@@ -3017,12 +3017,10 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
     Ok(())
 }
 
-/// Issue #79: a credential-less write request is a real 401 that **offers
-/// `Basic`** — git holds credentials (URL userinfo, helpers) but only sends
-/// them after a 401 challenge; a 403 made a fresh `git push` give up on every
-/// token-mode deployment that had not run the installer. The Basic password is
-/// interpreted as the token itself (§1.3); an authenticated identity that
-/// merely lacks write keeps its 403 (retry cannot help).
+/// The #79 challenge flow end to end (§1.3 holds the full telling): a
+/// credential-less push gets the Basic-first 401, then git sends the URL
+/// userinfo and the push lands; an authenticated identity that merely lacks
+/// write keeps its 403.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bare_push_gets_a_basic_challenge_and_then_sends_url_userinfo() -> TestResult {
     let server = Server::start_with_tweak(|c| {
@@ -3088,9 +3086,7 @@ async fn bare_push_gets_a_basic_challenge_and_then_sends_url_userinfo() -> TestR
         .await?;
     assert!(r.status().is_success(), "create repo: {}", r.status());
     let src = TestRepo::synthetic(2, 1)?;
-    let authed = server
-        .repo_url("t", "chal")
-        .replacen("http://", "http://dev:dev@", 1);
+    let authed = server.repo_url_with_userinfo("t", "chal", "dev", "dev");
     git_in(&src, &["remote", "add", "origin", &authed])?;
     git_in(&src, &["-c", "credential.helper=", "push", "-q", "origin", "main"])?;
     // The read side goes through the same challenge flow — userinfo only, no
