@@ -109,6 +109,20 @@ pub enum CollabAction {
         #[arg(long)]
         push: Option<String>,
     },
+    /// Fetch the host-global principal registry (issue #76) from the checkout's
+    /// origin host and cache it under `refs/walgit/principals/*` locally — after
+    /// this, repo B verifies a principal registered in repo A with no further
+    /// network access (offline-verifiable cache).
+    PrincipalFetch {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote whose URL names the walgit host (default `origin`).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Bearer token for the host (default `$WALGIT_TOKEN`).
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Read-only observability dashboard (D1 §8): aggregate all collab state
     /// into a summary — threads, PR status, verification health, activity.
     Report {
@@ -232,6 +246,11 @@ pub fn run(action: CollabAction) -> Result<()> {
             principal,
             push,
         } => run_principal_revoke(&repo, &principal, push.as_deref())?,
+        CollabAction::PrincipalFetch {
+            repo,
+            remote,
+            token,
+        } => run_principal_fetch(&repo, &remote, token.as_deref())?,
         CollabAction::Report {
             repo,
             format,
@@ -500,6 +519,100 @@ fn run_principal_register(
     }
     println!("{ref_name} {oid}");
     Ok(())
+}
+
+/// `collab principal-fetch`: pull the host-global registry and cache it as local
+/// refs under `refs/walgit/principals/*` (read by `CollabReader::principals`).
+fn run_principal_fetch(repo: &Path, remote: &str, token: Option<&str>) -> Result<()> {
+    let url = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["remote", "get-url", remote])
+        .output()
+        .context("git remote get-url")?;
+    anyhow::ensure!(
+        url.status.success(),
+        "git remote get-url failed: {}",
+        String::from_utf8_lossy(&url.stderr).trim()
+    );
+    let remote_url = String::from_utf8_lossy(&url.stdout).trim().to_string();
+    let root = host_root(&remote_url)?;
+    let token = token
+        .map(str::to_string)
+        .or_else(|| std::env::var("WALGIT_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty());
+    let body = tokio::runtime::Handle::current()
+        .block_on(async move {
+            let mut req = reqwest::Client::new()
+                .get(format!("{root}/api/v1/principals"))
+                .header("Accept", "application/json");
+            if let Some(t) = &token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp = req.send().await.context("GET host principals")?;
+            let status = resp.status();
+            let text = resp.text().await.context("reading host principals")?;
+            anyhow::ensure!(
+                status.is_success(),
+                "GET {root}/api/v1/principals -> {status}: {text}"
+            );
+            Ok::<_, anyhow::Error>(text)
+        })
+        .context("fetching host principals")?;
+    let map: HashMap<String, String> = serde_json::from_str(&body)?;
+
+    // Purge cached principals that the host no longer lists (revoked/rotated
+    // away) — otherwise the offline cache would keep trusting a revoked key.
+    let existing = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/walgit/principals",
+        ])
+        .output()
+        .context("git for-each-ref refs/walgit/principals")?;
+    anyhow::ensure!(
+        existing.status.success(),
+        "git for-each-ref failed: {}",
+        String::from_utf8_lossy(&existing.stderr).trim()
+    );
+    for name in String::from_utf8_lossy(&existing.stdout).lines() {
+        let Some(principal) = name.strip_prefix("refs/walgit/principals/") else {
+            continue;
+        };
+        if !map.contains_key(principal) {
+            git_update_ref(repo, name, None)?;
+        }
+    }
+
+    let mut n = 0;
+    for (principal, public_key) in map {
+        ref_segment("principal", &principal)?;
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "principal": principal,
+            "public_key": public_key,
+            "registered_at": 0,
+        }))?;
+        let oid = git_write_blob(repo, &content)?;
+        let ref_name = format!("refs/walgit/principals/{principal}");
+        git_update_ref(repo, &ref_name, Some(&oid))?;
+        n += 1;
+    }
+    println!("cached {n} host principal(s) under refs/walgit/principals/*");
+    Ok(())
+}
+
+/// `https://host[:port]/owner/repo[.git]` → `https://host[:port]`.
+fn host_root(remote: &str) -> Result<String> {
+    let without_git = remote.strip_suffix(".git").unwrap_or(remote);
+    let (scheme, rest) = without_git
+        .split_once("://")
+        .with_context(|| format!("remote URL {remote:?} has no scheme"))?;
+    let slash = rest.find('/').unwrap_or(rest.len());
+    Ok(format!("{scheme}://{}", &rest[..slash]))
 }
 
 fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Result<()> {
@@ -1039,12 +1152,15 @@ impl CollabReader {
             .collect())
     }
 
-    /// `refs/collab/meta/principals/<principal>` -> principal -> public key b64.
+    /// `refs/collab/meta/principals/<principal>` (repo-local) and
+    /// `refs/walgit/principals/<principal>` (host registry cached by
+    /// `collab principal-fetch`, issue #76) → principal → public key b64.
     fn principals(&self) -> Result<HashMap<String, String>> {
         let out = self.git(&[
             "for-each-ref",
             "--format=%(refname) %(objectname)",
             "refs/collab/meta/principals",
+            "refs/walgit/principals",
         ])?;
         let mut map = HashMap::new();
         for l in String::from_utf8_lossy(&out).lines() {
@@ -1052,14 +1168,20 @@ impl CollabReader {
             let (Some(name), Some(oid)) = (it.next(), it.next()) else {
                 continue;
             };
-            let Some(principal) = name.strip_prefix("refs/collab/meta/principals/") else {
+            let principal = name
+                .strip_prefix("refs/collab/meta/principals/")
+                .or_else(|| name.strip_prefix("refs/walgit/principals/"));
+            let Some(principal) = principal else {
                 continue;
             };
             let blob = self.git(&["cat-file", "blob", oid])?;
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&blob)
                 && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
             {
-                map.insert(principal.to_string(), k.to_string());
+                // for-each-ref iterates refs/collab/* before refs/walgit/*, so
+                // or_insert keeps the repo-local key authoritative (matches the
+                // server's `principals.entry(..).or_insert(..)`).
+                map.entry(principal.to_string()).or_insert_with(|| k.to_string());
             }
         }
         Ok(map)
@@ -1481,5 +1603,70 @@ mod entry_refs_tests {
         let digest2 = format!("{:x}", sha2::Sha256::digest(&decoded));
         assert_eq!(digest, digest2);
         assert_eq!(decoded, content);
+    }
+}
+
+#[cfg(test)]
+mod host_root_tests {
+    use super::host_root;
+
+    #[test]
+    fn parses_repo_remote_to_host_root() {
+        assert_eq!(
+            host_root("http://walgit.localhost:8081/gqf2008/vox-seat.git").unwrap(),
+            "http://walgit.localhost:8081"
+        );
+        assert_eq!(
+            host_root("https://git.example.com/acme/monorepo").unwrap(),
+            "https://git.example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_schemeless() {
+        assert!(host_root("walgit.localhost:8081/o/r.git").is_err());
+    }
+}
+
+#[cfg(test)]
+mod principal_cache_tests {
+    use super::*;
+
+    #[test]
+    fn principals_repo_local_overrides_host_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+
+        let local_oid = git_write_blob(
+            repo,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "principal": "p",
+                "public_key": "LOCAL",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let host_oid = git_write_blob(
+            repo,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "principal": "p",
+                "public_key": "HOST",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        git_update_ref(repo, "refs/collab/meta/principals/p", Some(&local_oid)).unwrap();
+        git_update_ref(repo, "refs/walgit/principals/p", Some(&host_oid)).unwrap();
+
+        let map = CollabReader::new(repo).principals().unwrap();
+        assert_eq!(map.get("p").map(String::as_str), Some("LOCAL"));
     }
 }

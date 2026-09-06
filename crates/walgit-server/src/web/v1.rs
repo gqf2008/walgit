@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
@@ -23,10 +23,14 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use walgit_store::{ObjectStoreExt, PutMode};
 
 use crate::repo::RepoRoute;
-use crate::web::api::{Need, RefInfo, etag_for, json_swr, run};
+use crate::web::api::{Need, RefInfo, auth_err, etag_for, json_swr, run};
 use crate::{AppState, error::ApiError};
 
 /// Canonical prefix of the versioned API.
@@ -48,6 +52,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             &format!("{API_V1}/owners/{{owner}}/repos"),
             get(crate::web::api::owner_repos),
+        )
+        // Host-global principal registry (cross-repo identity, D1 §5 extension):
+        // one registration verifies in every repository of this host.
+        .route(&format!("{API_V1}/principals"), get(host_principals))
+        .route(
+            &format!("{API_V1}/principals/{{principal}}"),
+            axum::routing::put(host_principal_put).delete(host_principal_delete),
         );
     // Repo admin under both lanes: summary/create/delete, policy, settings.
     for base in crate::web::api::REPO_API_BASES {
@@ -68,6 +79,117 @@ pub fn router(state: Arc<AppState>) -> Router {
             );
     }
     r.with_state(state)
+}
+
+// ---- host-global principals (cross-repo identity, issue #76) -----------------------
+
+/// Store key prefix for host-global principal certificates. Repo-local
+/// `refs/collab/meta/principals/*` remains authoritative when present; this
+/// is the fallback that makes a registration effective in every repository.
+const HOST_PRINCIPALS: &str = "host/principals/";
+
+fn host_principal_key(principal: &str) -> String {
+    format!("{HOST_PRINCIPALS}{principal}")
+}
+
+/// Read the whole host registry into principal → public key. Best effort:
+/// a failing store read surfaces as an internal error, never as a silent
+/// "unverified" fallback.
+pub(crate) async fn host_principals_map(st: &AppState) -> Result<HashMap<String, String>, ApiError> {
+    let mut map = HashMap::new();
+    let mut stream = st.store.list(HOST_PRINCIPALS, None);
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| ApiError::Internal(e.to_string()))?;
+        let Some(principal) = meta.key.strip_prefix(HOST_PRINCIPALS) else {
+            continue;
+        };
+        if principal.is_empty() || principal.contains('/') {
+            continue;
+        }
+        let Some((_, bytes)) = st
+            .store
+            .get_bytes(&meta.key)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+        else {
+            continue;
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(k) = v.get("public_key").and_then(|k| k.as_str())
+        {
+            map.insert(principal.to_string(), k.to_string());
+        }
+    }
+    Ok(map)
+}
+
+#[derive(Deserialize)]
+struct HostPrincipalPut {
+    public_key: String,
+}
+
+/// `GET /api/v1/principals` — every registered principal (self-describing map).
+async fn host_principals(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    let map = host_principals_map(&st).await?;
+    Ok(json_swr(&map, None).into_response(&headers))
+}
+
+/// `PUT /api/v1/principals/{principal}` — register/replace this principal's key.
+/// The authenticated principal must match the path (self-registration), exactly
+/// like the repo-scoped `collab/principal` endpoint.
+async fn host_principal_put(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(principal): Path<String>,
+    Json(body): Json<HostPrincipalPut>,
+) -> Result<Response, ApiError> {
+    let auth = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    if !auth.anonymous && auth.name != principal {
+        return Err(ApiError::Forbidden);
+    }
+    if !crate::web::api::ref_segment_ok(&principal) {
+        return Err(ApiError::BadRequest(format!(
+            "principal {principal:?} is not a refname-safe segment"
+        )));
+    }
+    let content = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "principal": principal,
+        "public_key": body.public_key,
+        "registered_at": chrono::Utc::now().timestamp(),
+    }))
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    st.store
+        .put_bytes(&host_principal_key(&principal), content, PutMode::Overwrite)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(json_swr(
+        &serde_json::json!({ "principal": principal, "registered": true }),
+        None,
+    )
+    .into_response(&headers))
+}
+
+/// `DELETE /api/v1/principals/{principal}` — revoke. Self only for now; admin
+/// escalation is a policy follow-up.
+async fn host_principal_delete(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(principal): Path<String>,
+) -> Result<Response, ApiError> {
+    let auth = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    if !auth.anonymous && auth.name != principal {
+        return Err(ApiError::Forbidden);
+    }
+    st.store
+        .delete(&host_principal_key(&principal), None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ---- CORS (browser lane from other origins) -----------------------------------

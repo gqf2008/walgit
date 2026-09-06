@@ -21,6 +21,7 @@ mod compact;
 mod import;
 mod import_direct;
 mod mirror;
+mod principal_cmd;
 pub mod repo;
 mod serve;
 #[cfg(test)]
@@ -109,6 +110,11 @@ enum Command {
     Collab {
         #[command(subcommand)]
         action: collab_cmd::CollabAction,
+    },
+    /// Host-global principal registry (cross-repo identity, issue #76).
+    Principal {
+        #[command(subcommand)]
+        action: principal_cmd::PrincipalAction,
     },
     /// Decentralized CI (`docs/D1_CI_PROTOCOL.md`): a client-side runner that
     /// subscribes to ref updates, claims runs with signed entries, executes the
@@ -710,7 +716,7 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
 fn is_host_read(command: &Command) -> bool {
     matches!(
         command,
-        Command::Repo {
+        Command::Principal { .. } | Command::Repo {
             action: RepoAction::Refs { .. }
                 | RepoAction::Ref { .. }
                 | RepoAction::MergeBase { .. }
@@ -753,6 +759,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
         Command::Collab { action } => collab_cmd::run(action),
+        Command::Principal { action } => principal_cmd::run(action),
         Command::Ci { action } => ci_cmd::run(action),
         Command::Mirror {
             from,
