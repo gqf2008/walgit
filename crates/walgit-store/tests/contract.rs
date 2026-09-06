@@ -700,6 +700,8 @@ async fn s3_contract() {
             region: "us-east-1".into(),
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            access_key: None,
+            secret_key: None,
             force_path_style: true,
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
