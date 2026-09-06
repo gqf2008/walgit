@@ -99,6 +99,15 @@ impl Server {
     /// The setup wizard's shape: memory WITHOUT the deliberate flag
     /// (`needs_setup`) plus the config file the save writes back to.
     pub async fn start_setup(config_path: &std::path::Path) -> Result<Self> {
+        Self::start_setup_with_tweak(config_path, |_| {}).await
+    }
+
+    /// `start_setup` with a further config tweak (e.g. an auth mode that is
+    /// already `token` — the F1 branch of the save).
+    pub async fn start_setup_with_tweak(
+        config_path: &std::path::Path,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
         let store = MemoryStore::shared();
         let cache = tempfile::tempdir()?;
         let path = config_path.to_path_buf();
@@ -106,8 +115,9 @@ impl Server {
             store,
             cache.path().to_path_buf(),
             Some(cache),
-            |c| {
+            move |c| {
                 c.store.memory_backend_intentional = false;
+                tweak(c);
             },
             move |st| {
                 st.config_path = Some(path);

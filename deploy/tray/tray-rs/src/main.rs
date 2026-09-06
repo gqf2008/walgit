@@ -211,6 +211,9 @@ fn spawn_service() -> Result<std::process::Child, String> {
     let cfg = deploy_dir().join("walgit.toml");
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--config").arg(&cfg);
+    // D43: the setup save exits 75 only when the server knows a supervisor
+    // will respawn it — this marker arms the exit.
+    cmd.env("WALGIT_SUPERVISED", "1");
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

@@ -41,7 +41,10 @@ pub async fn run(cfg: &Arc<Config>, config_path: &std::path::Path) -> Result<()>
     // the state yet.
     if let Some(st) = Arc::get_mut(&mut state) {
         st.config_path = Some(config_path.to_path_buf());
-        st.setup_exit = true;
+        // The setup save exits 75 only under a supervisor that will respawn
+        // (the tray sets WALGIT_SUPERVISED=1, D43); a bare standalone run gets
+        // `restart: "manual"` and the wizard page says to restart by hand.
+        st.setup_exit = std::env::var("WALGIT_SUPERVISED").is_ok_and(|v| v == "1");
     }
 
     // Spawn background loops for non-serving roles.

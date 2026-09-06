@@ -258,13 +258,11 @@ pub fn router(state: Arc<AppState>) -> Router {
     // auth (no credentials exist yet), compression and spans. Mounted only
     // while `needs_setup`; the configured path never pays for the check.
     if state.needs_setup {
-        app.layer(axum::middleware::from_fn_with_state(
-            state,
-            setup_wizard::gate,
-        ))
+        app.layer(axum::middleware::from_fn(setup_wizard::gate))
     } else {
         app
     }
+        .with_state(state)
 }
 
 async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {

@@ -43,12 +43,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// wizard needs is answered here, ahead of the auth and compression layers;
 /// the setup API passes through to its own router; all else is a 503 that
 /// names `/setup`.
-pub async fn gate(
-    State(st): State<Arc<AppState>>,
-    req: Request<Body>,
-    next: axum::middleware::Next,
-) -> Response {
-    let _ = st;
+pub async fn gate(req: Request<Body>, next: axum::middleware::Next) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     // Liveness probes stay open (a supervisor must tell the wizard instance is alive).
@@ -168,14 +163,6 @@ fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<()
     Ok(())
 }
 
-fn setup_backend(st: &AppState) -> &'static str {
-    match st.cfg.store.backend {
-        walgit_config::StoreBackend::Gcs => "gcs",
-        walgit_config::StoreBackend::S3 => "s3",
-        walgit_config::StoreBackend::Memory => "memory",
-    }
-}
-
 /// `POST /api/v1/setup/test` — build a store from the submitted params (never
 /// persisted) and probe the bucket: HEAD of a key that cannot exist yet. A
 /// NotFound *is* success (credentials + bucket reachable, no such object); a
@@ -202,7 +189,11 @@ async fn test_connection(State(st): State<Arc<AppState>>, body: Body) -> Respons
     if let Err(e) = apply_store(&mut scratch, &store) {
         return e.into_response();
     }
-    let backend = setup_backend(&st);
+    let backend = match scratch.store.backend {
+        walgit_config::StoreBackend::Gcs => "gcs",
+        walgit_config::StoreBackend::S3 => "s3",
+        walgit_config::StoreBackend::Memory => "memory",
+    };
     match walgit_store::open_store(&scratch).await {
         Ok(opened) => {
             let probe_key = format!("{}setup-probe", scratch.store_prefix());
@@ -288,26 +279,45 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if let Err(e) = apply_store(&mut scratch, &req.store) {
         return e.into_response();
     }
-    if let Some(token) = req.admin_token.as_deref().filter(|t| !t.trim().is_empty()) {
-        if st.cfg.server.auth.mode == walgit_config::AuthMode::None {
-            scratch.server.auth.mode = walgit_config::AuthMode::Token;
-            scratch.server.auth.tokens = vec![walgit_config::StaticToken {
-                principal: req
-                    .admin_principal
-                    .as_deref()
-                    .filter(|p| !p.trim().is_empty())
-                    .unwrap_or("admin")
-                    .to_string(),
-                token: token.trim().to_string(),
-                token_env: None,
-                write: true,
-                admin: true,
-            }];
-        } else {
-            warnings.push(
-                "auth is already configured (not `none`); the admin step was skipped".to_string(),
-            );
-        }
+    // The admin step applies only when the running auth is `none` (the wizard
+    // bootstraps the *first* identity). An already-configured auth is left to
+    // its own admin tooling — the same decision must govern the file edit,
+    // not just this scratch validation (a divergent edit would write a live
+    // admin token while telling the user it was skipped).
+    let write_admin = req
+        .admin_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+        && st.cfg.server.auth.mode == walgit_config::AuthMode::None;
+    if req
+        .admin_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+        && !write_admin
+    {
+        warnings.push(
+            "auth is already configured (not `none`); the admin step was skipped".to_string(),
+        );
+    }
+    if write_admin {
+        scratch.server.auth.mode = walgit_config::AuthMode::Token;
+        scratch.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: req
+                .admin_principal
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or("admin")
+                .to_string(),
+            token: req
+                .admin_token
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            token_env: None,
+            write: true,
+            admin: true,
+        }];
     }
     if let Err(e) = scratch.validate() {
         return (
@@ -341,7 +351,7 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
                 .into_response();
         }
     };
-    if let Err(e) = edit_document(&mut doc, &req) {
+    if let Err(e) = edit_document(&mut doc, &req, write_admin) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("config edit failed: {e:#}"),
@@ -408,7 +418,11 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
 
 /// Edit the TOML document: `[store]` (+ `[store.s3]` / `[store.gcs]`) and,
 /// for a first admin, `[server.auth]` mode + `[[server.auth.tokens]]`.
-fn edit_document(doc: &mut toml_edit::DocumentMut, req: &SetupSave) -> anyhow::Result<()> {
+fn edit_document(
+    doc: &mut toml_edit::DocumentMut,
+    req: &SetupSave,
+    write_admin: bool,
+) -> anyhow::Result<()> {
     use toml_edit::{Item, Table, value};
 
     let store_entry = doc.entry("store").or_insert(Item::Table(Table::new()));
@@ -451,7 +465,8 @@ fn edit_document(doc: &mut toml_edit::DocumentMut, req: &SetupSave) -> anyhow::R
         _ => {}
     }
 
-    if let Some(token) = req.admin_token.as_deref().filter(|t| !t.trim().is_empty()) {
+    if write_admin && let Some(token) = req.admin_token.as_deref().filter(|t| !t.trim().is_empty())
+    {
         let principal = req
             .admin_principal
             .as_deref()
@@ -515,7 +530,7 @@ backend = \"memory\"
             admin_token: Some("wgt-first-admin-token".into()),
             admin_principal: None,
         };
-        edit_document(&mut doc, &req).unwrap();
+        edit_document(&mut doc, &req, true).unwrap();
         let out = doc.to_string();
         // Comments survive; the store keys changed; the auth gained a token.
         assert!(out.contains("# 顶注释保留"), "{out}");
@@ -556,7 +571,7 @@ backend = \"memory\"
             admin_token: None,
             admin_principal: None,
         };
-        edit_document(&mut doc, &req).unwrap();
+        edit_document(&mut doc, &req, true).unwrap();
         let out = doc.to_string();
         assert!(!out.contains("access_key = \"old\""), "{out}");
         let cfg: walgit_config::Config = toml::from_str(&out).unwrap();

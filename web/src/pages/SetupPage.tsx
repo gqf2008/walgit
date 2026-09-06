@@ -75,8 +75,13 @@ export function SetupPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const body = (await r.json()) as { ok: boolean; message: string };
-      setTestResult({ ok: body.ok, message: body.message });
+      if (r.ok) {
+        const body = (await r.json()) as { ok: boolean; message: string };
+        setTestResult({ ok: body.ok, message: body.message });
+      } else {
+        // The rejection paths answer text/plain with the reason.
+        setTestResult({ ok: false, message: await r.text() });
+      }
     } catch (e) {
       setTestResult({ ok: false, message: String(e) });
     } finally {
@@ -97,18 +102,22 @@ export function SetupPage() {
           admin_principal: adminPrincipal,
         }),
       });
-      const body = (await r.json()) as {
-        saved?: boolean;
-        restart?: "supervisor" | "manual";
-        file?: string;
-      };
-      if (r.ok && body.saved) {
-        setRestart(body.restart ?? "manual");
-        setPhase("saved");
+      if (r.ok) {
+        const body = (await r.json()) as {
+          saved?: boolean;
+          restart?: "supervisor" | "manual";
+        };
+        if (body.saved) {
+          setRestart(body.restart ?? "manual");
+          setPhase("saved");
+          return;
+        }
+        setSaveError("server answered ok but did not save");
       } else {
+        // The rejection paths answer text/plain with the reason.
         setSaveError(await r.text());
-        setPhase("form");
       }
+      setPhase("form");
     } catch (e) {
       setSaveError(String(e));
       setPhase("form");
@@ -266,7 +275,7 @@ export function SetupPage() {
           <button
             className="btn primary"
             type="button"
-            disabled={phase !== "form" || !payload.bucket.trim()}
+            disabled={phase !== "form" || !payload.bucket.trim() || !st.can_save}
             onClick={runSave}
           >
             {phase === "saving" ? t("setup.saving") : t("setup.save")}

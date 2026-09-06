@@ -177,6 +177,69 @@ async fn save_refuses_an_invalid_composed_config() -> TestResult {
     Ok(())
 }
 
+/// F1 regression: an auth mode that is already configured (`token`) makes
+/// the save skip the admin step in the FILE too — no live token is written
+/// while the response says "skipped".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn save_with_configured_auth_skips_admin_edits_in_the_file_too() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(
+        &cfg_path,
+        "# 已有 token 模式
+[server.auth]
+mode = \"token\"
+
+[[server.auth.tokens]]
+principal = \"existing\"
+token = \"existing-token\"
+
+[store]
+backend = \"memory\"
+",
+    )?;
+    let server = Server::start_setup_with_tweak(&cfg_path, |c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "existing".into(),
+            token: "existing-token".into(),
+            token_env: None,
+            write: true,
+            admin: true,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .post(format!("{}/api/v1/setup/save", server.base_url))
+        .json(&serde_json::json!({
+            "store": { "backend": "s3", "bucket": "b", "endpoint": "http://127.0.0.1:9000" },
+            "admin_token": "must-not-land"
+        }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(body["saved"], true, "{body}");
+    assert!(
+        body["warnings"][0].as_str().unwrap().contains("skipped"),
+        "{body}"
+    );
+
+    let text = std::fs::read_to_string(&cfg_path)?;
+    assert!(!text.contains("must-not-land"), "{text}");
+    let cfg: walgit_config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(cfg.server.auth.mode, walgit_config::AuthMode::Token);
+    assert_eq!(
+        cfg.server.auth.tokens.len(),
+        1,
+        "the file's tokens stay as they were — {text}"
+    );
+    assert_eq!(cfg.server.auth.tokens[0].token, "existing-token");
+    Ok(())
+}
+
 /// Setup state refuses a non-loopback bind (fail-closed, §1.3's convention).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn setup_state_refuses_a_non_loopback_bind() -> TestResult {
