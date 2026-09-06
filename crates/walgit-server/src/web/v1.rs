@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use walgit_store::{ObjectStoreExt, PutMode};
 
 use crate::repo::RepoRoute;
-use crate::web::api::{Need, RefInfo, auth_err, etag_for, json_swr, run};
+use crate::web::api::{Need, RefInfo, etag_for, json_swr, run};
 use crate::{AppState, error::ApiError};
 
 /// Canonical prefix of the versioned API.
@@ -133,7 +133,7 @@ async fn host_principals(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    st.auth.require_read(&headers).await.map_err(ApiError::from)?;
     let map = host_principals_map(&st).await?;
     Ok(json_swr(&map, None).into_response(&headers))
 }
@@ -147,7 +147,7 @@ async fn host_principal_put(
     Path(principal): Path<String>,
     Json(body): Json<HostPrincipalPut>,
 ) -> Result<Response, ApiError> {
-    let auth = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let auth = st.auth.require_write(&headers).await.map_err(ApiError::from)?;
     if !auth.anonymous && auth.name != principal {
         return Err(ApiError::Forbidden);
     }
@@ -181,7 +181,7 @@ async fn host_principal_delete(
     headers: HeaderMap,
     Path(principal): Path<String>,
 ) -> Result<Response, ApiError> {
-    let auth = st.auth.require_write(&headers).await.map_err(auth_err)?;
+    let auth = st.auth.require_write(&headers).await.map_err(ApiError::from)?;
     if !auth.anonymous && auth.name != principal {
         return Err(ApiError::Forbidden);
     }
