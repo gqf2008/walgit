@@ -161,6 +161,31 @@ pub fn sign_entry(entry: &mut Entry, key: &SigningKey) -> String {
 /// Structured cross-thread references (issue #75 ③): the entry-body fields
 /// `related` / `depends_on` carry arrays of entry oids. Extracted here so the
 /// thread view and the write path agree on the exact convention.
+/// Transition 门禁(issue #75 ①, 方案 A:硬编码通用状态机)。
+///
+/// `status` 条目写 `done` 时校验前置条件:线程当前处于 `needs-review`
+/// 且存在 verified approve review。其余流转自由;`closed` 不限前置。
+pub fn validate_status_transition(
+    thread_entries: &[&EntryRef],
+    principals: &HashMap<String, String, impl std::hash::BuildHasher>,
+) -> Result<(), String> {
+    let current = card_status(thread_entries);
+    if current != "needs-review" {
+        return Err(format!(
+            "transition → done requires current status needs-review (got {current})"
+        ));
+    }
+    let has_approve = thread_entries.iter().any(|r| {
+        r.entry.kind == "review"
+            && r.entry.body.get("decision").and_then(|v| v.as_str()) == Some("approve")
+            && r.is_verified(principals)
+    });
+    if !has_approve {
+        return Err("transition → done requires a verified approve review in the thread".into());
+    }
+    Ok(())
+}
+
 pub fn referenced_oids(body: &serde_json::Value) -> Vec<String> {
     ["related", "depends_on"]
         .iter()
@@ -1174,5 +1199,84 @@ name = "everything else"
         let def = parse_board_def("version = 1\n[[column]]\nname = \"only blocked\"\nstatus = \"blocked\"\n").expect("def");
         let board = build_board(&borrowed, &principals, &MergeRules::default(), &def);
         assert!(board.columns.len() == 1 && board.columns[0].cards.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn entry(kind: &str, id: &str, actor: &str, oid: &str, ts: i64, body: serde_json::Value) -> EntryRef {
+        EntryRef {
+            oid: oid.to_string(),
+            principal: actor.to_string(),
+            entry: Entry {
+                version: 1,
+                kind: kind.to_string(),
+                id: id.to_string(),
+                actor: actor.to_string(),
+                ts,
+                parent: String::new(),
+                refs: None,
+                body,
+                sig: String::new(),
+            },
+        }
+    }
+
+    fn make_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+    }
+
+    fn signed_entry(key: &ed25519_dalek::SigningKey, kind: &str, id: &str, actor: &str, oid: &str, ts: i64, body: serde_json::Value) -> EntryRef {
+        let mut e = Entry {
+            version: 1,
+            kind: kind.to_string(),
+            id: id.to_string(),
+            actor: actor.to_string(),
+            ts,
+            parent: String::new(),
+            refs: None,
+            body,
+            sig: String::new(),
+        };
+        e.sig = sign_entry(&mut e, key);
+        EntryRef { oid: oid.to_string(), principal: actor.to_string(), entry: e }
+    }
+
+    #[test]
+    fn done_requires_needs_review_and_verified_approve() {
+        let key = make_key();
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pub_b64);
+
+        // thread: issue -> review(approve) -> status(needs-review)
+        let e1 = signed_entry(&key, "issue", "t1", "alice", "e1", 1, serde_json::json!({"title": "x"}));
+        let e3 = signed_entry(&key, "review", "t1", "alice", "e3", 3, serde_json::json!({"decision": "approve"}));
+        let e4 = signed_entry(&key, "status", "t1", "alice", "e4", 4, serde_json::json!({"status": "needs-review"}));
+        let entries = [e1, e3, e4];
+        let refs: Vec<&EntryRef> = entries.iter().collect();
+        assert!(validate_status_transition(&refs, &principals).is_ok());
+
+        // open -> done: no needs-review prerequisite -> reject
+        let entries_open = [
+            entry("issue", "t2", "alice", "f1", 1, serde_json::json!({"title": "x"})),
+        ];
+        let refs2: Vec<&EntryRef> = entries_open.iter().collect();
+        assert!(validate_status_transition(&refs2, &principals).is_err());
+    }
+
+    #[test]
+    fn done_requires_verified_approve() {
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), "fake".to_string());
+
+        let entries = [
+            entry("issue", "t3", "alice", "g1", 1, serde_json::json!({"title": "x"})),
+            entry("status", "t3", "alice", "g2", 2, serde_json::json!({"status": "needs-review"})),
+        ];
+        let refs: Vec<&EntryRef> = entries.iter().collect();
+        assert!(validate_status_transition(&refs, &principals).is_err());
     }
 }
