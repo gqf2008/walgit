@@ -3093,17 +3093,9 @@ async fn bare_push_gets_a_basic_challenge_and_then_sends_url_userinfo() -> TestR
         .replacen("http://", "http://dev:dev@", 1);
     git_in(&src, &["remote", "add", "origin", &authed])?;
     git_in(&src, &["-c", "credential.helper=", "push", "-q", "origin", "main"])?;
-    let remote_tip = git_in(
-        &src,
-        &[
-            "-c",
-            "http.extraHeader=Authorization: Bearer dev",
-            "ls-remote",
-            "-q",
-            "origin",
-            "refs/heads/main",
-        ],
-    )?;
+    // The read side goes through the same challenge flow — userinfo only, no
+    // extraHeader (the challenge, not a proactive bearer, moves git here too).
+    let remote_tip = git_in(&src, &["ls-remote", "-q", "origin", "refs/heads/main"])?;
     let local_tip = git_in(&src, &["rev-parse", "HEAD"])?;
     assert_eq!(
         remote_tip.split_whitespace().next().unwrap_or_default(),
