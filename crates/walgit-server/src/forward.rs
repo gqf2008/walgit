@@ -108,6 +108,20 @@ pub async fn receive_pack(
         );
         return ForwardOutcome::Fallback;
     }
+    // A 401 from the broker is the *hop's* credential failing (rotated
+    // `wal.push_broker_token`), not the end user's — but relayed bare it
+    // makes git call `erase` on its helpers and drop the user's good token,
+    // and a 401 is not in retryable-auth territory for libcurl mid-request.
+    // The broker is an optimisation, never a dependency (D28): fall back to
+    // the local receive-pack path instead of surfacing the broker's
+    // challenge as ours (issue #92).
+    if response.status() == StatusCode::UNAUTHORIZED {
+        tracing::warn!(
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "push broker rejected the hop credential (401); falling back to local receive-pack"
+        );
+        return ForwardOutcome::Fallback;
+    }
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -120,6 +134,10 @@ pub async fn receive_pack(
         header::CONTENT_ENCODING,
         header::CACHE_CONTROL,
         header::ETAG,
+        // The broker's auth verdict travels with its challenge: a relayed 401/403
+        // without `WWW-Authenticate` is a bare failure git cannot act on (and
+        // `erase`s a good credential for) — relay the header verbatim (issue #92).
+        header::WWW_AUTHENTICATE,
     ] {
         if let Some(value) = response_headers.get(&name) {
             builder = builder.header(name, value);
@@ -143,4 +161,119 @@ fn is_local_broker(url: &str) -> bool {
         return false;
     };
     matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot broker: reads exactly one request (headers + body — either a
+    /// satisfied Content-Length or a chunked terminator / EOF), answers `status`
+    /// plus `www` when given, closes.
+    async fn mini_broker(status: StatusCode, www: Option<&str>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let www = www.map(str::to_string);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                let Some((head, rest)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = head.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().to_string())
+                });
+                let done = match content_length.as_deref() {
+                    Some(len) => rest.len() >= len.parse::<usize>().unwrap_or(0),
+                    None => rest.ends_with("0\r\n\r\n"),
+                };
+                if done {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {} {}\r\nContent-Length: 0\r\n{}Connection: close\r\n\r\n",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                www.map(|w| format!("WWW-Authenticate: {w}\r\n"))
+                    .unwrap_or_default(),
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn forward_to(broker_url: &str) -> ForwardOutcome {
+        let route = RepoRoute {
+            id: "o/r".parse().unwrap(),
+            subpath: "git-receive-pack".into(),
+            had_git_suffix: true,
+        };
+        let principal = Principal {
+            name: "dev@example.com".into(),
+            write: true,
+            admin: false,
+            anonymous: false,
+        };
+        receive_pack(
+            broker_url,
+            &route,
+            &HeaderMap::new(),
+            Body::empty(),
+            &principal,
+            None,
+        )
+        .await
+    }
+
+    /// Issue #92: a broker 401 is the *hop's* credential failing, not the end
+    /// user's — relaying it bare makes git `erase` the user's good token from
+    /// its helpers. The broker is an optimisation (D28): fall back to the local
+    /// receive-pack path.
+    #[tokio::test]
+    async fn broker_401_falls_back_instead_of_relaying() {
+        let broker = mini_broker(StatusCode::UNAUTHORIZED, Some("Basic realm=\"walgit\"")).await;
+        let outcome = forward_to(&broker).await;
+        assert!(
+            matches!(outcome, ForwardOutcome::Fallback),
+            "a broker 401 must fall back to the local path (D28)"
+        );
+    }
+
+    /// Issue #92: a relayed 4xx keeps the broker's challenge — a bare 401/403
+    /// is a failure git cannot act on.
+    #[tokio::test]
+    async fn relayed_4xx_carries_www_authenticate() {
+        let broker = mini_broker(
+            StatusCode::FORBIDDEN,
+            Some("Bearer realm=\"walgit\", error=\"insufficient_scope\""),
+        )
+        .await;
+        let outcome = forward_to(&broker).await;
+        let ForwardOutcome::Response(resp) = outcome else {
+            panic!("a relayed 403 must surface, not fall back");
+        };
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "Bearer realm=\"walgit\", error=\"insufficient_scope\"",
+            "the broker's WWW-Authenticate must travel with the relayed response"
+        );
+    }
 }

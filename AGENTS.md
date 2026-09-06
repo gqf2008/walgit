@@ -96,9 +96,11 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 - **The server answers an invalid/expired credential with a real 401** — that is what makes git `erase` it from
   its helpers and ask again; the friendly 200 + in-band ERR is reserved for failures a retry cannot fix (account
   not allowed, verifier down). A 200 leaves git re-storing a dead token for its cache's lifetime. A **missing**
-  credential is the same real 401, answered with `WWW-Authenticate: Basic …, Bearer …` (git sends the credentials
-  it holds — URL userinfo, helpers — only after a 401 that offers Basic; a 403 makes a fresh push give up), while
-  an authenticated identity that is not allowed stays 403 (issue #79).
+  credential is the same real 401 (git sends the credentials it holds — URL userinfo, helpers — only after a 401
+  that offers Basic; a 403 makes a fresh push give up), while an authenticated identity that is not allowed stays
+  403 (issue #79). The challenge is **channel-scoped**: git smart HTTP, LFS and bundle downloads answer
+  `WWW-Authenticate: Basic …, Bearer …`; every browser-reachable surface answers `Bearer` only — a `Basic`
+  challenge on a navigation or credentialed fetch pops the browser's native password dialog.
 - **An edge announces what it took over, per request, in `X-Walgit-Capabilities`** (D39): `client-authorization`
   (the client's bearer travels in `X-Walgit-Authorization`; `Authorization` is the hop's own credential and is
   never read as the client's) and `accel-redirect` (static bytes by `X-Accel-Redirect`, honoured only when
