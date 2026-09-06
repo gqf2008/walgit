@@ -1255,12 +1255,12 @@ mod transition_tests {
         let e1 = signed_entry(&key, "issue", "t1", "alice", "e1", 1, serde_json::json!({"title": "x"}));
         let e3 = signed_entry(&key, "review", "t1", "alice", "e3", 3, serde_json::json!({"decision": "approve"}));
         let e4 = signed_entry(&key, "status", "t1", "alice", "e4", 4, serde_json::json!({"status": "needs-review"}));
-        let entries = vec![e1, e3, e4];
+        let entries = [e1, e3, e4];
         let refs: Vec<&EntryRef> = entries.iter().collect();
         assert!(validate_status_transition(&refs, &principals).is_ok());
 
         // open -> done: no needs-review prerequisite -> reject
-        let entries_open = vec![
+        let entries_open = [
             entry("issue", "t2", "alice", "f1", 1, serde_json::json!({"title": "x"})),
         ];
         let refs2: Vec<&EntryRef> = entries_open.iter().collect();
@@ -1272,7 +1272,7 @@ mod transition_tests {
         let mut principals = HashMap::new();
         principals.insert("alice".to_string(), "fake".to_string());
 
-        let entries = vec![
+        let entries = [
             entry("issue", "t3", "alice", "g1", 1, serde_json::json!({"title": "x"})),
             entry("status", "t3", "alice", "g2", 2, serde_json::json!({"status": "needs-review"})),
         ];
