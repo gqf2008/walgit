@@ -18,17 +18,17 @@
 //! Once configured (`backend != memory` or the flag set), `needs_setup` is
 //! false, the gate is not mounted and `/api/v1/setup/*` answers 404.
 
+use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::web::ui;
 use crate::{AppState, error::ApiError};
-use crate::web::ui as ui;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -132,10 +132,7 @@ fn default_true() -> bool {
 
 /// Apply the submitted store to a scratch config — shared by the test
 /// connection (never persisted) and the save (persisted after validation).
-fn apply_store(
-    cfg: &mut walgit_config::Config,
-    store: &SetupStore,
-) -> Result<(), ApiError> {
+fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<(), ApiError> {
     if store.bucket.trim().is_empty() {
         return Err(ApiError::BadRequest("bucket is required".into()));
     }
@@ -150,10 +147,10 @@ fn apply_store(
             } else {
                 store.region.trim().to_string()
             };
-            s3.access_key = (!store.access_key.trim().is_empty())
-                .then(|| store.access_key.trim().to_string());
-            s3.secret_key = (!store.secret_key.trim().is_empty())
-                .then(|| store.secret_key.trim().to_string());
+            s3.access_key =
+                (!store.access_key.trim().is_empty()).then(|| store.access_key.trim().to_string());
+            s3.secret_key =
+                (!store.secret_key.trim().is_empty()).then(|| store.secret_key.trim().to_string());
             s3.force_path_style = store.force_path_style;
         }
         "gcs" => {
@@ -183,11 +180,7 @@ fn setup_backend(st: &AppState) -> &'static str {
 /// persisted) and probe the bucket: HEAD of a key that cannot exist yet. A
 /// NotFound *is* success (credentials + bucket reachable, no such object); a
 /// success is success too; anything else is the surfaced error.
-async fn test_connection(
-    State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    body: Body,
-) -> Response {
+async fn test_connection(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if !st.needs_setup {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -263,11 +256,7 @@ struct SetupSave {
 /// running `walgit.toml` in place with `toml_edit` (comments and unrelated
 /// keys survive), and — when the CLI serve path armed it — exit 75 so the
 /// supervisor restarts into the configured instance.
-async fn save(
-    State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    body: Body,
-) -> Response {
+async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if !st.needs_setup {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -344,7 +333,10 @@ async fn save(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("config file {} is not valid TOML: {e}", config_path.display()),
+                format!(
+                    "config file {} is not valid TOML: {e}",
+                    config_path.display()
+                ),
             )
                 .into_response();
         }
@@ -429,9 +421,7 @@ fn edit_document(doc: &mut toml_edit::DocumentMut, req: &SetupSave) -> anyhow::R
     match req.store.backend.as_str() {
         "s3" => {
             store_tbl.remove("gcs");
-            let s3_entry = store_tbl
-                .entry("s3")
-                .or_insert(Item::Table(Table::new()));
+            let s3_entry = store_tbl.entry("s3").or_insert(Item::Table(Table::new()));
             let s3 = s3_entry
                 .as_table_mut()
                 .ok_or_else(|| anyhow::anyhow!("[store.s3] is not a table"))?;
@@ -452,9 +442,7 @@ fn edit_document(doc: &mut toml_edit::DocumentMut, req: &SetupSave) -> anyhow::R
         }
         "gcs" => {
             store_tbl.remove("s3");
-            let gcs_entry = store_tbl
-                .entry("gcs")
-                .or_insert(Item::Table(Table::new()));
+            let gcs_entry = store_tbl.entry("gcs").or_insert(Item::Table(Table::new()));
             let gcs = gcs_entry
                 .as_table_mut()
                 .ok_or_else(|| anyhow::anyhow!("[store.gcs] is not a table"))?;
@@ -485,10 +473,10 @@ fn edit_document(doc: &mut toml_edit::DocumentMut, req: &SetupSave) -> anyhow::R
             .as_array_of_tables_mut()
             .ok_or_else(|| anyhow::anyhow!("server.auth.tokens is not an array of tables"))?;
         let mut first = Table::new();
-        first["principal"] = value(principal);
-        first["token"] = value(token.trim());
-        first["write"] = value(true);
-        first["admin"] = value(true);
+        first.insert("principal", value(principal));
+        first.insert("token", value(token.trim()));
+        first.insert("write", value(true));
+        first.insert("admin", value(true));
         aot.push(first);
     }
     Ok(())
@@ -534,7 +522,10 @@ backend = \"memory\"
         assert!(out.contains("# 内存后端:数据不落盘"), "{out}");
         assert!(out.contains("backend = \"s3\""), "{out}");
         assert!(out.contains("bucket = \"my-bucket\""), "{out}");
-        assert!(out.contains("endpoint = \"https://acct.r2.cloudflarestorage.com\""), "{out}");
+        assert!(
+            out.contains("endpoint = \"https://acct.r2.cloudflarestorage.com\""),
+            "{out}"
+        );
         assert!(out.contains("access_key = \"AK\""), "{out}");
         assert!(!out.contains("mode = \"none\""), "{out}");
         assert!(out.contains("mode = \"token\""), "{out}");

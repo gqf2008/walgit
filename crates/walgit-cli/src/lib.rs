@@ -707,7 +707,7 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async move { dispatch(command, cfg).await })
+    rt.block_on(async move { dispatch(command, cfg, config.to_path_buf()).await })
 }
 
 /// True only for the `walgit repo` HTTP reads (issue #61): commands that talk
@@ -737,7 +737,7 @@ fn is_host_read(command: &Command) -> bool {
     )
 }
 
-async fn dispatch(command: Command, cfg: Config) -> Result<()> {
+async fn dispatch(command: Command, cfg: Config, config_path: std::path::PathBuf) -> Result<()> {
     let cfg = std::sync::Arc::new(cfg);
     match command {
         Command::Config { action } => config_cmd::run(action, &cfg),
@@ -748,7 +748,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             files,
             seed,
         } => synth::run(&out, size, commits, files, seed),
-        Command::Serve => serve::run(&cfg, config).await,
+        Command::Serve => serve::run(&cfg, &config_path).await,
         Command::Compact {
             repo,
             all,
