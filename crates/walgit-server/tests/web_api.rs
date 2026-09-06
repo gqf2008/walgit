@@ -1053,7 +1053,10 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
     assert_eq!(bad_status, 403, "actor != principal refused");
 
     // No credential -> 401 (a challenge: the client may still authenticate;
-    // issue #79 — a 403 here made git and API clients give up).
+    // issue #79 — a 403 here made git and API clients give up). The web lane's
+    // challenge is Bearer-only: a `Basic` challenge pops a native password
+    // dialog on the SDK sign-in popup's navigation (and on credentialed
+    // fetch/XHR) — `Basic` must never reach a browser-reachable surface.
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "entry": entry }))
@@ -1063,6 +1066,34 @@ async fn collab_thin_api_posts_signed_entries() -> TestResult {
         resp.status(),
         401,
         "unauthenticated refused (token mode, no credential)"
+    );
+    let www = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        www.starts_with("bearer") && !www.contains("basic"),
+        "web lane is Bearer-only, got WWW-Authenticate: {www}"
+    );
+
+    // Same contract on the v1 lane the SDK popup lands on (`/api/v1/me` goes
+    // through the same mapper): 401, Bearer-only.
+    let resp = client
+        .get(format!("{}/api/v1/me", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 401, "{}", resp.status());
+    let www = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        www.starts_with("bearer") && !www.contains("basic"),
+        "v1 lane is Bearer-only, got WWW-Authenticate: {www}"
     );
     Ok(())
 }

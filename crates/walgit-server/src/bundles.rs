@@ -148,7 +148,7 @@ pub async fn object(
 fn auth_err(e: crate::auth::AuthError) -> ApiError {
     match e {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
+            ApiError::UnauthorizedGit
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
         crate::auth::AuthError::Unavailable => {
