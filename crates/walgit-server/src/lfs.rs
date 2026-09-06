@@ -78,16 +78,20 @@ pub async fn batch(
     headers: &HeaderMap,
     body_bytes: Bytes,
 ) -> Result<Response, ApiError> {
-    let body: BatchRequest = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ApiError::BadRequest(format!("invalid lfs batch: {e}")))?;
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
+    // Auth before parse: a body-less challenge probe (an edge's sign-in
+    // fallback strips the body; §1.3) must land the 401 + Basic challenge,
+    // not a parse error — git-lfs retries credentials on a 401, never on
+    // a 400 (#93 review).
     let _ = st
         .auth
         .require_read(headers)
         .await
         .map_err(|e| ApiError::from(e).git_lane())?;
+    let body: BatchRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid lfs batch: {e}")))?;
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
@@ -478,14 +482,16 @@ pub async fn verify(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let body: BatchObject = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
-    require_lfs_oid(&body.oid)?;
+    // Auth before parse, same as `batch`: the 401 challenge must outrank a
+    // body parse error on the challenge path (#93 review).
     let _ = st
         .auth
         .require_write(headers)
         .await
         .map_err(|e| ApiError::from(e).git_lane())?;
+    let body: BatchObject = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
+    require_lfs_oid(&body.oid)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(&body.oid);

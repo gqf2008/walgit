@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Json, Path, Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -1194,13 +1194,19 @@ async fn collab_entries(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo_name)): Path<(String, String)>,
-    Json(body): Json<CollabPost>,
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
         .require_write(&headers)
         .await
         .map_err(ApiError::from)?;
+    // Parse after auth: the raw-bytes extractor keeps a body-less challenge
+    // probe (an edge's sign-in fallback strips the body; the SDK's 401 dance)
+    // answerable with the 401 it needs — `Json<>` would reject it first with
+    // a 400 no client retries credentials on (#93 review).
+    let body: CollabPost = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid collab post: {e}")))?;
     let handle = open(&st, &headers, &owner, &repo_name).await?;
     let r = view(&st, handle.clone(), Need::Refs, Reporter::none()).await?;
     let entry = body.entry;
@@ -1403,13 +1409,16 @@ async fn collab_principal(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo_name)): Path<(String, String)>,
-    Json(body): Json<CollabPrincipalPost>,
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
         .require_write(&headers)
         .await
         .map_err(ApiError::from)?;
+    // Parse after auth — same reason as `collab_entries` (#93 review).
+    let body: CollabPrincipalPost = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid principal post: {e}")))?;
     if !principal.anonymous && body.principal != principal.name {
         return Err(ApiError::Forbidden);
     }

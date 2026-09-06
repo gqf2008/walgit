@@ -130,9 +130,10 @@ http {
             # came back behind this edge. Body-less: the app's auth check
             # precedes any body handling, and re-transferring a refused push
             # (pack bytes to a credential-less client's 401) would double edge
-            # egress for nothing — a client that legitimately signed in inside
-            # the auth_request negative-cache window (5s) gets a 400 here and
-            # succeeds on the retry, which is the milder side of that trade.
+            # egress for nothing. A request inside the auth_request
+            # negative-cache window (5s) is a hard failure here (400, no
+            # auto-retry: git resends credentials on a 401, never on a 400);
+            # a manual retry after the cache expiry succeeds.
             # Principal stays cleared like every other proxied hop: this path
             # answers unauthenticated traffic, and the app honours
             # X-Walgit-Principal only from trusted forwarders.
