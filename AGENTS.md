@@ -465,8 +465,9 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 - Known flaky (find the cause, not the assertion):
   `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`;
   passes alone; rerun, not skip).
-  Windows-only timing cases (issue #94; assertions widened for windows and the walgit-wal CI step
-  reruns once): `walgit_wal::tests::test_refs_sync_never_waits_behind_a_long_read_guard` and
+  Windows-only timing cases (issue #94; assertions widened for windows; the walgit-wal CI step
+  reruns once and the sim suite already reruns once):
+  `walgit_wal::tests::test_refs_sync_never_waits_behind_a_long_read_guard` and
   `sim::liveness_stale_instance_cannot_starve_the_core`. `reads_after_an_acknowledged_push_never_show_the_previous_tip` is
   hardened (PR #28): a sustained run of ≥3 consecutive identical foreign tips is a hard failure with a
   full DIAG dump (contenders/prev_winner/base/winner/after/seen) — a red means the read-side race of
