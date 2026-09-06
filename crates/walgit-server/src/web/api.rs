@@ -1108,7 +1108,7 @@ struct CollabPrincipalPost {
     public_key: String,
 }
 
-fn ref_segment_ok(s: &str) -> bool {
+pub(crate) fn ref_segment_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 255
         && !s.contains("..") // git forbids `..` inside a component; the WAL
@@ -1439,7 +1439,7 @@ struct CollabState {
     rules: MergeRules,
 }
 
-async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
+async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
     // Refs-level work: the byte-sorted index, no LIST on the bucket.
     let mut principals: HashMap<String, String> = HashMap::new();
     let mut plan: Vec<(&str, String, String)> = Vec::new(); // (kind, rest, oid)
@@ -1510,6 +1510,15 @@ async fn collab_load(r: &Repo) -> Result<CollabState, ApiError> {
             }
         }
     }
+    // Cross-repo identity (issue #76): a principal absent from this repo's local
+    // registry may still be registered at host level. Best-effort: a host store
+    // failure degrades to repo-local verification (old behavior).
+    if let Ok(host) = crate::web::v1::host_principals_map(st).await {
+        for (principal, public_key) in host {
+            principals.entry(principal).or_insert(public_key);
+        }
+    }
+
     if let Some(oid) = rules_oid
         && let Some(bytes) = blobs.get(&oid)
     {
@@ -1530,6 +1539,7 @@ async fn collab_report(
     headers: HeaderMap,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
+    let st2 = st.clone();
     run(
         &st,
         &headers,
@@ -1538,7 +1548,7 @@ async fn collab_report(
         Need::Objects,
         None,
         move |r| async move {
-            let state = collab_load(&r).await?;
+            let state = collab_load(&st2, &r).await?;
             let refs: Vec<&EntryRef> = state.entries.iter().collect();
             let report = build_report(
                 &refs,
@@ -1559,6 +1569,7 @@ async fn collab_thread(
     headers: HeaderMap,
     Path((owner, repo_name, id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
+    let st2 = st.clone();
     run(
         &st,
         &headers,
@@ -1567,7 +1578,7 @@ async fn collab_thread(
         Need::Objects,
         None,
         move |r| async move {
-            let state = collab_load(&r).await?;
+            let state = collab_load(&st2, &r).await?;
             let filtered: Vec<&EntryRef> =
                 state.entries.iter().filter(|e| e.entry.id == id).collect();
             if filtered.is_empty() {
@@ -1625,6 +1636,7 @@ async fn collab_board(
     headers: HeaderMap,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
+    let st2 = st.clone();
     run(
         &st,
         &headers,
@@ -1633,7 +1645,7 @@ async fn collab_board(
         Need::Objects,
         None,
         move |r| async move {
-            let state = collab_load(&r).await?;
+            let state = collab_load(&st2, &r).await?;
             let board_def = load_board_def(&r).await?;
             let refs: Vec<&EntryRef> = state.entries.iter().collect();
             let board: Board = build_board(&refs, &state.principals, &state.rules, &board_def);

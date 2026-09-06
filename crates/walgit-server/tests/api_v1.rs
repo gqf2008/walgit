@@ -542,3 +542,119 @@ async fn repository_delete_requires_admin() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_principal_registry_self_only_and_verifiable() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "alice".into(),
+                token: "alice-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "bob".into(),
+                token: "bob-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+        ];
+    })
+    .await?;
+
+    async fn call(
+        server: &Server,
+        method: reqwest::Method,
+        path: &str,
+        auth: &str,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<reqwest::StatusCode> {
+        let mut r = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .request(method, format!("{}{path}", server.base_url))
+            .header("Accept", "application/json")
+            .header("Authorization", auth);
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        Ok(r.send().await?.status())
+    }
+
+    let alice = "Bearer alice-token";
+    let bob = "Bearer bob-token";
+
+    // Anonymous reads are denied in this deployment.
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/api/v1/principals", &[])
+            .await?
+            .0,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    // Self-registration: alice writes her own key.
+    assert_eq!(
+        call(
+            &server,
+            reqwest::Method::PUT,
+            "/api/v1/principals/alice",
+            alice,
+            Some(serde_json::json!({ "public_key": "alice-key" })),
+        )
+        .await?,
+        reqwest::StatusCode::OK
+    );
+
+    // Bob may not impersonate alice (self-only).
+    assert_eq!(
+        call(
+            &server,
+            reqwest::Method::PUT,
+            "/api/v1/principals/alice",
+            bob,
+            Some(serde_json::json!({ "public_key": "bob-key" })),
+        )
+        .await?,
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // The registry lists alice's key.
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/principals",
+        &[("Authorization", alice)],
+    )
+    .await?;
+    assert_eq!(st, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(v["alice"], "alice-key");
+
+    // Bob may not revoke alice; alice may.
+    assert_eq!(
+        call(&server, reqwest::Method::DELETE, "/api/v1/principals/alice", bob, None).await?,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&server, reqwest::Method::DELETE, "/api/v1/principals/alice", alice, None).await?,
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/principals",
+        &[("Authorization", alice)],
+    )
+    .await?;
+    assert_eq!(st, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(v, serde_json::json!({}));
+
+    Ok(())
+}
