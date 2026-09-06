@@ -224,6 +224,12 @@ pub struct StaticToken {
 #[serde(deny_unknown_fields, default)]
 pub struct StoreConfig {
     pub backend: StoreBackend,
+    /// True only for deliberate memory use (tests, an ephemeral demo): a
+    /// memory deployment without this flag is "unconfigured" — the first-run
+    /// setup wizard (D43) takes over the instance until a real bucket is
+    /// configured.
+    #[serde(default)]
+    pub memory_backend_intentional: bool,
     pub bucket: String,
     /// Global key prefix inside the bucket (no leading slash; trailing slash added).
     pub prefix: String,
@@ -241,7 +247,9 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
-    /// Tests only.
+    /// Tests and deliberate ephemeral use only: without
+    /// `memory_backend_intentional` a memory deployment is "unconfigured" and
+    /// the setup wizard (D43) owns the instance.
     Memory,
 }
 
@@ -278,6 +286,13 @@ pub struct S3Config {
     pub region: String,
     pub access_key_env: String,
     pub secret_key_env: String,
+    /// Literal credentials (D43: the setup wizard writes these; 0600 the
+    /// config file). Take precedence over `*_env` when present — one file,
+    /// no env-dance for a single-machine deployment.
+    #[serde(default)]
+    pub access_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
     pub force_path_style: bool,
 }
 
@@ -1072,6 +1087,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
             backend: StoreBackend::Gcs,
+            memory_backend_intentional: false,
             bucket: "walgit".into(),
             prefix: String::new(),
             gcs: GcsConfig::default(),
@@ -1100,6 +1116,8 @@ impl Default for S3Config {
             region: "us-east-1".into(),
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            access_key: None,
+            secret_key: None,
             force_path_style: true,
         }
     }
@@ -1582,6 +1600,14 @@ impl Config {
     }
 
     /// Store prefix normalized to either "" or "something/".
+    /// The first-run setup wizard (D43) owns this instance until a real
+    /// bucket is configured: `memory` without the deliberate-use flag is the
+    /// "unconfigured" shape (the installer's initial config ships exactly
+    /// that).
+    pub fn needs_setup(&self) -> bool {
+        self.store.backend == StoreBackend::Memory && !self.store.memory_backend_intentional
+    }
+
     pub fn store_prefix(&self) -> String {
         let p = self.store.prefix.trim_matches('/');
         if p.is_empty() {

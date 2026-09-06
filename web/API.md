@@ -26,6 +26,29 @@ Client: **`web/sdk/repos.ts`** (the SDK; the SPA's `web/src/api.ts` is a thin
 adapter over it — the dogfood rule) and `web/src/use-resolved.ts` (the
 resolve-then-fetch-by-sha flow of §2a).
 
+## 0a. First-run setup (D43, setup state only)
+
+While the store is `memory` without `memory_backend_intentional` (the
+installer's initial config), the instance serves **only** the wizard: `/setup`
+(SPA shell), its `/_ui/*` assets, `/healthz`, `/readyz`, and the data-free
+`/api/v1/setup/*` surface below — open like `/_auth/*`, no bearer, no repo
+data; `/` redirects to `/setup`; everything else answers 503 with a pointer.
+Once configured (backend != memory) every `/api/v1/setup/*` path answers 404.
+
+```
+GET  /api/v1/setup/status  → 200 {needs_setup:true, backend:"memory", auth_mode, can_save}; 404 once configured
+POST /api/v1/setup/test    → {backend:"s3"|"gcs", bucket, endpoint, region, access_key, secret_key, force_path_style}
+                              → 200 {ok:true, ...} when the bucket is reachable; 400 {ok:false, message} otherwise (nothing persisted)
+POST /api/v1/setup/save    → {store:{...same}, admin_token?, admin_principal?}
+                              → 200 {saved:true, restart:"supervisor"|"manual", warnings, file} — the config file is
+                                rewritten (comments preserved); the CLI serve path then exits 75 for the supervisor
+                              → 400/503/500 with the reason; nothing written on refusal
+```
+
+Setup state requires a loopback listen (startup refusal otherwise). S3
+credentials persist as literals (`[store.s3] access_key`/`secret_key`, they
+win over `*_env`; 0600 the file); GCS rides ADC.
+
 ## 0. Lanes and auth (D27)
 
 | Lane | Path | Who | Credentials |

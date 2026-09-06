@@ -25,6 +25,7 @@ pub mod rebuild;
 pub mod repo;
 pub mod settings;
 pub mod setup;
+pub mod setup_wizard;
 pub mod smart;
 pub mod sse;
 pub mod static_object;
@@ -74,6 +75,17 @@ pub struct AppState {
     pub follow: follow::FollowStatuses,
     /// In-process TLS (standalone, D39); `None` behind an edge (h2c).
     pub tls: Option<Arc<tls::Tls>>,
+    /// The first-run setup wizard owns this instance (D43): `memory` store
+    /// without the deliberate-use flag. Computed once at build; the gate
+    /// middleware and the setup API key off it.
+    pub needs_setup: bool,
+    /// The `--config` file this instance runs from — where the setup wizard's
+    /// save writes. `None` for library/test use (save answers 503 then).
+    pub config_path: Option<std::path::PathBuf>,
+    /// Only the CLI serve path sets this: the setup save may exit(75) for the
+    /// supervisor (the tray, D43) to restart. Tests leave it false — a save
+    /// responds and the test lives.
+    pub setup_exit: bool,
 }
 
 impl AppState {
@@ -117,6 +129,9 @@ impl AppState {
             bridge,
             follow: follow::FollowStatuses::default(),
             tls,
+            needs_setup: cfg.needs_setup(),
+            config_path: None,
+            setup_exit: false,
         }))
     }
 }
@@ -154,7 +169,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             web::require_auth,
         ));
     
-    Router::new()
+    let app = Router::new()
         .merge(
             web::api::router(state.clone())
                 .with_state(())
@@ -178,6 +193,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // `/services/public/*` is the one open area: data-free routes only, never a
         // bearer, never repo data — today exactly the installer, everything else 404.
         .merge(web::ui::public_router(state.clone()).with_state(()))
+        // The first-run setup wizard (D43): open, data-free; 404 once configured.
+        .merge(setup_wizard::router(state.clone()).with_state(()))
         .merge(web::login::router(state.clone()).with_state(()))
         // Events bridge wake-up (docs/EVENTS.md): the Pub/Sub push envelope of
         // a GCS notification. Authenticated (the push SA's ID token); 404 when
@@ -236,6 +253,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.inflight.clone(),
             middleware::request_id,
         ))
+        .with_state(state.clone());
+    // Setup state (D43): the wizard gate is the outermost policy — ahead of
+    // auth (no credentials exist yet), compression and spans. Mounted only
+    // while `needs_setup`; the configured path never pays for the check.
+    if state.needs_setup {
+        app.layer(axum::middleware::from_fn(setup_wizard::gate))
+    } else {
+        app
+    }
         .with_state(state)
 }
 
@@ -540,6 +566,15 @@ pub async fn serve(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    // Setup state is the pre-credential phase (D43): the wizard must never
+    // answer on a non-loopback bind (fail-closed, same convention as §1.3's
+    // `mode = none` loopback rule).
+    if state.cfg.needs_setup() && !state.cfg.server.listen.ip().is_loopback() {
+        anyhow::bail!(
+            "setup state (a memory store without `memory_backend_intentional`) requires a loopback listen; \
+             bind 127.0.0.1 to run the first-run wizard, or set `[store] memory_backend_intentional = true`"
+        );
+    }
     let addr = state.cfg.server.listen;
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());

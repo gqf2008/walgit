@@ -166,6 +166,13 @@ fn index(method: &Method, headers: &HeaderMap) -> Response {
     }
 }
 
+/// The SPA shell for the setup wizard's `/setup` route (D43): in setup state
+/// the wizard gate serves it ahead of the auth layer — there are no
+/// credentials yet, so the normal gated route cannot answer.
+pub(crate) fn shell(method: &Method, headers: &HeaderMap) -> Response {
+    index(method, headers)
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct InstallQuery {
     /// `owner/name` — the script ends by exec'ing `git clone` of that repository.
@@ -299,7 +306,13 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 ///   request time.
 /// * `Content-Length` always; `HEAD` answered without a body.
 async fn asset(AxumPath(path): AxumPath<String>, req: Request<Body>) -> Response {
-    let path = path.trim_start_matches('/');
+    asset_bytes(path.trim_start_matches('/'), req.method(), req.headers())
+}
+
+/// One embedded `/_ui/*` asset with the repo's static rules — shared with the
+/// setup wizard's gate (D43), which serves assets in setup state ahead of the
+/// auth layer.
+pub(crate) fn asset_bytes(path: &str, method: &Method, headers: &HeaderMap) -> Response {
     // Never hand out the precompressed siblings directly: their identity is the
     // uncompressed asset (content negotiation picks the encoding). The build
     // only emits lowercase `.br`/`.gz`, but compare case-insensitively so a
@@ -316,7 +329,7 @@ async fn asset(AxumPath(path): AxumPath<String>, req: Request<Body>) -> Response
     } else {
         "no-cache"
     };
-    embedded_response(path, content, req.method(), req.headers(), cache)
+    embedded_response(path, content, method, headers, cache)
 }
 
 fn embedded_response(

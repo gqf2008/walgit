@@ -25,12 +25,14 @@ const CollabPage = lazy(() => track(import("./pages/CollabPage")).then((m) => ({
 const CollabBoardPage = lazy(() => track(import("./pages/CollabBoardPage")).then((m) => ({ default: m.CollabBoardPage })));
 const CollabThreadPage = lazy(() => track(import("./pages/CollabThreadPage")).then((m) => ({ default: m.CollabThreadPage })));
 const CollabGuidePage = lazy(() => track(import("./pages/CollabGuidePage")).then((m) => ({ default: m.CollabGuidePage })));
+const SetupPage = lazy(() => track(import("./pages/SetupPage")).then((m) => ({ default: m.SetupPage })));
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <I18nProvider>
       <BrowserRouter>
       <Routes>
+        <Route path="setup" element={<SetupPage />} />
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="repos" element={<ReposIndex />} />
