@@ -59,108 +59,101 @@ pub enum PrincipalAction {
     },
 }
 
-pub fn run(action: PrincipalAction) -> Result<()> {
+pub async fn run(action: PrincipalAction) -> Result<()> {
     match action {
         PrincipalAction::Register {
             url,
             principal,
             key,
             token,
-        } => put(&url, &principal, &key, token.as_deref(), "registered"),
+        } => put(&url, &principal, &key, token.as_deref(), "registered").await,
         PrincipalAction::Rotate {
             url,
             principal,
             key,
             token,
-        } => put(&url, &principal, &key, token.as_deref(), "rotated"),
-        PrincipalAction::List { url, token } => list(&url, token.as_deref()),
+        } => put(&url, &principal, &key, token.as_deref(), "rotated").await,
+        PrincipalAction::List { url, token } => list(&url, token.as_deref()).await,
         PrincipalAction::Revoke {
             url,
             principal,
             token,
-        } => revoke(&url, &principal, token.as_deref()),
+        } => revoke(&url, &principal, token.as_deref()).await,
     }
 }
 
-fn bearer(token: Option<&str>) -> Result<String> {
-    let t = token
+/// Require a bearer for write commands; reads may be anonymous.
+fn required_bearer(token: Option<&str>) -> Result<String> {
+    token
         .map(str::to_string)
         .or_else(|| std::env::var("WALGIT_TOKEN").ok())
         .filter(|t| !t.trim().is_empty())
-        .with_context(|| "no bearer token: pass --token or set WALGIT_TOKEN")?;
-    Ok(t)
+        .with_context(|| "no bearer token: pass --token or set WALGIT_TOKEN")
 }
 
-fn put(url: &str, principal: &str, key: &PathBuf, token: Option<&str>, verb: &str) -> Result<()> {
+fn optional_bearer(token: Option<&str>) -> Option<String> {
+    token
+        .map(str::to_string)
+        .or_else(|| std::env::var("WALGIT_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty())
+}
+
+async fn put(url: &str, principal: &str, key: &PathBuf, token: Option<&str>, verb: &str) -> Result<()> {
     ref_segment("principal", principal)?;
-    let token = bearer(token)?;
+    let token = required_bearer(token)?;
     let sk = read_signing_key(key)?;
     let public_key = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
-    let body = json!({ "public_key": public_key });
-    tokio::runtime::Handle::current().block_on(async move {
-        let resp = reqwest::Client::new()
-            .put(format!("{url}/api/v1/principals/{principal}"))
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .context("PUT host principal")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::ensure!(
-            status.is_success(),
-            "PUT {url}/api/v1/principals/{principal} -> {status}: {text}"
-        );
-        Ok::<_, anyhow::Error>(())
-    })?;
+    let resp = reqwest::Client::new()
+        .put(format!("{url}/api/v1/principals/{principal}"))
+        .bearer_auth(token)
+        .json(&json!({ "public_key": public_key }))
+        .send()
+        .await
+        .context("PUT host principal")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "PUT {url}/api/v1/principals/{principal} -> {status}: {text}"
+    );
     println!("{verb} {principal} at {url}");
     Ok(())
 }
 
-fn list(url: &str, token: Option<&str>) -> Result<()> {
-    let token = token
-        .map(str::to_string)
-        .or_else(|| std::env::var("WALGIT_TOKEN").ok())
-        .filter(|t| !t.trim().is_empty());
-    let out = tokio::runtime::Handle::current().block_on(async move {
-        let mut req = reqwest::Client::new()
-            .get(format!("{url}/api/v1/principals"))
-            .header("Accept", "application/json");
-        if let Some(t) = &token {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.context("GET host principals")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::ensure!(
-            status.is_success(),
-            "GET {url}/api/v1/principals -> {status}: {text}"
-        );
-        Ok::<_, anyhow::Error>(text)
-    })?;
-    println!("{out}");
+async fn list(url: &str, token: Option<&str>) -> Result<()> {
+    let token = optional_bearer(token);
+    let mut req = reqwest::Client::new()
+        .get(format!("{url}/api/v1/principals"))
+        .header("Accept", "application/json");
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.context("GET host principals")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "GET {url}/api/v1/principals -> {status}: {text}"
+    );
+    println!("{text}");
     Ok(())
 }
 
-fn revoke(url: &str, principal: &str, token: Option<&str>) -> Result<()> {
+async fn revoke(url: &str, principal: &str, token: Option<&str>) -> Result<()> {
     ref_segment("principal", principal)?;
-    let token = bearer(token)?;
-    tokio::runtime::Handle::current().block_on(async move {
-        let resp = reqwest::Client::new()
-            .delete(format!("{url}/api/v1/principals/{principal}"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .context("DELETE host principal")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::ensure!(
-            status.is_success(),
-            "DELETE {url}/api/v1/principals/{principal} -> {status}: {text}"
-        );
-        Ok::<_, anyhow::Error>(())
-    })?;
+    let token = required_bearer(token)?;
+    let resp = reqwest::Client::new()
+        .delete(format!("{url}/api/v1/principals/{principal}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("DELETE host principal")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "DELETE {url}/api/v1/principals/{principal} -> {status}: {text}"
+    );
     println!("revoked {principal} at {url}");
     Ok(())
 }
-

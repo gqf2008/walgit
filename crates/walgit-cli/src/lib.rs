@@ -758,8 +758,8 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         Command::Bundle { action } => bundle_cmd::run(action, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
-        Command::Collab { action } => collab_cmd::run(action),
-        Command::Principal { action } => principal_cmd::run(action),
+        Command::Collab { action } => collab_cmd::run(action).await,
+        Command::Principal { action } => principal_cmd::run(action).await,
         Command::Ci { action } => ci_cmd::run(action),
         Command::Mirror {
             from,
