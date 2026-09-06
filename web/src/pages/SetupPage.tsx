@@ -78,8 +78,13 @@ export function SetupPage() {
       if (r.ok) {
         const body = (await r.json()) as { ok: boolean; message: string };
         setTestResult({ ok: body.ok, message: body.message });
+      } else if ((r.headers.get("content-type") ?? "").includes("application/json")) {
+        // The most common failure (bad credentials / unreachable endpoint) is
+        // a 400 + {ok:false, message} — show the message, not the JSON.
+        const body = (await r.json()) as { ok?: boolean; message?: string };
+        setTestResult({ ok: false, message: body.message ?? String(body) });
       } else {
-        // The rejection paths answer text/plain with the reason.
+        // Validation rejections answer text/plain with the reason.
         setTestResult({ ok: false, message: await r.text() });
       }
     } catch (e) {
