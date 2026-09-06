@@ -185,6 +185,11 @@ async fn host_principal_delete(
     if !auth.anonymous && auth.name != principal {
         return Err(ApiError::Forbidden);
     }
+    if !crate::web::api::ref_segment_ok(&principal) {
+        return Err(ApiError::BadRequest(format!(
+            "principal {principal:?} is not a refname-safe segment"
+        )));
+    }
     st.store
         .delete(&host_principal_key(&principal), None)
         .await

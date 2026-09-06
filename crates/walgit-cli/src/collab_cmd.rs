@@ -482,6 +482,20 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
         body,
         sig: String::new(),
     };
+    // Transition 门禁（issue #102）：CLI 与服务端一致，status=done 必须
+    // 当前 needs-review 且存在 verified approve review。
+    if entry.kind == "status"
+        && entry.body.get("status").and_then(|v| v.as_str()) == Some("done")
+    {
+        let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
+        let thread_refs: Vec<&EntryRef> = thread_entries
+            .iter()
+            .filter(|e| e.entry.id == entry.id)
+            .collect();
+        if let Err(e) = walgit_wal::collab::validate_status_transition(&thread_refs, &principals) {
+            anyhow::bail!("status transition rejected: {e}");
+        }
+    }
     let key = read_signing_key(&args.key)?;
     entry.sig = sign_entry(&mut entry, &key);
     let content = serde_json::to_string_pretty(&entry)?;
