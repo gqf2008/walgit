@@ -177,7 +177,7 @@ pub enum CollabAction {
     },
 }
 
-pub fn run(action: CollabAction) -> Result<()> {
+pub async fn run(action: CollabAction) -> Result<()> {
     match action {
         CollabAction::Ls { repo } => {
             let reader = CollabReader::new(&repo);
@@ -250,7 +250,7 @@ pub fn run(action: CollabAction) -> Result<()> {
             repo,
             remote,
             token,
-        } => run_principal_fetch(&repo, &remote, token.as_deref())?,
+        } => run_principal_fetch(&repo, &remote, token.as_deref()).await?,
         CollabAction::Report {
             repo,
             format,
@@ -482,6 +482,20 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
         body,
         sig: String::new(),
     };
+    // Transition 门禁（issue #102）：CLI 与服务端一致，status=done 必须
+    // 当前 needs-review 且存在 verified approve review。
+    if entry.kind == "status"
+        && entry.body.get("status").and_then(|v| v.as_str()) == Some("done")
+    {
+        let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
+        let thread_refs: Vec<&EntryRef> = thread_entries
+            .iter()
+            .filter(|e| e.entry.id == entry.id)
+            .collect();
+        if let Err(e) = walgit_wal::collab::validate_status_transition(&thread_refs, &principals) {
+            anyhow::bail!("status transition rejected: {e}");
+        }
+    }
     let key = read_signing_key(&args.key)?;
     entry.sig = sign_entry(&mut entry, &key);
     let content = serde_json::to_string_pretty(&entry)?;
@@ -523,7 +537,7 @@ fn run_principal_register(
 
 /// `collab principal-fetch`: pull the host-global registry and cache it as local
 /// refs under `refs/walgit/principals/*` (read by `CollabReader::principals`).
-fn run_principal_fetch(repo: &Path, remote: &str, token: Option<&str>) -> Result<()> {
+async fn run_principal_fetch(repo: &Path, remote: &str, token: Option<&str>) -> Result<()> {
     let url = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -541,24 +555,20 @@ fn run_principal_fetch(repo: &Path, remote: &str, token: Option<&str>) -> Result
         .map(str::to_string)
         .or_else(|| std::env::var("WALGIT_TOKEN").ok())
         .filter(|t| !t.trim().is_empty());
-    let body = tokio::runtime::Handle::current()
-        .block_on(async move {
-            let mut req = reqwest::Client::new()
-                .get(format!("{root}/api/v1/principals"))
-                .header("Accept", "application/json");
-            if let Some(t) = &token {
-                req = req.header("Authorization", format!("Bearer {t}"));
-            }
-            let resp = req.send().await.context("GET host principals")?;
-            let status = resp.status();
-            let text = resp.text().await.context("reading host principals")?;
-            anyhow::ensure!(
-                status.is_success(),
-                "GET {root}/api/v1/principals -> {status}: {text}"
-            );
-            Ok::<_, anyhow::Error>(text)
-        })
-        .context("fetching host principals")?;
+    let mut req = reqwest::Client::new()
+        .get(format!("{root}/api/v1/principals"))
+        .header("Accept", "application/json");
+    if let Some(t) = &token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await.context("GET host principals")?;
+    let status = resp.status();
+    let text = resp.text().await.context("reading host principals")?;
+    anyhow::ensure!(
+        status.is_success(),
+        "GET {root}/api/v1/principals -> {status}: {text}"
+    );
+    let body = text;
     let map: HashMap<String, String> = serde_json::from_str(&body)?;
 
     // Purge cached principals that the host no longer lists (revoked/rotated
