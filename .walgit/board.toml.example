@@ -1,0 +1,37 @@
+# walgit 看板定义示例（.walgit/board.toml）
+# 看板是线程集合在声明式列定义下的确定性投影：卡片进入【第一个】满足谓词的列；
+# 字段留空 = 匹配任意。未命中任何列的线程不出现在看板上。
+# 移动卡片 = 追加一条签名 `status` 条目，不是改这个文件。
+
+version = 1
+
+[sort]
+by = "ts"          # ts(默认,按最后活动) | id(按线程 id)
+direction = "desc" # desc(默认,新在前) | asc
+
+# 一列一个谓词；只声明你真正想看到的列。
+# 字段：name(必填)、kind、status、merge、unverified
+#   kind       —— 线程必须包含该 kind 的条目
+#   status     —— 卡片有效状态(card_status)必须等于它
+#   merge      —— "allowed" | "blocked"：patch 的合并规则判定（无 patch 的线程不匹配）
+#   unverified —— true 时只收"至少含 1 条未验签条目"的卡片
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "done"
+status = "done"
+
+# 典型补充：只把"被规则判为不可合并"的 PR 单独列出来
+# [[column]]
+# name = "blocked"
+# merge = "blocked"
