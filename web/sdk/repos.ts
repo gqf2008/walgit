@@ -606,6 +606,7 @@ export class ReposClient {
         done = true;
         window.removeEventListener("message", onMsg);
         clearInterval(poll);
+        clearTimeout(overall);
         resolve(ok);
       };
       const onMsg = (ev: MessageEvent) => {
@@ -621,6 +622,9 @@ export class ReposClient {
           this.probe().then(finish, () => finish(false));
         }
       }, 300);
+      // A user mid-IdP sign-in must not hang the awaiting fetch forever: cap
+      // the dance (the popup stays — a later `signIn()` re-attaches to it).
+      const overall = setTimeout(() => finish(false), 60_000);
     });
   }
 

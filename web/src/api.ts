@@ -72,12 +72,16 @@ function onProgress(p: Progress) {
 /** The SDK client for this origin. Same-origin lane: `/api/v1`; identity is the session cookie. */
 export const client = createClient({ base: window.location.origin, lane: "same-origin", onProgress, interactive: false });
 
-/** 401 = the session lapsed (fetches are not redirected): reload so the sign-in redirect runs again. */
-async function authRedirect<T>(p: Promise<T>): Promise<T> {
+/**
+ * 401 = the session lapsed (fetches are not redirected): reload so the sign-in
+ * redirect runs again. Reads only — writes pass `{ write: true }` and rethrow
+ * instead: a reload here would silently drop what the user just typed (#93).
+ */
+async function authRedirect<T>(p: Promise<T>, opts: { write?: boolean } = {}): Promise<T> {
   try {
     return await track(p);
   } catch (e) {
-    if (e instanceof ReposError && e.status === 401 && !redirecting) {
+    if (e instanceof ReposError && e.status === 401 && !redirecting && !opts.write) {
       redirecting = true;
       window.location.reload();
       await new Promise(() => {}); // never resolves; the page is reloading
@@ -119,9 +123,9 @@ export const api = {
     report: () => authRedirect(client.repo(repo).collab.report()),
     thread: (id: string) => authRedirect(client.repo(repo).collab.thread(id)),
     board: () => authRedirect(client.repo(repo).collab.board()),
-    post: (entry: Record<string, unknown>) => authRedirect(client.repo(repo).collab.post(entry)),
+    post: (entry: Record<string, unknown>) => authRedirect(client.repo(repo).collab.post(entry), { write: true }),
     registerPrincipal: (principal: string, publicKey: string) =>
-      authRedirect(client.repo(repo).collab.registerPrincipal({ principal, publicKey })),
+      authRedirect(client.repo(repo).collab.registerPrincipal({ principal, publicKey }), { write: true }),
   }),
   /** Build a signed collab entry (SDK canonical form + caller's Ed25519 sign)
       ready for `collab.post` — the browser write path. */
