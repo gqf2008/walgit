@@ -10,7 +10,19 @@ use axum::response::{IntoResponse, Response};
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
+    /// 401 on a browser-reachable lane (web api/v1/ui, settings, policy,
+    /// admin, bridge, login): challenges `Bearer` only. A `Basic` challenge
+    /// pops the browser's native password dialog on navigations and
+    /// credentialed fetch/XHR (the SDK sign-in popup navigates to
+    /// `/api-browser/v1/authenticate`) — `Basic` must never reach a surface
+    /// a browser can navigate to (issue #91).
     Unauthorized,
+    /// 401 on the git lane (smart HTTP, LFS, bundle downloads): challenges
+    /// `Basic` first, `Bearer` second. git/libcurl holds credentials (URL
+    /// userinfo, helpers) but only sends them after a 401 that offers Basic —
+    /// a Bearer-only challenge leaves it without a scheme it implements, and
+    /// the Basic password is interpreted as the token itself (issue #79).
+    UnauthorizedGit,
     Forbidden,
     Conflict(String),
     PayloadTooLarge,
@@ -24,7 +36,7 @@ impl ApiError {
         match self {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Unauthorized | ApiError::UnauthorizedGit => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -41,7 +53,7 @@ impl ApiError {
         match self {
             ApiError::NotFound(m) => format!("not found: {m}"),
             ApiError::BadRequest(m) => format!("bad request: {m}"),
-            ApiError::Unauthorized => "unauthorized".to_string(),
+            ApiError::Unauthorized | ApiError::UnauthorizedGit => "unauthorized".to_string(),
             ApiError::Forbidden => "forbidden".to_string(),
             ApiError::Conflict(m) => format!("conflict: {m}"),
             ApiError::PayloadTooLarge => "payload too large".to_string(),
@@ -64,16 +76,24 @@ impl IntoResponse for ApiError {
         }
         let mut resp = (status, msg).into_response();
         // RFC 6750: a 401 from a Bearer-protected resource MUST include
-        // WWW-Authenticate. `Basic` first: git holds credentials (URL userinfo,
-        // helpers) but only sends them after a 401 that offers Basic — a
-        // Bearer-only challenge leaves libcurl without a scheme it implements
-        // (issue #79); the Basic password is interpreted as the token itself.
-        // The browser SPA lane is a different code path (`web::require_auth`,
-        // Bearer-only there — fetch never prompts, but navigations would).
-        if self.status() == StatusCode::UNAUTHORIZED {
+        // WWW-Authenticate. The challenge is channel-scoped (issue #91):
+        // the git lane challenges `Basic` first — git holds credentials (URL
+        // userinfo, helpers) but only sends them after a 401 that offers Basic;
+        // a Bearer-only challenge leaves libcurl without a scheme it implements
+        // (issue #79), and the Basic password is interpreted as the token
+        // itself. Browser-reachable lanes challenge `Bearer` only: a Basic
+        // challenge pops the browser's native password dialog on navigations
+        // and credentialed fetch (the SDK sign-in popup navigates to a
+        // browser-reachable 401) — the dialog sends the user's SSO password to
+        // this host as a token and preempts the designed sign-in flow.
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = match self {
+                ApiError::UnauthorizedGit => "Basic realm=\"walgit\", Bearer realm=\"walgit\"",
+                _ => "Bearer realm=\"walgit\"",
+            };
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Basic realm=\"walgit\", Bearer realm=\"walgit\""),
+                axum::http::HeaderValue::from_static(challenge),
             );
         }
         // 503s are transient by contract (placement refusal during a fallback,
