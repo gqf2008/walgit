@@ -19,7 +19,8 @@
 //!
 //! Auth: `--to` gets a bearer token handed to git through `GIT_CONFIG_*` env (never argv), for
 //! http(s) destinations only: `--identity token` (default) uses `$WALGIT_TOKEN` (an access
-//! token from the destination's `/_auth/tokens`, or a static token); `--identity gcloud` runs
+//! token from the destination's `/_auth/tokens`, or a static token); `--identity git` uses the
+//! machine's own git credentials (credential helpers / HTTP Basic, for GitHub); `--identity gcloud` runs
 //! `gcloud auth print-identity-token` (a Google ID token, for a walgit whose OIDC issuer is
 //! Google); `--identity gce` asks the GCE metadata server for an ID token with the destination
 //! origin as audience. `--from` uses whatever the machine's git config does for that URL. The
@@ -56,6 +57,9 @@ pub enum Identity {
     Gcloud,
     /// The GCE metadata server: this VM's service account, audience = the destination origin.
     Gce,
+    /// The machine's own git credentials (credential helpers / HTTP Basic) — for destinations
+    /// such as GitHub that do not accept a Bearer token on the push.
+    Git,
 }
 
 pub async fn run(args: MirrorArgs) -> Result<()> {
@@ -377,6 +381,10 @@ impl Mirror {
     /// Destination auth: a bearer token for HTTP(S) destinations, through environment
     /// config (not argv); credential helpers off so a bad token fails instead of prompting.
     async fn auth(&mut self, cmd: &mut Command) -> Result<()> {
+        if self.token.identity == Identity::Git {
+            // 交给本机 git 凭据（credential helper / HTTP Basic），不注入 Bearer、不禁用 helper。
+            return Ok(());
+        }
         if !(self.to.starts_with("https://") || self.to.starts_with("http://")) {
             return Ok(());
         }
@@ -431,6 +439,7 @@ impl Token {
                 .context("WALGIT_TOKEN is unset: export an access token for the destination (its /_auth/tokens page), or use --identity gcloud|gce")?,
             Identity::Gcloud => gcloud_identity_token().await?,
             Identity::Gce => gce_identity_token(&self.audience).await?,
+            Identity::Git => bail!("--identity git has no bearer token; machine git credentials are used instead"),
         };
         self.value = Some((token.clone(), Instant::now()));
         Ok(token)
@@ -612,6 +621,24 @@ mod tests {
             token: Token::new(Identity::Token, &to.display().to_string()),
             pushed: HashMap::new(),
         }
+    }
+
+    /// `--identity git` has no bearer: `auth` is a no-op (machine credentials), and any
+    /// accidental `Token::bearer()` call fails instead of producing an empty header.
+    #[tokio::test]
+    async fn identity_git_has_no_bearer_and_auth_is_noop() {
+        let mut t = Token::new(Identity::Git, "https://example.com/repo.git");
+        assert!(t.bearer().await.is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = mirror(
+            &tmp.path().join("src.git"),
+            &tmp.path().join("dst.git"),
+            &tmp.path().join("buf.git"),
+            false,
+        );
+        m.token = Token::new(Identity::Git, &m.to.clone());
+        m.auth(&mut Command::new("git")).await.unwrap();
     }
 
     /// Source → buffer → destination over <file://>: first tick publishes everything, a moved
