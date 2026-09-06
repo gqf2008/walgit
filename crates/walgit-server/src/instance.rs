@@ -26,6 +26,10 @@ pub struct InstanceInfo {
     pub shape: String,
     pub cpus: usize,
     pub memory_bytes: u64,
+    /// Store backend in force (`memory` | `s3` | `gcs`). The runtime warning
+    /// (`内存后端:数据不落盘` — the tray status line or a Web UI banner, #73)
+    /// keys off this, sharing the setup wizard's judgement (D43).
+    pub store_backend: &'static str,
 }
 
 fn cgroup_memory_max() -> Option<u64> {
@@ -167,6 +171,11 @@ pub fn info(cfg: &walgit_config::Config) -> InstanceInfo {
         "serverless" => format!("a serverless host · {cpus} vCPU · {}", gib(memory_bytes)),
         _ => format!("{cpus} cpus · {}", gib(memory_bytes)),
     };
+    let store_backend = match cfg.store.backend {
+        walgit_config::StoreBackend::Gcs => "gcs",
+        walgit_config::StoreBackend::S3 => "s3",
+        walgit_config::StoreBackend::Memory => "memory",
+    };
     InstanceInfo {
         kind,
         name,
@@ -178,6 +187,7 @@ pub fn info(cfg: &walgit_config::Config) -> InstanceInfo {
         shape,
         cpus,
         memory_bytes,
+        store_backend,
     }
 }
 

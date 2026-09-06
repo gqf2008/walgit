@@ -64,6 +64,7 @@ rustls-pemfile.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 tempfile.workspace = true
+toml_edit = "0.25.13"
 
 # statvfs behind `walgit_wal::platform::capacity` — the only libc use here.
 [target.'cfg(unix)'.dependencies]

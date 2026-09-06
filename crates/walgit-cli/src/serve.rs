@@ -25,7 +25,7 @@ use walgit_config::{Config, Role};
 use walgit_server::{AppState, serve};
 use walgit_store::open_store;
 
-pub async fn run(cfg: &Arc<Config>) -> Result<()> {
+pub async fn run(cfg: &Arc<Config>, config_path: &std::path::Path) -> Result<()> {
     info!(backend = ?cfg.store.backend, "opening store");
     let store = open_store(cfg).await?;
     info!(backend = store.backend(), "store ready");
@@ -34,7 +34,15 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     std::fs::create_dir_all(&cfg.cache.dir).ok();
 
     // AppState::new constructs the registry, bundler, auth, semaphores, metrics.
-    let state = AppState::new(cfg.clone(), store).await?;
+    let mut state = AppState::new(cfg.clone(), store).await?;
+    // The setup wizard (D43) writes its result back to the --config file and
+    // exits 75 for the supervisor (the tray) to restart; only this entry path
+    // runs the file-backed shape. `Arc::get_mut` succeeds: nothing has cloned
+    // the state yet.
+    if let Some(st) = Arc::get_mut(&mut state) {
+        st.config_path = Some(config_path.to_path_buf());
+        st.setup_exit = true;
+    }
 
     // Spawn background loops for non-serving roles.
     let mut bg_handles = Vec::new();

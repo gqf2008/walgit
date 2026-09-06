@@ -748,7 +748,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             files,
             seed,
         } => synth::run(&out, size, commits, files, seed),
-        Command::Serve => serve::run(&cfg).await,
+        Command::Serve => serve::run(&cfg, config).await,
         Command::Compact {
             repo,
             all,
