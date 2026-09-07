@@ -710,6 +710,9 @@ pub struct BoardCard {
     pub id: String,
     /// The root entry's `body.title`, "" when it has none.
     pub title: String,
+    /// The root entry's human-written prose (issue #112 — the same first
+    /// non-empty field walk the thread page renders; "" for machine entries).
+    pub prose: String,
     pub actor: String,
     /// Effective work-unit status (see `card_status`).
     pub status: String,
@@ -810,6 +813,22 @@ fn sort_cards(cards: &mut [BoardCard], sort: BoardSort) {
     });
 }
 
+/// The human-written prose of an entry: the first non-empty of the fields the
+/// write paths use (issue #112 — mirrors the SPA thread page's extraction, so
+/// the board card and the thread page show the same text).
+fn entry_prose(body: &serde_json::Value) -> String {
+    ["text", "body", "note", "message", "summary"]
+        .iter()
+        .find_map(|k| {
+            body.get(*k)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
 /// The board projection: a pure function `(entries, principals, rules, board
 /// definition) → columns`. Threads group by entry `id` exactly as
 /// `build_report` does; each becomes at most one card in the first column whose
@@ -871,6 +890,7 @@ pub fn build_board(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            prose: root.map_or(String::new(), |r| entry_prose(&r.entry.body)),
             actor: root.map(|r| r.entry.actor.clone()).unwrap_or_default(),
             status: card_status(&ordered),
             created_ts: root.map_or(0, |r| r.entry.ts),
@@ -1278,5 +1298,29 @@ mod transition_tests {
         ];
         let refs: Vec<&EntryRef> = entries.iter().collect();
         assert!(validate_status_transition(&refs, &principals).is_err());
+    }
+
+    #[test]
+    fn card_prose_is_the_thread_page_field_walk() {
+        // issue #112: the card's prose is the first non-empty of
+        // text/body/note/message/summary — the same walk the SPA renders.
+        assert_eq!(entry_prose(&serde_json::json!({})), "");
+        assert_eq!(entry_prose(&serde_json::json!({"text": "web"})), "web");
+        assert_eq!(
+            entry_prose(&serde_json::json!({"text": "", "body": "cli"})),
+            "cli"
+        );
+        assert_eq!(
+            entry_prose(&serde_json::json!({"text": "", "body": "", "note": "rev"})),
+            "rev"
+        );
+        assert_eq!(
+            entry_prose(&serde_json::json!({"message": "patch", "summary": "sum"})),
+            "patch"
+        );
+        assert_eq!(
+            entry_prose(&serde_json::json!({"text": "  trimmed  "})),
+            "trimmed"
+        );
     }
 }

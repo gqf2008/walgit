@@ -162,6 +162,10 @@ const en = {
   "entry.result.title": "result {task} · attempt {attempt}",
   "entry.result.meta": "{ref} @ {commit} · exit {code} · {ms} ms · log sha {sha}",
   "entry.issue.untitled": "(issue)",
+  "entry.attachments": "attachments",
+  "entry.attachment.download": "download",
+  "entry.attachment.bad": "bad base64",
+  "entry.attachment.big": "attachment too large",
 
   // CollabWrite
   "write.enable": "Enable my key & register",
@@ -826,6 +830,10 @@ const zhCN: Record<I18nKey, string> = {
   "entry.result.title": "结果 {task} · 第 {attempt} 次尝试",
   "entry.result.meta": "{ref} @ {commit} · 退出码 {code} · {ms} ms · 日志 sha {sha}",
   "entry.issue.untitled": "（议题）",
+  "entry.attachments": "附件",
+  "entry.attachment.download": "下载",
+  "entry.attachment.bad": "损坏的 base64",
+  "entry.attachment.big": "附件过大",
 
   // CollabWrite
   "write.enable": "启用我的密钥并注册",
@@ -1486,6 +1494,10 @@ const zhTW: Record<I18nKey, string> = {
   "entry.result.title": "結果 {task} · 第 {attempt} 次嘗試",
   "entry.result.meta": "{ref} @ {commit} · 結束碼 {code} · {ms} ms · 日誌 sha {sha}",
   "entry.issue.untitled": "（議題）",
+  "entry.attachments": "附件",
+  "entry.attachment.download": "下載",
+  "entry.attachment.bad": "損壞的 base64",
+  "entry.attachment.big": "附件過大",
 
   // CollabWrite
   "write.enable": "啟用我的金鑰並註冊",

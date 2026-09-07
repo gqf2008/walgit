@@ -4,6 +4,7 @@ import { api, refListStream, type CollabBoardCard } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
+import { Markdown } from "../components/Markdown";
 import { enableCollabKey } from "../components/CollabWrite";
 import { signCanonical } from "../collab";
 import { useI18n, statusLabel } from "../i18n";
@@ -133,6 +134,11 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
         {" · "}
         {fmtTime(card.last_ts)}
       </div>
+      {card.prose && (
+        <div className="muted card-prose">
+          <Markdown source={card.prose} />
+        </div>
+      )}
       <div className="row gap" style={{ alignItems: "center", marginTop: 4 }}>
         <select
           aria-label={`Move ${card.id}`}

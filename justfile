@@ -16,6 +16,10 @@ default:
 web-build:
     cd web && pnpm install --frozen-lockfile && pnpm run build
 
+# The web unit tests (vitest — MarkdownRenderer XSS boundary, issue #112).
+web-test:
+    cd web && pnpm install --frozen-lockfile && pnpm test
+
 # Local dev = standalone: the server with every role (serve, maintain, events) at
 # https://walgit.localhost:$PORT (default 8080) against local rustfs. Self-contained: starts rustfs (+ bucket) if
 # it is not answering on :9000 and builds the SPA if web/dist is missing, then runs the server.

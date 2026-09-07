@@ -522,6 +522,18 @@ h2 {
   line-height: 1.6;
   max-width: 1012px;
 }
+/* Board cards render the issue prose compactly: 3 lines, clipped. */
+.card-prose .markdown-body {
+  font-size: 13px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.card-prose .markdown-body p {
+  margin: 2px 0;
+}
 .markdown-body > :first-child {
   margin-top: 0;
 }

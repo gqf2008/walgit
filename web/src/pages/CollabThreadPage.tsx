@@ -9,6 +9,75 @@ import { Box } from "../components/Layout";
 import { CollabWriteBox } from "../components/CollabWrite";
 import { useI18n, kindLabel, type TFunc } from "../i18n";
 import { Markdown } from "../components/Markdown";
+import { fmtSize } from "../format";
+
+/** One attachment (`--attach`, issue #75 ④): `{filename, sha256, content_b64}`
+    embedded in the signed entry body. Materialized to a Blob on demand —
+    never rendered through a `data:` URL. */
+type Attach = { filename: string; sha256: string; content_b64: string };
+
+function EntryAttachments({ body }: { body: Record<string, unknown> }) {
+  const { t } = useI18n();
+  const raw = body.attachments;
+  if (!Array.isArray(raw)) return null;
+  const items = raw.filter((a): a is Attach => {
+    if (a === null || typeof a !== "object") return false;
+    const o = a as Record<string, unknown>;
+    return typeof o.filename === "string" && typeof o.sha256 === "string" && typeof o.content_b64 === "string";
+  });
+  if (items.length === 0) return null;
+  return (
+    <div className="attachments" style={{ marginTop: 8 }}>
+      <div className="muted" style={{ fontSize: "0.85em" }}>{t("entry.attachments")}</div>
+      {items.map((a) => (
+        <AttachmentItem key={`${a.sha256}:${a.filename}`} a={a} label={t("entry.attachment.download")} />
+      ))}
+    </div>
+  );
+}
+
+function AttachmentItem({ a, label }: { a: Attach; label: string }) {
+  const { t } = useI18n();
+  const [error, setError] = useState<string | null>(null);
+  // 防御性上限:CLI 侧 ≤64 KiB/文件,但条目是任意写者签名的数据——超大的
+  // base64 不做渲染期解码(每次打开线程页都会跑),只显示 sha。
+  const oversized = a.content_b64.length > 4 * 64 * 1024;
+  const size = (() => {
+    if (oversized) return 0;
+    try {
+      return atob(a.content_b64).length;
+    } catch {
+      return 0;
+    }
+  })();
+  const download = () => {
+    if (oversized) {
+      setError(t("entry.attachment.big"));
+      return;
+    }
+    try {
+      const bytes = Uint8Array.from(atob(a.content_b64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes]);
+      const u = URL.createObjectURL(blob);
+      const el = document.createElement("a");
+      el.href = u;
+      el.download = a.filename;
+      el.click();
+      setTimeout(() => URL.revokeObjectURL(u), 10_000);
+    } catch {
+      setError(t("entry.attachment.bad"));
+    }
+  };
+  return (
+    <div className="row gap" style={{ alignItems: "center", fontSize: "0.85em" }}>
+      <button type="button" className="btn link" title={label} onClick={download}>{a.filename}</button>
+      <span className="muted mono">
+        {size > 0 ? `${fmtSize(size)} · ${a.sha256.slice(0, 8)}` : a.sha256.slice(0, 8)}
+      </span>
+      {error && <span className="muted" style={{ color: "var(--danger, #f85149)" }}>{error}</span>}
+    </div>
+  );
+}
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -160,10 +229,12 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
   // 对话正文：兼容 CLI（issue body.body / review·merge_result body.note / patch
   // body.message）与 Web 写入口（issue·comment body.text / patch body.message）。
   // 除纯机器条目外都渲染 Markdown，让线程页可见 agent/人写的实际内容。
+  // trim 后返回:与投影端 entry_prose(issue #112)同文,看板卡片与线程页一致。
   const proseKinds = new Set(["issue", "comment", "review", "status", "patch"]);
   const prose = proseKinds.has(kind)
     ? [body.text, body.body, body.note, body.message, body.summary]
-        .find((v): v is string => typeof v === "string" && v.trim() !== "") ?? ""
+        .find((v): v is string => typeof v === "string" && v.trim() !== "")
+        ?.trim() ?? ""
     : "";
   const title =
     kind === "issue" ? String(body.title ?? t("entry.issue.untitled"))
@@ -191,6 +262,7 @@ function EntryBox({ e, n }: { e: CollabEntryRef; n: number }) {
           )}
         </div>
         {prose && <Markdown source={prose} />}
+        <EntryAttachments body={body} />
         {kind === "ci_result" && (
           <div className="mono muted">
             {t("entry.result.meta", {

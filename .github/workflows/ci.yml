@@ -64,6 +64,9 @@ jobs:
       # oxlint --deny-warnings and tsc --noEmit, so the web gate is covered here too.
       - name: Build the SPA and the SDK
         run: just web-build
+      # The renderer security boundary (issue #112) — vitest, jsdom.
+      - name: Web unit tests
+        run: just web-test
 
       - run: just warnings
       # The 300 s timeout in the justfile can trip under CI load (measured
