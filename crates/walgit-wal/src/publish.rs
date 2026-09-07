@@ -415,16 +415,19 @@ fn refs_diag_commit_counts() -> &'static parking_lot::Mutex<HashMap<(String, Str
     C.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
+/// (`WALGIT_TEST_REFS_DIAG`) The 7-hex short form of an oid for the DIAG lines;
+/// "∅" for empty/all-zero oids ("no object": create / delete / must-not-exist).
+fn diag_short_oid(oid: &str) -> String {
+    if oid.is_empty() || oid.chars().all(|c| c == '0') {
+        "∅".to_string()
+    } else {
+        oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
+    }
+}
+
 /// The txn summaries of a batch's valid requests: `refs/heads/main:base->c1`
 /// per update (short oids), for the retry/reject DIAG lines.
 fn refs_diag_batch_summary(batch: &[PublishRequest], verified: &[Verified]) -> String {
-    let short = |oid: &str| {
-        if oid.is_empty() || oid.chars().all(|c| c == '0') {
-            "∅".to_string()
-        } else {
-            oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
-        }
-    };
     batch
         .iter()
         .zip(verified)
@@ -434,8 +437,8 @@ fn refs_diag_batch_summary(batch: &[PublishRequest], verified: &[Verified]) -> S
                 format!(
                     "{}:{}->{}",
                     u.name,
-                    short(&u.old_oid),
-                    short(&u.new_oid)
+                    diag_short_oid(&u.old_oid),
+                    diag_short_oid(&u.new_oid)
                 )
             })
         })
@@ -591,6 +594,12 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         //    times in this batch — the WAL's created_at order is history).
         let mut verified: Vec<Verified> = Vec::with_capacity(batch.len());
         let mut floor: Option<std::time::SystemTime> = *handle.last_entry_time.lock();
+        // (WALGIT_TEST_REFS_DIAG) Per-attempt refs snapshots keyed by ref name:
+        // one `refs_diag` snapshot reads the whole packed-refs file from disk,
+        // so take it once per distinct name per attempt and share it across
+        // every request's DIAG-PASS lines. Never populated when the gate is
+        // off (HashMap::new does not allocate).
+        let mut diag_snaps: HashMap<String, walgit_git::RefsDiag> = HashMap::new();
         for req in &batch {
             let mut per_ref = verify_txn(&req.txn, &working_refs);
             // Issue #4 (WALGIT_TEST_REFS_DIAG): an update that is about to pass
@@ -652,23 +661,23 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             // so the next red shows whether the working view was actually
             // current when `old` was accepted, and a rejected txn is visible
             // with its oid (the issue's "rejected txn never enters the view").
+            // `commit` is the request-level outcome: a DIAG-PASS line with
+            // commit=false is an update that passed verification inside a
+            // request that will not commit (a sibling update was rejected) —
+            // not a granted commit.
+            let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
             if refs_diag_on() {
                 let applied_seq = handle.state.lock().applied_seq;
-                let short = |oid: &str| {
-                    if oid.is_empty() || oid.chars().all(|c| c == '0') {
-                        "∅".to_string()
-                    } else {
-                        oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
-                    }
-                };
                 for (u, (rname, r)) in req.txn.updates.iter().zip(per_ref.iter()) {
                     debug_assert_eq!(rname, &u.name);
                     let view_tip = working_refs.get(&u.name).unwrap_or_default();
-                    let d = handle.local.refs_diag(&u.name);
+                    let d = diag_snaps
+                        .entry(u.name.clone())
+                        .or_insert_with(|| handle.local.refs_diag(&u.name));
                     let disk_tip = if d.loose_oid.is_empty() {
-                        d.packed_oid
+                        d.packed_oid.clone()
                     } else {
-                        d.loose_oid
+                        d.loose_oid.clone()
                     };
                     let (cache_key_gen, cache_current, cache_data, cache_pending) =
                         match &d.cache {
@@ -692,26 +701,25 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     match r {
                         Ok(()) => {
                             eprintln!(
-                                "DIAG-PASS repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} rev={rev} ver={ver} prior_commits={prior} view={view_tip} disk={disk_tip} gen={gen_now} parses={parses} cache_key_gen={cache_key_gen} cache_current={cache_current} cache_data={cache_data} cache_pending={cache_pending:?}",
+                                "DIAG-PASS repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} commit={all_ok} rev={rev} ver={ver} prior_commits={prior} view={view_tip} disk={disk_tip} gen={gen_now} parses={parses} cache_key_gen={cache_key_gen} cache_current={cache_current} cache_data={cache_data} cache_pending={cache_pending:?}",
                                 handle.id,
                                 u.name,
-                                short(&u.old_oid),
-                                short(&u.new_oid),
+                                diag_short_oid(&u.old_oid),
+                                diag_short_oid(&u.new_oid),
                             );
                         }
                         Err(e) => {
                             eprintln!(
-                                "DIAG-REJECT repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} view={view_tip} disk={disk_tip} err={e:?}",
+                                "DIAG-REJECT repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} commit={all_ok} view={view_tip} disk={disk_tip} err={e:?}",
                                 handle.id,
                                 u.name,
-                                short(&u.old_oid),
-                                short(&u.new_oid),
+                                diag_short_oid(&u.old_oid),
+                                diag_short_oid(&u.new_oid),
                             );
                         }
                     }
                 }
             }
-            let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
             if all_ok {
                 apply_txn_to_map(&req.txn, &mut working_refs);
             }

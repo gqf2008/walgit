@@ -14,7 +14,7 @@ use walgit_git::{LocalRepo, RepoId};
 use walgit_proto::v1::Manifest;
 use walgit_proto::{keys, v1::PackRef};
 use walgit_store::{
-    GetOptions, GetResult, ObjectStore, Prefixed, StoreError, Version,
+    ObjectStore, Prefixed, Version,
 };
 
 use crate::error::WalError;
@@ -410,13 +410,12 @@ impl RepoHandle {
         // these segments (replay_log filters `manifest.log_segments`), so a
         // segment missing from the bucket = a silently skipped tail entry and
         // a segment present but unlisted would be an orphan no reader folds.
+        // Meta-only probes: `head` costs a stat per segment; `get` would pull
+        // every named segment's full body over the wire just to print a size.
         for s in &m.log_segments {
-            let bucket = match self.store.get(&s.key, GetOptions::default()).await {
-                Ok(GetResult::NotModified { .. }) => "present".to_string(),
-                Ok(GetResult::Object { meta, .. }) => {
-                    format!("present {}B", meta.size)
-                }
-                Err(StoreError::NotFound { .. }) => "ABSENT".to_string(),
+            let bucket = match self.store.head(&s.key).await {
+                Ok(Some(meta)) => format!("present {}B", meta.size),
+                Ok(None) => "ABSENT".to_string(),
                 Err(e) => format!("err {e}"),
             };
             eprintln!(
@@ -428,10 +427,9 @@ impl RepoHandle {
         // segment already sits there (a CAS loser that left its segment).
         let next_seq = m.head_seq + 1;
         let next_key = keys::log_segment_key(next_seq);
-        let next_bucket = match self.store.get(&next_key, GetOptions::default()).await {
-            Ok(GetResult::NotModified { .. }) => "present".to_string(),
-            Ok(GetResult::Object { meta, .. }) => format!("present {}B", meta.size),
-            Err(StoreError::NotFound { .. }) => "absent".to_string(),
+        let next_bucket = match self.store.head(&next_key).await {
+            Ok(Some(meta)) => format!("present {}B", meta.size),
+            Ok(None) => "absent".to_string(),
             Err(e) => format!("err {e}"),
         };
         let listed = m

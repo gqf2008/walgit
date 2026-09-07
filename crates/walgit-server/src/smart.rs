@@ -92,12 +92,17 @@ pub async fn info_refs(
     pktline::encode_flush(&mut buf);
 
     let mut v0_served_from_cache = false;
+    // The manifest version the v0 advertisement is keyed on (None when the
+    // branch was the v2 capability advert); DIAG uses it to tell a legal serve
+    // of an older version from a genuine advert/view divergence.
+    let mut v0_keyed: Option<walgit_store::Version> = None;
     if let (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack) = (protocol, service) {
         v2_capability_advert(st, &route.id, &handle, &mut buf).await?;
     } else {
         // v0 (and receive-pack always).
         let repo_key = route.id.to_string();
         let ver = handle.manifest_version();
+        v0_keyed.clone_from(&ver);
         if let Some(cached) = st
             .caches
             .ref_advert
@@ -123,15 +128,23 @@ pub async fn info_refs(
     // Issue #4 reverse-direction instrumentation (WALGIT_TEST_REFS_DIAG): one
     // observation line per v0 advertisement (the `git ls-remote` reader of
     // the reads_after e2e speaks v0 — the v2-only DIAG-ADVERT of PR #82 never
-    // saw it) plus the deep dump when the served tip disagrees with the local
-    // ref_view (a loser txn or an absorbed orphan segment would surface here).
+    // saw it) plus the deep dump when a cache-served tip disagrees with the
+    // local ref_view under the same keyed manifest version.
     if !matches!(
         (protocol, service),
         (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack)
     ) && std::env::var("WALGIT_TEST_REFS_DIAG").is_ok()
     {
         let (heads, main_tip) = v0_advert_heads(&buf);
-        refs_diag_advert_observe(&handle, "v0", v0_served_from_cache, main_tip, heads).await;
+        refs_diag_advert_observe(
+            &handle,
+            "v0",
+            v0_served_from_cache,
+            v0_keyed,
+            main_tip,
+            heads,
+        )
+        .await;
     }
 
     let ct = format!("application/x-{service_param}-advertisement");
@@ -198,17 +211,31 @@ fn v0_advert_heads(buf: &[u8]) -> (Vec<String>, Option<String>) {
 /// the served tip diverges from the local view, the deep dump (the manifest's
 /// named log segments probed against the bucket, the head+1 slot, the applied
 /// state, the refs cache). Env-gated: prod pays nothing, and the store probes
-/// run only when a divergence is observed.
+/// run only when a genuine divergence is observed.
+///
+/// `keyed` is the manifest version the served advertisement was built under
+/// (the handler captured it right before the cache lookup / generation). The
+/// deep dump is restricted to the case where that version is still current:
+/// when the version has advanced since the advert was keyed, a commit landed
+/// mid-request and the serve is legal at its linearization point — printing a
+/// divergence would be a false positive. A *freshly generated* advert is built
+/// from the same refs snapshot this function re-reads, so any difference there
+/// can only be a concurrent mid-request commit; only a *cached* advert can
+/// genuinely disagree with the current view under the same keyed version (the
+/// view moved — or the cache is stale — without the version), which is the
+/// divergence under study.
 async fn refs_diag_advert_observe(
     handle: &Arc<walgit_wal::RepoHandle>,
     proto: &str,
     cached: bool,
+    keyed: Option<walgit_store::Version>,
     advert_main: Option<String>,
     advert_heads: Vec<String>,
 ) {
     if std::env::var("WALGIT_TEST_REFS_DIAG").is_err() {
         return;
     }
+    let current = handle.manifest_version();
     let view_main = handle
         .local()
         .ref_view()
@@ -227,12 +254,10 @@ async fn refs_diag_advert_observe(
         .map_or((0, false), |c| (c.key_generation, c.current));
     let m = handle.manifest();
     eprintln!(
-        "DIAG-ADVERT proto={proto} repo={} ver={} cached={cached} adv_main={} view_main={view_main} disk_main={disk_main} head={} applied={} rev={} gen={} cache_key_gen={cache_key_gen} cache_current={cache_current} heads=[{}]",
+        "DIAG-ADVERT proto={proto} repo={} keyed={} ver={} cached={cached} adv_main={} view_main={view_main} disk_main={disk_main} head={} applied={} rev={} gen={} cache_key_gen={cache_key_gen} cache_current={cache_current} heads=[{}]",
         handle.id(),
-        handle
-            .manifest_version()
-            .as_ref()
-            .map_or("none", walgit_store::Version::as_str),
+        keyed.as_ref().map_or("none", walgit_store::Version::as_str),
+        current.as_ref().map_or("none", walgit_store::Version::as_str),
         advert_main.as_deref().unwrap_or("none"),
         m.head_seq,
         handle.applied_seq(),
@@ -240,7 +265,17 @@ async fn refs_diag_advert_observe(
         d.generation,
         advert_heads.join(" | ")
     );
-    if advert_main.is_some() && !view_main.is_empty() && advert_main != Some(view_main.clone()) {
+    // `keyed != current` = a commit landed between the keyed snapshot and now:
+    // the advert was legal for the version it was keyed on — no dump. Fresh
+    // adverts come from the same snapshot re-read here — no dump. Only a cache
+    // hit at a still-current version that disagrees with the view is a real
+    // divergence (stale cache / view moved without the version).
+    if cached
+        && keyed == current
+        && advert_main.is_some()
+        && !view_main.is_empty()
+        && advert_main != Some(view_main.clone())
+    {
         handle
             .refs_diag_read_dump(
                 &format!("advert-{proto}-mismatch"),
@@ -390,8 +425,15 @@ async fn upload_pack_v2(
                         None
                     }
                 });
-                refs_diag_advert_observe(handle, "v2-lsrefs", v2_served_from_cache, main_tip, heads)
-                    .await;
+                refs_diag_advert_observe(
+                    handle,
+                    "v2-lsrefs",
+                    v2_served_from_cache,
+                    version,
+                    main_tip,
+                    heads,
+                )
+                .await;
             }
             let mut buf = Vec::with_capacity(1024);
             for line in &lines {
