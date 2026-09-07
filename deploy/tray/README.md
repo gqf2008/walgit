@@ -34,6 +34,8 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
   `walgit(.exe)` + `walgit.toml`;macOS 另需 `walgit-ensure` 与
   `run-walgit.sh`(release DMG 的托盘首次启动会自动落盘这四件骨架,
   已存在的文件不覆盖;凭证 `~/walgit/.r2-credentials` 由使用者自填)。
+  macOS 首次启动还会幂等建 `/usr/local/bin/walgit` 软链 → 部署二进制,
+  终端直接可用(测试用 `WALGIT_CLI_LINK` 覆盖)。
 - **release 资产一个平台一件安装器(issue #108)**:
   macOS `walgit-<version>-arm64.dmg`(app 拖入 Applications,首次启动
   自动建部署骨架)、Windows `walgit-setup-<version>-x64.exe`

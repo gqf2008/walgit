@@ -119,6 +119,38 @@ func bootstrapDeploy() {
             logLine("bootstrap: 写版本标记失败: \(error)")
         }
     }
+    // CLI 软链:让终端里的 `walgit` 直达部署二进制(/usr/local/bin 归用户所有,
+    // 无需管理员)。测试用 WALGIT_CLI_LINK 覆盖——必须与 WALGIT_DEPLOY_DIR
+    // 成对设置,且 deployDir 须为绝对路径(软链目标按字面解析,不做 tilde
+    // 展开;非绝对路径会改指真实 /usr/local/bin/walgit)。
+    if !deployDir.hasPrefix("/") {
+        logLine("bootstrap: deployDir 非绝对路径,跳过 CLI 软链")
+    } else {
+        let cliLink = ProcessInfo.processInfo.environment["WALGIT_CLI_LINK"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? "/usr/local/bin/walgit"
+        do {
+            if let attrs = try? fm.attributesOfItem(atPath: cliLink) {
+                if attrs[.type] as? FileAttributeType == .typeSymbolicLink {
+                    if (try? fm.destinationOfSymbolicLink(atPath: cliLink)) != "\(deployDir)/walgit" {
+                        try fm.removeItem(atPath: cliLink)
+                        try fm.createSymbolicLink(atPath: cliLink, withDestinationPath: "\(deployDir)/walgit")
+                        logLine("bootstrap: 更新 CLI 软链 \(cliLink)")
+                    }
+                } else {
+                    logLine("bootstrap: \(cliLink) 已存在且非软链(用户自己的文件),不覆盖")
+                }
+            } else {
+                let parent = (cliLink as NSString).deletingLastPathComponent
+                if !parent.isEmpty && parent != "." {
+                    try fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
+                }
+                try fm.createSymbolicLink(atPath: cliLink, withDestinationPath: "\(deployDir)/walgit")
+                logLine("bootstrap: 建 CLI 软链 \(cliLink)")
+            }
+        } catch {
+            logLine("bootstrap: CLI 软链失败: \(error)")
+        }
+    }
     logLine("bootstrap: 部署骨架就绪(\(deployDir))")
 }
 
