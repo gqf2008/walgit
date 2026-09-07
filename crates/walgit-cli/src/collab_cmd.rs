@@ -414,6 +414,33 @@ struct EntryArgs {
     attach: Vec<std::path::PathBuf>,
 }
 
+/// The client-side transition gate (issue #102/#104): identical to the
+/// server's — `status=done` requires the thread (parent-chain ordered, never
+/// refs-collection order) to be at needs-review with a verified approve
+/// review. Extractable so the rejection path is unit-testable without a repo.
+fn check_status_transition(
+    entry: &Entry,
+    thread_entries: &[EntryRef],
+    principals: &HashMap<String, String>,
+) -> Result<()> {
+    if entry.kind == "status" && entry.body.get("status").and_then(|v| v.as_str()) == Some("done") {
+        let thread_refs: Vec<&EntryRef> = thread_entries
+            .iter()
+            .filter(|e| e.entry.id == entry.id)
+            .collect();
+        // 线程序先行(issue #104 观察 A):card_status 按给定顺序重放。
+        let thread_refs = walgit_wal::collab::thread(&thread_refs);
+        walgit_wal::collab::validate_status_transition(&thread_refs, principals).map_err(|e| {
+            // 观察 B:approve reviewer 的 key 可能只在 host registry——本地比对
+            // 更严,先 principal-fetch 再试,否则合法流转被 CLI 误拒。
+            anyhow::anyhow!(
+                "status transition rejected: {e}\n提示:approve reviewer 的 key 若仅在 host registry,先 `walgit collab principal-fetch` 再试"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn run_entry(args: &EntryArgs) -> Result<()> {
     ref_segment("entry.actor", &args.actor)?;
     let mut body: serde_json::Value = serde_json::from_str(&args.body)
@@ -482,20 +509,9 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
         body,
         sig: String::new(),
     };
-    // Transition 门禁（issue #102）：CLI 与服务端一致，status=done 必须
-    // 当前 needs-review 且存在 verified approve review。
-    if entry.kind == "status"
-        && entry.body.get("status").and_then(|v| v.as_str()) == Some("done")
-    {
-        let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
-        let thread_refs: Vec<&EntryRef> = thread_entries
-            .iter()
-            .filter(|e| e.entry.id == entry.id)
-            .collect();
-        if let Err(e) = walgit_wal::collab::validate_status_transition(&thread_refs, &principals) {
-            anyhow::bail!("status transition rejected: {e}");
-        }
-    }
+    // Transition 门禁（issue #102/#104）：与服务端一致,可测 helper。
+    let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
+    check_status_transition(&entry, &thread_entries, &principals)?;
     let key = read_signing_key(&args.key)?;
     entry.sig = sign_entry(&mut entry, &key);
     let content = serde_json::to_string_pretty(&entry)?;
@@ -1613,6 +1629,41 @@ mod entry_refs_tests {
         let digest2 = format!("{:x}", sha2::Sha256::digest(&decoded));
         assert_eq!(digest, digest2);
         assert_eq!(decoded, content);
+    }
+
+    /// `run_entry` 的 transition 门禁 helper(issue #104):status=done 被拒的
+    /// 机器可读错误 + host registry 提示;非 done 流转自由。拒绝路径不依赖
+    /// 真实签名(无 verified approve 本身就是拒绝理由)。
+    #[test]
+    fn transition_gate_rejects_done_without_prerequisites() {
+        let mk = |kind: &str, oid: &str, ts: i64, body: serde_json::Value| EntryRef {
+            oid: oid.to_string(),
+            principal: "alice".to_string(),
+            entry: Entry {
+                version: 1,
+                kind: kind.to_string(),
+                id: "t".to_string(),
+                actor: "alice".to_string(),
+                ts,
+                parent: String::new(),
+                refs: None,
+                body,
+                sig: String::new(),
+            },
+        };
+        let thread_entries = vec![
+            mk("issue", "e1", 1, serde_json::json!({"title": "x"})),
+            mk("status", "e2", 2, serde_json::json!({"status": "needs-review"})),
+        ];
+        let principals = HashMap::new();
+        let done = mk("status", "e3", 3, serde_json::json!({"status": "done"}));
+        let err = check_status_transition(&done.entry, &thread_entries, &principals).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("status transition rejected"), "got: {msg}");
+        assert!(msg.contains("principal-fetch"), "缺 host registry 提示: {msg}");
+        // 非 done 状态自由流转。
+        let open = mk("status", "e4", 4, serde_json::json!({"status": "open"}));
+        assert!(check_status_transition(&open.entry, &thread_entries, &principals).is_ok());
     }
 }
 

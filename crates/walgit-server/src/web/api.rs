@@ -1235,6 +1235,9 @@ async fn collab_entries(
             .iter()
             .filter(|e| e.entry.id == entry.get("id").and_then(|v| v.as_str()).unwrap_or(""))
             .collect();
+        // 线程序先行(issue #104 观察 A):card_status 按给定顺序重放,
+        // 未 thread() 的多 status 条目线程会误判当前状态。
+        let thread_refs = walgit_wal::collab::thread(&thread_refs);
         if let Err(e) = walgit_wal::collab::validate_status_transition(
             &thread_refs,
             &state.principals,

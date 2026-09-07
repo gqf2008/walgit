@@ -136,6 +136,14 @@
   构造注册条目，经 receive-pack push 到 `refs/collab/meta/principals/<principal>`；
   吊销 = 删该 ref（tombstone，`collab.revokePrincipal`）。"签发时自动注册"
   （扩展 `wgt_` 签发流程为"principal 注册"一步）留待服务端薄 API（§11）。
+- **host-global registry（issue #76）**：同一主机的跨仓库身份——`GET|PUT|DELETE
+  /api/v1/principals[/{principal}]`（web/API.md）。仓库本地的
+  `refs/collab/meta/principals/*` 始终优先；本地没有的 principal 回落 host
+  registry，一次注册对主机上所有仓库生效。读侧经 TTL 缓存（60 s，写即失效，
+  issue #104）——collab report/thread/board 每请求只付一次命中成本。
+  CLI 侧 `walgit collab principal-fetch` 把 host registry 拉成本地副本：
+  当 approve reviewer 的 key 仅在 host registry 时，CLI 的 transition 门禁
+  本地比对更严，须先 fetch 再判（否则合法流转被误拒）。
 - **读可以直连桶（可选强化）**：bundle 走 presigned URL、静态对象走 S3 读——有凭据即可；
   **写永远走 walgit receive-pack**（manifest CAS 是唯一提交点，原则 II），
   所以"一个 S3 token"不意味着绕过 walgit 写。

@@ -271,6 +271,24 @@ Sorted, `[]` for an unknown/empty owner (200, not 404). Cache: SWR.
 
 `401` without credentials. `Cache-Control: no-store`.
 
+### `GET /api/v1/principals` · `PUT|DELETE /api/v1/principals/{principal}`
+
+The host-global principal registry (issue #76; cross-repo identity — one
+registration verifies in every repository of this host; repo-local
+`refs/collab/meta/principals/*` remains authoritative when present):
+
+- `GET /api/v1/principals` → `{ "alice": "<base64 ed25519 public key>", … }`
+  (self-describing map; the collab read paths consult it per request through a
+  TTL cache — issue #104 — so reads never LIST the store hot).
+- `PUT /api/v1/principals/{principal}` with `{ "public_key": … }` —
+  register/rotate this principal's key; **the authenticated principal must
+  match the path** (self-registration), else `403`.
+- `DELETE /api/v1/principals/{principal}` — revoke; self only for now.
+
+Writes invalidate the cache immediately on this instance (a revoke is
+effective within the TTL — 60 s — on every other instance). `GET
+/api/v1/principals` requires read auth; PUT/DELETE write auth (§1.3).
+
 ### `GET /{owner}/{repo}/api`
 
 ```json
