@@ -91,6 +91,7 @@ pub async fn info_refs(
     pktline::encode_text(&mut buf, &svc_line);
     pktline::encode_flush(&mut buf);
 
+    let mut v0_served_from_cache = false;
     if let (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack) = (protocol, service) {
         v2_capability_advert(st, &route.id, &handle, &mut buf).await?;
     } else {
@@ -102,6 +103,7 @@ pub async fn info_refs(
             .ref_advert
             .get_v0(&repo_key, ver.as_ref(), service)
         {
+            v0_served_from_cache = true;
             buf.extend_from_slice(&cached);
         } else {
             let start = buf.len();
@@ -118,9 +120,134 @@ pub async fn info_refs(
                 .insert_v0(&repo_key, ver.as_ref(), service, advert_bytes);
         }
     }
+    // Issue #4 reverse-direction instrumentation (WALGIT_TEST_REFS_DIAG): one
+    // observation line per v0 advertisement (the `git ls-remote` reader of
+    // the reads_after e2e speaks v0 — the v2-only DIAG-ADVERT of PR #82 never
+    // saw it) plus the deep dump when the served tip disagrees with the local
+    // ref_view (a loser txn or an absorbed orphan segment would surface here).
+    if !matches!(
+        (protocol, service),
+        (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack)
+    ) && std::env::var("WALGIT_TEST_REFS_DIAG").is_ok()
+    {
+        let (heads, main_tip) = v0_advert_heads(&buf);
+        refs_diag_advert_observe(&handle, "v0", v0_served_from_cache, main_tip, heads).await;
+    }
 
     let ct = format!("application/x-{service_param}-advertisement");
     Ok(build_response(StatusCode::OK, &ct, no_cache_headers(), buf))
+}
+
+/// (DIAG-only, `WALGIT_TEST_REFS_DIAG`) The `refs/heads/*` refs rendered in a
+/// v0 advertisement buffer (pkt-line frames after the `# service` header),
+/// plus the tip of `refs/heads/main`. A v0 `ls-remote` reader (the
+/// `reads_after` e2e's spin loop) consumes exactly these bytes.
+fn v0_advert_heads(buf: &[u8]) -> (Vec<String>, Option<String>) {
+    let mut heads = Vec::new();
+    let mut main_tip = None;
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let Some(len_hex) = buf
+            .get(i..i + 4)
+            .and_then(|b| std::str::from_utf8(b).ok())
+        else {
+            break;
+        };
+        let Ok(len) = usize::from_str_radix(len_hex, 16) else {
+            break;
+        };
+        // Flush/delim/response-end frames (length field 0000/0001/0002) sit
+        // between the `# service` header and the advertisement (and close
+        // it): skip them, never stop the scan.
+        if len < 4 {
+            i += 4;
+            continue;
+        }
+        if i + len > buf.len() {
+            break;
+        }
+        let Some(payload) = buf.get(i + 4..i + len) else {
+            break;
+        };
+        let line = std::str::from_utf8(payload)
+            .unwrap_or_default()
+            .trim_end();
+        let mut it = line.split_whitespace();
+        if let (Some(oid), Some(name)) = (it.next(), it.next()) {
+            let hex_ok = oid.bytes().all(|b| b.is_ascii_hexdigit())
+                && (oid.len() == 40 || oid.len() == 64);
+            // The first ref line carries the NUL + capability list
+            // appended to its ref name; strip it.
+            let name = name.split('\0').next().unwrap_or(name);
+            if hex_ok && name.starts_with("refs/heads/") {
+                heads.push(format!("{oid} {name}"));
+                if name == "refs/heads/main" {
+                    main_tip = Some(oid.to_string());
+                }
+            }
+        }
+        i += len;
+    }
+    (heads, main_tip)
+}
+
+/// Issue #4 reverse-direction instrumentation (`WALGIT_TEST_REFS_DIAG`): one
+/// observation line per advertisement — the tip actually served vs the local
+/// `ref_view`/disk tip under the manifest version the advert was keyed on,
+/// plus the handle's head/applied state and refs-cache freshness — and, when
+/// the served tip diverges from the local view, the deep dump (the manifest's
+/// named log segments probed against the bucket, the head+1 slot, the applied
+/// state, the refs cache). Env-gated: prod pays nothing, and the store probes
+/// run only when a divergence is observed.
+async fn refs_diag_advert_observe(
+    handle: &Arc<walgit_wal::RepoHandle>,
+    proto: &str,
+    cached: bool,
+    advert_main: Option<String>,
+    advert_heads: Vec<String>,
+) {
+    if std::env::var("WALGIT_TEST_REFS_DIAG").is_err() {
+        return;
+    }
+    let view_main = handle
+        .local()
+        .ref_view()
+        .ok()
+        .and_then(|v| v.get("refs/heads/main"))
+        .unwrap_or_default();
+    let d = handle.local().refs_diag("refs/heads/main");
+    let disk_main = if d.loose_oid.is_empty() {
+        d.packed_oid
+    } else {
+        d.loose_oid
+    };
+    let (cache_key_gen, cache_current) = d
+        .cache
+        .as_ref()
+        .map_or((0, false), |c| (c.key_generation, c.current));
+    let m = handle.manifest();
+    eprintln!(
+        "DIAG-ADVERT proto={proto} repo={} ver={} cached={cached} adv_main={} view_main={view_main} disk_main={disk_main} head={} applied={} rev={} gen={} cache_key_gen={cache_key_gen} cache_current={cache_current} heads=[{}]",
+        handle.id(),
+        handle
+            .manifest_version()
+            .as_ref()
+            .map_or("none", walgit_store::Version::as_str),
+        advert_main.as_deref().unwrap_or("none"),
+        m.head_seq,
+        handle.applied_seq(),
+        m.revision,
+        d.generation,
+        advert_heads.join(" | ")
+    );
+    if advert_main.is_some() && !view_main.is_empty() && advert_main != Some(view_main.clone()) {
+        handle
+            .refs_diag_read_dump(
+                &format!("advert-{proto}-mismatch"),
+                &format!("advert shows {advert_main:?}, ref_view shows {view_main:?}"),
+            )
+            .await;
+    }
 }
 
 fn parse_query(query: &str, key: &str) -> Option<String> {
@@ -224,11 +351,16 @@ async fn upload_pack_v2(
             };
             let repo_key = route.id.to_string();
             let version = handle.manifest_version();
+            let mut v2_served_from_cache = false;
             let lines =
                 if let Some(lines) = st
                     .caches
                     .ref_advert
-                    .get_v2_ls_refs(&repo_key, version.as_ref(), &args) { lines } else {
+                    .get_v2_ls_refs(&repo_key, version.as_ref(), &args)
+                {
+                    v2_served_from_cache = true;
+                    lines
+                } else {
                     let lines = handle.local().ls_refs(&args).map_err(|e| git_err(&e))?;
                     st.caches.ref_advert.insert_v2_ls_refs(
                         &repo_key,
@@ -239,21 +371,27 @@ async fn upload_pack_v2(
                     lines
                 };
             // Issue #4 P1 instrumentation: what this ls-refs answer shows vs
-            // the manifest version it was keyed on. Readers' DIAG seen[] +
-            // these lines = the full read picture of a red.
+            // the manifest version it was keyed on — and, when the served tip
+            // diverges from the local view, the deep read-side dump. Readers'
+            // DIAG seen[] + these lines = the full read picture of a red.
             if std::env::var("WALGIT_TEST_REFS_DIAG").is_ok() {
-                let tips: Vec<String> = lines
+                let heads: Vec<String> = lines
                     .iter()
                     .filter(|l| l.render(&args).contains("refs/heads/"))
                     .map(|l| l.render(&args))
                     .collect();
-                eprintln!(
-                    "DIAG-ADVERT repo={} ver={:?} cached={} refs=[{}]",
-                    route.id,
-                    version.as_ref().map(walgit_store::Version::as_str),
-                    st.caches.ref_advert.get_v2_ls_refs(&repo_key, version.as_ref(), &args).is_some(),
-                    tips.join(" | ")
-                );
+                let main_tip = heads.iter().find_map(|h| {
+                    let mut it = h.split_whitespace();
+                    let oid = it.next()?;
+                    let name = it.next()?;
+                    if name == "refs/heads/main" {
+                        Some(oid.to_string())
+                    } else {
+                        None
+                    }
+                });
+                refs_diag_advert_observe(handle, "v2-lsrefs", v2_served_from_cache, main_tip, heads)
+                    .await;
             }
             let mut buf = Vec::with_capacity(1024);
             for line in &lines {
@@ -1829,4 +1967,28 @@ pub(crate) fn wal_err(e: &walgit_wal::WalError) -> ApiError {
 }
 fn bundle_err(e: &walgit_bundle::BundleError) -> ApiError {
     ApiError::Internal(format!("bundle: {e}"))
+}
+
+#[cfg(test)]
+mod issue4_diag_tests {
+    // The v0 advertisement the parser must read: `# service` header + flush,
+    // then `<oid> <name>[\0caps]` data frames and a closing flush.
+    fn pkt(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let total = data.len() + 4;
+        out.extend_from_slice(format!("{total:04x}").as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+    #[test]
+    fn v0_advert_heads_reads_frames_past_the_header_flush() {
+        let mut buf = pkt(b"# service=git-upload-pack\n");
+        buf.extend_from_slice(b"0000");
+        buf.extend_from_slice(&pkt(b"1111111111111111111111111111111111111111 refs/heads/main\0multi_ack thin-pack\n"));
+        buf.extend_from_slice(&pkt(b"2222222222222222222222222222222222222222 refs/heads/dev\n"));
+        buf.extend_from_slice(b"0000");
+        let (heads, main_tip) = super::v0_advert_heads(&buf);
+        assert_eq!(main_tip.as_deref(), Some("1111111111111111111111111111111111111111"));
+        assert_eq!(heads.len(), 2);
+    }
 }

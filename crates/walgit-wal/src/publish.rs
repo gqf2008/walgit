@@ -402,6 +402,47 @@ fn refs_diag_report(handle: &RepoHandle, tag: &str, ref_name: &str, detail: &str
     );
 }
 
+/// Issue #4 P1 counter (`WALGIT_TEST_REFS_DIAG`): committed publishes per
+/// (repo, ref) in this process. The reproductions showed ~213 committed
+/// publishes per ~25 pushes with every write-side invariant silent — the
+/// multi-commit signature is the same ref passing verification repeatedly
+/// against an old value. `DIAG-PASS` prints `prior_commits` so a repeated
+/// `old=base` chain reads as 1, 2, 3, … on the same ref; the count is bumped
+/// only after a CAS commit actually lands.
+fn refs_diag_commit_counts() -> &'static parking_lot::Mutex<HashMap<(String, String), u64>> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), u64>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// The txn summaries of a batch's valid requests: `refs/heads/main:base->c1`
+/// per update (short oids), for the retry/reject DIAG lines.
+fn refs_diag_batch_summary(batch: &[PublishRequest], verified: &[Verified]) -> String {
+    let short = |oid: &str| {
+        if oid.is_empty() || oid.chars().all(|c| c == '0') {
+            "∅".to_string()
+        } else {
+            oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
+        }
+    };
+    batch
+        .iter()
+        .zip(verified)
+        .filter(|(_, v)| v.valid)
+        .flat_map(|(req, _)| {
+            req.txn.updates.iter().map(move |u| {
+                format!(
+                    "{}:{}->{}",
+                    u.name,
+                    short(&u.old_oid),
+                    short(&u.new_oid)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Update the working ref map with a txn's new values.
 pub(crate) fn apply_txn_to_map(txn: &RefTransaction, refs: &mut walgit_git::RefView) {
     for u in &txn.updates {
@@ -600,6 +641,76 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     floor = Some(t);
                 }
             }
+            // Issue #4 reverse-direction instrumentation (WALGIT_TEST_REFS_DIAG):
+            // the multi-commit chain is made exactly here — a verify pass on an
+            // `old` value while earlier commits of the same round already moved
+            // the tip (the reproductions: ~213 committed publishes per ~25
+            // pushes, write-side invariants silent). Each pass prints the state
+            // the pass was granted on: the batch's manifest head_seq vs the
+            // handle's applied_seq, the working view's tip vs the disk tip, the
+            // refs cache freshness, and how many commits this ref already has —
+            // so the next red shows whether the working view was actually
+            // current when `old` was accepted, and a rejected txn is visible
+            // with its oid (the issue's "rejected txn never enters the view").
+            if refs_diag_on() {
+                let applied_seq = handle.state.lock().applied_seq;
+                let short = |oid: &str| {
+                    if oid.is_empty() || oid.chars().all(|c| c == '0') {
+                        "∅".to_string()
+                    } else {
+                        oid.get(..7.min(oid.len())).unwrap_or(oid).to_string()
+                    }
+                };
+                for (u, (rname, r)) in req.txn.updates.iter().zip(per_ref.iter()) {
+                    debug_assert_eq!(rname, &u.name);
+                    let view_tip = working_refs.get(&u.name).unwrap_or_default();
+                    let d = handle.local.refs_diag(&u.name);
+                    let disk_tip = if d.loose_oid.is_empty() {
+                        d.packed_oid
+                    } else {
+                        d.loose_oid
+                    };
+                    let (cache_key_gen, cache_current, cache_data, cache_pending) =
+                        match &d.cache {
+                            Some(c) => (
+                                c.key_generation,
+                                c.current,
+                                c.data_oid.clone(),
+                                c.pending_oids.clone(),
+                            ),
+                            None => (0, false, String::new(), Vec::new()),
+                        };
+                    let gen_now = d.generation;
+                    let parses = d.parses;
+                    let rev = handle.manifest().revision;
+                    let ver = known_version.is_some();
+                    let prior = refs_diag_commit_counts()
+                        .lock()
+                        .get(&(handle.id.to_string(), u.name.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    match r {
+                        Ok(()) => {
+                            eprintln!(
+                                "DIAG-PASS repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} rev={rev} ver={ver} prior_commits={prior} view={view_tip} disk={disk_tip} gen={gen_now} parses={parses} cache_key_gen={cache_key_gen} cache_current={cache_current} cache_data={cache_data} cache_pending={cache_pending:?}",
+                                handle.id,
+                                u.name,
+                                short(&u.old_oid),
+                                short(&u.new_oid),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "DIAG-REJECT repo={} {} {}->{} attempts={attempts} head={head_seq} applied={applied_seq} view={view_tip} disk={disk_tip} err={e:?}",
+                                handle.id,
+                                u.name,
+                                short(&u.old_oid),
+                                short(&u.new_oid),
+                            );
+                        }
+                    }
+                }
+            }
             let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
             if all_ok {
                 apply_txn_to_map(&req.txn, &mut working_refs);
@@ -698,6 +809,19 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let slot = match claim_result {
             Ok(ClaimOutcome::Claimed(slot)) => slot,
             Ok(ClaimOutcome::Contended) => {
+                // Issue #4 (WALGIT_TEST_REFS_DIAG): a lost slot claim is one
+                // half of the publish 412 path that the logs never showed
+                // (cas_retries is recorded only on the success/max-retry
+                // exits; the all-invalid re-verify exit stays 0). Print the
+                // attempted txn and the head_seq it was claimed against, so a
+                // loser's re-sync → re-verify → reject chain is observable.
+                if refs_diag_on() {
+                    eprintln!(
+                        "DIAG-CAS-LOST repo={} reason=contended attempts={attempts} head={head_seq} txn=[{}]",
+                        handle.id,
+                        refs_diag_batch_summary(&batch, &verified)
+                    );
+                }
                 attempts += 1;
                 if attempts >= max_retries {
                     span.record("cas_retries", attempts);
@@ -838,6 +962,22 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     handle.id,
                     tips.join(", ")
                 );
+                // P1 counter: this CAS is committed; the next DIAG-PASS on the
+                // same ref prints prior_commits = n (n ≥ 1 = the multi-commit
+                // chain is real, and the same ref is about to verify again).
+                {
+                    let mut counts = refs_diag_commit_counts().lock();
+                    for u in verified
+                        .iter()
+                        .zip(batch.iter())
+                        .filter(|(v, _)| v.valid)
+                        .flat_map(|(_, req)| req.txn.updates.iter())
+                    {
+                        *counts
+                            .entry((handle.id.to_string(), u.name.clone()))
+                            .or_insert(0) += 1;
+                    }
+                }
             }
 
             let mut local_ok = true;
@@ -985,6 +1125,21 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             return Ok(());
         }
         // Lost the CAS: drop exactly the segment we wrote, re-sync, retry.
+        // Issue #4 (WALGIT_TEST_REFS_DIAG): the manifest CAS 412 — the write
+        // side of the retry that the e2e reds' counts (~213 publishes per
+        // ~25 pushes) imply but the recorded spans never showed. Prints the
+        // attempted txn, the head_seq it was built against, and the attempt
+        // number, so the loser's drop → re-sync → re-verify chain is visible
+        // and the rejected txn's oid never silently reappears in a later
+        // advert without a DIAG trail.
+        if refs_diag_on() {
+            eprintln!(
+                "DIAG-CAS-LOST repo={} reason=precondition attempts={attempts} head={head_seq} slot_seq={} txn=[{}]",
+                handle.id,
+                slot.first_seq,
+                refs_diag_batch_summary(&batch, &verified)
+            );
+        }
         drop_own_slot(&handle.store, &slot)
             .instrument(span.clone())
             .await;
