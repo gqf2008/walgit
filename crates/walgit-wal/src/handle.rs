@@ -12,7 +12,10 @@ use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tracing::Instrument;
 use walgit_git::{LocalRepo, RepoId};
 use walgit_proto::v1::Manifest;
-use walgit_store::{Prefixed, Version};
+use walgit_proto::{keys, v1::PackRef};
+use walgit_store::{
+    GetOptions, GetResult, ObjectStore, Prefixed, StoreError, Version,
+};
 
 use crate::error::WalError;
 use crate::progress::{ProgressRx, ProgressTx, Reporter};
@@ -21,7 +24,6 @@ use crate::remote::{BlockCache, RemotePacks};
 use crate::state::RepoState;
 use crate::sync::{PackPlan, SyncLevel};
 use crate::tasks::{Begin, Tasks};
-use walgit_proto::v1::PackRef;
 
 pub(crate) fn instance_id() -> String {
     walgit_store::coord::instance_id().to_string()
@@ -375,6 +377,89 @@ impl RepoHandle {
     /// Last applied log entry sequence (local replay progress).
     pub fn applied_seq(&self) -> u64 {
         self.state.lock().applied_seq
+    }
+
+    /// Issue #4 reverse-direction diagnostics (`WALGIT_TEST_REFS_DIAG`): the
+    /// read-side truth in one dump — the manifest's named log segments (each
+    /// segment's folded-up-to seq) **probed against the bucket**, the slot a
+    /// next writer would claim at `head_seq + 1` (an unlisted/late segment
+    /// there would be foldable into every sync), the applied state, and the
+    /// refs cache/disk snapshot. Called by the advertise paths when the tip
+    /// they served disagrees with the local `ref_view`; env-gated (the store
+    /// GETs are the price of a red that carries the mechanism, and prod never
+    /// reaches them because the gate is checked first).
+    pub async fn refs_diag_read_dump(&self, tag: &str, detail: &str) {
+        if std::env::var("WALGIT_TEST_REFS_DIAG").is_err() {
+            return;
+        }
+        let m = self.manifest();
+        let state = self.state.lock().clone();
+        eprintln!("REFS_DIAG {tag} repo={} {detail}", self.id);
+        eprintln!(
+            "REFS_DIAG   state: head_seq={} applied_seq={} revision={} manifest_revision={} manifest_version={:?}",
+            m.head_seq,
+            state.applied_seq,
+            state.revision,
+            m.revision,
+            self.manifest_version
+                .lock()
+                .as_ref()
+                .map(walgit_store::Version::as_str)
+        );
+        // Manifest-named log segments vs the bucket: a reader folds exactly
+        // these segments (replay_log filters `manifest.log_segments`), so a
+        // segment missing from the bucket = a silently skipped tail entry and
+        // a segment present but unlisted would be an orphan no reader folds.
+        for s in &m.log_segments {
+            let bucket = match self.store.get(&s.key, GetOptions::default()).await {
+                Ok(GetResult::NotModified { .. }) => "present".to_string(),
+                Ok(GetResult::Object { meta, .. }) => {
+                    format!("present {}B", meta.size)
+                }
+                Err(StoreError::NotFound { .. }) => "ABSENT".to_string(),
+                Err(e) => format!("err {e}"),
+            };
+            eprintln!(
+                "REFS_DIAG   seg key={} folded={}..{} bucket={bucket}",
+                s.key, s.first_seq, s.last_seq
+            );
+        }
+        // The slot the next writer would claim, and whether an unlisted
+        // segment already sits there (a CAS loser that left its segment).
+        let next_seq = m.head_seq + 1;
+        let next_key = keys::log_segment_key(next_seq);
+        let next_bucket = match self.store.get(&next_key, GetOptions::default()).await {
+            Ok(GetResult::NotModified { .. }) => "present".to_string(),
+            Ok(GetResult::Object { meta, .. }) => format!("present {}B", meta.size),
+            Err(StoreError::NotFound { .. }) => "absent".to_string(),
+            Err(e) => format!("err {e}"),
+        };
+        let listed = m
+            .log_segments
+            .iter()
+            .any(|s| s.key == next_key || (s.first_seq..=s.last_seq).contains(&next_seq));
+        eprintln!(
+            "REFS_DIAG   slot head+1={next_seq} key={next_key} bucket={next_bucket} listed={listed}"
+        );
+        // The refs cache + disk snapshot for refs/heads/main (the test ref;
+        // the refs_diag fields answer which layer the view came from).
+        let d = self.local.refs_diag("refs/heads/main");
+        let (cache_key_gen, cache_current, cache_data, cache_pending) = match &d.cache {
+            Some(c) => (
+                c.key_generation,
+                c.current,
+                c.data_oid.clone(),
+                c.pending_oids.clone(),
+            ),
+            None => (0, false, String::new(), Vec::new()),
+        };
+        eprintln!(
+            "REFS_DIAG   refs/heads/main: gen={} parses={} loose={} packed={} head={}",
+            d.generation, d.parses, d.loose_oid, d.packed_oid, d.head
+        );
+        eprintln!(
+            "REFS_DIAG   cache: key_gen={cache_key_gen} current={cache_current} data={cache_data} pending={cache_pending:?}"
+        );
     }
 
     /// Persisted manifest version string from the local state file.
