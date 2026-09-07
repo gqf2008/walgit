@@ -189,7 +189,7 @@ crates/
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
   walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo|collab|ci`; `walgit-server` = `walgit serve`
 web/              React SPA (Vite) + sdk/repos.ts, built into the binary; the wire contract is web/API.md
-docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, D1_COLLAB_DESIGN, D1_CI_PROTOCOL, CONTRACT, WINDOWS (dev runbook), patches/
+docs/             USER_GUIDE (面向人类的使用手册), BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, D1_COLLAB_DESIGN, D1_CI_PROTOCOL, CONTRACT, WINDOWS (dev runbook), patches/
 ```
 
 ## Invariants worth memorising
