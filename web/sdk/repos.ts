@@ -198,6 +198,8 @@ export interface CollabThread {
 export interface CollabBoardCard {
   id: string;
   title: string;
+  /** The root entry's human-written prose (markdown); "" for machine entries. */
+  prose: string;
   actor: string;
   /** Effective work-unit status: the latest `status` entry's value. */
   status: string;

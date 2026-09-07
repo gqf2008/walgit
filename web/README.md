@@ -27,6 +27,26 @@ use `/{owner}/{repo}/api-browser/*`, and only non-repository discovery/authentic
 uses `/api/v1/*` (D26/D27). Changing the API means changing `sdk/repos.ts` and
 `API.md` in the same commit.
 
+## Markdown rendering and the XSS boundary (issue #112)
+
+- **Pipeline**: `components/Markdown.tsx` → lazy `MarkdownRenderer` —
+  react-markdown (v10) + remark-gfm. Consumers: the collab thread page
+  (entry prose for issue/comment/review/status/patch), the board page's card
+  prose, and READMEs on Tree/Blob pages.
+- **Untrusted input**: entry bodies are anyone's signed data, so the renderer
+  relies on react-markdown's fail-closed defaults — raw HTML is never parsed
+  (it renders as escaped text), and link/image URLs pass the protocol filter
+  (`javascript:` and friends are dropped). These defaults are locked by
+  `components/MarkdownRenderer.test.tsx` (vitest + testing-library): new
+  markdown work must keep the XSS cases green.
+- **Attachments** (`--attach`, issue #75 ④): the thread page lists
+  `body.attachments` (`{filename, sha256, content_b64}` ≤ 64 KiB/file) with a
+  download button — base64 is materialized to a Blob on demand, never a
+  `data:` URL.
+- **Tests**: `pnpm test` (vitest, jsdom; `src/**/*.test.{ts,tsx}`). The build
+  gate (`pnpm run build` = oxlint + tsc + vite + SDK) does not run tests —
+  CI runs both.
+
 ## Production build
 
 - **Code splitting**: vendor groups (`vendor-react`, `vendor-diffs`,
