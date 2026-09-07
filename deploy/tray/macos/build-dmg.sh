@@ -27,7 +27,9 @@ trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
-DMG="$DIST/walgit-${VERSION}-arm64.dmg"
+ARCH="$(uname -m)"
+[ "$ARCH" = "arm64" ] || [ "$ARCH" = "x86_64" ] || ARCH="unknown"
+DMG="$DIST/walgit-${VERSION}-${ARCH}.dmg"
 rm -f "$DMG"
 hdiutil create -volname "walgit" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 

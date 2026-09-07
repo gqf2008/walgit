@@ -126,7 +126,9 @@ jobs:
           body="$(cat changelog.txt 2>/dev/null || echo '')"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Re-cut of an existing release (a re-pushed tag rebuilds packaging):
-            # attach the fresh artefacts, leave the body untouched.
+            # attach the fresh artefacts, leave the body untouched. --clobber only
+            # replaces same-named assets — a release cut under an older shape (raw
+            # binaries) keeps them; the maintainer prunes those by hand.
             gh release upload "$tag" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$tag" artifacts/* \

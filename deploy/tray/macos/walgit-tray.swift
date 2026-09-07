@@ -24,6 +24,7 @@ let logPath = "\(deployDir)/tray.log"
 
 func ensurePath() -> String {
     let candidates = [
+        "\(deployDir)/walgit-ensure",
         NSString(string: "~/.claude/skills/walgit/scripts/walgit-ensure").expandingTildeInPath,
         NSString(string: "~/walgit/walgit-ensure").expandingTildeInPath,
     ]
@@ -83,7 +84,11 @@ func bootstrapDeploy() {
         do {
             try fm.copyItem(atPath: "\(res)/\(f)", toPath: dst)
             if f != "walgit.toml" {
-                try? fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: dst)
+                do {
+                    try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: dst)
+                } catch {
+                    logLine("bootstrap: \(f) chmod 失败: \(error)")
+                }
             }
             logLine("bootstrap: 写入 \(f)")
         } catch {

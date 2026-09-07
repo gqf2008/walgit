@@ -2,7 +2,7 @@
 # walgit-ensure — 确保本机 walgit 服务在跑（幂等）；status / stop 子命令
 set -euo pipefail
 
-BASE="$HOME/walgit"
+BASE="${WALGIT_DEPLOY_DIR:-$HOME/walgit}"
 URL="http://127.0.0.1:8081"
 HEALTH_URL="$URL/healthz"
 

@@ -70,9 +70,11 @@ cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Ca
 deploy/linux/build-deb.sh target/release 0.2.0           # 产物 walgit_0.2.0_amd64.deb
 ```
 
-`dpkg-deb` 组装,零新依赖:三件二进制 → /usr/bin,`walgit.example.toml` →
-/usr/share/walgit,托盘 → /usr/share/applications。CI 每个 PR 用 debug
-二进制校验脚本(release.yml 打 tag 时用 release 二进制)。
+`dpkg-deb` 组装,零新依赖:三件二进制 → /usr/bin,`walgit.example.toml` 与
+D43 未配置模板 → /usr/share/walgit,托盘 → /usr/share/applications;
+postinst 为安装用户落盘 `~/walgit` 骨架(幂等不覆盖,与 mac DMG /
+Windows 安装器一致)。CI 每个 PR 用 debug 二进制校验脚本(release.yml
+打 tag 时用 release 二进制)。
 
 ### Windows / Linux / macOS(Rust)
 
