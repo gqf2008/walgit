@@ -1,6 +1,8 @@
 # walgit.toml — 部署配置模板(由托盘首次启动写入 ~/walgit/walgit.toml)。
-# 凭证约定:~/walgit/.r2-credentials 导出 R2_ACCESS_KEY / R2_SECRET_KEY,
-#           ~/walgit/.walgit_token 放访问令牌(run-walgit.sh 会读取)。
+# 未配置态(D43):memory 后端且无 memory_backend_intentional → 首次启动
+# 进入 /setup 向导配置 S3/R2/GCS 与首管理员;保存后服务重启即生效。
+# 凭证约定(run-walgit.sh 存在才读):~/walgit/.r2-credentials 导出
+# R2_ACCESS_KEY / R2_SECRET_KEY,~/walgit/.walgit_token 放访问令牌。
 # 详细键位见源码仓库 walgit.example.toml。
 
 [server]
@@ -8,13 +10,4 @@ listen = "127.0.0.1:8081"        # 本机服务;托盘按此端口探活
 auto_create_on_push = true       # push 到不存在的仓库时自动创建
 
 [store]
-backend = "s3"                   # Cloudflare R2(也支持 GCS / MinIO / AWS S3)
-bucket = "<你的-bucket>"          # ← 改成你的 R2 bucket 名
-prefix = ""
-max_retries = 8
-multipart_threshold = "64MiB"
-multipart_part_size = "32MiB"
-
-[store.s3]
-endpoint = "https://<account-id>.r2.cloudflarestorage.com"   # ← 你的 R2 endpoint
-region = "auto"
+backend = "memory"               # 未配置态:向导会改写成 s3/gcs

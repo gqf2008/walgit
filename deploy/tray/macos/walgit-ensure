@@ -45,13 +45,9 @@ case "${1:-ensure}" in
       echo "walgit: already running (pid $(get_pid)) — $URL"
       exit 0
     fi
-    # 校验部署完整性
+    # 校验部署完整性(凭证可选:全新部署走 /setup 向导配置 store)
     if [ ! -x "$BASE/walgit" ] || [ ! -f "$BASE/walgit.toml" ] || [ ! -x "$BASE/run-walgit.sh" ]; then
       echo "walgit: 部署不完整（缺 $BASE 下的 walgit / walgit.toml / run-walgit.sh）" >&2
-      exit 1
-    fi
-    if [ ! -r "$BASE/.r2-credentials" ]; then
-      echo "walgit: 缺少 R2 凭证 $BASE/.r2-credentials" >&2
       exit 1
     fi
     # screen 保活启动（exec 会话会回收裸后台进程）
