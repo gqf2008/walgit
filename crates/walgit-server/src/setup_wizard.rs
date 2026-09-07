@@ -165,7 +165,7 @@ fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<()
 
 /// `POST /api/v1/setup/test` — build a store from the submitted params (never
 /// persisted) and probe the bucket: HEAD of a key that cannot exist yet. A
-/// NotFound *is* success (credentials + bucket reachable, no such object); a
+/// `NotFound` *is* success (credentials + bucket reachable, no such object); a
 /// success is success too; anything else is the surfaced error.
 async fn test_connection(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if !st.needs_setup {

@@ -21,15 +21,23 @@ APP="${TRAY_APP_DIR:-$HOME/Applications}/walgit-tray.app"
 BIN_DIR="$APP/Contents/MacOS"
 RES_DIR="$APP/Contents/Resources"
 
+# 部署目标 14.0(Sonoma):AppKit 代码全是最老 API,别让 swiftc 默认
+# minos=本机 SDK 版本把老系统消费者挡在门外。
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 swiftc -O -swift-version 5 -framework AppKit walgit-tray.swift -o walgit-tray
 
 rm -rf "$APP"
 mkdir -p "$BIN_DIR" "$RES_DIR"
 cp walgit-tray "$BIN_DIR/walgit-tray"
-# 部署骨架:首次启动 bootstrap 从 bundle 落盘 ~/walgit(已存在则不覆盖)
+# 部署骨架:首次启动 bootstrap 从 bundle 落盘 ~/walgit
 cp "$WALGIT_BIN" "$RES_DIR/walgit"
+# 内嵌 Mach-O 必须先签名:公证对包内所有可执行文件做静态检查,未签名
+# 裸二进制是常见拒绝原因。这里 ad-hoc 垫底;build-dmg.sh 会用 Developer
+# ID 身份重签后再公证。
+codesign --force --sign - "$RES_DIR/walgit" 2>/dev/null || true
 cp run-walgit.sh walgit-ensure "$RES_DIR/"
 cp walgit.toml.template "$RES_DIR/walgit.toml"
+printf '%s\n' "$VERSION" > "$RES_DIR/skeleton.version"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,6 +48,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key><string>walgit-tray</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleIconFile</key><string>walgit</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
