@@ -44,6 +44,8 @@ async fn start_server() -> TestResult<(String, tokio::sync::oneshot::Sender<()>)
     let cache = tempfile::tempdir()?;
     let mut cfg = Config::default();
     cfg.store.backend = StoreBackend::Memory;
+    // tests mean it (D43: not the unconfigured wizard placeholder)
+    cfg.store.memory_backend_intentional = true;
     cfg.store.bucket = "test".into();
     cfg.cache.dir = cache.path().to_path_buf();
     cfg.cache.max_bytes = bytesize::ByteSize::gib(2);

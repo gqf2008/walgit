@@ -1413,3 +1413,48 @@ table.kv.compact td { padding: 2px 0; }
   font-size: 20px;
   scroll-margin-top: 12px;
 }
+
+/* First-run setup wizard (issue #70 / D43): a standalone centered card, no
+   topbar — setup state has no repo chrome and no session. */
+.setup {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 48px 16px;
+}
+.setup-card {
+  background: var(--bg-overlay, #ffffff);
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 8px;
+  padding: 24px 28px;
+}
+.setup-card h1 { margin-top: 0; font-size: 1.5em; }
+.setup-card h2 { font-size: 1.1em; margin: 28px 0 12px; }
+.setup-grid { display: grid; gap: 14px; }
+.setup-field { display: grid; gap: 4px; }
+.setup-field span { font-weight: 600; font-size: 0.9em; }
+.setup-field input, .setup-field select {
+  padding: 6px 8px;
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 6px;
+  background: var(--bg, #ffffff);
+  color: var(--fg, #1f2328);
+  font: inherit;
+}
+.setup-check { display: flex; gap: 8px; align-items: center; font-size: 0.9em; }
+.setup-ok {
+  border: 1px solid #1f6f3a;
+  background: rgba(31, 111, 58, 0.08);
+  color: #1f6f3a;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 12px;
+}
+.setup-warn {
+  border: 1px solid #d4a72c;
+  background: rgba(212, 167, 44, 0.1);
+  color: #8a6d1a;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}

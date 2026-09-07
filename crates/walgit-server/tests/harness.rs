@@ -96,14 +96,61 @@ impl Server {
         Self::start_with_parts(store, dir, Some(cache), tweak).await
     }
 
+    /// The setup wizard's shape: memory WITHOUT the deliberate flag
+    /// (`needs_setup`) plus the config file the save writes back to.
+    pub async fn start_setup(config_path: &std::path::Path) -> Result<Self> {
+        Self::start_setup_with_tweak(config_path, |_| {}).await
+    }
+
+    /// `start_setup` with a further config tweak (e.g. an auth mode that is
+    /// already `token` — the F1 branch of the save).
+    pub async fn start_setup_with_tweak(
+        config_path: &std::path::Path,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
+        let store = MemoryStore::shared();
+        let cache = tempfile::tempdir()?;
+        let path = config_path.to_path_buf();
+        Self::start_with_parts_and_state_hook(
+            store,
+            cache.path().to_path_buf(),
+            Some(cache),
+            move |c| {
+                c.store.memory_backend_intentional = false;
+                tweak(c);
+            },
+            move |st| {
+                st.config_path = Some(path);
+            },
+        )
+        .await
+    }
+
     async fn start_with_parts(
-        mut store: Arc<MemoryStore>,
+        store: Arc<MemoryStore>,
         cache_dir: std::path::PathBuf,
         cache: Option<tempfile::TempDir>,
         tweak: impl FnOnce(&mut Config),
     ) -> Result<Self> {
+        Self::start_with_parts_and_state_hook(store, cache_dir, cache, tweak, |_| {}).await
+    }
+
+    /// `start_with_parts` plus a post-build hook on `AppState` (the setup
+    /// wizard's tests arm `config_path` this way — `Arc::get_mut` succeeds
+    /// because nothing has cloned the state yet).
+    async fn start_with_parts_and_state_hook(
+        mut store: Arc<MemoryStore>,
+        cache_dir: std::path::PathBuf,
+        cache: Option<tempfile::TempDir>,
+        tweak: impl FnOnce(&mut Config),
+        state_hook: impl FnOnce(&mut AppState),
+    ) -> Result<Self> {
         let mut cfg = Config::default();
         cfg.store.backend = StoreBackend::Memory;
+        // Tests mean it: the memory backend here is a deliberate in-process
+        // store, not the "unconfigured" placeholder the setup wizard (D43)
+        // keys on.
+        cfg.store.memory_backend_intentional = true;
         cfg.store.bucket = "test".into();
         cfg.cache.dir = cache_dir;
         cfg.cache.max_bytes = ByteSize::gib(2);
@@ -131,9 +178,10 @@ impl Server {
         }
         if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
             && let Ok(ms) = ms.parse::<u64>()
-                && let Some(s) = Arc::get_mut(&mut store) {
-                    s.latency = Some(std::time::Duration::from_millis(ms));
-                }
+            && let Some(s) = Arc::get_mut(&mut store)
+        {
+            s.latency = Some(std::time::Duration::from_millis(ms));
+        }
 
         tweak(&mut cfg);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -143,7 +191,10 @@ impl Server {
         cfg.validate().context("config validate")?;
 
         let dyn_store: DynStore = store.clone();
-        let state = AppState::new(Arc::new(cfg), dyn_store).await?;
+        let mut state = AppState::new(Arc::new(cfg), dyn_store).await?;
+        if let Some(st) = Arc::get_mut(&mut state) {
+            state_hook(st);
+        }
 
         let registry = state.registry.clone();
         let bundles = state.bundles.clone();
@@ -180,9 +231,10 @@ impl Server {
         let mut store = MemoryStore::shared();
         if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
             && let Ok(ms) = ms.parse::<u64>()
-                && let Some(s) = Arc::get_mut(&mut store) {
-                    s.latency = Some(std::time::Duration::from_millis(ms));
-                }
+            && let Some(s) = Arc::get_mut(&mut store)
+        {
+            s.latency = Some(std::time::Duration::from_millis(ms));
+        }
         let a = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
         let b = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
         Ok((a, b))
@@ -422,7 +474,8 @@ pub fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Ou
         .stderr(Stdio::piped())
         .output()
         .expect("run upstream git");
-    assert!(up.status.success(), 
+    assert!(
+        up.status.success(),
         "git {first:?} failed: {} — stderr: {}",
         up.status,
         String::from_utf8_lossy(&up.stderr)
@@ -442,7 +495,8 @@ pub fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Ou
         let _ = stdin.write_all(&up.stdout);
     }
     let out = down.wait_with_output().expect("wait downstream git");
-    assert!(out.status.success(), 
+    assert!(
+        out.status.success(),
         "git {second:?} failed: {} — stderr: {}",
         out.status,
         String::from_utf8_lossy(&out.stderr)

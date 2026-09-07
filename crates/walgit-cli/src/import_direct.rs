@@ -1438,6 +1438,8 @@ mod resume_tests {
     fn cfg() -> Arc<Config> {
         let mut c = Config::default();
         c.store.backend = walgit_config::StoreBackend::Memory;
+        // tests mean it (D43: not the unconfigured wizard placeholder)
+        c.store.memory_backend_intentional = true;
         Arc::new(c)
     }
 

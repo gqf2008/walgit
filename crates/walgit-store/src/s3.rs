@@ -69,17 +69,24 @@ pub struct S3Store {
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// Credentials are read from the env vars named in
-    /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
+    /// Literal `access_key`/`secret_key` (D43, written by the setup wizard)
+    /// take precedence; otherwise credentials are read from the env vars named
+    /// in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
     /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
     /// `AWS_SESSION_TOKEN` when present.
     pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
-        })?;
-        let secret_key = std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
-        })?;
+        let access_key = match cfg.s3.access_key.as_deref().filter(|v| !v.is_empty()) {
+            Some(k) => k.to_string(),
+            None => std::env::var(&cfg.s3.access_key_env).map_err(|_| {
+                anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
+            })?,
+        };
+        let secret_key = match cfg.s3.secret_key.as_deref().filter(|v| !v.is_empty()) {
+            Some(k) => k.to_string(),
+            None => std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
+                anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
+            })?,
+        };
 
         let creds = static_credentials(
             &access_key,

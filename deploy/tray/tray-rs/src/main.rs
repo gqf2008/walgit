@@ -192,31 +192,87 @@ fn service_start() -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let exe = deploy_dir().join(exe_name());
-        let cfg = deploy_dir().join("walgit.toml");
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("serve").arg("--config").arg(&cfg);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED | NEW_GROUP
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        let child = spawn_service()?;
         std::fs::write(pid_file(), child.id().to_string())
             .map_err(|e| format!("pidfile: {e}"))?;
+        // D43: the setup wizard's save exits 75 ("restart me"). Supervise the
+        // child so 保存并重启 is one click — respawn on 75, bounded (a real
+        // restart loop means the written config does not hold).
+        std::thread::spawn(move || supervise_service(child));
         Ok(())
+    }
+}
+
+/// Spawn `walgit serve --config walgit.toml` detached (windows: no console
+/// window, new group; unix: own session).
+#[cfg(not(target_os = "macos"))]
+fn spawn_service() -> Result<std::process::Child, String> {
+    let exe = deploy_dir().join(exe_name());
+    let cfg = deploy_dir().join("walgit.toml");
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("serve").arg("--config").arg(&cfg);
+    // D43: the setup save exits 75 only when the server knows a supervisor
+    // will respawn it — this marker arms the exit.
+    cmd.env("WALGIT_SUPERVISED", "1");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED | NEW_GROUP
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn()
+        .map_err(|e| format!("spawn {}: {e}", exe.display()))
+}
+
+/// Watch the service process: exit code 75 = the setup wizard saved and asks
+/// for a restart (D43) — respawn, at most five times in a row (a loop means
+/// the written config does not hold; the user reads the log). Any other exit
+/// is final.
+#[cfg(not(target_os = "macos"))]
+fn supervise_service(mut child: std::process::Child) {
+    let mut restarts: u32 = 0;
+    loop {
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("walgit service watcher: {e}");
+                return;
+            }
+        };
+        if status.code() != Some(75) {
+            eprintln!(
+                "walgit service exited ({})",
+                status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string())
+            );
+            return;
+        }
+        restarts += 1;
+        if restarts > 5 {
+            eprintln!("walgit service restarted 5 times in a row — giving up (check walgit.toml)");
+            return;
+        }
+        eprintln!("walgit service: restart after setup save ({restarts})");
+        match spawn_service() {
+            Ok(c) => {
+                let _ = std::fs::write(pid_file(), c.id().to_string());
+                child = c;
+            }
+            Err(e) => {
+                eprintln!("walgit service restart failed: {e}");
+                return;
+            }
+        }
     }
 }
 
