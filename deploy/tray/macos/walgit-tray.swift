@@ -18,8 +18,42 @@ let deployDir: String = {
     if let d = UserDefaults.standard.string(forKey: "deployDir"), !d.isEmpty { return d }
     return NSString(string: "~/walgit").expandingTildeInPath
 }()
-let healthURL = URL(string: "http://127.0.0.1:8081/healthz")!
-let webURL = URL(string: "http://walgit.localhost:8081/")!
+/// 部署目录 walgit.toml 行扫描 → (listen, backend, memoryIntentional);
+/// 注释行/行尾注释跳过,找不到回退 127.0.0.1:8081(#73:探活/开页与配置
+/// 同源,改 listen 不再使状态行恒「已停止」、升级健康验证恒失败)。
+func deployConfig() -> (listen: String, backend: String, memoryIntentional: Bool) {
+    var listen = ""
+    var backend = ""
+    var intentional = false
+    let path = "\(deployDir)/walgit.toml"
+    if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+        for raw in text.split(separator: "\n") {
+            // TOML 行尾注释(#115 审查修正):仓库模板全是
+            // `listen = "127.0.0.1:8081"  # 注释` 风格,先剥掉 # 起头部分。
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            if let hash = line.firstIndex(of: "#") {
+                line = String(line[..<hash]).trimmingCharacters(in: .whitespaces)
+            }
+            if line.isEmpty { continue }
+            if line.hasPrefix("listen = \""), line.hasSuffix("\"") {
+                listen = String(line.dropFirst("listen = \"".count).dropLast(1))
+            } else if line.hasPrefix("backend = \""), line.hasSuffix("\"") {
+                backend = String(line.dropFirst("backend = \"".count).dropLast(1))
+            } else if line.hasPrefix("memory_backend_intentional = ") {
+                intentional = line.hasSuffix("true")
+            }
+        }
+    }
+    if listen.isEmpty { listen = "127.0.0.1:8081" }
+    return (listen, backend, intentional)
+}
+
+var healthURL: URL { URL(string: "http://\(deployConfig().listen)/healthz")! }
+var webURL: URL {
+    // walgit.localhost 解析回本机,浏览器 UI 惯用名不变,端口随配置走。
+    let port = deployConfig().listen.split(separator: ":").last.map(String.init) ?? "8081"
+    return URL(string: "http://walgit.localhost:\(port)/")!
+}
 let logPath = "\(deployDir)/tray.log"
 
 func ensurePath() -> String {
@@ -300,9 +334,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         let stateText: String
+        // 运行层警示(#73):**有意选择**的 memory 后端数据不落盘——状态行显式
+        // 标注。未配置态(无 intentional 标志)由 D43 向导接管,不显示。
+        let cfg = deployConfig()
+        let backendNote = cfg.backend == "memory" && cfg.memoryIntentional ? " · 内存后端(数据不落盘)" : ""
         switch serviceState {
-        case "running": stateText = "运行中 \(serviceVersion.isEmpty ? "" : "· \(serviceVersion)")"
-        case "stopped": stateText = "已停止"
+        case "running": stateText = "运行中 \(serviceVersion.isEmpty ? "" : "· \(serviceVersion)")\(backendNote)"
+        case "stopped": stateText = "已停止\(backendNote)"
         default: stateText = "检查中…"
         }
         let head = NSMenuItem(title: "walgit 服务:\(stateText)", action: nil, keyEquivalent: "")
@@ -497,10 +535,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let (rc, rout) = sh("'\(ensurePath())' 2>&1")
         logLine("upgrade: start rc=\(rc) \(rout.suffix(120))")
 
-        // 健康验证 ≤15s,失败回滚
+        // 健康验证 ≤15s,失败回滚——与探活同源的地址(#115 审查修正:
+        // 硬编码 8081 会让改端口后的升级在验证步恒失败、误回滚)。
+        let health = "http://\(deployConfig().listen)/healthz"
         var ok = false
         for _ in 0..<15 {
-            let (hc, hout) = sh("curl -sf --max-time 2 http://127.0.0.1:8081/healthz 2>&1 || true")
+            let (hc, hout) = sh("curl -sf --max-time 2 \(health) 2>&1 || true")
             if hc == 0, hout.contains("ok"), hout.contains(sha) { ok = true; break }
             sleep(1)
         }

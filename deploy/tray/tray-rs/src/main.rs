@@ -26,7 +26,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 
-const HEALTH_HOST: &str = "127.0.0.1:8081";
+const DEFAULT_LISTEN: &str = "127.0.0.1:8081";
 
 // 升级状态机(abb app.slint 同款)
 const ST_IDLE: u8 = 0; // 未查:检查更新…
@@ -52,16 +52,18 @@ fn deploy_dir() -> PathBuf {
 }
 
 fn repo_dir() -> PathBuf {
-    std::env::var("WALGIT_REPO").map(PathBuf::from).unwrap_or_else(|_| {
-        #[cfg(target_os = "macos")]
-        {
-            PathBuf::from("/Volumes/Workspace/GitHub/walgit")
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            home().join("walgit-repo")
-        }
-    })
+    std::env::var("WALGIT_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            #[cfg(target_os = "macos")]
+            {
+                PathBuf::from("/Volumes/Workspace/GitHub/walgit")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                home().join("walgit-repo")
+            }
+        })
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -86,21 +88,71 @@ fn log_line(s: &str) {
     // 部署目录首次运行可能不存在:建出来,否则日志被 OpenOptions 静默丢弃。
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("tray.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "[{s}]");
     }
 }
 
 // ---------- 裸 HTTP ----------
 
+/// 部署目录 walgit.toml 的行扫描解析 → (listen, backend, memory_intentional)。注释行跳过;
+/// 找不到/解析失败回退默认。简单位扫描即可——`listen` 只在 [server] 节、
+/// `backend` 只在 [store] 节出现(#73:托盘探活与配置同源,用户改 listen
+/// 不再使状态行恒「已停止」、升级健康验证恒失败)。
+fn deploy_config() -> (String, String, bool) {
+    let path = deploy_dir().join("walgit.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (DEFAULT_LISTEN.to_string(), String::new(), false);
+    };
+    let mut listen = String::new();
+    let mut backend = String::new();
+    let mut intentional = false;
+    for line in text.lines() {
+        // TOML 行尾注释(#115 审查修正):仓库模板全是
+        // `listen = "127.0.0.1:8081"  # 注释` 风格,不剥则解析恒落空。
+        // listen/backend 的值不可能含 #,split 安全。
+        let t = line.trim().split('#').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(v) = t
+            .strip_prefix("listen = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            listen = v.to_string();
+        } else if let Some(v) = t
+            .strip_prefix("backend = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            backend = v.to_string();
+        } else if t.starts_with("memory_backend_intentional = ") {
+            intentional = t.ends_with("true");
+        }
+    }
+    if listen.is_empty() {
+        listen = DEFAULT_LISTEN.to_string();
+    }
+    (listen, backend, intentional)
+}
+
 /// 返回 healthz 响应体(含 version 字段);服务不在时 None。
 fn healthz() -> Option<String> {
-    let mut stream = TcpStream::connect(HEALTH_HOST).ok()?;
+    let (host, _, _) = deploy_config();
+    let mut stream = TcpStream::connect(&host).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    let host = HEALTH_HOST.split(':').next()?;
+    // [::1]:8081 的 IPv6 括号形式:取 ] 前的部分当 Host。
+    let hostname = host
+        .trim_start_matches('[')
+        .split([']', ':'])
+        .next()
+        .unwrap_or("localhost");
     write!(
         stream,
-        "GET /healthz HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        "GET /healthz HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
     let mut buf = String::new();
@@ -124,11 +176,14 @@ fn version_of(body: &str) -> String {
 // 认单引号);Windows 一律走 run() 的 argv 直传,不过 shell。
 #[cfg(not(target_os = "windows"))]
 fn sh(cmd: &str) -> (i32, String) {
-    match std::process::Command::new("sh").arg("-lc").arg(cmd).output() {
+    match std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(cmd)
+        .output()
+    {
         Ok(o) => (
             o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stdout).to_string()
-                + &String::from_utf8_lossy(&o.stderr),
+            String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
         ),
         Err(e) => (-1, format!("{e}")),
     }
@@ -140,7 +195,12 @@ fn sh(cmd: &str) -> (i32, String) {
 /// 变量),cmd 又从不认单引号(`git -C 'x'` fatal)。Windows 侧加
 /// CREATE_NO_WINDOW:GUI 进程每 spawn 一个控制台程序(cmd/git/taskkill)
 /// 不带它就闪一次黑窗。环境变量经 .env() 传,不经 `set`。
-fn run(dir: Option<&std::path::Path>, program: &str, args: &[&str], envs: &[(&str, &str)]) -> (i32, String) {
+fn run(
+    dir: Option<&std::path::Path>,
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, String) {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     if let Some(d) = dir {
@@ -158,8 +218,7 @@ fn run(dir: Option<&std::path::Path>, program: &str, args: &[&str], envs: &[(&st
     match cmd.output() {
         Ok(o) => (
             o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stdout).to_string()
-                + &String::from_utf8_lossy(&o.stderr),
+            String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
         ),
         Err(e) => (-1, format!("{e}")),
     }
@@ -193,8 +252,7 @@ fn service_start() -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         let child = spawn_service()?;
-        std::fs::write(pid_file(), child.id().to_string())
-            .map_err(|e| format!("pidfile: {e}"))?;
+        std::fs::write(pid_file(), child.id().to_string()).map_err(|e| format!("pidfile: {e}"))?;
         // D43: the setup wizard's save exits 75 ("restart me"). Supervise the
         // child so 保存并重启 is one click — respawn on 75, bounded (a real
         // restart loop means the written config does not hold).
@@ -324,7 +382,12 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
 
     report("对齐 main…".into());
     let _ = run(Some(&repo), "git", &["fetch", "origin", "main"], &[]);
-    let (mc, mout) = run(Some(&repo), "git", &["merge", "--ff-only", "origin/main"], &[]);
+    let (mc, mout) = run(
+        Some(&repo),
+        "git",
+        &["merge", "--ff-only", "origin/main"],
+        &[],
+    );
     if mc != 0 {
         log_line(&format!(
             "upgrade: ff-merge FAILED {}",
@@ -383,7 +446,10 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
     Err(match (restore.is_ok(), restart.is_ok()) {
         (true, true) => format!("{why},已回滚旧版本并重启"),
         (true, false) => format!("{why},备份已还原但服务重启失败(托盘菜单「启动服务」重试)"),
-        _ => format!("{why},回滚失败——备份损坏,请重装或手动处理 {}", bak.display()),
+        _ => format!(
+            "{why},回滚失败——备份损坏,请重装或手动处理 {}",
+            bak.display()
+        ),
     })
 }
 
@@ -394,7 +460,22 @@ fn upgrade_pipeline(report: &dyn Fn(String)) -> Result<String, String> {
 /// 引号全灭,实测会挂起事件循环线程 2 分钟以上)。
 fn open_web() {
     log_line("web: opening page");
-    let url = "http://127.0.0.1:8081/";
+    // 与探活同源的地址(#73):用户改 walgit.toml 的 listen 后,打开的页面
+    // 仍是同一个服务。
+    let (host, _, _) = deploy_config();
+    // 通配监听(0.0.0.0/::)浏览器开不出地址——回环替换,只取端口(#115 审查)。
+    let (hostname, port) = host
+        .rsplit_once(':')
+        .map_or((host.as_str(), ""), |(h, p)| (h, p));
+    let hostname = match hostname {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    let url = if port.is_empty() {
+        format!("http://{hostname}/")
+    } else {
+        format!("http://{hostname}:{port}/")
+    };
     #[cfg(target_os = "macos")]
     sh(&format!("open '{url}'"));
     #[cfg(target_os = "windows")]
@@ -455,8 +536,7 @@ fn icon_rgba(size: usize, color: [u8; 3]) -> Vec<u8> {
         prev = [x, y];
     }
     let circles: [(f32, f32, f32); 2] = [(78.0, 200.0, 17.0), (186.0, 200.0, 17.0)];
-    let slabs: [(f32, f32, f32, f32); 2] =
-        [(52.0, 22.0, 152.0, 24.0), (52.0, 50.0, 152.0, 24.0)];
+    let slabs: [(f32, f32, f32, f32); 2] = [(52.0, 22.0, 152.0, 24.0), (52.0, 50.0, 152.0, 24.0)];
     let half = 7.5;
 
     for py in 0..n {
@@ -545,12 +625,25 @@ impl App {
     fn rebuild_menu(&mut self) {
         let Some(h) = &self.items else { return };
         let running = self.running;
+        // 运行层警示(#73):**有意选择**的 memory 后端数据不落盘——状态行显式
+        // 标注,不再只靠配置文件注释。未配置态(无 intentional 标志)由 D43
+        // 向导接管,不显示「数据不落盘」(那态连数据都没有)。
+        let (_, backend, intentional) = deploy_config();
+        let backend_note = if backend == "memory" && intentional {
+            " · 内存后端(数据不落盘)"
+        } else {
+            ""
+        };
         h.status.set_text(if self.busy == 1 {
             "walgit 服务:切换中…".into()
         } else if running {
-            format!("walgit 服务:运行中 · {}", self.current_version())
+            format!(
+                "walgit 服务:运行中 · {}{}",
+                self.current_version(),
+                backend_note
+            )
         } else {
-            "walgit 服务:已停止".into()
+            format!("walgit 服务:已停止{}", backend_note)
         });
         h.toggle.set_text(
             if self.busy == 1 {
@@ -564,23 +657,31 @@ impl App {
         );
         h.toggle.set_enabled(self.busy == 0);
         let cur = self.current_version();
-        h.upgrade.set_text(match self.state {
-            ST_CHECKING => format!("版本 {cur} · 正在检查更新…"),
-            ST_LATEST => format!("版本 {cur} · 已是最新 ✓(点击重查)"),
-            ST_AVAILABLE => format!("⬆️ 升级到新版本 {}(当前 {cur})", self.available_sha),
-            ST_INSTALLING => {
-                if self.note.is_empty() {
-                    "升级中…".into()
-                } else {
-                    format!("升级中… · {}", self.note)
+        // 无源码仓库(经安装器部署的机器):升级菜单禁点并指路(#73)——检测
+        // 管线需要 git 仓库,恒失败只会误导。
+        let has_repo = repo_dir().join(".git").exists();
+        if !has_repo {
+            h.upgrade.set_text(format!("版本 {cur}(经安装器升级)"));
+            h.upgrade.set_enabled(false);
+        } else {
+            h.upgrade.set_text(match self.state {
+                ST_CHECKING => format!("版本 {cur} · 正在检查更新…"),
+                ST_LATEST => format!("版本 {cur} · 已是最新 ✓(点击重查)"),
+                ST_AVAILABLE => format!("⬆️ 升级到新版本 {}(当前 {cur})", self.available_sha),
+                ST_INSTALLING => {
+                    if self.note.is_empty() {
+                        "升级中…".into()
+                    } else {
+                        format!("升级中… · {}", self.note)
+                    }
                 }
-            }
-            ST_FAILED => "上次升级失败(点击重查)".into(),
-            _ => format!("版本 {cur} · 检查更新…"),
-        });
-        h.upgrade.set_enabled(
-            self.busy == 0 && self.state != ST_CHECKING && self.state != ST_INSTALLING,
-        );
+                ST_FAILED => "上次升级失败(点击重查)".into(),
+                _ => format!("版本 {cur} · 检查更新…"),
+            });
+            h.upgrade.set_enabled(
+                self.busy == 0 && self.state != ST_CHECKING && self.state != ST_INSTALLING,
+            );
+        }
         // 升级中禁用退出:此刻 exit 会把升级线程杀在 停→换→起 之间,
         // 服务留下停机且再无托盘可救。
         h.quit.set_enabled(self.busy != 2);
@@ -666,10 +767,7 @@ impl ApplicationHandler<Msg> for App {
                             } else {
                                 let _ = proxy.send_event(Msg::UpdateState(ST_LATEST));
                             }
-                            log_line(&format!(
-                                "detect: local={:.7} remote={:.7}",
-                                local, remote
-                            ));
+                            log_line(&format!("detect: local={:.7} remote={:.7}", local, remote));
                         });
                     }
                     ST_AVAILABLE => {
@@ -753,8 +851,8 @@ fn main() {
     let event_loop = EventLoop::<Msg>::with_user_event().build().unwrap();
     let proxy = Arc::new(event_loop.create_proxy());
 
-    let icon =
-        tray_icon::Icon::from_rgba(icon_rgba(32, state_color(false, 0)), 32, 32).expect("icon rgba");
+    let icon = tray_icon::Icon::from_rgba(icon_rgba(32, state_color(false, 0)), 32, 32)
+        .expect("icon rgba");
     let menu = Menu::new();
     let status = MenuItem::with_id("status", "walgit 服务:检查中…", false, None);
     let toggle = MenuItem::with_id("stop", "停止服务", true, None);
@@ -810,7 +908,7 @@ fn main() {
     // 本机没有源码仓库(安装器部署的机器)就整条停用:检测/升级都依赖
     // WALGIT_REPO 指向的 checkout + rustup/cargo,没有它只会每 30 分钟
     // 往 tray.log 写一条 skip 噪音。升级走新 setup.exe。
-    if !repo_dir().exists() {
+    if !repo_dir().join(".git").exists() {
         log_line(&format!(
             "detect: no repo at {} — update checks disabled (set WALGIT_REPO to enable)",
             repo_dir().display()
@@ -829,9 +927,8 @@ fn main() {
                 if c1 == 0 && c2 == 0 && !local.is_empty() && !remote.is_empty() {
                     if local != remote {
                         let _ = detect_proxy.send_event(Msg::UpdateState(ST_AVAILABLE));
-                        let _ = detect_proxy.send_event(Msg::Available(
-                            remote[..7.min(remote.len())].to_string(),
-                        ));
+                        let _ = detect_proxy
+                            .send_event(Msg::Available(remote[..7.min(remote.len())].to_string()));
                     }
                     log_line(&format!("detect: local={:.7} remote={:.7}", local, remote));
                 } else {

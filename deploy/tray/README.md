@@ -42,7 +42,9 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
   (`deploy/windows/`,含托盘与本体)、Linux `walgit_<version>_amd64.deb`
   (`deploy/linux/build-deb.sh`,装 /usr/bin 三件 + 示例配置 + 托盘
   .desktop)。裸二进制不再发布。
-- 服务地址:`http://127.0.0.1:8081`
+- 服务地址:`http://127.0.0.1:8081`(托盘探活/开页与 `walgit.toml` 的
+  `[server] listen` 同源解析,改端口不再需要改托盘;#73)
+- 内存后端:托盘点状态行与 Web 概览页横幅显式标注「数据不落盘」(#73)
 - 源码仓库:环境变量 `WALGIT_REPO`,默认 `/Volumes/Workspace/GitHub/walgit`
 - 日志:`<部署目录>/tray.log`
 
