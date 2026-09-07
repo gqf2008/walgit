@@ -41,9 +41,12 @@ const repos = createClient({ base: "https://git.example.com", token: process.env
 ## Surface
 
 ```ts
-repos.me()                                   → { principal, write, anonymous }
+repos.me()                                   → { principal, write, admin, anonymous }
 repos.owners.list()                          → ["acme", …]
 repos.owners.repos("acme")                   → ["monorepo", …]
+repos.store.get()                            → redacted storage snapshot (admin; #127)
+repos.store.test(edit)                       → { ok, message }  (probe, nothing persisted)
+repos.store.save(edit)                       → { saved, restart, file }  (blank creds = keep)
 repos.repo("acme/monorepo")                     → RepoClient (no request)
 
 r.get()                                      → { owner, name, full_name, head, branches, tags, clone_url, html_url, api_url }

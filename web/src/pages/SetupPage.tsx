@@ -1,18 +1,29 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
+import { ApiError, api } from "../api";
+import type { StoreSettings } from "../api";
 
 /**
- * The first-run setup wizard (issue #70, D43). Served only while the instance
- * is in setup state (a `memory` store without the deliberate-use flag): every
- * other route answers 503, so this page IS the whole UI until the store and
- * the first admin are configured. Plain `fetch` to the open, data-free
- * `/api/v1/setup/*` surface — no SDK lane (no repo, no session exists yet).
+ * `/setup` wears two faces:
  *
+ * **First-run wizard** (issue #70, D43) — while the instance is in setup
+ * state (a `memory` store without the deliberate-use flag) every other route
+ * answers 503, so this page IS the whole UI until the store and the first
+ * admin are configured. Plain `fetch` to the open, data-free
+ * `/api/v1/setup/*` surface — no SDK lane (no repo, no session exists yet).
  * Flow: ① object storage (S3/R2 or GCS) → test connection → ② first admin
- * token → save → the server writes walgit.toml (comments preserved) and exits
- * 75 for the supervisor to restart; without a supervisor the page tells the
+ * token → save → the server writes walgit.toml (comments preserved) and
+ * exits 75 for the supervisor to restart; without one the page tells the
  * user to restart manually.
+ *
+ * **Admin storage editor** (issue #127) — once configured, the wizard
+ * surface 404s and the page asks `GET /api/v1/store` (SDK lane, admin-only):
+ * an admin gets the same form over the *current* values (credentials show as
+ * presence bits — they never leave the server — and a blank credential field
+ * means "keep"); everyone else lands on the "already configured" card. The
+ * save rides the wizard's mechanism: compose + validate before touching the
+ * file, `toml_edit` write-back, exit 75 for the supervisor.
  */
 
 interface SetupStatus {
@@ -34,18 +45,24 @@ interface SetupPayload {
 
 type Phase = "form" | "testing" | "saving" | "saved";
 
+type Mode = "loading" | "wizard" | "edit" | "configured";
+
+const emptyPayload: SetupPayload = {
+  backend: "s3",
+  bucket: "",
+  endpoint: "",
+  region: "auto",
+  access_key: "",
+  secret_key: "",
+  force_path_style: true,
+};
+
 export function SetupPage() {
   const { t } = useI18n();
-  const [status, setStatus] = useState<SetupStatus | "404" | "loading">("loading");
-  const [payload, setPayload] = useState<SetupPayload>({
-    backend: "s3",
-    bucket: "",
-    endpoint: "",
-    region: "auto",
-    access_key: "",
-    secret_key: "",
-    force_path_style: true,
-  });
+  const [mode, setMode] = useState<Mode>("loading");
+  const [status, setStatus] = useState<SetupStatus | null>(null);
+  const [snapshot, setSnapshot] = useState<StoreSettings | null>(null);
+  const [payload, setPayload] = useState<SetupPayload>(emptyPayload);
   const [adminToken, setAdminToken] = useState("");
   const [adminPrincipal, setAdminPrincipal] = useState("");
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -53,42 +70,90 @@ export function SetupPage() {
   const [restart, setRestart] = useState<"supervisor" | "manual" | null>(null);
   const [phase, setPhase] = useState<Phase>("form");
 
-  // Load once: are we even in setup state?
+  // Load once: wizard, editor, or neither.
   useEffect(() => {
-    fetch("/api/v1/setup/status")
-      .then(async (r) => {
-        if (r.status === 404) setStatus("404");
-        else setStatus((await r.json()) as SetupStatus);
-      })
-      .catch(() => setStatus("404"));
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/v1/setup/status");
+        if (r.ok) {
+          if (!cancelled) {
+            setStatus((await r.json()) as SetupStatus);
+            setMode("wizard");
+          }
+          return;
+        }
+      } catch {
+        /* fall through to the editor probe */
+      }
+      // Configured: the editor answers for admins only. A 401/403 (or any
+      // other answer) is not an error to show — it is simply "not yours",
+      // and the card below is the truthful response.
+      try {
+        const s = await api.store.get();
+        if (cancelled) return;
+        setSnapshot(s);
+        setPayload({
+          backend: s.backend === "gcs" ? "gcs" : "s3",
+          bucket: s.bucket,
+          endpoint: s.endpoint,
+          region: s.region || "auto",
+          access_key: "",
+          secret_key: "",
+          force_path_style: s.force_path_style,
+        });
+        setMode("edit");
+      } catch {
+        if (!cancelled) setMode("configured");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const set = (k: keyof SetupPayload, v: string | boolean) =>
     setPayload((p) => ({ ...p, [k]: v }));
 
+  const showTestFailure = (e: unknown) => {
+    // The 400 body is the {ok:false,message} JSON; anything else is shown raw.
+    const raw = e instanceof ApiError ? e.message : String(e);
+    try {
+      const body = JSON.parse(raw) as { message?: string };
+      setTestResult({ ok: false, message: body.message ?? raw });
+    } catch {
+      setTestResult({ ok: false, message: raw });
+    }
+  };
+
   const runTest = async () => {
     setPhase("testing");
     setTestResult(null);
     try {
-      const r = await fetch("/api/v1/setup/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (r.ok) {
-        const body = (await r.json()) as { ok: boolean; message: string };
-        setTestResult({ ok: body.ok, message: body.message });
-      } else if ((r.headers.get("content-type") ?? "").includes("application/json")) {
-        // The most common failure (bad credentials / unreachable endpoint) is
-        // a 400 + {ok:false, message} — show the message, not the JSON.
-        const body = (await r.json()) as { ok?: boolean; message?: string };
-        setTestResult({ ok: false, message: body.message ?? String(body) });
+      if (mode === "edit") {
+        const body = await api.store.test(payload);
+        setTestResult({ ok: true, message: body.message ?? "" });
       } else {
-        // Validation rejections answer text/plain with the reason.
-        setTestResult({ ok: false, message: await r.text() });
+        const r = await fetch("/api/v1/setup/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (r.ok) {
+          const body = (await r.json()) as { ok: boolean; message: string };
+          setTestResult({ ok: body.ok, message: body.message });
+        } else if ((r.headers.get("content-type") ?? "").includes("application/json")) {
+          // The most common failure (bad credentials / unreachable endpoint) is
+          // a 400 + {ok:false, message} — show the message, not the JSON.
+          const body = (await r.json()) as { ok?: boolean; message?: string };
+          setTestResult({ ok: false, message: body.message ?? String(body) });
+        } else {
+          // Validation rejections answer text/plain with the reason.
+          setTestResult({ ok: false, message: await r.text() });
+        }
       }
     } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
+      showTestFailure(e);
     } finally {
       setPhase("form");
     }
@@ -98,20 +163,8 @@ export function SetupPage() {
     setPhase("saving");
     setSaveError(null);
     try {
-      const r = await fetch("/api/v1/setup/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          store: payload,
-          admin_token: adminToken,
-          admin_principal: adminPrincipal,
-        }),
-      });
-      if (r.ok) {
-        const body = (await r.json()) as {
-          saved?: boolean;
-          restart?: "supervisor" | "manual";
-        };
+      if (mode === "edit") {
+        const body = await api.store.save(payload);
         if (body.saved) {
           setRestart(body.restart ?? "manual");
           setPhase("saved");
@@ -119,17 +172,50 @@ export function SetupPage() {
         }
         setSaveError("server answered ok but did not save");
       } else {
-        // The rejection paths answer text/plain with the reason.
-        setSaveError(await r.text());
+        const r = await fetch("/api/v1/setup/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            store: payload,
+            admin_token: adminToken,
+            admin_principal: adminPrincipal,
+          }),
+        });
+        if (r.ok) {
+          const body = (await r.json()) as {
+            saved?: boolean;
+            restart?: "supervisor" | "manual";
+          };
+          if (body.saved) {
+            setRestart(body.restart ?? "manual");
+            setPhase("saved");
+            return;
+          }
+          setSaveError("server answered ok but did not save");
+        } else {
+          // The rejection paths answer text/plain with the reason.
+          setSaveError(await r.text());
+        }
       }
       setPhase("form");
     } catch (e) {
-      setSaveError(String(e));
+      setSaveError(e instanceof ApiError ? e.message : String(e));
       setPhase("form");
     }
   };
 
-  if (status === "404") {
+  if (mode === "loading") {
+    return (
+      <main className="setup">
+        <div className="setup-card">
+          <h1>{t("setup.title")}</h1>
+          <p className="muted">…</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (mode === "configured") {
     return (
       <main className="setup">
         <div className="setup-card">
@@ -142,26 +228,32 @@ export function SetupPage() {
       </main>
     );
   }
-  if (status === "loading") {
-    return (
-      <main className="setup">
-        <div className="setup-card">
-          <h1>{t("setup.title")}</h1>
-          <p className="muted">…</p>
-        </div>
-      </main>
-    );
-  }
 
   const st = status;
+  const snap = snapshot;
+  const edit = mode === "edit";
+  const canSave = edit ? (snap?.can_save ?? false) : (st?.can_save ?? false);
+  const heading = edit ? t("store.title") : t("setup.title");
+
   if (phase === "saved") {
     return (
       <main className="setup">
         <div className="setup-card">
-          <h1>{t("setup.title")}</h1>
+          <h1>{heading}</h1>
           <p className="setup-ok">
-            {restart === "supervisor" ? t("setup.saved") : t("setup.saved.manual")}
+            {edit
+              ? restart === "supervisor"
+                ? t("store.saved")
+                : t("store.saved.manual")
+              : restart === "supervisor"
+                ? t("setup.saved")
+                : t("setup.saved.manual")}
           </p>
+          {edit && (
+            <Link className="btn primary" to="/">
+              {t("setup.open")}
+            </Link>
+          )}
         </div>
       </main>
     );
@@ -170,11 +262,16 @@ export function SetupPage() {
   return (
     <main className="setup">
       <div className="setup-card">
-        <h1>{t("setup.title")}</h1>
-        <p>{t("setup.lede")}</p>
-        <div className="setup-warn">{t("setup.memory.warn")}</div>
+        <h1>{heading}</h1>
+        <p>{edit ? t("store.lede") : t("setup.lede")}</p>
+        {!edit && <div className="setup-warn">{t("setup.memory.warn")}</div>}
 
         <h2>{t("setup.step.store")}</h2>
+        {edit && snap && snap.prefix !== "" && (
+          <p className="muted">
+            {t("store.prefix")}: <code>{snap.prefix}</code>
+          </p>
+        )}
         <div className="setup-grid">
           <label className="setup-field">
             <span>{t("setup.backend")}</span>
@@ -217,7 +314,11 @@ export function SetupPage() {
                   value={payload.access_key}
                   onChange={(e) => set("access_key", e.target.value)}
                   autoComplete="off"
+                  placeholder={edit ? t("store.creds.keep") : undefined}
                 />
+                {edit && snap?.has_access_key && (
+                  <small className="muted">{t("store.creds.set")}</small>
+                )}
               </label>
               <label className="setup-field">
                 <span>{t("setup.secret_key")}</span>
@@ -226,8 +327,15 @@ export function SetupPage() {
                   value={payload.secret_key}
                   onChange={(e) => set("secret_key", e.target.value)}
                   autoComplete="new-password"
+                  placeholder={edit ? t("store.creds.keep") : undefined}
                 />
-                <small className="muted">{t("setup.creds.hint")}</small>
+                <small className="muted">
+                  {edit
+                    ? snap?.has_secret_key
+                      ? t("store.creds.set")
+                      : t("store.creds.keep")
+                    : t("setup.creds.hint")}
+                </small>
               </label>
               <label className="setup-check">
                 <input
@@ -254,41 +362,43 @@ export function SetupPage() {
           </div>
         )}
 
-        <h2>{t("setup.step.admin")}</h2>
-        <div className="setup-grid">
-          <label className="setup-field">
-            <span>{t("setup.admin.token")}</span>
-            <input
-              type="password"
-              value={adminToken}
-              onChange={(e) => setAdminToken(e.target.value)}
-              autoComplete="new-password"
-            />
-            <small className="muted">{t("setup.admin.token.hint")}</small>
-          </label>
-          <label className="setup-field">
-            <span>{t("setup.admin.principal")}</span>
-            <input
-              value={adminPrincipal}
-              onChange={(e) => setAdminPrincipal(e.target.value)}
-              placeholder="admin"
-            />
-          </label>
-        </div>
+        {!edit && (
+          <>
+            <h2>{t("setup.step.admin")}</h2>
+            <div className="setup-grid">
+              <label className="setup-field">
+                <span>{t("setup.admin.token")}</span>
+                <input
+                  type="password"
+                  value={adminToken}
+                  onChange={(e) => setAdminToken(e.target.value)}
+                  autoComplete="new-password"
+                />
+                <small className="muted">{t("setup.admin.token.hint")}</small>
+              </label>
+              <label className="setup-field">
+                <span>{t("setup.admin.principal")}</span>
+                <input
+                  value={adminPrincipal}
+                  onChange={(e) => setAdminPrincipal(e.target.value)}
+                  placeholder="admin"
+                />
+              </label>
+            </div>
+          </>
+        )}
 
         <p>
           <button
             className="btn primary"
             type="button"
-            disabled={phase !== "form" || !payload.bucket.trim() || !st.can_save}
+            disabled={phase !== "form" || !payload.bucket.trim() || !canSave}
             onClick={runSave}
           >
             {phase === "saving" ? t("setup.saving") : t("setup.save")}
           </button>
         </p>
-        {!st.can_save && (
-          <p className="muted">{t("setup.nosave")}</p>
-        )}
+        {!canSave && <p className="muted">{edit ? t("store.nosave") : t("setup.nosave")}</p>}
         {saveError && <div className="setup-warn">{`${t("setup.save.fail")} ${saveError}`}</div>}
       </div>
     </main>
