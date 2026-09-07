@@ -257,3 +257,435 @@ async fn setup_state_refuses_a_non_loopback_bind() -> TestResult {
     assert!(text.contains("loopback"), "{text}");
     Ok(())
 }
+
+// ---- configured-state admin store settings (issue #127) --------------------
+//
+// Same write-back mechanism as the wizard above, admin-gated and with the
+// editor's "blank = keep" credential semantics. The instances here run from
+// a real file in a tempdir (`start_configured_with_config`); the in-process
+// store stays memory, which is fine — these endpoints read/validate the
+// config, they never touch the bucket except through the test probe.
+
+/// A configured file in the shape the wizard's own save produced: a comment
+/// to prove `toml_edit` survives, and a credential pair to prove blanks keep.
+fn configured_file() -> String {
+    "# 顶注释保留
+[server]
+listen = \"127.0.0.1:8081\"
+
+[store]
+backend = \"s3\"
+bucket = \"old-bucket\"
+
+[store.s3]
+# 凭据在文件里
+endpoint = \"https://old.example.com\"
+region = \"auto\"
+access_key = \"old-ak\"
+secret_key = \"old-sk\"
+force_path_style = true
+"
+    .to_string()
+}
+
+/// While the wizard owns the instance, the admin store surface answers 404
+/// (it passes the gate precisely so both entry points stay single-owned).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_surface_404s_while_the_wizard_owns_the_instance() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, "[store]\nbackend = \"memory\"\n")?;
+    let server = Server::start_setup(&cfg_path).await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let body = serde_json::json!({ "store": { "backend": "s3", "bucket": "b" } });
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 404, "{}", r.status());
+    let r = client
+        .post(format!("{}/api/v1/store/test", server.base_url))
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 404, "{}", r.status());
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 404, "{}", r.status());
+
+    // The gate still owns everything else it ever owned.
+    let r = client
+        .get(format!("{}/api/v1/owners", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 503, "{}", r.status());
+    assert!(r.text().await?.contains("/setup"));
+    Ok(())
+}
+
+/// `GET /api/v1/store` on a configured instance: the parameters in clear,
+/// the credentials only as presence bits — the secret text must not appear
+/// anywhere in the response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_snapshot_is_redacted() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, configured_file())?;
+    let server = Server::start_configured_with_config(&cfg_path, |c| {
+        c.store.backend = walgit_config::StoreBackend::S3;
+        c.store.bucket = "prod-bucket".into();
+        c.store.prefix = "data/".into();
+        c.store.s3.endpoint = "https://acct.r2.cloudflarestorage.com".into();
+        c.store.s3.region = "auto".into();
+        c.store.s3.access_key = Some("literal-ak-value".into());
+        c.store.s3.secret_key = Some("literal-sk-value".into());
+        c.store.s3.force_path_style = true;
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    // mode `none` on loopback = admin: the surface answers without a credential.
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.status());
+    assert_eq!(
+        r.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let text = r.text().await?;
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(v["backend"], "s3", "{v}");
+    assert_eq!(v["bucket"], "prod-bucket", "{v}");
+    assert_eq!(v["prefix"], "data/", "{v}");
+    assert_eq!(
+        v["endpoint"], "https://acct.r2.cloudflarestorage.com",
+        "{v}"
+    );
+    assert_eq!(v["region"], "auto", "{v}");
+    assert_eq!(v["force_path_style"], true, "{v}");
+    assert_eq!(v["has_access_key"], true, "{v}");
+    assert_eq!(v["has_secret_key"], true, "{v}");
+    assert_eq!(v["can_save"], true, "harness armed config_path");
+    assert!(!text.contains("literal-ak-value"), "{text}");
+    assert!(!text.contains("literal-sk-value"), "{text}");
+    assert!(!text.contains("old-ak"), "{text}");
+    Ok(())
+}
+
+/// `PUT /api/v1/store` with blank credential fields keeps what the file has
+/// (comments too); a submitted pair overwrites; and the wizard-only
+/// `admin_token` field is a 400 on this surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_edit_save_blank_credentials_keep_the_file_values() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, configured_file())?;
+    let server = Server::start_configured_with_config(&cfg_path, |_| {}).await?;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({
+            "store": {
+                "backend": "s3",
+                "bucket": "new-bucket",
+                "endpoint": "https://new.example.com",
+                "region": "auto",
+                "force_path_style": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(body["saved"], true, "{body}");
+    assert_eq!(
+        body["restart"], "manual",
+        "harness servers never exit — {body}"
+    );
+
+    let text = std::fs::read_to_string(&cfg_path)?;
+    assert!(text.contains("# 顶注释保留"), "{text}");
+    assert!(text.contains("# 凭据在文件里"), "{text}");
+    assert!(text.contains("bucket = \"new-bucket\""), "{text}");
+    assert!(
+        text.contains("endpoint = \"https://new.example.com\""),
+        "{text}"
+    );
+    assert!(text.contains("access_key = \"old-ak\""), "{text}");
+    assert!(text.contains("secret_key = \"old-sk\""), "{text}");
+
+    // A new pair overwrites.
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({
+            "store": {
+                "backend": "s3",
+                "bucket": "new-bucket",
+                "access_key": "fresh-ak",
+                "secret_key": "fresh-sk"
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    let text = std::fs::read_to_string(&cfg_path)?;
+    assert!(text.contains("access_key = \"fresh-ak\""), "{text}");
+    assert!(text.contains("secret_key = \"fresh-sk\""), "{text}");
+    assert!(!text.contains("old-ak"), "{text}");
+
+    // The first-admin fields are wizard-only: sending them is refused, not
+    // silently dropped.
+    let before = text;
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({
+            "store": { "backend": "s3", "bucket": "b2" },
+            "admin_token": "must-not-land"
+        }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 400, "{}", r.status());
+    assert_eq!(std::fs::read_to_string(&cfg_path)?, before);
+    Ok(())
+}
+
+/// A refused save (empty bucket) does not touch the file, and a
+/// not-from-a-file instance refuses the save with a 503 that explains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_edit_save_refusals() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, configured_file())?;
+    let server = Server::start_configured_with_config(&cfg_path, |_| {}).await?;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({ "store": { "backend": "s3", "bucket": "" } }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 400, "{}", r.status());
+    assert_eq!(std::fs::read_to_string(&cfg_path)?, configured_file());
+
+    // No config file → nothing to edit (library/test shape): 503, and the
+    // snapshot says so via can_save.
+    let server = Server::start().await?;
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["can_save"], false, "{v}");
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({ "store": { "backend": "s3", "bucket": "b" } }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 503, "{}", r.status());
+    assert!(r.text().await?.contains("--config"));
+    Ok(())
+}
+
+/// `POST /api/v1/store/test` probes the *submitted* parameters overlaid on
+/// the RUNNING config: blank credentials keep the running literals (a probe
+/// that would otherwise have no way to sign succeeds), a reachable bucket
+/// answers `{ok:true}` and an unreachable one `{ok:false}` with 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_edit_test_probes_the_candidate_with_kept_credentials() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A fake S3 endpoint: every HEAD answers 404, which the probe contract
+    // counts as "bucket reachable with these credentials".
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let probe_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, configured_file())?;
+    let server = Server::start_configured_with_config(&cfg_path, |c| {
+        c.store.backend = walgit_config::StoreBackend::S3;
+        c.store.bucket = "live-bucket".into();
+        c.store.s3.access_key = Some("keep-ak".into());
+        c.store.s3.secret_key = Some("keep-sk".into());
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    // Blank credentials + the fake endpoint: the kept running credentials
+    // sign the probe; the 404 reads as success.
+    let r = client
+        .post(format!("{}/api/v1/store/test", server.base_url))
+        .json(&serde_json::json!({
+            "backend": "s3",
+            "bucket": "b",
+            "endpoint": format!("http://{probe_addr}"),
+            "region": "us-east-1",
+            "force_path_style": true
+        }))
+        .send()
+        .await?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["bucket"], "b", "{v}");
+
+    // An unreachable endpoint is a surfaced failure, not a panic or a lie.
+    let r = client
+        .post(format!("{}/api/v1/store/test", server.base_url))
+        .json(&serde_json::json!({
+            "backend": "s3",
+            "bucket": "b",
+            "endpoint": "http://127.0.0.1:1",
+            "region": "us-east-1",
+            "force_path_style": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 400, "{}", r.status());
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["ok"], false, "{v}");
+
+    // Validation rejections answer the wizard's text shape.
+    let r = client
+        .post(format!("{}/api/v1/store/test", server.base_url))
+        .json(&serde_json::json!({ "backend": "s3", "bucket": "" }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 400, "{}", r.status());
+    assert!(r.text().await?.contains("bucket is required"));
+    Ok(())
+}
+
+/// The store surface is admin-gated with §1.3's channel semantics: a missing
+/// credential challenges (401, Bearer-only), an authenticated non-admin is a
+/// real 403 that never reaches the file, and the admin token gets through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_surface_requires_admin() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(&cfg_path, configured_file())?;
+    let server = Server::start_configured_with_config(&cfg_path, |c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "root".into(),
+                token: "t-admin".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+            walgit_config::StaticToken {
+                principal: "reader".into(),
+                token: "t-read".into(),
+                token_env: None,
+                write: false,
+                admin: false,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    // No credential: 401 (a challenge), Bearer-only (browser surface, #91).
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 401, "{}", r.status());
+    let www = r
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(www.starts_with("bearer") && !www.contains("basic"), "{www}");
+
+    // Authenticated but not admin: a real 403 on every lane.
+    for (method, path) in [
+        (reqwest::Method::GET, "/api/v1/store"),
+        (reqwest::Method::PUT, "/api/v1/store"),
+        (reqwest::Method::POST, "/api/v1/store/test"),
+    ] {
+        let mut req = client.request(method.clone(), format!("{}{path}", server.base_url));
+        if !matches!(method, reqwest::Method::GET) {
+            req = req.json(&serde_json::json!({ "store": { "backend": "s3", "bucket": "evil" } }));
+        }
+        let r = req.header("authorization", "Bearer t-read").send().await?;
+        assert_eq!(r.status(), 403, "{method} {path}: {}", r.status());
+    }
+    assert_eq!(std::fs::read_to_string(&cfg_path)?, configured_file());
+
+    // Admin: through.
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .header("authorization", "Bearer t-admin")
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.status());
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .header("authorization", "Bearer t-admin")
+        .json(&serde_json::json!({ "store": { "backend": "s3", "bucket": "moved" } }))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    assert!(std::fs::read_to_string(&cfg_path)?.contains("bucket = \"moved\""));
+    // `me` carries the admin bit so the SPA can gate its entry.
+    let r = client
+        .get(format!("{}/api/v1/me", server.base_url))
+        .header("authorization", "Bearer t-admin")
+        .send()
+        .await?;
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["admin"], true, "{v}");
+    let r = client
+        .get(format!("{}/api/v1/me", server.base_url))
+        .header("authorization", "Bearer t-read")
+        .send()
+        .await?;
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["admin"], false, "{v}");
+    Ok(())
+}

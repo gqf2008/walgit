@@ -373,6 +373,8 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /api/v1/owners",
             "GET  /api/v1/owners/{owner}/repos",
             "GET  /api/v1/authenticate   (also /api-browser/v1/me|authenticate for the browser lane)",
+            "GET|PUT /api/v1/store        (admin — redacted storage snapshot / edit the config file, #127)",
+            "POST /api/v1/store/test      (admin — probe a candidate without persisting)",
             "-- repository routes live under the repository (D27): /{owner}/{repo}/api/… (bearer/session) and /{owner}/{repo}/api-browser/… (browser lane) --",
             "GET|PUT|DELETE /{owner}/{repo}/api",
             "GET  /{owner}/{repo}/api/refs",
@@ -407,6 +409,7 @@ async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
             let mut r = axum::Json(serde_json::json!({
                 "principal": p.name,
                 "write": p.write,
+                "admin": p.admin,
                 "anonymous": p.anonymous,
             }))
             .into_response();

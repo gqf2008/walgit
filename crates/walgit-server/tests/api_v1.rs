@@ -112,9 +112,14 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     );
 
     // me (auth mode none in tests → anonymous principal)
-    let (st, _, hdrs) = req(&server, reqwest::Method::GET, "/api/v1/me", &[]).await?;
+    let (st, text, hdrs) = req(&server, reqwest::Method::GET, "/api/v1/me", &[]).await?;
     assert_eq!(st, 200);
     assert_eq!(hdr(&hdrs, "cache-control"), "no-store");
+    // #127: `admin` travels on `me` (the SPA's 存储配置 entry keys off it);
+    // mode `none` on loopback is admin (§1.3).
+    let me: Value = serde_json::from_str(&text)?;
+    assert_eq!(me["admin"], true, "{me}");
+    assert_eq!(me["write"], true, "{me}");
 
     // owners
     assert_eq!(

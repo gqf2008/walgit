@@ -53,6 +53,12 @@ pub async fn gate(req: Request<Body>, next: axum::middleware::Next) -> Response 
     if path == "/api/v1/setup" || path.starts_with("/api/v1/setup/") {
         return next.run(req).await;
     }
+    // The configured-state store surface (#127) is not the wizard's: let it
+    // reach its handler so it answers 404 here (the wizard owns setup state),
+    // rather than the gate's 503.
+    if path == "/api/v1/store" || path.starts_with("/api/v1/store/") {
+        return next.run(req).await;
+    }
     // The wizard page is a client route of the SPA shell; its assets ride the
     // normal immutable/no-cache asset rules. Served here — the auth layer
     // would 401: setup state has no credentials yet.
@@ -101,33 +107,52 @@ async fn status(State(st): State<Arc<AppState>>) -> Response {
 }
 
 /// What the wizard offers the user to configure (steps ① + ③ of the issue).
+/// Shared with the configured-state admin surface (#127): the same shape is
+/// the body of `POST /api/v1/store/test` and of the `PUT /api/v1/store` edit.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SetupStore {
+pub(crate) struct SetupStore {
     /// `s3` (R2 is S3-compatible) or `gcs`.
-    backend: String,
-    bucket: String,
+    pub(crate) backend: String,
+    pub(crate) bucket: String,
     #[serde(default)]
-    endpoint: String,
+    pub(crate) endpoint: String,
     #[serde(default)]
-    region: String,
+    pub(crate) region: String,
     /// Literal credentials (D43). Empty = the `*_env` names in the config win
     /// (kept as-is) — the S3-only fields are ignored for `gcs`.
     #[serde(default)]
-    access_key: String,
+    pub(crate) access_key: String,
     #[serde(default)]
-    secret_key: String,
+    pub(crate) secret_key: String,
     #[serde(default = "default_true")]
-    force_path_style: bool,
+    pub(crate) force_path_style: bool,
 }
 
 fn default_true() -> bool {
     true
 }
 
+/// What a **blank** credential field means, which differs by surface:
+/// the first-run wizard omits blank credentials (the `*_env` names win),
+/// while the admin editor (#127) keeps what the config already holds —
+/// a GET never echoes the secrets, so the edit form can only pre-fill
+/// blanks, and a blank must not read as "clear them".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlankCreds {
+    /// Empty field ⇒ the literal credential is absent (env names win).
+    Omit,
+    /// Empty field ⇒ leave the existing literal credential untouched.
+    Keep,
+}
+
 /// Apply the submitted store to a scratch config — shared by the test
 /// connection (never persisted) and the save (persisted after validation).
-fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<(), ApiError> {
+pub(crate) fn apply_store(
+    cfg: &mut walgit_config::Config,
+    store: &SetupStore,
+    blank: BlankCreds,
+) -> Result<(), ApiError> {
     if store.bucket.trim().is_empty() {
         return Err(ApiError::BadRequest("bucket is required".into()));
     }
@@ -142,10 +167,8 @@ fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<()
             } else {
                 store.region.trim().to_string()
             };
-            s3.access_key =
-                (!store.access_key.trim().is_empty()).then(|| store.access_key.trim().to_string());
-            s3.secret_key =
-                (!store.secret_key.trim().is_empty()).then(|| store.secret_key.trim().to_string());
+            set_credential(&mut s3.access_key, &store.access_key, blank);
+            set_credential(&mut s3.secret_key, &store.secret_key, blank);
             s3.force_path_style = store.force_path_style;
         }
         "gcs" => {
@@ -163,38 +186,59 @@ fn apply_store(cfg: &mut walgit_config::Config, store: &SetupStore) -> Result<()
     Ok(())
 }
 
+/// One credential line of `apply_store`: a submitted value always wins; a
+/// blank one is omitted (wizard) or kept (editor) per `blank`.
+fn set_credential(slot: &mut Option<String>, submitted: &str, blank: BlankCreds) {
+    let submitted = submitted.trim();
+    if !submitted.is_empty() {
+        *slot = Some(submitted.to_string());
+    } else if blank == BlankCreds::Omit {
+        *slot = None;
+    }
+}
+
 /// `POST /api/v1/setup/test` — build a store from the submitted params (never
-/// persisted) and probe the bucket: HEAD of a key that cannot exist yet. A
-/// `NotFound` *is* success (credentials + bucket reachable, no such object); a
-/// success is success too; anything else is the surfaced error.
+/// persisted) and probe the bucket. A `memory`-rooted scratch is the wizard's
+/// shape; the configured-state editor (#127) probes a scratch rooted at the
+/// running config instead.
 async fn test_connection(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if !st.needs_setup {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match crate::collect_body(body).await {
-        Ok(b) => b,
-        Err(e) => return e.into_response(),
-    };
-    let store: SetupStore = match serde_json::from_slice(&bytes) {
+    let store = match parse_setup_store(body, "setup payload").await {
         Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid setup payload: {e}"),
-            )
-                .into_response();
-        }
+        Err(r) => return *r,
     };
     let mut scratch = walgit_config::Config::default();
-    if let Err(e) = apply_store(&mut scratch, &store) {
+    if let Err(e) = apply_store(&mut scratch, &store, BlankCreds::Omit) {
         return e.into_response();
     }
+    probe_store(&scratch).await
+}
+
+/// Parse a `SetupStore` JSON body, answering the wizard's 400 shape on failure
+/// (the boxed `Response` keeps the `Result` under clippy's `result_large_err`).
+pub(crate) async fn parse_setup_store(body: Body, what: &str) -> Result<SetupStore, Box<Response>> {
+    let bytes = match crate::collect_body(body).await {
+        Ok(b) => b,
+        Err(e) => return Err(Box::new(e.into_response())),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        Box::new((StatusCode::BAD_REQUEST, format!("invalid {what}: {e}")).into_response())
+    })
+}
+
+/// Open a store on the scratch config and probe the bucket: HEAD of a key
+/// that cannot exist yet. A `NotFound` *is* success (credentials + bucket
+/// reachable, no such object); a success is success too; anything else is
+/// the surfaced error. Nothing is persisted either way.
+pub(crate) async fn probe_store(scratch: &walgit_config::Config) -> Response {
     let backend = match scratch.store.backend {
         walgit_config::StoreBackend::Gcs => "gcs",
         walgit_config::StoreBackend::S3 => "s3",
         walgit_config::StoreBackend::Memory => "memory",
     };
-    match walgit_store::open_store(&scratch).await {
+    match walgit_store::open_store(scratch).await {
         Ok(opened) => {
             let probe_key = format!("{}setup-probe", scratch.store_prefix());
             match opened.head(&probe_key).await {
@@ -276,7 +320,7 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
 
     // 1. Compose + validate a scratch config *before* touching the file.
     let mut scratch = walgit_config::Config::default();
-    if let Err(e) = apply_store(&mut scratch, &req.store) {
+    if let Err(e) = apply_store(&mut scratch, &req.store, BlankCreds::Omit) {
         return e.into_response();
     }
     // The admin step applies only when the running auth is `none` (the wizard
@@ -423,50 +467,11 @@ fn edit_document(
     req: &SetupSave,
     write_admin: bool,
 ) -> anyhow::Result<()> {
-    use toml_edit::{Item, Table, value};
-
-    let store_entry = doc.entry("store").or_insert(Item::Table(Table::new()));
-    let store_tbl = store_entry
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[store] is not a table"))?;
-    store_tbl["backend"] = value(&req.store.backend);
-    store_tbl["bucket"] = value(req.store.bucket.trim());
-    store_tbl.remove("memory_backend_intentional");
-    match req.store.backend.as_str() {
-        "s3" => {
-            store_tbl.remove("gcs");
-            let s3_entry = store_tbl.entry("s3").or_insert(Item::Table(Table::new()));
-            let s3 = s3_entry
-                .as_table_mut()
-                .ok_or_else(|| anyhow::anyhow!("[store.s3] is not a table"))?;
-            s3["endpoint"] = value(req.store.endpoint.trim());
-            s3["region"] = value(if req.store.region.trim().is_empty() {
-                "auto"
-            } else {
-                req.store.region.trim()
-            });
-            s3["force_path_style"] = value(req.store.force_path_style);
-            if req.store.access_key.trim().is_empty() {
-                s3.remove("access_key");
-                s3.remove("secret_key");
-            } else {
-                s3["access_key"] = value(req.store.access_key.trim());
-                s3["secret_key"] = value(req.store.secret_key.trim());
-            }
-        }
-        "gcs" => {
-            store_tbl.remove("s3");
-            let gcs_entry = store_tbl.entry("gcs").or_insert(Item::Table(Table::new()));
-            let gcs = gcs_entry
-                .as_table_mut()
-                .ok_or_else(|| anyhow::anyhow!("[store.gcs] is not a table"))?;
-            gcs["endpoint"] = value(req.store.endpoint.trim());
-        }
-        _ => {}
-    }
+    edit_store_table(doc, &req.store, BlankCreds::Omit)?;
 
     if write_admin && let Some(token) = req.admin_token.as_deref().filter(|t| !t.trim().is_empty())
     {
+        use toml_edit::{Item, Table, value};
         let principal = req
             .admin_principal
             .as_deref()
@@ -493,6 +498,75 @@ fn edit_document(
         first.insert("write", value(true));
         first.insert("admin", value(true));
         aot.push(first);
+    }
+    Ok(())
+}
+
+/// Edit only the `[store]` section (+ `[store.s3]` / `[store.gcs]`) of the
+/// TOML document, preserving every comment and unrelated key. Shared by the
+/// first-run save (blank ⇒ clear) and the configured-state editor (blank ⇒
+/// keep, #127). `blank` controls the literal credential fields only.
+pub(crate) fn edit_store_table(
+    doc: &mut toml_edit::DocumentMut,
+    store: &SetupStore,
+    blank: BlankCreds,
+) -> anyhow::Result<()> {
+    use toml_edit::{Item, Table, value};
+
+    let store_entry = doc.entry("store").or_insert(Item::Table(Table::new()));
+    let store_tbl = store_entry
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[store] is not a table"))?;
+    store_tbl["backend"] = value(&store.backend);
+    store_tbl["bucket"] = value(store.bucket.trim());
+    store_tbl.remove("memory_backend_intentional");
+    match store.backend.as_str() {
+        "s3" => {
+            store_tbl.remove("gcs");
+            let s3_entry = store_tbl.entry("s3").or_insert(Item::Table(Table::new()));
+            let s3 = s3_entry
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("[store.s3] is not a table"))?;
+            s3["endpoint"] = value(store.endpoint.trim());
+            s3["region"] = value(if store.region.trim().is_empty() {
+                "auto"
+            } else {
+                store.region.trim()
+            });
+            s3["force_path_style"] = value(store.force_path_style);
+            // One pair, two policies: the wizard treats the two fields as a
+            // unit (blank access key clears both), the editor keeps each
+            // field it was not given (#127) — an echo-back of "keep" must
+            // never read as "clear".
+            match blank {
+                BlankCreds::Omit => {
+                    if store.access_key.trim().is_empty() {
+                        s3.remove("access_key");
+                        s3.remove("secret_key");
+                    } else {
+                        s3["access_key"] = value(store.access_key.trim());
+                        s3["secret_key"] = value(store.secret_key.trim());
+                    }
+                }
+                BlankCreds::Keep => {
+                    if !store.access_key.trim().is_empty() {
+                        s3["access_key"] = value(store.access_key.trim());
+                    }
+                    if !store.secret_key.trim().is_empty() {
+                        s3["secret_key"] = value(store.secret_key.trim());
+                    }
+                }
+            }
+        }
+        "gcs" => {
+            store_tbl.remove("s3");
+            let gcs_entry = store_tbl.entry("gcs").or_insert(Item::Table(Table::new()));
+            let gcs = gcs_entry
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("[store.gcs] is not a table"))?;
+            gcs["endpoint"] = value(store.endpoint.trim());
+        }
+        _ => {}
     }
     Ok(())
 }
