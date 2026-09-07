@@ -130,6 +130,12 @@ export function OverviewPage() {
         </Box>
       </div>
 
+      {(o.instance as { store_backend?: string }).store_backend === "memory" && (
+        <div className="banner warn" role="alert">
+          {t("ov.memoryBackendWarning")}
+        </div>
+      )}
+
       <div className="row gap">
         <Box title={t("ov.packs")} className="grow">
           <KV

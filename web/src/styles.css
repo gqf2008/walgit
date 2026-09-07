@@ -871,6 +871,14 @@ table.kv.compact td { padding: 2px 0; }
 .chain-node:first-child .chain-root { border-top: 0; margin-top: 0; }
 .chain-edge { color: var(--fg2); font-family: monospace; width: 1.6em; display: inline-block; }
 .warn { color: #7a4a00; }
+/* 运行层警示横幅(#73):memory 后端等部署级警告,跨页面可见。 */
+.banner.warn {
+  background: rgba(255, 180, 0, 0.12);
+  border: 1px solid rgba(255, 180, 0, 0.45);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+}
 
 /* ---- D1 collaboration layer (Collab tab) ---------------------------------- */
 .collab-body {
