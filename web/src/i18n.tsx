@@ -166,6 +166,8 @@ const en = {
   "entry.attachment.download": "download",
   "entry.attachment.bad": "bad base64",
   "entry.attachment.big": "attachment too large",
+  "taskerr.replayable": "refs at the bundle base are not replayable — the log was folded past it and no checkpoint anchors it. Run `walgit compact --base` to rebuild the base with a checkpoint.",
+  "taskerr.original": "server text",
 
   // CollabWrite
   "write.enable": "Enable my key & register",
@@ -835,6 +837,8 @@ const zhCN: Record<I18nKey, string> = {
   "entry.attachment.download": "下载",
   "entry.attachment.bad": "损坏的 base64",
   "entry.attachment.big": "附件过大",
+  "taskerr.replayable": "bundle 基准处的 refs 不可回放——log 已折叠过基准且没有 checkpoint 锚定。运行 `walgit compact --base` 重建基准并落 checkpoint。",
+  "taskerr.original": "服务端原文",
 
   // CollabWrite
   "write.enable": "启用我的密钥并注册",
@@ -1500,6 +1504,8 @@ const zhTW: Record<I18nKey, string> = {
   "entry.attachment.download": "下載",
   "entry.attachment.bad": "損壞的 base64",
   "entry.attachment.big": "附件過大",
+  "taskerr.replayable": "bundle 基準處的 refs 無法回放——log 已摺疊過基準且無 checkpoint 錨定。執行 `walgit compact --base` 重建基準並寫入 checkpoint。",
+  "taskerr.original": "伺服器原文",
 
   // CollabWrite
   "write.enable": "啟用我的金鑰並註冊",

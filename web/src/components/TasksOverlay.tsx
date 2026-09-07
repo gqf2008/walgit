@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type TaskRecord } from "../api";
 import { reportError } from "../data";
 import { useI18n, type I18nKey, type TFunc } from "../i18n";
+import { taskErrorText } from "../taskErrors";
 
 /** Poll cadence while something runs / when idle (API.md §2c). */
 const BUSY_MS = 1500;
@@ -70,7 +71,10 @@ export function TasksOverlay({ repo }: { repo: string }) {
           else if (res.hostname === seenHost) done.push({ ...prev, ok: true, finished: prev.finished ?? new Date().toISOString(), summary: prev.summary || t("tasks.done") });
           // else: a different instance answered; keep waiting for the owner.
         }
-        for (const rec of done) if (rec.ok === false) reportError(new Error(rec.summary), `${kindLabel(t, rec.kind)} task`);
+        for (const rec of done)
+          if (rec.ok === false)
+            // 任务错误按已知模式翻译(issue #117)。
+            reportError(new Error(taskErrorText(t, rec.summary).text), `${kindLabel(t, rec.kind)} task`);
         seenHost = res.hostname;
         seen = now;
         setRunning(res.running);

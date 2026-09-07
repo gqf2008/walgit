@@ -6,6 +6,7 @@ import { BundlePlan } from "../components/BundlePlan";
 import { BundleChain } from "../components/BundleChain";
 import { useRepo } from "./RepoLayout";
 import { useI18n, type I18nKey } from "../i18n";
+import { taskErrorText } from "../taskErrors";
 
 const fmtBytes = (n: number) => {
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -267,12 +268,14 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
             if (ev.event === "log") setLog((l) => [...l, ev.line]);
             else if (ev.event === "started") setStatus({ text: t("ov.ops.runningOn", { op, host: ev.record.hostname }) });
             else if (ev.event === "done") setStatus({ ok: true, text: ev.record.summary });
-            else if (ev.event === "error") setStatus({ ok: false, text: ev.message });
+            else if (ev.event === "error")
+              // 任务错误按已知模式翻译(issue #117);原文进日志留证。
+              setStatus({ ok: false, text: taskErrorText(t, ev.message).text });
           },
           abort.current.signal,
         );
       } catch (e) {
-        setStatus({ ok: false, text: (e as Error).message });
+        setStatus({ ok: false, text: taskErrorText(t, (e as Error).message).text });
       } finally {
         setLog((l) => [...l, t("ov.ops.finished", { s: ((performance.now() - t0) / 1000).toFixed(1) })]);
         abort.current = null;
