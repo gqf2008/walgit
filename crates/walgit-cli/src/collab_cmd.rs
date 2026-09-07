@@ -431,11 +431,15 @@ fn check_status_transition(
         // 线程序先行(issue #104 观察 A):card_status 按给定顺序重放。
         let thread_refs = walgit_wal::collab::thread(&thread_refs);
         walgit_wal::collab::validate_status_transition(&thread_refs, principals).map_err(|e| {
-            // 观察 B:approve reviewer 的 key 可能只在 host registry——本地比对
-            // 更严,先 principal-fetch 再试,否则合法流转被 CLI 误拒。
-            anyhow::anyhow!(
-                "status transition rejected: {e}\n提示:approve reviewer 的 key 若仅在 host registry,先 `walgit collab principal-fetch` 再试"
-            )
+            // 观察 B:仅当缺 verified approve(可能只在 host registry)时才指路
+            // fetch——「当前状态不是 needs-review」fetch 也救不了,不误导。
+            if e.contains("verified approve") {
+                anyhow::anyhow!(
+                    "status transition rejected: {e}\n提示:approve reviewer 的 key 若仅在 host registry,先 `walgit collab principal-fetch` 再试"
+                )
+            } else {
+                anyhow::anyhow!("status transition rejected: {e}")
+            }
         })?;
     }
     Ok(())
@@ -510,8 +514,15 @@ fn run_entry(args: &EntryArgs) -> Result<()> {
         sig: String::new(),
     };
     // Transition 门禁（issue #102/#104）：与服务端一致,可测 helper。
-    let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
-    check_status_transition(&entry, &thread_entries, &principals)?;
+    // load 只在 done 分支执行——收件箱里他人坏条目/缺对象不该阻断
+    // issue/comment 等普通写(#114 审查回归修正),也避免每写一次 O(N)
+    // git cat-file。
+    if entry.kind == "status"
+        && entry.body.get("status").and_then(|v| v.as_str()) == Some("done")
+    {
+        let (thread_entries, principals) = CollabReader::new(&args.repo).load()?;
+        check_status_transition(&entry, &thread_entries, &principals)?;
+    }
     let key = read_signing_key(&args.key)?;
     entry.sig = sign_entry(&mut entry, &key);
     let content = serde_json::to_string_pretty(&entry)?;
