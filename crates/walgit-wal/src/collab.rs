@@ -1288,6 +1288,36 @@ mod transition_tests {
     }
 
     #[test]
+    fn multi_status_thread_needs_thread_ordering_before_the_verdict() {
+        // issue #104 观察 A:card_status 按给定顺序重放。真实链序(ts)以
+        // in-progress 结尾,但 refs 收集顺序可能把 needs-review 排最后——
+        // 不先 thread() 就会误放行 done。本测试锁「thread() 先行」的语义:
+        // 危险顺序下旧行为误判放行,thread() 后按链序正确拒绝。
+        let key = make_key();
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pub_b64);
+
+        let issue = signed_entry(&key, "issue", "t9", "alice", "i1", 1, serde_json::json!({"title": "x"}));
+        let approve = signed_entry(&key, "review", "t9", "alice", "a1", 3, serde_json::json!({"decision": "approve"}));
+        let in_progress = signed_entry(&key, "status", "t9", "alice", "s2", 4, serde_json::json!({"status": "in-progress"}));
+        let needs_review = signed_entry(&key, "status", "t9", "alice", "s1", 2, serde_json::json!({"status": "needs-review"}));
+
+        // 反收集顺序:needs-review 排最后——不 thread() 的旧行为会误判当前
+        // 状态为 needs-review 且有 verified approve → 错误放行。
+        let collected = [&issue, &approve, &in_progress, &needs_review];
+        assert!(
+            validate_status_transition(&collected, &principals).is_ok(),
+            "危险顺序构造无效:该顺序下不 thread() 应误判放行"
+        );
+        let ordered = thread(&collected);
+        assert!(
+            validate_status_transition(&ordered, &principals).is_err(),
+            "thread() 后按链序判定:当前 in-progress,拒绝 done"
+        );
+    }
+
+    #[test]
     fn done_requires_verified_approve() {
         let mut principals = HashMap::new();
         principals.insert("alice".to_string(), "fake".to_string());

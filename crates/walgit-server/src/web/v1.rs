@@ -92,10 +92,23 @@ fn host_principal_key(principal: &str) -> String {
     format!("{HOST_PRINCIPALS}{principal}")
 }
 
-/// Read the whole host registry into principal → public key. Best effort:
-/// a failing store read surfaces as an internal error, never as a silent
-/// "unverified" fallback.
+/// Read the whole host registry into principal → public key, TTL-cached
+/// (issue #104): the collab report/thread/board paths consult this per request
+/// — uncached that is a full LIST + one GET per key per read. Writes
+/// (`host_principal_put`/`delete`) invalidate, so a revoke is effective
+/// immediately on the writer instance and within the TTL everywhere else.
+/// Best effort: a failing store read surfaces as an internal error, never as a
+/// silent "unverified" fallback.
 pub(crate) async fn host_principals_map(st: &AppState) -> Result<HashMap<String, String>, ApiError> {
+    if let Some(hit) = st.caches.host_principals.get(&()) {
+        return Ok(hit);
+    }
+    let map = host_principals_read(st).await?;
+    st.caches.host_principals.insert((), map.clone());
+    Ok(map)
+}
+
+async fn host_principals_read(st: &AppState) -> Result<HashMap<String, String>, ApiError> {
     let mut map = HashMap::new();
     let mut stream = st.store.list(HOST_PRINCIPALS, None);
     while let Some(item) = stream.next().await {
@@ -167,6 +180,8 @@ async fn host_principal_put(
         .put_bytes(&host_principal_key(&principal), content, PutMode::Overwrite)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // 写失效(issue #104):注册/轮换立即生效,不等 TTL。
+    st.caches.host_principals.invalidate(&());
     Ok(json_swr(
         &serde_json::json!({ "principal": principal, "registered": true }),
         None,
@@ -194,6 +209,8 @@ async fn host_principal_delete(
         .delete(&host_principal_key(&principal), None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // 写失效(issue #104):吊销立即生效,不等 TTL。
+    st.caches.host_principals.invalidate(&());
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

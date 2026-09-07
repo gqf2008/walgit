@@ -15,6 +15,8 @@ use moka::sync::Cache;
 use walgit_git::LsRefsLine;
 use walgit_store::Version;
 
+use std::collections::HashMap;
+
 // ---------------------------------------------------------------------------
 // Ref advertisement cache
 // ---------------------------------------------------------------------------
@@ -351,6 +353,12 @@ pub struct ServerCaches {
     /// download that failed, and gets ONE upload-pack clone per
     /// `FALLBACK_EVERY` (the second entry, `repo\0principal\0fallback`).
     pub bundle_attempts: Cache<String, std::time::Instant>,
+    /// Host-global principal registry (issue #76, TTL-cached since #104): the
+    /// collab report/thread/board paths consult it per request — without a
+    /// cache that is a full LIST + one GET per key per read. Writes
+    /// (`host_principal_put`/`delete`) invalidate; a revoke is effective
+    /// within the TTL at worst, immediately on the writer instance.
+    pub host_principals: Cache<(), HashMap<String, String>>,
 }
 
 impl ServerCaches {
@@ -368,6 +376,10 @@ impl ServerCaches {
             bundle_attempts: Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_hours(6))
+                .build(),
+            host_principals: Cache::builder()
+                .max_capacity(1)
+                .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
         }
     }
