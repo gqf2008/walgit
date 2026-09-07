@@ -11,13 +11,20 @@
 
 import AppKit
 
-let deployDir = NSString(string: "~/walgit").expandingTildeInPath
+let deployDir: String = {
+    // 测试/多部署覆盖:WALGIT_DEPLOY_DIR 环境变量优先,defaults 其次,默认 ~/walgit
+    // (NSString 的 tilde 展开走 passwd 主目录,不认 HOME 环境变量)。
+    if let d = ProcessInfo.processInfo.environment["WALGIT_DEPLOY_DIR"], !d.isEmpty { return d }
+    if let d = UserDefaults.standard.string(forKey: "deployDir"), !d.isEmpty { return d }
+    return NSString(string: "~/walgit").expandingTildeInPath
+}()
 let healthURL = URL(string: "http://127.0.0.1:8081/healthz")!
 let webURL = URL(string: "http://walgit.localhost:8081/")!
-let logPath = NSString(string: "~/walgit/tray.log").expandingTildeInPath
+let logPath = "\(deployDir)/tray.log"
 
 func ensurePath() -> String {
     let candidates = [
+        "\(deployDir)/walgit-ensure",
         NSString(string: "~/.claude/skills/walgit/scripts/walgit-ensure").expandingTildeInPath,
         NSString(string: "~/walgit/walgit-ensure").expandingTildeInPath,
     ]
@@ -53,6 +60,68 @@ func sh(_ command: String) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+/// 首次启动 bootstrap:从 app bundle Resources 落盘 ~/walgit 部署骨架。
+/// 托管文件(walgit 二进制、run-walgit.sh、walgit-ensure)按 bundle 内
+/// skeleton.version 覆盖更新——DMG 覆盖安装即升级;用户文件(walgit.toml)
+/// 永不覆盖(配置与凭证安全)。开发构建(bundle 里没有 walgit 资源)跳过。
+func bootstrapDeploy() {
+    let fm = FileManager.default
+    guard let res = Bundle.main.resourceURL?.path,
+        fm.fileExists(atPath: "\(res)/walgit")
+    else {
+        logLine("bootstrap: bundle 无 walgit 资源(开发构建),跳过")
+        return
+    }
+    do {
+        try fm.createDirectory(atPath: deployDir, withIntermediateDirectories: true)
+    } catch {
+        logLine("bootstrap: 建 ~/walgit 失败: \(error)")
+        return
+    }
+    let bundledVersion = (try? String(contentsOfFile: "\(res)/skeleton.version", encoding: .utf8))
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+    let marker = "\(deployDir)/.skeleton-version"
+    let installedVersion = (try? String(contentsOfFile: marker, encoding: .utf8))
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+    // 托管文件:版本不同则整体覆盖(覆盖安装 DMG = 升级路径)
+    let needsUpdate = !bundledVersion.isEmpty && bundledVersion != installedVersion
+    for f in ["walgit", "run-walgit.sh", "walgit-ensure"] {
+        let dst = "\(deployDir)/\(f)"
+        if !needsUpdate && fm.fileExists(atPath: dst) { continue }
+        if fm.fileExists(atPath: dst) { try? fm.removeItem(atPath: dst) }
+        do {
+            try fm.copyItem(atPath: "\(res)/\(f)", toPath: dst)
+            do {
+                try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: dst)
+            } catch {
+                logLine("bootstrap: \(f) chmod 失败: \(error)")
+            }
+            logLine("bootstrap: 写入 \(f)")
+        } catch {
+            logLine("bootstrap: \(f) 失败: \(error)")
+        }
+    }
+    // 用户文件:永不覆盖
+    let userFile = "\(deployDir)/walgit.toml"
+    if !fm.fileExists(atPath: userFile) {
+        do {
+            try fm.copyItem(atPath: "\(res)/walgit.toml", toPath: userFile)
+            logLine("bootstrap: 写入 walgit.toml")
+        } catch {
+            logLine("bootstrap: walgit.toml 失败: \(error)")
+        }
+    }
+    if !bundledVersion.isEmpty && installedVersion != bundledVersion {
+        do {
+            try bundledVersion.write(toFile: marker, atomically: true, encoding: .utf8)
+            logLine("bootstrap: 骨架版本 \(installedVersion.isEmpty ? "新建" : "\(installedVersion) → \(bundledVersion)")")
+        } catch {
+            logLine("bootstrap: 写版本标记失败: \(error)")
+        }
+    }
+    logLine("bootstrap: 部署骨架就绪(\(deployDir))")
+}
+
 enum UpdateState {
     case idle, checking, latest, available, installing, failed
 }
@@ -80,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         rebuildMenu()
+        bootstrapDeploy()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.poll() }
         poll()
         // 启动 30 秒后做一次升级检查;此后每 30 分钟。
@@ -221,6 +291,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let cur = serviceVersion.isEmpty ? "…" : String(serviceVersion.prefix(7))
         let up: NSMenuItem
+        if !hasSourceRepo() {
+            // DMG 消费者形态:没有源码仓库,升级 = 下载新 DMG 覆盖安装
+            // (bootstrap 按骨架版本换托管文件)。
+            up = NSMenuItem(title: "下载新版本(打开发布页)", action: #selector(openReleases), keyEquivalent: "")
+        } else {
         switch updateState {
         case .idle:
             up = NSMenuItem(title: "版本 \(cur) · 检查更新…", action: #selector(checkUpdateNow), keyEquivalent: "")
@@ -236,6 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             up.isEnabled = false
         case .failed:
             up = NSMenuItem(title: "上次升级失败(点击重查)", action: #selector(checkUpdateNow), keyEquivalent: "")
+        }
         }
         menu.addItem(up)
 
@@ -274,7 +350,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openWeb() { NSWorkspace.shared.open(webURL) }
 
+    func hasSourceRepo() -> Bool {
+        FileManager.default.fileExists(atPath: "\(repoPath())/.git")
+    }
+
+    @objc func openReleases() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/gqf2008/walgit/releases")!)
+    }
+
     @objc func checkUpdateNow() {
+        guard hasSourceRepo() else { openReleases(); return }
         updateState = .checking; refreshButton()
         DispatchQueue.global().async {
             let repo = self.repoPath()
@@ -304,6 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func autoCheck() {
+        guard hasSourceRepo() else { return } // DMG 消费者:升级走下载新版本
         guard updateState != .installing, updateState != .checking, !transitioning else { return }
         guard updateState == .idle || updateState == .latest || updateState == .failed else { return }
         DispatchQueue.global().async {

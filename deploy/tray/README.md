@@ -31,9 +31,15 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
 ## 约定
 
 - 部署目录:`$HOME/walgit`(Windows:`%USERPROFILE%\walgit`),内含
-  `walgit(.exe)` + `walgit.toml`;macOS 另需 `walgit-ensure`(安装器/
-  技能包提供);Windows 可直接装 release 附件
-  `walgit-setup-<version>-x64.exe`(`deploy/windows/`,含托盘与本体)
+  `walgit(.exe)` + `walgit.toml`;macOS 另需 `walgit-ensure` 与
+  `run-walgit.sh`(release DMG 的托盘首次启动会自动落盘这四件骨架,
+  已存在的文件不覆盖;凭证 `~/walgit/.r2-credentials` 由使用者自填)。
+- **release 资产一个平台一件安装器(issue #108)**:
+  macOS `walgit-<version>-arm64.dmg`(app 拖入 Applications,首次启动
+  自动建部署骨架)、Windows `walgit-setup-<version>-x64.exe`
+  (`deploy/windows/`,含托盘与本体)、Linux `walgit_<version>_amd64.deb`
+  (`deploy/linux/build-deb.sh`,装 /usr/bin 三件 + 示例配置 + 托盘
+  .desktop)。裸二进制不再发布。
 - 服务地址:`http://127.0.0.1:8081`
 - 源码仓库:环境变量 `WALGIT_REPO`,默认 `/Volumes/Workspace/GitHub/walgit`
 - 日志:`<部署目录>/tray.log`
@@ -43,12 +49,32 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
 ### macOS(Swift)
 
 ```bash
-cd deploy/tray/macos && ./build.sh     # 产物 ~/Applications/walgit-tray.app
+cargo build --release --bin walgit                 # 先有 walgit 二进制
+cd deploy/tray/macos && ./build.sh 0.2.0           # 产物 ~/Applications/walgit-tray.app
+./build-dmg.sh 0.2.0                               # 产物 dist/walgit-0.2.0-arm64.dmg
 ```
 
-需要 Xcode Command Line Tools(swiftc)。Dock 品牌图标:把 `walgit.icns`
-放在同目录再跑 build.sh(可选,缺省用通用图标)。开机自启:系统设置 →
-通用 → 登录项 → 添加 walgit-tray.app。
+需要 Xcode Command Line Tools(swiftc)。`build.sh` 把 walgit 二进制 +
+`run-walgit.sh` + `walgit-ensure` + `walgit.toml.template` 打进 app
+Resources——首次启动 bootstrap 到 `~/walgit`(幂等)。`build-dmg.sh` 走全链:
+app 签名+公证+装订(`~/scripts/notarize.sh`,profile `voicecall-notary`)
+→ hdiutil 出 DMG(拖放安装)→ DMG 签名+公证+装订。Dock 品牌图标:把
+`walgit.icns` 放在同目录再跑 build.sh(可选,缺省用通用图标)。开机自启:
+系统设置 → 通用 → 登录项 → 添加 walgit-tray.app。
+
+### Linux(.deb)
+
+```bash
+cargo build --release --bin walgit --bin walgit-server   # 先有二进制
+cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Cargo.toml
+deploy/linux/build-deb.sh target/release 0.2.0           # 产物 walgit_0.2.0_amd64.deb
+```
+
+`dpkg-deb` 组装,零新依赖:三件二进制 → /usr/bin,`walgit.example.toml` 与
+D43 未配置模板 → /usr/share/walgit,托盘 → /usr/share/applications;
+postinst 为安装用户落盘 `~/walgit` 骨架(幂等不覆盖,与 mac DMG /
+Windows 安装器一致)。CI 每个 PR 用 debug 二进制校验脚本(release.yml
+打 tag 时用 release 二进制)。
 
 ### Windows / Linux / macOS(Rust)
 
