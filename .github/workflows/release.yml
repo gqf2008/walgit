@@ -19,9 +19,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: walgit-linux-x86_64
           - os: windows-latest
-            artifact: walgit-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +56,16 @@ jobs:
       # the same dir the upload globs and installer.iss expect.
       - name: Build the tray app
         run: cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Cargo.toml
+      # One installer per platform (issue #108): the .deb is the only linux release
+      # artefact, the Inno Setup exe the only windows one; raw binaries are not
+      # published. The macOS DMG is built outside CI (deploy/tray/macos/build-dmg.sh)
+      # and uploaded to the release.
+      - name: Assemble the linux .deb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          deploy/linux/build-deb.sh target/release "$tag"
       - name: Build the Windows installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: bash
@@ -70,14 +78,12 @@ jobs:
           iscc="$(command -v ISCC.exe || echo '/c/Program Files (x86)/Inno Setup 6/ISCC.exe')"
           tag="${GITHUB_REF#refs/tags/}"
           "$iscc" "-DMyAppVersion=${tag#v}" deploy/windows/installer.iss
-      - name: Upload artifact
+      - name: Upload the .deb (linux)
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            target/release/walgit${{ runner.os == 'Windows' && '.exe' || '' }}
-            target/release/walgit-server${{ runner.os == 'Windows' && '.exe' || '' }}
-            target/release/walgit-tray${{ runner.os == 'Windows' && '.exe' || '' }}
+          name: walgit-linux-deb
+          path: walgit_*.deb
       # The installer rides a SEPARATE artifact: upload-artifact roots an artifact
       # at the least-common-ancestor of its paths, so mixing target/release with
       # deploy/windows/Output would re-root at the workspace root and hand
@@ -118,7 +124,13 @@ jobs:
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           body="$(cat changelog.txt 2>/dev/null || echo '')"
-          gh release create "$tag" artifacts/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$tag" \
-            --notes "$body"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Re-cut of an existing release (a re-pushed tag rebuilds packaging):
+            # attach the fresh artefacts, leave the body untouched.
+            gh release upload "$tag" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" artifacts/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --notes "$body"
+          fi

@@ -11,10 +11,16 @@
 
 import AppKit
 
-let deployDir = NSString(string: "~/walgit").expandingTildeInPath
+let deployDir: String = {
+    // 测试/多部署覆盖:WALGIT_DEPLOY_DIR 环境变量优先,defaults 其次,默认 ~/walgit
+    // (NSString 的 tilde 展开走 passwd 主目录,不认 HOME 环境变量)。
+    if let d = ProcessInfo.processInfo.environment["WALGIT_DEPLOY_DIR"], !d.isEmpty { return d }
+    if let d = UserDefaults.standard.string(forKey: "deployDir"), !d.isEmpty { return d }
+    return NSString(string: "~/walgit").expandingTildeInPath
+}()
 let healthURL = URL(string: "http://127.0.0.1:8081/healthz")!
 let webURL = URL(string: "http://walgit.localhost:8081/")!
-let logPath = NSString(string: "~/walgit/tray.log").expandingTildeInPath
+let logPath = "\(deployDir)/tray.log"
 
 func ensurePath() -> String {
     let candidates = [
@@ -53,6 +59,40 @@ func sh(_ command: String) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+/// 首次启动 bootstrap:从 app bundle Resources 落盘 ~/walgit 部署骨架
+/// (walgit 二进制 + run-walgit.sh + walgit-ensure + walgit.toml 模板),
+/// 幂等——已存在的文件绝不覆盖(用户的配置与凭证安全)。开发构建
+/// (bundle 里没有 walgit 资源)静默跳过。
+func bootstrapDeploy() {
+    let fm = FileManager.default
+    guard let res = Bundle.main.resourceURL?.path,
+        fm.fileExists(atPath: "\(res)/walgit")
+    else {
+        logLine("bootstrap: bundle 无 walgit 资源(开发构建),跳过")
+        return
+    }
+    do {
+        try fm.createDirectory(atPath: deployDir, withIntermediateDirectories: true)
+    } catch {
+        logLine("bootstrap: 建 ~/walgit 失败: \(error)")
+        return
+    }
+    for f in ["walgit", "run-walgit.sh", "walgit-ensure", "walgit.toml"] {
+        let dst = "\(deployDir)/\(f)"
+        guard !fm.fileExists(atPath: dst) else { continue }
+        do {
+            try fm.copyItem(atPath: "\(res)/\(f)", toPath: dst)
+            if f != "walgit.toml" {
+                try? fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: dst)
+            }
+            logLine("bootstrap: 写入 \(f)")
+        } catch {
+            logLine("bootstrap: \(f) 失败: \(error)")
+        }
+    }
+    logLine("bootstrap: 部署骨架就绪(\(deployDir))")
+}
+
 enum UpdateState {
     case idle, checking, latest, available, installing, failed
 }
@@ -80,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         rebuildMenu()
+        bootstrapDeploy()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.poll() }
         poll()
         // 启动 30 秒后做一次升级检查;此后每 30 分钟。
