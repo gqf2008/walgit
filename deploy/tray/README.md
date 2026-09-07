@@ -53,7 +53,7 @@ origin/main,静默、失败不打扰。发现新版本 → 菜单行变「⬆️
 ### macOS(Swift)
 
 ```bash
-cargo build --release --bin walgit                 # 先有 walgit 二进制
+WALGIT_BUILD_SHA=v0.2.0 cargo build --release --bin walgit  # 发布二进制报版本号而非 sha(issue #121)
 cd deploy/tray/macos && ./build.sh 0.2.0           # 产物 ~/Applications/walgit-tray.app
 ./build-dmg.sh 0.2.0                               # 产物 dist/walgit-0.2.0-arm64.dmg
 ```

@@ -50,6 +50,10 @@ jobs:
         run: just web-build
         shell: bash
       - name: Build release binary
+        # Release binaries report the tag (v0.2.0), not the commit sha
+        # (build.rs prefers WALGIT_BUILD_SHA; dev builds keep sha, issue #121).
+        env:
+          WALGIT_BUILD_SHA: ${{ github.ref_name }}
         run: cargo build --release --bin walgit --bin walgit-server
       # --target-dir pins the tray exe into the root target/ regardless of how
       # cargo resolves the nested workspace's own [workspace]/.cargo config —
