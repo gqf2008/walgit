@@ -1,13 +1,29 @@
+import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { RouteBoundary, TopProgress, useBusy } from "./Loading";
 import { ErrorTray } from "./ErrorTray";
 import { InstanceFooter } from "./InstanceFooter";
 import { LangSwitch, useI18n } from "../i18n";
+import { api } from "../api";
 
 export function Layout() {
   const busy = useBusy();
   const { t } = useI18n();
+  // #127: the storage editor is an admin surface (GET /api/v1/store is
+  // admin-gated server-side too — this is visibility, not security).
+  // `identity()` never redirects, so a 401 just hides the entry.
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api
+      .identity()
+      .then((m) => live && setIsAdmin(!!m.admin))
+      .catch(() => live && setIsAdmin(false));
+    return () => {
+      live = false;
+    };
+  }, []);
   // On a repo page the API tab pre-fills that repo in the examples.
   const m = /^\/([^/_][^/]*)\/([^/]+)/.exec(useLocation().pathname);
   const apiHref = m && m[1] !== "services" ? `/api?repo=${m[1]}/${m[2]}` : "/api";
@@ -35,6 +51,14 @@ export function Layout() {
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
             API
           </NavLink>
+          {isAdmin && (
+            <NavLink
+              to="/setup"
+              className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}
+            >
+              {t("nav.store")}
+            </NavLink>
+          )}
           <LangSwitch />
         </nav>
       </header>

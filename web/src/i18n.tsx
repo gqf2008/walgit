@@ -692,6 +692,18 @@ const en = {
   "setup.save.fail": "Save failed:",
   "setup.already": "walgit is already configured — no setup needed.",
   "setup.open": "Open walgit",
+
+  // Admin storage editor (#127): the configured-state twin of the wizard.
+  "nav.store": "Storage",
+  "store.title": "Storage settings",
+  "store.lede":
+    "Change this instance's object storage. Current values are pre-filled; credentials never leave the server — they are shown only as “configured”. Saving rewrites walgit.toml (comments intact) and restarts the service.",
+  "store.prefix": "Key prefix",
+  "store.creds.keep": "Leave empty to keep the current value",
+  "store.creds.set": "Configured in walgit.toml — leave empty to keep",
+  "store.nosave": "This instance was not started from a config file, so the editor cannot save — edit walgit.toml by hand and restart.",
+  "store.saved": "Saved. The service restarts and serves the new bucket once it is back.",
+  "store.saved.manual": "Saved — restart the service manually (start it again, or the tray's 启动服务) to pick up the new storage settings.",
 } as const;
 
 export type I18nKey = keyof typeof en;
@@ -1361,6 +1373,18 @@ const zhCN: Record<I18nKey, string> = {
   "setup.save.fail": "保存失败:",
   "setup.already": "walgit 已配置完成,无需向导。",
   "setup.open": "打开 walgit",
+
+  // 已配置态的存储设置编辑页(#127):向导的管理员镜像面。
+  "nav.store": "存储配置",
+  "store.title": "存储配置",
+  "store.lede":
+    "修改本实例的对象存储。当前参数已预填;凭据永不下发——只显示「已配置」。保存会重写 walgit.toml(注释保留)并重启服务。",
+  "store.prefix": "键前缀",
+  "store.creds.keep": "留空 = 保留现值",
+  "store.creds.set": "已在 walgit.toml 中配置——留空即保留",
+  "store.nosave": "本实例不是从配置文件启动的,无法保存——请手编 walgit.toml 后重启。",
+  "store.saved": "已保存。服务将重启,恢复后即为新存储。",
+  "store.saved.manual": "已保存——请手动重启服务(重新启动,或托盘的「启动服务」)以启用新存储配置。",
 };
 
 const zhTW: Record<I18nKey, string> = {
@@ -2028,6 +2052,18 @@ const zhTW: Record<I18nKey, string> = {
   "setup.save.fail": "保存失敗:",
   "setup.already": "walgit 已設定完成,無需精靈。",
   "setup.open": "開啟 walgit",
+
+  // 已設定態的儲存設定編輯頁(#127):精靈的管理員鏡像面。
+  "nav.store": "儲存設定",
+  "store.title": "儲存設定",
+  "store.lede":
+    "修改本實例的物件儲存。目前參數已預填;憑證永不下發——僅顯示「已設定」。儲存會重寫 walgit.toml(註解保留)並重啟服務。",
+  "store.prefix": "鍵前綴",
+  "store.creds.keep": "留空 = 保留現值",
+  "store.creds.set": "已在 walgit.toml 中設定——留空即保留",
+  "store.nosave": "本實例不是從設定檔啟動的,無法儲存——請手動編輯 walgit.toml 後重啟。",
+  "store.saved": "已儲存。服務將重啟,恢復後即為新儲存。",
+  "store.saved.manual": "已儲存——請手動重啟服務(重新啟動,或託盤的「啟動服務」)以啟用新儲存設定。",
 };
 
 const DICTS: Record<Lang, Record<I18nKey, string>> = { en, "zh-CN": zhCN, "zh-TW": zhTW };

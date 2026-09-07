@@ -126,6 +126,29 @@ impl Server {
         .await
     }
 
+    /// A **configured** instance (harness defaults: intentional memory store,
+    /// so `needs_setup` is false) that nonetheless runs from a config file —
+    /// the fixture shape of the admin store-settings surface (#127), whose
+    /// PUT edits that file.
+    pub async fn start_configured_with_config(
+        config_path: &std::path::Path,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
+        let store = MemoryStore::shared();
+        let cache = tempfile::tempdir()?;
+        let path = config_path.to_path_buf();
+        Self::start_with_parts_and_state_hook(
+            store,
+            cache.path().to_path_buf(),
+            Some(cache),
+            tweak,
+            move |st| {
+                st.config_path = Some(path);
+            },
+        )
+        .await
+    }
+
     async fn start_with_parts(
         store: Arc<MemoryStore>,
         cache_dir: std::path::PathBuf,

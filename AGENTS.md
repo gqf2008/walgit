@@ -437,6 +437,19 @@ decision in §4 — or the PR is; never "fix later".
   says so. `InstanceInfo.store_backend` (`memory` | `s3` | `gcs`) is the shared runtime-warning judgement for
   #73. The bundled SPA page lives outside the authed `Layout`.
 
+- **D44** **The storage editor: configured-state admin surface (2026-09-07, #127).**
+  D43's wizard owns only the unconfigured state; once configured, `GET|PUT
+  /api/v1/store` and `POST /api/v1/store/test` (admin, §1.3/D24's challenge
+  shape; 404 in setup state) are the same write mechanism hung a second time:
+  compose + validate before touching the file, `toml_edit` write-back
+  (comments survive), exit-75 supervisor handoff. Credentials never travel on
+  the read side (`has_access_key`/`has_secret_key` presence bits), so a blank
+  credential field on this surface means **keep**, where the wizard's blank
+  meant omit (`BlankCreds::Keep`/`Omit`); the edit-state test overlays the
+  submission on the *running* config, never `Config::default()`. `/api/v1/me`
+  carries `admin` so the SPA can gate its entry; `/setup` renders the double
+  face. One mechanism, two mounts (`crates/walgit-server/src/store_settings.rs`).
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---

@@ -309,7 +309,46 @@ export interface RepoSummary {
 export interface Me {
   principal: string;
   write: boolean;
+  /** May mutate settings/policy and the host's storage config (#127). */
+  admin: boolean;
   anonymous: boolean;
+}
+/** The redacted storage snapshot of `GET /api/v1/store` (#127, admin). */
+export interface StoreSettings {
+  backend: "s3" | "gcs" | "memory";
+  bucket: string;
+  prefix: string;
+  endpoint: string;
+  region: string;
+  force_path_style: boolean;
+  /** Presence bits only — the credential values never leave the server. */
+  has_access_key: boolean;
+  has_secret_key: boolean;
+  /** False when the instance does not run from a config file (nothing to save into). */
+  can_save: boolean;
+}
+/** One edit of the storage config (the wizard's store step; #127). Blank
+ *  credentials on this surface mean "keep the current value". */
+export interface StoreEdit {
+  backend: "s3" | "gcs";
+  bucket: string;
+  endpoint?: string;
+  region?: string;
+  access_key?: string;
+  secret_key?: string;
+  force_path_style?: boolean;
+}
+/** The answer of `POST /api/v1/store/test` (and `/api/v1/setup/test`). */
+export interface StoreTestResult {
+  ok: boolean;
+  backend?: string;
+  bucket?: string;
+  message: string;
+}
+export interface StoreSaveResult {
+  saved: boolean;
+  restart: "supervisor" | "manual";
+  file: string;
 }
 export interface TaskProgress {
   label: string;
@@ -647,6 +686,28 @@ export class ReposClient {
     list: (opts?: CallOptions) => this.json<string[]>("owners", opts),
     /** Repositories under one owner (short names). */
     repos: (owner: string, opts?: CallOptions) => this.json<string[]>(`owners/${enc(owner)}/repos`, opts),
+  };
+
+  /**
+   * The instance's own object storage (#127, D43's configured-state twin):
+   * admin-only; `GET` is redacted (credential presence bits only), a blank
+   * credential on `test`/`save` keeps the current value, and `save` arms the
+   * same exit-75 supervisor restart as the first-run wizard.
+   */
+  readonly store = {
+    get: (opts?: CallOptions) => this.json<StoreSettings>("store", opts),
+    test: (edit: StoreEdit, opts?: CallOptions) =>
+      this.json<StoreTestResult>("store/test", opts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(edit),
+      }),
+    save: (edit: StoreEdit, opts?: CallOptions) =>
+      this.json<StoreSaveResult>("store", opts, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ store: edit }),
+      }),
   };
 
   /** A handle on `owner/name` (no request is made). */

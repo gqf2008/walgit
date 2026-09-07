@@ -39,6 +39,8 @@ export type {
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, StrategyInfo, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
+export type { StoreSettings, StoreEdit, StoreTestResult, StoreSaveResult } from "../sdk/repos";
+import type { StoreEdit } from "../sdk/repos";
 
 /** Kept for callers: the SDK's error class under the UI's historical name. */
 export const ApiError = ReposError;
@@ -108,8 +110,25 @@ export const api = {
   commits: (repo: string, sha: string, path: string, skip: number) => authRedirect(client.repo(repo).commits({ ref: sha, path, skip })),
   commit: (repo: string, sha: string) => authRedirect(client.repo(repo).commit(sha)),
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
-  /** Who am I (principal + write + anonymous) — D1 collab identity. */
+  /** Who am I (principal + write + admin + anonymous) — D1 collab identity. */
   me: () => authRedirect(client.me()),
+  /**
+   * Identity for chrome decisions (the 存储配置 nav entry, #127): like
+   * `me()` but **no reload on 401** — an unauthenticated visitor on a
+   * sign-in-required host must not be reload-looped by its own top bar.
+   */
+  identity: () => track(client.me()),
+  /**
+   * #127: the admin storage surface. **No authRedirect**: a 401 here is an
+   * expected answer (not-an-admin / not-signed-in visitor opening `/setup`),
+   * and reload-on-401 in that spot would loop the page. Callers render the
+   * refusal.
+   */
+  store: {
+    get: () => track(client.store.get()),
+    test: (edit: StoreEdit) => track(client.store.test(edit)),
+    save: (edit: StoreEdit) => track(client.store.save(edit)),
+  },
   /** Unified/stat/name-status diff between two revisions (D1 PR review). */
   diff: (repo: string, from: string, to: string, format: "patch" | "stat" | "name-status" = "patch") =>
     authRedirect(client.repo(repo).diff({ from, to, format })),

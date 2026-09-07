@@ -33,7 +33,9 @@ installer's initial config), the instance serves **only** the wizard: `/setup`
 (SPA shell), its `/_ui/*` assets, `/healthz`, `/readyz`, and the data-free
 `/api/v1/setup/*` surface below — open like `/_auth/*`, no bearer, no repo
 data; `/` redirects to `/setup`; everything else answers 503 with a pointer.
-Once configured (backend != memory) every `/api/v1/setup/*` path answers 404.
+Once configured (backend != memory) every `/api/v1/setup/*` path answers 404;
+the configured-state entry point for the same settings is the admin
+`/api/v1/store` surface (§4, #127).
 
 ```
 GET  /api/v1/setup/status  → 200 {needs_setup:true, backend:"memory", auth_mode, can_save}; 404 once configured
@@ -64,7 +66,7 @@ Every request authenticates (§1.3 of AGENTS.md); a missing/expired browser
 session answers `401` and the SDK opens **`/api-browser/v1/authenticate`** in a popup —
 walgit's own sign-in (`/_auth/login`) runs before the application page `postMessage`s
 `{type: "repos:authenticated"}` to its opener and closes — then retries once.
-`GET /api/v1/me` → `{principal, write, anonymous}` (`no-store`).
+`GET /api/v1/me` → `{principal, write, admin, anonymous}` (`no-store`).
 
 CORS: origins listed in `server.cors_origins` (exact, or one leading `*.`,
 e.g. `https://*.docs.example.com`) get `Access-Control-Allow-Origin: <origin>`
@@ -266,10 +268,52 @@ Sorted, `[]` for an unknown/empty owner (200, not 404). Cache: SWR.
 ### `GET /api/v1/me`
 
 ```json
-{ "principal": "jane@example.com", "write": true, "anonymous": false }
+{ "principal": "jane@example.com", "write": true, "admin": true, "anonymous": false }
 ```
 
-`401` without credentials. `Cache-Control: no-store`.
+`401` without credentials. `Cache-Control: no-store`. `admin` (§1.3/D24's
+judgement) gates the admin surfaces — `PUT/DELETE` of settings and
+`policy.json`, and the storage editor below; `mode = none` on loopback is
+admin for everyone.
+
+### `GET|PUT /api/v1/store` · `POST /api/v1/store/test` — storage editor (#127, admin)
+
+The configured-state twin of the §0a wizard: one mechanism (the wizard's
+compose + validate + `toml_edit` write-back + exit-75 supervisor handoff),
+hung twice. **404 while the instance is in setup state** (the wizard owns
+that; this surface passes the gate precisely to say so). Admin-gated with
+§1.3's channel semantics: missing credential `401` (Bearer-only challenge),
+authenticated non-admin `403`.
+
+```
+GET  /api/v1/store  → 200 {backend,bucket,prefix,endpoint,region,force_path_style,
+                            has_access_key,has_secret_key,can_save}  (`no-store`)
+POST /api/v1/store/test → {backend:"s3"|"gcs",bucket,endpoint,region,access_key,secret_key,force_path_style}
+                            → 200 {ok:true,…} / 400 {ok:false,message}; nothing persisted
+PUT  /api/v1/store  → {store:{…same fields…}}
+                            → 200 {saved:true,restart:"supervisor"|"manual",file}; 400/503 on refusal
+```
+
+Two contracts distinguish this from the wizard's surface:
+
+* **Credentials never leave the server.** `GET` answers them as presence
+  bits only (`has_access_key` / `has_secret_key`); the secret values exist
+  in `walgit.toml` and nowhere on the wire.
+* **A blank credential field means “keep the current value”** (the wizard's
+  blank meant “omit”). Test and save overlay the submitted parameters on a
+  clone of the *running* config, so an unmentioned field behaves as the
+  instance runs today, and blank fields in the write-back leave the file's
+  existing `access_key`/`secret_key` untouched. A submitted value always
+  overwrites.
+* `PUT` body is exactly `{store: {...}}` — the wizard's first-admin fields
+  (`admin_token`, `admin_principal`) are refused with a `400` here. Validation
+  happens **before** the file is touched: a `400` writes nothing.
+* `can_save: false` (instance not started from a config file, D39) ⇒ `PUT`
+  answers `503` with the reason.
+
+The SPA renders this as `/setup`'s admin face (pre-filled form, the top-bar
+「存储配置」entry for `me.admin`); the SDK maps all three
+(`client.store.get/test/save`, D20).
 
 ### `GET /api/v1/principals` · `PUT|DELETE /api/v1/principals/{principal}`
 

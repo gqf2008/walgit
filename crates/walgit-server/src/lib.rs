@@ -29,6 +29,7 @@ pub mod setup_wizard;
 pub mod smart;
 pub mod sse;
 pub mod static_object;
+pub mod store_settings;
 pub mod stream;
 pub mod telemetry;
 pub mod tls;
@@ -195,6 +196,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(web::ui::public_router(state.clone()).with_state(()))
         // The first-run setup wizard (D43): open, data-free; 404 once configured.
         .merge(setup_wizard::router(state.clone()).with_state(()))
+        // The configured-state storage surface (#127): admin-gated (the
+        // handlers do their own `require_admin`); 404 while the wizard owns
+        // the instance.
+        .merge(store_settings::router(state.clone()).with_state(()))
         .merge(web::login::router(state.clone()).with_state(()))
         // Events bridge wake-up (docs/EVENTS.md): the Pub/Sub push envelope of
         // a GCS notification. Authenticated (the push SA's ID token); 404 when
