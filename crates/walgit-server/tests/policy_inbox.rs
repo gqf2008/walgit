@@ -61,13 +61,26 @@ fn inbox_policy() -> String {
 
 /// Redact everything in `s` that could carry this test's credential.
 ///
-/// Two vectors, both real in git's stderr: the **URL userinfo** form git echoes back on a
-/// transport failure (`unable to access 'https://git:<token>@host/…'`), and any
-/// **`Authorization:` header line** (what `GIT_TRACE_CURL` used to print here — including the
-/// base64 form, which no literal-token replacement can catch, so the whole line goes). The
-/// returned string is what feeds `assert!(…, "{err}")` messages, and those land in CI logs on
-/// failure (issue #142). The token here is a fixture, not a secret — the point is that the
-/// shape never becomes how this suite reports failures.
+/// Vectors, checked against real `git 2.50.1` output (issue #142's review):
+///
+/// - the **`== Info: Issue another request to this URL: 'http://git:<token>@host/…'`**
+///   trace line — the one that still prints the credential in the clear, and it names no
+///   header, so only the literal replacement catches it;
+/// - an **`Authorization:` header line** — current git redacts it itself
+///   (`Basic <redacted>`), older gits printed the base64 of `git:<token>`, which no literal
+///   replacement can catch, so the whole line goes;
+/// - a **URL userinfo echo** in `unable to access '…'` — git ≥ 2.32 masks that itself; the
+///   literal replacement is the belt for older clients.
+///
+/// Precondition: the harness percent-encodes the password
+/// (`Server::repo_url_with_userinfo`), so a token containing characters that encode
+/// differently (e.g. `+ / =`) would appear in URLs in its encoded form and slip past the
+/// literal replacement — the fixture tokens here use only unreserved characters. Keep it so,
+/// or extend this function to scrub the encoded form too.
+///
+/// The returned string is what feeds `assert!(…, "{err}")` messages, and those land in CI
+/// logs on failure. The token here is a fixture, not a secret — the point is that the shape
+/// never becomes how this suite reports failures.
 fn scrub_credentials(s: &str, token: &str) -> String {
     let replaced = s.replace(token, "<redacted>");
     replaced
@@ -104,11 +117,13 @@ fn push_inbox(src: &TestRepo, server: &Server, actor: &str, name: &str, token: &
         return (false, String::new());
     }
     // URL userinfo form — the #79 challenge flow (§1.3); password = token.
-    // No GIT_TRACE_CURL here: it printed the full request-header set (including
-    // `Authorization: Basic <base64(git:token)>`) into the stderr that feeds every
-    // assert message in this file (issue #142).
+    // No GIT_TRACE_CURL here: it printed the request-header set into the stderr that feeds
+    // every assert message in this file (issue #142). `env_remove` too, so a runner or a
+    // developer shell exporting it globally cannot resurrect the trace.
     let out = Command::new("git")
         .current_dir(&src.dir)
+        .env_remove("GIT_TRACE_CURL")
+        .env_remove("GIT_CURL_VERBOSE")
         .args([
             "push",
             &server.repo_url_with_userinfo("t", "secured", "git", token),
@@ -116,10 +131,20 @@ fn push_inbox(src: &TestRepo, server: &Server, actor: &str, name: &str, token: &
         ])
         .output();
     match out {
-        Ok(o) => (
-            o.status.success(),
-            scrub_credentials(&String::from_utf8_lossy(&o.stderr), token),
-        ),
+        Ok(o) => {
+            let err = scrub_credentials(&String::from_utf8_lossy(&o.stderr), token);
+            // Wiring guard: the last line before the value escapes into `assert!(…, "{err}")`
+            // messages. It states the invariant the unit test cannot reach — *whatever git
+            // printed, what this returns carries no credential* — so a future trace vector
+            // (or a scrub weakened to miss one) fails here, on every push in the suite,
+            // rather than appearing in a CI log. It does NOT fire on the scrub call alone
+            // being deleted while git stays silent: that combination leaks nothing today.
+            assert!(
+                !err.contains(token) && !err.to_ascii_lowercase().contains("authorization:"),
+                "push_inbox is returning unscrubbed stderr (#142)"
+            );
+            (o.status.success(), err)
+        }
         Err(e) => (false, format!("{e}")),
     }
 }
@@ -191,19 +216,21 @@ async fn collab_inbox_pushes_are_gated_per_actor_in_token_mode() -> TestResult {
 }
 
 /// The credential this suite pushes with must not survive into the text that feeds
-/// `assert!(…, "{err}")` — those messages are printed into CI logs on failure.
-/// Covers both vectors [`scrub_credentials`] names: the URL userinfo git echoes on a
-/// transport failure, and an `Authorization:` header line whose base64 payload no
-/// literal-token replacement could catch (issue #142).
+/// `assert!(…, "{err}")` — those messages are printed into CI logs on failure. Lines are
+/// shaped as measured against real `git 2.50.1` output in issue #145's review: the
+/// `== Info:` URL line (still in the clear), a base64 `Authorization:` header (older gits;
+/// 2.50 prints `<redacted>` itself), and the server's real rejection wording.
 #[test]
 fn failure_text_never_carries_the_credential() {
     let token = "alice-s3cret";
     let git_stderr = "\
-fatal: unable to access 'https://git:alice-s3cret@127.0.0.1:4321/t/secured/': Failed to connect
+== Info: Found bundle for host: 0x0 [serially]
+== Info: Issue another request to this URL: 'http://git:alice-s3cret@127.0.0.1:4321/t/secured.git/info/refs?service=git-receive-pack'
 => Send header: POST /t/secured.git/info/refs?service=git-receive-pack HTTP/1.1
 => Send header: Authorization: Basic Z2l0OmFsaWNlLXMzY3JldA==
 => Send header: User-Agent: git/2.50.1
-remote: error: deny-rule: lock-alice-inbox
+! [remote rejected] HEAD -> refs/collab/inbox/alice/e2 (rejected by rule 'lock-alice-inbox')
+error: failed to push some refs to 'http://127.0.0.1:4321/t/secured.git'
 ";
     let scrubbed = scrub_credentials(git_stderr, token);
     assert!(
@@ -218,9 +245,12 @@ remote: error: deny-rule: lock-alice-inbox
         !scrubbed.contains("Z2l0OmFsaWNlLXMzY3Jld"),
         "the base64 credential survived the scrub: {scrubbed}"
     );
-    // The scrub must not cost the diagnosis: what a failing push is about still reads out.
+    // The scrub must not cost the diagnosis: what the push was refused for, and why the
+    // transport line exists at all, still read out afterwards.
     assert!(
-        scrubbed.contains("deny-rule: lock-alice-inbox") && scrubbed.contains("Failed to connect"),
+        scrubbed.contains("rejected by rule 'lock-alice-inbox'")
+            && scrubbed.contains("failed to push some refs")
+            && scrubbed.contains("Issue another request to this URL"),
         "scrubbing removed more than credentials: {scrubbed}"
     );
 }
