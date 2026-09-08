@@ -125,8 +125,9 @@ jobs:
             echo "a listed suite ran 0 tests on ubuntu — a platform gate hid it (#137); the lines above name the binary"
             exit 1
           fi
-      # Rerun once on failure: sim has known-flaky cases (~1 in 7 base_rebuild,
-      # AGENTS.md §5); a second failure is a regression.
+      # Rerun once on failure: sim has known-flaky cases (base_rebuild, AGENTS.md §5);
+      # a second failure is a regression. The rate cannot be read off this step: the
+      # rerun is why #138 had to count first-pass reds in the logs instead.
       - name: Simulation suite
         run: |
           just sim || { echo "sim failed once (possibly known-flaky); rerunning"; sleep 5; just sim; }
@@ -262,8 +263,10 @@ jobs:
           fi
       - name: Simulation suite
         # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
-        # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7
-        # (shared TEST_ABORT_AFTER; AGENTS.md) — rerun once, not skip.
+        # base_rebuild_resumes_after_a_kill_between_any_two_phases (shared
+        # TEST_ABORT_AFTER; AGENTS.md §5) — rerun once, not skip. Note this rerun
+        # is exactly why the step cannot measure its own flake rate: #138 had to
+        # count first-pass reds in the log, not job conclusions.
         shell: bash
         run: |
           cargo test -p walgit-server --test sim || { echo "sim failed once (possibly known-flaky); rerunning"; sleep 5; cargo test -p walgit-server --test sim; }
