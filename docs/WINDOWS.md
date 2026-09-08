@@ -104,9 +104,16 @@ default); a symlink-capable volume is only needed for the mount-link case.
 
 ## 5. What CI covers (fork, issue #2)
 
-- **ubuntu** build-test: `just ci` (warnings, clippy, test, e2e, sim).
-- **windows** leg: compiles every target, runs the fast tier, sim and e2e
-  (`cargo`, not `just` — the job exists so platform seams drift loudly).
+- **ubuntu** build-test: `just warnings`, `just test` and `just sim` (clippy and
+  e2e are separate jobs; `just ci` bundles all five for the laptop). Its
+  "Server suite list is complete" step asserts every file in
+  `crates/walgit-server/tests/` is registered in the justfile's `SERVER_TESTS`
+  or exempted (issue #137) — a suite nobody runs goes red instead of staying silent.
+- **windows** leg: compiles every target, runs the fast tier, the server
+  integration suites, sim and e2e. The integration set is the justfile's
+  `SERVER_TESTS` — one list, both legs, so the two cannot drift (issue #137);
+  the leg calls `just` only for probe-free recipes and plain cargo elsewhere —
+  the job exists so platform seams drift loudly.
 - Known flaky on both platforms (rerun, not skip): `sim::base_rebuild…`
   ~1 in 7 (shared `TEST_ABORT_AFTER`), `fetch_from_front_…` ~1 in 3 under the
   full e2e suite; both pass alone.

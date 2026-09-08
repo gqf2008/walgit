@@ -69,6 +69,32 @@ jobs:
         run: just web-test
 
       - run: just warnings
+      # #137's structural anti-drift guard: the filesystem is the truth, the list is
+      # the claim. Every suite in crates/walgit-server/tests/ must be enumerated in
+      # the justfile's SERVER_TESTS (both CI legs consume that one variable), or the
+      # PR that forgot it goes red here — hand-syncing two enumerations drifted
+      # twice (c971024, then 7f18675/#136). The reverse direction self-guards: cargo
+      # aborts with "no test target named" on a stale entry. Both legs consume the
+      # same variable, so this one check covers both; the windows step additionally
+      # asserts no listed suite compiled to zero tests.
+      - name: Server suite list is complete
+        run: |
+          set -euo pipefail
+          if [ -n "$(find crates/walgit-server/tests -mindepth 2 -name '*.rs')" ]; then
+            echo "nested test target (tests/<dir>/main.rs) is outside the guard's glob: flatten it or extend this step"
+            exit 1
+          fi
+          grep -qF 'cargo test -p walgit-server {{SERVER_TESTS}}' justfile || {
+            echo "test-server-integration no longer interpolates SERVER_TESTS — the single source became decorative"; exit 1; }
+          list="$(just --evaluate SERVER_TESTS)"
+          exempt="$(just --evaluate SERVER_TEST_EXEMPT)"
+          for f in crates/walgit-server/tests/*.rs; do
+            n="$(basename "$f" .rs)"
+            case " $exempt " in *" $n "*) continue ;; esac
+            case " $list " in *" --test $n "*) ;;
+              *) echo "unregistered suite: $n — add --test $n to SERVER_TESTS in the justfile (or to SERVER_TEST_EXEMPT if it is not a suite)"; exit 1 ;;
+            esac
+          done
       # The 300 s timeout in the justfile can trip under CI load (measured
       # exit 124 on 2026-08-28); a rerun after a timeout is a retry, not a
       # regression signal. The retry lives inside this step, like sim/e2e: a
@@ -148,10 +174,12 @@ jobs:
           just e2e || { echo "e2e failed once (possibly known-flaky); rerunning"; sleep 5; just e2e; }
 
   # Reachability for every cfg(windows) branch (issue #16): this leg compiles all
-  # targets and runs the fast hermetic tier on a real Windows host. Plain cargo +
-  # pnpm, not `just`: the recipes are bash-first and this job exists exactly so
-  # platform seams stop drifting unnoticed. Clippy joins once its gate is green
-  # workspace-wide (it currently trips pre-existing pedantic hits independent of OS).
+  # targets and runs the test tiers on a real Windows host. Plain cargo for the
+  # fast/sim/e2e lines; `just` only for recipes whose body references no bash-only
+  # probe — issue #137 moved the server-integration set into the justfile's
+  # SERVER_TESTS, one list both legs consume (the no-probe invariant is stated at
+  # `test-server-integration`). This job exists exactly so platform seams stop
+  # drifting unnoticed; the clippy leg waits on its ruleset check (AGENTS.md §5).
   windows:
     name: windows fast tier
     runs-on: windows-latest
@@ -192,12 +220,24 @@ jobs:
           # walgit-wal tests carry the windows-timing-sensitive refs-sync case
           # (AGENTS.md §5, issue #94): rerun once, then treat a repeat as real.
           cargo test -p walgit-wal --tests || { echo "walgit-wal tests failed once (windows timing flaky); rerunning"; sleep 3; cargo test -p walgit-wal --tests; }
-          # setup_wizard (issue #134): the config write-back is the platform
-          # seam (atomic temp+rename, 0600, /dev/null-vs-NUL — #129/#135), so
-          # it earns the windows leg; its one unix-only case is #[cfg(unix)]-
-          # gated. The api_cli/follow/policy/policy_inbox family is covered
-          # on ubuntu through the justfile's `test` (AGENTS.md §5 fast tier).
-          cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test setup_wizard
+      # The server integration suites: the justfile's SERVER_TESTS — the same 15
+      # both legs run (issue #137; this leg's hand-copied enumeration is gone).
+      # Suite-set-level rerun once (windows timing; AGENTS.md §5), then a repeat
+      # is real. timeout-minutes replaces the justfile's tN guards — windows must
+      # not wrap cargo lines with them (see the recipe's comment). The zero-test
+      # assertion: a cfg-gated suite compiles to an empty binary and exits GREEN,
+      # which is #137's silent-shrinkage failure one granularity deeper; this leg
+      # is where shrinkage was proven possible, so the assertion lives here.
+      - name: Server integration
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -eo pipefail
+          just test-server-integration 2>&1 | tee server-integration.log || { echo "server integration failed once (windows timing flaky); rerunning"; sleep 5; just test-server-integration 2>&1 | tee server-integration.log; }
+          if grep -n '^running 0 tests' server-integration.log; then
+            echo "a listed suite ran 0 tests on windows — a platform gate hid it (#137); the lines above name the binary"
+            exit 1
+          fi
       - name: Simulation suite
         # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
         # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7
@@ -232,9 +272,14 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
             });
             const lines = [];
-            // Steps with a built-in rerun (sim/e2e/fast tier): a failure there
-            // already survived one retry, so it is a regression, not a flake.
-            const rerun_once = /Simulation suite|Smart-HTTP end-to-end|Fast tier/;
+            // Steps with a built-in rerun (sim/e2e/fast tier/server integration): a
+            // failure there already survived one retry, so it is a regression, not a
+            // flake. This matches step-name LITERALS: a step that reruns itself must
+            // add its name here in the SAME commit (windows' "Fast hermetic tier"
+            // predates this regex and has never matched it — do not create another
+            // such pair). Job names are ruleset-pinned (AGENTS.md §6.4): never rename
+            // those.
+            const rerun_once = /Simulation suite|Smart-HTTP end-to-end|Fast tier|Server integration/;
             for (const j of jobs) {
               if (j.name === 'CI summary') continue; // don't report on ourselves
               const failed = j.steps.filter(s => s.conclusion === 'failure').map(s => s.name);

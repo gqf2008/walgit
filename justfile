@@ -80,6 +80,40 @@ dev-store-stop:
 #   test-s3    store contract against local rustfs (just dev-store)
 #   test-gcs   store contract against a real bucket (writes under a unique prefix)
 
+# The server integration suites — THE list (issue #137). Both CI legs run exactly
+# this set: ubuntu through `test` below, windows through the "Server integration"
+# step in ci.yml calling `test-server-integration`. The windows leg used to
+# hand-copy an enumeration and drifted twice: c971024 added events/budgets here
+# without ever touching ci.yml; 7f18675 (#136) edited both lists side by side and
+# still missed them. The build-test job asserts this list is complete. Facts kept
+# from the old windows-leg comment: setup_wizard's one unix-only case is
+# #[cfg(unix)]-gated in its suite; events/budgets and the #134 five (setup_wizard,
+# api_cli, follow, policy, policy_inbox — 21 tests, ~6 s on ubuntu) were evaluated
+# platform-clean for windows in #137 (no cfg/shell/signal/file-mode seams; the
+# same hermetic harness the windows-approved suites use since issue #2).
+SERVER_TESTS := "--test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test budgets --test setup_wizard --test api_cli --test follow --test policy --test policy_inbox"
+
+# tests/ files that are not suites: harness.rs is the shared module the suites
+# `mod` in (it has no #[test] of its own); e2e/sim are separate tiers with their
+# own recipes. Read by the ci.yml guard step.
+SERVER_TEST_EXEMPT := "harness e2e sim"
+
+# The probe invariant: just evaluates EVERY top-level backtick variable when any
+# recipe runs (probed on just 1.48.0), so the windows leg already loads t5/t10/t15
+# today via `just web-build` and must keep loading them — the probes always exit 0.
+# USING a probe's value is the separate hazard: where just takes git-bash's sh,
+# the probe's `command -v timeout` finds System32's timeout.exe (not coreutils —
+# `timeout 300 cargo` is a hard error there), so a timeout-wrapped recipe line must
+# stay unreachable from windows. Hang protection on the windows leg is the CI
+# step's timeout-minutes; ubuntu wraps the call in `test` below with t10 — one
+# 600 s budget for all 15 suites, the sum of the old two t5 lines, because 300 s
+# has tripped this tier under CI load (exit 124; see the note at ci.yml's
+# fast-tier step).
+
+# Run the server integration set, unwrapped: the body never references {{tN}}.
+test-server-integration:
+    cargo test -p walgit-server {{SERVER_TESTS}}
+
 # Fast hermetic tier (< 30 s): every test not marked #[ignore].
 # Fast tier (default, < 1 min): unit tests + the quick integration suites.
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
@@ -87,11 +121,7 @@ dev-store-stop:
 test:
     {{t5}} cargo test --workspace --lib --bins
     {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test budgets
-    # #134 (PR #133 audit): these five hermetic harness suites existed but
-    # were never enumerated — CI never ran them. Same shape as the line above
-    # (in-memory store, tempdir caches, real git; ~6 s for their 21 tests).
-    {{t5}} cargo test -p walgit-server --test setup_wizard --test api_cli --test follow --test policy --test policy_inbox
+    {{t10}} just test-server-integration
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
