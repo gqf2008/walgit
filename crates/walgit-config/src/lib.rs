@@ -269,7 +269,10 @@ pub enum StoreBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GcsConfig {
-    /// gRPC endpoint.
+    /// JSON API endpoint (`https://storage.googleapis.com` by default) — the
+    /// `Storage` data client speaks the REST/JSON API here; the
+    /// `StorageControl` metadata client rides gRPC to the same host
+    /// (#133 audit, issue #135: this key used to be labelled "gRPC").
     pub endpoint: String,
     pub direct_connectivity: bool,
     /// Service account for signed URLs; None = ADC/IAM signBlob.
@@ -1417,6 +1420,21 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        // #130 added these socket bounds; #135 pins their floor: `0s` is not
+        // "no bound" — reqwest/AWS SDK fail every connect or idle check
+        // immediately, so the store looks permanently down (each failure
+        // looks retryable) while `0` reads like "unlimited" to whoever set
+        // it. There is no disable-by-zero here; omit the key for the default.
+        anyhow::ensure!(
+            !self.store.connect_timeout.is_zero(),
+            "store.connect_timeout must be > 0 (a 0 bound fails every bucket connect instantly; \
+             omit the key for the default \"10s\" — see walgit.example.toml)"
+        );
+        anyhow::ensure!(
+            !self.store.idle_timeout.is_zero(),
+            "store.idle_timeout must be > 0 (a 0 bound cuts every bucket read before a byte \
+             arrives; omit the key for the default \"120s\" — see walgit.example.toml)"
+        );
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1851,6 +1869,27 @@ mod tests {
             maintain: vec!["acme/monorepo".into()],
             maintain_exclude: vec![],
         };
+        c.validate().unwrap();
+    }
+
+    /// #135: a zero socket timeout is "fail every operation instantly",
+    /// not "no limit" — each instant failure reads as a retryable store
+    /// outage. `validate` pins the floor so the typo cannot boot.
+    #[test]
+    fn validate_refuses_zero_store_timeouts() {
+        let mut c = Config::default();
+        c.store.bucket = "b".into();
+        c.validate().unwrap(); // the documented defaults (#130) are fine
+        c.store.connect_timeout = std::time::Duration::ZERO;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("store.connect_timeout must be > 0"), "{err}");
+        assert!(err.contains("walgit.example.toml"), "{err}");
+        c.store.connect_timeout = std::time::Duration::from_secs(10);
+        c.store.idle_timeout = std::time::Duration::ZERO;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("store.idle_timeout must be > 0"), "{err}");
+        assert!(err.contains("walgit.example.toml"), "{err}");
+        c.store.idle_timeout = std::time::Duration::from_secs(120);
         c.validate().unwrap();
     }
 

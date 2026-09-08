@@ -165,10 +165,28 @@ fn temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
 /// D39). `std::fs::write` truncates first — a crash or ENOSPC mid-write
 /// destroyed it. Rename is the linearization point here, like the manifest
 /// CAS for the bucket: readers see either the old file or the new one, never
-/// a half-written config. A failed write cleans up its temp file.
+/// a half-written config.
+///
+/// Hardened by the #133 audit (issue #135): the post-rename directory fsync
+/// makes the rename itself durable ([`sync_parent_dir`]), the temp cleanup
+/// only ever touches a file this call created, and the 0600 is a chmod, not
+/// a `mode()` request the umask can mask away.
 pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    write_atomic_via(path, &temp_sibling(path), text)
+}
+
+/// The one write; `tmp` is a separate argument so the "cleanup deletes only
+/// our own file" contract is testable (issue #135: `temp_sibling` embeds a
+/// nanosecond, so its collision path is otherwise unreachable in a unit
+/// test).
+fn write_atomic_via(path: &std::path::Path, tmp: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = temp_sibling(path);
+    // Only a temp this call created is this call's to remove. If
+    // `create_new` failed the name belonged to someone else — a concurrent
+    // save in this process that lost the nanosecond lottery, or any file at
+    // that path — and removing it here would destroy the *winner's* in
+    // flight write (#135).
+    let mut ours = false;
     let result = (|| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -177,17 +195,66 @@ pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Resul
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp)?;
+        let mut file = opts.open(tmp)?;
+        ours = true;
+        #[cfg(unix)]
+        {
+            // `mode(0o600)` is a request the process umask masks: a
+            // pathological umask (any owner bit in it, e.g. 0o277) would
+            // land a config the next boot cannot read or write — the file
+            // that holds the only copy of the credentials locking itself
+            // out. chmod is immune to the umask (#135).
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(text.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp, path)?;
+        #[cfg(unix)]
+        sync_parent_dir(path).map_err(|e| {
+            // The rename has landed: the config IS on disk. A plain io error
+            // here would surface through the callers' shared
+            // "config file … could not be saved" arm reading as if nothing
+            // was written — a lie (PR #136 review B1 ②). Say what is true:
+            // written; only the durability confirmation failed, and a retry
+            // of the save is harmless.
+            std::io::Error::other(format!(
+                "written, but its durability could not be confirmed: \
+                 parent-directory fsync failed: {e}"
+            ))
+        })?;
+        Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if result.is_err() && ours {
+        let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// Persist the **rename** itself: the new file's bytes reached the disk with
+/// the temp's fsync, but the directory entry swap is metadata the filesystem
+/// keeps separately — after a power loss the parent directory can come back
+/// holding the old mapping, silently reverting the config (#135). Opening
+/// the parent and `sync_all`-ing it flushes that entry. A rename is atomic
+/// either way, so the worst failure mode stays "old config", never a torn
+/// one. On Windows this is skipped: `std` cannot open a directory without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and NTFS journals metadata, so a completed
+/// rename survives a crash on its own.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    // `Path::new("walgit.toml").parent()` is `Some("")`, not `None` — the
+    // empty component must resolve to the working directory (PR #136 review
+    // B1). Without this, every bare relative `--config` name (the documented
+    // shape, AGENTS.md §0: `--config walgit.standalone.toml`) failed the
+    // post-rename sync on `File::open("")` — after the rename had already
+    // landed, so the save was reported 500 while the file was written.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::OpenOptions::new().read(true).open(parent)?.sync_all()
 }
 
 /// What a **blank** credential field means, which differs by surface:
@@ -230,8 +297,9 @@ pub(crate) fn apply_store(
         }
         "gcs" => {
             cfg.store.backend = walgit_config::StoreBackend::Gcs;
-            // Credentials ride ADC/IAM; only the gRPC endpoint (an emulator,
-            // or empty = real GCS) and the bucket are wizard concerns.
+            // Credentials ride ADC/IAM; only the JSON API endpoint (an
+            // emulator, or empty = real GCS) and the bucket are wizard
+            // concerns.
             cfg.store.gcs.endpoint = store.endpoint.trim().to_string();
         }
         other => {
@@ -492,7 +560,10 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if let Err(e) = write_atomic(&config_path, &edited_text) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("config file {} is not writable: {e}", config_path.display()),
+            format!(
+                "config file {} could not be saved: {e}",
+                config_path.display()
+            ),
         )
             .into_response();
     }
@@ -756,6 +827,177 @@ backend = \"memory\"
         let deep = dir.path().join("nope").join("walgit.toml");
         assert!(write_atomic(&deep, "new = true\n").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true\n");
+    }
+
+    /// #135: a `create_new` collision (the same nanosecond in two
+    /// concurrent saves, or any file already at the temp path) means the
+    /// temp belongs to the *other* writer. Losing the race must leave that
+    /// file — and the target — exactly as they were; the old cleanup
+    /// deleted the winner's in-flight temp.
+    #[test]
+    fn write_atomic_removes_only_a_temp_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walgit.toml");
+        std::fs::write(&path, "old = true\n").unwrap();
+        let other_temp = dir.path().join("walgit.toml.someone-else.tmp");
+        std::fs::write(&other_temp, "in-flight payload\n").unwrap();
+        // The fixed-name temp stands in for the winner of a collision —
+        // `temp_sibling` embeds a nanosecond, so the collision itself is
+        // not reachable from a test without pinning the name.
+        assert!(matches!(
+            write_atomic_via(&path, &other_temp, "new = true\n"),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&other_temp).unwrap(),
+            "in-flight payload\n",
+            "the other writer's temp must survive our defeat"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true\n");
+    }
+
+    /// #135: `OpenOptionsExt::mode` is masked by the process umask, so a
+    /// pathological umask used to be able to land the credentials carrier
+    /// read-only or unreadable to its owner. The post-open `set_permissions`
+    /// is a chmod and immune. The mask is process-global, so the assertion
+    /// runs in a dedicated single-test child (where setting it is safe) —
+    /// this binary's threads never see it, and CI asserts the real thing.
+    /// (Crash durability of the post-rename directory fsync cannot be
+    /// asserted from userspace — that step's contract is pinned below, and
+    /// the property it buys is the filesystem's.)
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_pins_permissions_past_a_pathological_umask() {
+        let self_exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(self_exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "setup_wizard::tests::write_atomic_under_pathological_umask_child",
+            ])
+            .env("WALGIT_UMASK_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the umask child failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The child half of the test above — `#[ignore]`d so it never runs in
+    /// the parent's concurrent threads, and gated on `WALGIT_UMASK_CHILD`
+    /// so even a deliberate `--ignored` sweep (the test-slow tier) refuses
+    /// to mutate the shared mask there.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned single-test by write_atomic_pins_permissions_past_a_pathological_umask"]
+    #[allow(unsafe_code)]
+    fn write_atomic_under_pathological_umask_child() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("WALGIT_UMASK_CHILD").is_none() {
+            // A bare `--ignored` sweep (the test-slow tier): the mask must
+            // not be set next to other threads, and the spawning test
+            // covers this assertion — skip quietly.
+            eprintln!("skipped: not spawned by the parent test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap(); // under the normal mask
+        let path = dir.path().join("walgit.toml");
+        // SAFETY: `umask` is process-global; this child is one test on one
+        // thread, created solely for this assertion, and the mask is
+        // restored on every path below. 0o277 keeps owner-read but strips
+        // owner-write and all group/other bits — enough to defeat a bare
+        // `mode(0o600)` request.
+        let previous = unsafe { libc::umask(0o277) };
+        let wrote = write_atomic(&path, "backend = \"s3\"\n");
+        // SAFETY: restore the captured mask immediately after the masked
+        // write; nothing else runs in this process.
+        unsafe { libc::umask(previous) };
+        wrote.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o} — the chmod must beat the umask");
+        // And the next save still works — the file is writable by its owner.
+        write_atomic(&path, "# second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# second\n");
+    }
+
+    /// B1 regression (PR #136 review): `--config walgit.toml` — a **bare
+    /// relative name** — is a documented shape (AGENTS.md §0:
+    /// `--config walgit.standalone.toml`). Its `Path::parent()` is
+    /// `Some("")`, not `None`; before the fix the post-rename parent fsync
+    /// failed on `File::open("")` with ENOENT *after the rename had
+    /// landed*, so both save surfaces answered 500 "config file … is not
+    /// writable" for a config that was in fact written. cwd is
+    /// process-global, so the child runs single-test like the umask one.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_survives_a_bare_relative_config_name() {
+        let self_exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(self_exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "setup_wizard::tests::write_atomic_bare_relative_name_child",
+            ])
+            .env("WALGIT_BARE_NAME_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the bare-relative-name child failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The child half of the test above — `#[ignore]`d and env-gated like
+    /// the umask child (chdir is process-global too).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned single-test by write_atomic_survives_a_bare_relative_config_name"]
+    fn write_atomic_bare_relative_name_child() {
+        if std::env::var_os("WALGIT_BARE_NAME_CHILD").is_none() {
+            eprintln!("skipped: not spawned by the parent test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let rel = std::path::Path::new("walgit.toml");
+        write_atomic(rel, "backend = \"s3\"\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rel).unwrap(),
+            "backend = \"s3\"\n",
+            "the bare relative config must be written and readable"
+        );
+    }
+
+    /// #135: the fsync-after-rename is a real durability step. The helper's
+    /// own contract: a live parent syncs; a vanished one errors. Two things
+    /// this deliberately does NOT pin, both settled elsewhere (PR #136
+    /// review B1): a **bare relative name** must never reach `File::open("")`
+    /// — `write_atomic` normalizes the empty parent to "." (the child test
+    /// above) — and a post-rename sync failure is wrapped by
+    /// `write_atomic` as "written, but durability unconfirmed", so the save
+    /// surfaces never report a written config as "not writable". (What the
+    /// fsync buys — the rename surviving a power loss — is a filesystem
+    /// property no userspace test can witness.)
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_dir_flushes_a_live_directory_and_reports_a_dead_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walgit.toml");
+        write_atomic(&path, "a = 1\n").unwrap(); // includes the parent sync
+        assert!(sync_parent_dir(&path).is_ok());
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let inside = gone.join("walgit.toml");
+        std::fs::remove_dir(&gone).unwrap();
+        assert!(
+            sync_parent_dir(&inside).is_err(),
+            "a vanished parent must fail, not silently pass"
+        );
     }
 
     #[test]

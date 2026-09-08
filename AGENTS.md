@@ -157,7 +157,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
-Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
+Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS (REST/JSON API data, gRPC metadata —
+the "gRPC" blanket label was the #133 audit's issue #135 fix), S3 (AWS SDK) and in-memory stores share
 one contract suite (`crates/walgit-store/tests/contract.rs`, incl. compose).
 
 ### 2.2 Write path
