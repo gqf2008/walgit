@@ -51,7 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// The masked snapshot of the running `[store]` config. `endpoint` follows
-/// the active backend (S3's URL or the GCS gRPC endpoint); `region` /
+/// the active backend (S3's URL or the GCS JSON API endpoint); `region` /
 /// `force_path_style` / the credential bits are the S3 fields, false-ish for
 /// other backends. Secrets are presence only.
 #[derive(Serialize)]
@@ -333,7 +333,10 @@ async fn save(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -
     if let Err(e) = write_atomic(&config_path, &edited_text) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("config file {} is not writable: {e}", config_path.display()),
+            format!(
+                "config file {} could not be saved: {e}",
+                config_path.display()
+            ),
         )
             .into_response();
     }

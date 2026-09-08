@@ -46,7 +46,7 @@ repos.owners.list()                          → ["acme", …]
 repos.owners.repos("acme")                   → ["monorepo", …]
 repos.store.get()                            → redacted storage snapshot (admin; #127)
 repos.store.test(edit)                       → { ok, message }  (probe, nothing persisted)
-repos.store.save(edit)                       → { saved, restart, file }  (blank creds = keep)
+repos.store.save(edit)                       → { saved, restart, warnings?, file }  (blank creds = keep; #129/#134 — warnings says how the saved file is not self-sufficient)
 repos.repo("acme/monorepo")                     → RepoClient (no request)
 
 r.get()                                      → { owner, name, full_name, head, branches, tags, clone_url, html_url, api_url }

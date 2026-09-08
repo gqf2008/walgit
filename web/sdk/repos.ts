@@ -357,6 +357,15 @@ export interface StoreTestResult {
 export interface StoreSaveResult {
   saved: boolean;
   restart: "supervisor" | "manual";
+  /**
+   * (issue #129, surfaced by #134) Ways the written file is not
+   * self-sufficient — today: credentials supplied only by the environment,
+   * which the file cannot capture. The save succeeded; a restart outside
+   * that environment may fail to open the store. Empty/absent = the save
+   * is durable on its own. The `/api/v1/setup/save` answer carries the
+   * same field.
+   */
+  warnings?: string[];
   file: string;
 }
 export interface TaskProgress {

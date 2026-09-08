@@ -156,10 +156,13 @@ pub struct GcsStore {
     bulk: Vec<Storage>,
     bulk_next: std::sync::atomic::AtomicUsize,
     /// Bulk **reads** go over plain HTTPS (JSON API `alt=media` + `Range`)
-    /// through reqwest clients with their own connection pools: the gRPC
-    /// clients above all share one transport, so even separate `Storage` /
-    /// `StorageControl` instances queue a 200-byte GET behind a 7.5 GB
-    /// download (measured: control calls 3–11 s while 32 stripes stream).
+    /// through reqwest clients with their own connection pools: the
+    /// google-cloud-storage clients above all share one transport, so even
+    /// separate `Storage` / `StorageControl` instances queue a 200-byte GET
+    /// behind a 7.5 GB download (measured: control calls 3–11 s while 32
+    /// stripes stream). (#133 audit / issue #135: those clients were called
+    /// "gRPC" here — the `Storage` data client speaks the REST/JSON API;
+    /// only `StorageControl`'s metadata calls ride gRPC.)
     bulk_http: Vec<reqwest::Client>,
     /// #130: `store.idle_timeout` — the silence bound for every streaming
     /// read (open + per chunk).
@@ -541,7 +544,19 @@ impl BulkHttp {
             );
         }
         let resp = match tokio::time::timeout(self.idle, req.send()).await {
-            Ok(r) => r.map_err(StoreError::other)?,
+            // A failed `send` (connect refused/reset, name resolution, a
+            // transport error under the idle window) is the same class of
+            // fault as the two arms below — the idle timeout here and the
+            // mid-stream deadline in the body — all of which are classified
+            // retryable. #135: it used to reach the caller as `other`, so a
+            // bulk read hit by a transient network fault was not retried
+            // where the identical fault one moment later was.
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                return Err(StoreError::retryable(anyhow::anyhow!(
+                    "gcs bulk read {key}: {e}"
+                )))
+            }
             Err(_) => return Err(deadline_error("read", key, self.idle)),
         };
         let status = resp.status();
@@ -1661,5 +1676,28 @@ mod resume_tests {
         assert!(err.is_retryable(), "dead peer must be retryable: {err:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
         accept.abort();
+    }
+
+    /// #135: a transport failure of the **send** (connect refused — the
+    /// moment-of-connection shape of the dead tunnel above) must classify
+    /// like the timeout and mid-stream paths, retryable, not `other`. The
+    /// three arms of one fault class must not answer differently.
+    #[tokio::test]
+    async fn refused_peer_bulk_open_is_retryable() {
+        let addr = {
+            // Bind to learn a free port, then drop the listener: a
+            // connection to it is refused.
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let bulk = BulkHttp::for_tests(
+            format!("http://{addr}"),
+            "b".into(),
+            std::time::Duration::from_secs(10),
+        );
+        let Err(err) = bulk.open("wal/pack.pack", None, None).await else {
+            panic!("a refused port must not answer");
+        };
+        assert!(err.is_retryable(), "refused connect must be retryable: {err:?}");
     }
 }

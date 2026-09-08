@@ -68,6 +68,7 @@ export function SetupPage() {
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [restart, setRestart] = useState<"supervisor" | "manual" | null>(null);
+  const [saveWarnings, setSaveWarnings] = useState<string[]>([]);
   const [phase, setPhase] = useState<Phase>("form");
 
   // Load once: wizard, editor, or neither.
@@ -167,6 +168,11 @@ export function SetupPage() {
         const body = await api.store.save(payload);
         if (body.saved) {
           setRestart(body.restart ?? "manual");
+          // #134 (D20): the server says when the saved file is not
+          // self-sufficient (e.g. env-supplied credentials it cannot
+          // capture). Render it — silent here means a surprise at the
+          // next restart.
+          setSaveWarnings(body.warnings ?? []);
           setPhase("saved");
           return;
         }
@@ -185,9 +191,11 @@ export function SetupPage() {
           const body = (await r.json()) as {
             saved?: boolean;
             restart?: "supervisor" | "manual";
+            warnings?: string[];
           };
           if (body.saved) {
             setRestart(body.restart ?? "manual");
+            setSaveWarnings(body.warnings ?? []);
             setPhase("saved");
             return;
           }
@@ -249,6 +257,16 @@ export function SetupPage() {
                 ? t("setup.saved")
                 : t("setup.saved.manual")}
           </p>
+          {saveWarnings.length > 0 && (
+            <div className="setup-warn">
+              <p>{t("setup.saved.warnings")}</p>
+              <ul>
+                {saveWarnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {edit && (
             <Link className="btn primary" to="/">
               {t("setup.open")}
