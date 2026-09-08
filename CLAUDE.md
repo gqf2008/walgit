@@ -9,4 +9,5 @@
   job 不再是 known-red——ruleset 将其列入 required checks 前，红即该 PR 引入回归、
   按约定阻塞合并。
 - e2e 与 sim 套件已在 Windows 上跑通（issue #2 已合并）；CI 的 windows leg 覆盖
-  快速层 + sim + e2e。测试偶发红先查 AGENTS.md §5 known-flaky 名单与 §6.3 CI 信号。
+  快速层 + server 集成套件 + sim + e2e（集成套件清单两处同源：justfile 的
+  SERVER_TESTS，issue #137）。测试偶发红先查 AGENTS.md §5 known-flaky 名单与 §6.3 CI 信号。
