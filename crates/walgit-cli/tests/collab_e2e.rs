@@ -158,17 +158,18 @@ async fn cli_full_collab_flow_against_a_real_server() -> TestResult {
     assert_eq!(pv["pr"]["human_approvals"][0]["actor"], "alice");
     assert_eq!(pv["merge"]["allowed"], serde_json::Value::Bool(true));
 
-    // Read-only observability dashboard over the same refs.
+    // Read-only observability dashboard over the same refs. Rows lead with
+    // the thread title, falling back to the id (issue #131).
     let text = run(&["collab", "report", "--repo", repo_b])?;
     assert!(text.contains("collab report"), "{text}");
-    assert!(text.contains("pr1"), "{text}");
+    assert!(text.contains("add thing"), "titled thread renders by title: {text}");
     assert!(text.contains("verified"), "{text}");
     let md = run(&["collab", "report", "--repo", repo_b, "--format", "markdown"])?;
     assert!(md.contains("## PRs"), "{md}");
     let html = run(&["collab", "report", "--repo", repo_b, "--format", "html"])?;
     assert!(html.contains("<!doctype html>"), "{html}");
     assert!(html.contains("</html>"), "{html}");
-    assert!(html.contains("pr1"), "{html}");
+    assert!(html.contains("add thing"), "{html}");
     Ok(())
 }
 
