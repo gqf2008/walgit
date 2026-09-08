@@ -663,6 +663,17 @@ fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Res
     Ok(())
 }
 
+/// What a work unit is called on a list: its title, falling back to the
+/// thread id when it has none (issue #131 — the board cards and the report
+/// lists label the same way).
+fn unit_label<'a>(title: &'a str, id: &'a str) -> &'a str {
+    if title.is_empty() {
+        id
+    } else {
+        title
+    }
+}
+
 fn render_report_text(r: &Report) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -678,7 +689,7 @@ fn render_report_text(r: &Report) -> String {
         let _ = writeln!(
             out,
             "  {}: {} entries ({} verified), kinds {}, last {}",
-            t.id,
+            unit_label(&t.title, &t.id),
             t.entries,
             t.verified,
             t.kinds.join("/"),
@@ -690,7 +701,8 @@ fn render_report_text(r: &Report) -> String {
         let _ = writeln!(
             out,
             "  {} [{}] approvals={} merge_allowed={} ({})",
-            p.id, p.status, p.approvals, p.merge_allowed, p.merge_reason
+            unit_label(&p.title, &p.id),
+            p.status, p.approvals, p.merge_allowed, p.merge_reason
         );
     }
     let _ = writeln!(out, "\nactivity");
@@ -712,13 +724,13 @@ fn render_report_markdown(r: &Report) -> String {
     );
     let _ = writeln!(
         out,
-        "## threads\n\n| id | entries | verified | kinds | last |\n|---|---|---|---|---|"
+        "## threads\n\n| title | entries | verified | kinds | last |\n|---|---|---|---|---|"
     );
     for t in &r.threads {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} | {} |",
-            t.id,
+            esc(unit_label(&t.title, &t.id)),
             t.entries,
             t.verified,
             t.kinds.join("/"),
@@ -727,13 +739,14 @@ fn render_report_markdown(r: &Report) -> String {
     }
     let _ = writeln!(
         out,
-        "\n## PRs\n\n| id | status | approvals | merge |\n|---|---|---|---|"
+        "\n## PRs\n\n| title | status | approvals | merge |\n|---|---|---|---|"
     );
     for p in &r.prs {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} |",
-            p.id, p.status, p.approvals, p.merge_allowed
+            esc(unit_label(&p.title, &p.id)),
+            p.status, p.approvals, p.merge_allowed
         );
     }
     out
@@ -745,7 +758,7 @@ fn render_report_html(r: &Report) -> String {
         let _ = writeln!(
             rows,
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            esc(&t.id),
+            esc(unit_label(&t.title, &t.id)),
             t.entries,
             t.verified,
             esc(&t.kinds.join("/")),
@@ -757,7 +770,7 @@ fn render_report_html(r: &Report) -> String {
         let _ = writeln!(
             prs,
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            esc(&p.id),
+            esc(unit_label(&p.title, &p.id)),
             esc(&p.status),
             p.approvals,
             p.merge_allowed
@@ -768,8 +781,8 @@ fn render_report_html(r: &Report) -> String {
 <style>body{{font-family:system-ui;margin:2rem;color:#111}}table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:.3rem .6rem;text-align:left}}</style>\
 </head><body><h1>collab report</h1>\
 <p>{} threads, {} PRs, {}/{} entries verified</p>\
-<h2>threads</h2><table><tr><th>id</th><th>entries</th><th>verified</th><th>kinds</th><th>last</th></tr>{}</table>\
-<h2>PRs</h2><table><tr><th>id</th><th>status</th><th>approvals</th><th>merge</th></tr>{}</table>\
+<h2>threads</h2><table><tr><th>title</th><th>entries</th><th>verified</th><th>kinds</th><th>last</th></tr>{}</table>\
+<h2>PRs</h2><table><tr><th>title</th><th>status</th><th>approvals</th><th>merge</th></tr>{}</table>\
 </body></html>",
         r.threads.len(),
         r.prs.len(),
@@ -842,7 +855,7 @@ fn load_board_def(repo: &Path, override_path: Option<&Path>) -> Result<BoardDef>
 }
 
 fn card_label(c: &walgit_wal::collab::BoardCard) -> &str {
-    if c.title.is_empty() { &c.id } else { &c.title }
+    unit_label(&c.title, &c.id)
 }
 
 fn render_board_text(b: &Board) -> String {
@@ -1418,6 +1431,10 @@ mod tests {
         let r1 = build_report(&refs, &principals, &rules, 1_700_000_000);
         assert_eq!(r1.threads.len(), 1);
         assert_eq!(r1.threads[0].id, "pr1");
+        assert_eq!(
+            r1.threads[0].title, "t",
+            "the root entry's title is the thread's (issue #131)"
+        );
         assert_eq!(r1.threads[0].entries, 4);
         assert_eq!(
             r1.threads[0].verified, 3,
@@ -1428,6 +1445,7 @@ mod tests {
         assert_eq!(r1.unverified_entries, 1);
         assert_eq!(r1.missing_principals, 1, "bob has no key");
         assert_eq!(r1.prs.len(), 1);
+        assert_eq!(r1.prs[0].title, "t", "the PR row carries the same title");
         assert_eq!(r1.prs[0].approvals, 1);
         assert!(r1.prs[0].merge_allowed);
         assert_eq!(
@@ -1442,6 +1460,11 @@ mod tests {
         assert_eq!(render_report_html(&r1), render_report_html(&r2));
         assert!(render_report_html(&r1).contains("<!doctype html>"));
         assert!(render_report_html(&r1).contains("</html>"));
+        // Lists lead with the title, not the bare id (issue #131).
+        let text = render_report_text(&r1);
+        assert!(text.contains("  t: "), "thread row is titled: {text}");
+        assert!(text.contains("  t [open]"), "PR row is titled: {text}");
+        assert!(!text.contains("pr1"), "the id hides behind a title: {text}");
     }
 
     #[test]

@@ -716,8 +716,8 @@ is `walgit-wal::collab::Report`:
 
 ```json
 {
-  "threads": [ { "id": "t1", "entries": 4, "verified": 3, "last_ts": 1786500000, "kinds": ["comment","issue","patch","review"] } ],
-  "prs": [ { "id": "t1", "base": "refs/heads/main", "head": "refs/heads/topic", "status": "open", "approvals": 1, "merge_allowed": true, "merge_reason": "…" } ],
+  "threads": [ { "id": "t1", "title": "hi", "entries": 4, "verified": 3, "last_ts": 1786500000, "kinds": ["comment","issue","patch","review"] } ],
+  "prs": [ { "id": "t1", "title": "hi", "base": "refs/heads/main", "head": "refs/heads/topic", "status": "open", "approvals": 1, "merge_allowed": true, "merge_reason": "…" } ],
   "runs": [ { "id": "ci-9a1b…", "task": "test", "repo_ref": "refs/heads/main", "commit": "c0ffee…", "state": "done", "conclusion": "success", "runner": "ci-runner-a", "claims": 2, "last_ts": 1786500100 } ],
   "total_entries": 4,
   "verified_entries": 3,
@@ -727,6 +727,12 @@ is `walgit-wal::collab::Report`:
   "by_kind": [["comment", 1], ["issue", 1], ["patch", 1], ["review", 1]]
 }
 ```
+
+`title` is the root entry's `body.title`, `""` when it has none — lists render
+`title || id` (issue #131, same rule as board cards). The list order is part
+of the projection and clients render it as-is: `threads` newest activity
+first (`last_ts` desc, id asc on ties); `prs` `open` before `merged` before
+`closed`, then newest activity first (id asc on ties).
 
 `state` ∈ `pending | claimed | stale | done` — the attempt state machine of
 `docs/D1_CI_PROTOCOL.md` §7.3, evaluated at request time (claims expire).

@@ -409,6 +409,10 @@ pub fn merge_rule_eval(rules: &MergeRules, pr: &PrView) -> MergeEval {
 #[derive(Serialize, Clone, Debug)]
 pub struct ReportThread {
     pub id: String,
+    /// The root entry's `body.title`, "" when it has none (issue #131 — the
+    /// same rule as `BoardCard.title`, so the report list and the board cards
+    /// never disagree about what a thread is called).
+    pub title: String,
     pub entries: usize,
     pub verified: usize,
     pub last_ts: i64,
@@ -418,6 +422,8 @@ pub struct ReportThread {
 #[derive(Serialize, Clone, Debug)]
 pub struct ReportPr {
     pub id: String,
+    /// The root entry's `body.title`, "" when it has none (issue #131).
+    pub title: String,
     pub base: Option<String>,
     pub head: Option<String>,
     pub status: String,
@@ -446,7 +452,13 @@ pub struct ReportRun {
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct Report {
+    /// Ordered by the projection, not by the caller: newest activity first
+    /// (`last_ts` descending, id ascending breaks ties). Every client
+    /// (CLI text/markdown/html, the API JSON, the SPA table) renders this
+    /// order, which keeps the two clients byte-identical.
     pub threads: Vec<ReportThread>,
+    /// `open` first, then `merged`, then `closed`; within a status newest
+    /// activity first, id ascending breaks ties.
     pub prs: Vec<ReportPr>,
     /// CI runs (§8.3) — pure-CI threads are skipped above and projected here
     /// by `ci::collect_runs` instead.
@@ -457,6 +469,18 @@ pub struct Report {
     pub missing_principals: usize,
     pub by_actor: Vec<(String, usize)>,
     pub by_kind: Vec<(String, usize)>,
+}
+
+/// The thread's title: the root entry's `body.title`, "" when it has none or
+/// the thread is empty. One extraction rule for `BoardCard`, `ReportThread`
+/// and `ReportPr` — the board cards and the report lists show the same name.
+fn root_title(ordered: &[&EntryRef]) -> String {
+    ordered
+        .first()
+        .and_then(|r| r.entry.body.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 pub fn build_report(
@@ -488,27 +512,57 @@ pub fn build_report(
         kinds.dedup();
         report.threads.push(ReportThread {
             id: (*id).to_string(),
+            title: root_title(&ordered),
             entries: group.len(),
             verified,
             last_ts: group.iter().map(|r| r.entry.ts).max().unwrap_or(0),
             kinds,
         });
     }
+    let mut prs: Vec<(i64, ReportPr)> = Vec::new();
     for (id, group) in &by_thread {
         if group.iter().any(|r| r.entry.kind == "patch") {
             let pr = pr_view(group, principals);
             let eval = merge_rule_eval(rules, &pr);
-            report.prs.push(ReportPr {
-                id: (*id).to_string(),
-                base: pr.base.clone(),
-                head: pr.head.clone(),
-                status: pr.status.clone(),
-                approvals: pr.human_approvals.len(),
-                merge_allowed: eval.allowed,
-                merge_reason: eval.reason.clone(),
-            });
+            let last_ts = group.iter().map(|r| r.entry.ts).max().unwrap_or(0);
+            prs.push((
+                last_ts,
+                ReportPr {
+                    id: (*id).to_string(),
+                    title: root_title(&thread(group)),
+                    base: pr.base.clone(),
+                    head: pr.head.clone(),
+                    status: pr.status.clone(),
+                    approvals: pr.human_approvals.len(),
+                    merge_allowed: eval.allowed,
+                    merge_reason: eval.reason.clone(),
+                },
+            ));
         }
     }
+    // The list order is part of the projection (issue #131 follow-up: a
+    // meaningful order the CLI text, the API JSON and the SPA all agree on —
+    // clients render arrival order and never re-sort). Threads: newest
+    // activity first. PRs: `open` before `merged` before `closed`, then newest
+    // activity first. Both tie-break on id ascending, so the sort is a total
+    // order over the input: the same refs give the same bytes on every client.
+    report.threads.sort_by(|a, b| {
+        b.last_ts
+            .cmp(&a.last_ts)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    prs.sort_by(|(ts_a, a), (ts_b, b)| {
+        let rank = |s: &str| match s {
+            "open" => 0u8,
+            "merged" => 1,
+            _ => 2, // "closed" and anything else a status entry can name
+        };
+        rank(&a.status)
+            .cmp(&rank(&b.status))
+            .then_with(|| ts_b.cmp(ts_a))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    report.prs = prs.into_iter().map(|(_, p)| p).collect();
     report.total_entries = entries.len();
     for r in entries {
         let verified = r.is_verified(principals);
@@ -885,11 +939,7 @@ pub fn build_board(
         });
         let card = BoardCard {
             id: (*id).to_string(),
-            title: root
-                .and_then(|r| r.entry.body.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            title: root_title(&ordered),
             prose: root.map_or(String::new(), |r| entry_prose(&r.entry.body)),
             actor: root.map(|r| r.entry.actor.clone()).unwrap_or_default(),
             status: card_status(&ordered),
@@ -1219,6 +1269,141 @@ name = "everything else"
         let def = parse_board_def("version = 1\n[[column]]\nname = \"only blocked\"\nstatus = \"blocked\"\n").expect("def");
         let board = build_board(&borrowed, &principals, &MergeRules::default(), &def);
         assert!(board.columns.len() == 1 && board.columns[0].cards.is_empty());
+    }
+
+    /// Issue #131: the report's thread and PR projections carry the root
+    /// entry's title with the one board rule — titled, untitled, and a title
+    /// that lives only on a child (then: no title) all read the same way.
+    #[test]
+    fn report_threads_and_prs_project_the_root_title() {
+        let principals = HashMap::new();
+        let mut patch = entry(
+            "pr-1",
+            "patch",
+            "alice",
+            "",
+            2,
+            serde_json::json!({"title": "child title"}),
+        );
+        patch.refs = Some(EntryRefs {
+            base: Some("refs/heads/main".into()),
+            head: Some("refs/heads/topic".into()),
+        });
+        let owned = refs_of(&[
+            entry(
+                "pr-1",
+                "issue",
+                "alice",
+                "",
+                1,
+                serde_json::json!({"title": "ship the report"}),
+            ),
+            patch,
+            entry("ci-9", "comment", "bob", "", 3, serde_json::json!({"text": "no title here"})),
+            entry("solo-7", "comment", "bob", "", 4, serde_json::json!({"text": "root has no title"})),
+            entry("solo-7", "comment", "bob", "", 5, serde_json::json!({"title": "title only below the root"})),
+        ]);
+        let refs: Vec<&EntryRef> = owned.iter().collect();
+        let report = build_report(&refs, &principals, &MergeRules::default(), 10);
+
+        let title_of = |id: &str| {
+            report
+                .threads
+                .iter()
+                .find(|t| t.id == id)
+                .unwrap_or_else(|| panic!("thread {id} in {:?}", report.threads))
+                .title
+                .clone()
+        };
+        assert_eq!(title_of("pr-1"), "ship the report", "root title wins over a child's");
+        assert_eq!(title_of("ci-9"), "", "untitled thread is \"\"");
+        assert_eq!(title_of("solo-7"), "", "a title below the root is not the thread's");
+        assert_eq!(report.prs.len(), 1);
+        assert_eq!(report.prs[0].id, "pr-1");
+        assert_eq!(
+            report.prs[0].title, "ship the report",
+            "the PR projection carries the same root title"
+        );
+        // One rule for all three projections: the board card agrees.
+        let board = build_board(&refs, &principals, &MergeRules::default(), &default_board());
+        let card = board
+            .columns
+            .iter()
+            .flat_map(|c| &c.cards)
+            .find(|c| c.id == "pr-1")
+            .expect("pr-1 card");
+        assert_eq!(card.title, "ship the report");
+        // Missing root (empty thread): "" — never a panic.
+        assert_eq!(root_title(&[]), "");
+    }
+
+    /// Issue #131 follow-up: the projection owns the order — threads newest
+    /// activity first (id ascending breaks ties), PRs `open` before `merged`
+    /// before `closed`, then newest activity first. Clients render arrival
+    /// order, so CLI and API agree byte-for-byte.
+    #[test]
+    fn report_lists_arrive_ordered_from_the_projection() {
+        let principals = HashMap::new();
+        let mk_patch = |id: &str, ts: i64| {
+            let mut p = entry(id, "patch", "alice", "", ts, serde_json::json!({"title": id}));
+            p.refs = Some(EntryRefs {
+                base: Some("refs/heads/main".into()),
+                head: Some(format!("refs/heads/{id}")),
+            });
+            p
+        };
+        let entries = vec![
+            entry("t-mid", "comment", "bob", "", 20, serde_json::json!({})),
+            entry("t-late", "comment", "bob", "", 30, serde_json::json!({})),
+            entry("t-tie-b", "comment", "bob", "", 10, serde_json::json!({})),
+            entry("t-tie-a", "comment", "bob", "", 10, serde_json::json!({})),
+            mk_patch("pr-merged", 50),
+            entry(
+                "pr-merged",
+                "status",
+                "alice",
+                "",
+                51,
+                serde_json::json!({"status": "merged"}),
+            ),
+            mk_patch("pr-cold", 100),
+            entry(
+                "pr-cold",
+                "status",
+                "alice",
+                "",
+                101,
+                serde_json::json!({"status": "closed"}),
+            ),
+            mk_patch("pr-open-old", 1),
+            mk_patch("pr-open-new", 5),
+        ];
+        let owned = refs_of(&entries);
+        let refs: Vec<&EntryRef> = owned.iter().collect();
+        let report = build_report(&refs, &principals, &MergeRules::default(), 200);
+        // Every thread is in the threads list (the PR threads are threads too):
+        // pr-cold's last activity is ts 101 (the status entry), pr-merged 51.
+        let thread_ids: Vec<&str> = report.threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            thread_ids,
+            [
+                "pr-cold",
+                "pr-merged",
+                "t-late",
+                "t-mid",
+                "t-tie-a",
+                "t-tie-b",
+                "pr-open-new",
+                "pr-open-old",
+            ],
+            "last_ts descending, id ascending on ties"
+        );
+        let pr_ids: Vec<&str> = report.prs.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            pr_ids,
+            ["pr-open-new", "pr-open-old", "pr-merged", "pr-cold"],
+            "open before merged before closed, then newest activity"
+        );
     }
 }
 

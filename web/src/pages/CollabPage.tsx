@@ -67,7 +67,7 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
           <table className="grid">
             <thead>
               <tr>
-                <th>{t_("collab.th.id")}</th>
+                <th>{t_("collab.th.title")}</th>
                 <th>{t_("collab.th.kinds")}</th>
                 <th>{t_("collab.th.entries")}</th>
                 <th>{t_("collab.th.verified")}</th>
@@ -78,9 +78,18 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
               {report.threads.map((t) => (
                 <tr key={t.id}>
                   <td>
-                    <Link to={`/${full}/collab/thread/${encodeURIComponent(t.id)}`} className="strong">
-                      {t.id}
+                    <Link
+                      to={`/${full}/collab/thread/${encodeURIComponent(t.id)}`}
+                      className="strong"
+                      title={t.id}
+                    >
+                      {t.title || t.id}
                     </Link>
+                    {t.title ? (
+                      <span className="muted mono" style={{ marginLeft: 6, fontSize: "0.85em" }}>
+                        {t.id}
+                      </span>
+                    ) : null}
                   </td>
                   <td>{t.kinds.map((k) => kindLabel(t_, k)).join(", ")}</td>
                   <td>{t.entries}</td>
@@ -99,7 +108,7 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
           <table className="grid">
             <thead>
               <tr>
-                <th>{t_("collab.th.id")}</th>
+                <th>{t_("collab.th.title")}</th>
                 <th>{t_("collab.th.baseHead")}</th>
                 <th>{t_("collab.th.status")}</th>
                 <th>{t_("collab.th.approvals")}</th>
@@ -110,9 +119,18 @@ function CollabView({ full, report }: { full: string; report: CollabReport }) {
               {report.prs.map((p) => (
                 <tr key={p.id}>
                   <td>
-                    <Link to={`/${full}/collab/thread/${encodeURIComponent(p.id)}`} className="strong">
-                      {p.id}
+                    <Link
+                      to={`/${full}/collab/thread/${encodeURIComponent(p.id)}`}
+                      className="strong"
+                      title={p.id}
+                    >
+                      {p.title || p.id}
                     </Link>
+                    {p.title ? (
+                      <span className="muted mono" style={{ marginLeft: 6, fontSize: "0.85em" }}>
+                        {p.id}
+                      </span>
+                    ) : null}
                   </td>
                   <td className="mono">{p.base ?? "?"} → {p.head ?? "?"}</td>
                   <td>{p.status}</td>

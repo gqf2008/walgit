@@ -129,6 +129,9 @@ export interface CollabEntryRef {
 }
 export interface CollabReportThread {
   id: string;
+  /** Root entry's `body.title`, "" when it has none (issue #131 — render
+      `title || id` like the board cards). */
+  title: string;
   entries: number;
   verified: number;
   last_ts: number;
@@ -156,6 +159,8 @@ export interface CollabMergeEval {
 }
 export interface CollabReportPr {
   id: string;
+  /** Root entry's `body.title`, "" when it has none (issue #131). */
+  title: string;
   base: string | null;
   head: string | null;
   status: string;
@@ -178,7 +183,11 @@ export interface CollabReportRun {
   last_ts: number;
 }
 export interface CollabReport {
+  /** Ordered by the projection (newest activity first, id on ties); render
+      arrival order — do not re-sort, the CLI renders the same order. */
   threads: CollabReportThread[];
+  /** Ordered by the projection: `open` before `merged` before `closed`, then
+      newest activity first, id on ties. */
   prs: CollabReportPr[];
   runs: CollabReportRun[];
   total_entries: number;

@@ -1262,8 +1262,10 @@ async fn collab_report_and_thread_aggregate_entries() -> TestResult {
     assert_eq!(report["total_entries"], 3);
     assert_eq!(report["threads"].as_array().unwrap().len(), 1);
     assert_eq!(report["threads"][0]["id"], "t1");
+    assert_eq!(report["threads"][0]["title"], "hi", "root title projected (issue #131)");
     assert_eq!(report["threads"][0]["entries"], 3);
     assert_eq!(report["prs"].as_array().unwrap().len(), 1);
+    assert_eq!(report["prs"][0]["title"], "hi");
     assert_eq!(report["prs"][0]["base"], "refs/heads/main");
     assert_eq!(report["prs"][0]["head"], "refs/heads/topic");
     assert_eq!(report["prs"][0]["status"], "open");
