@@ -689,3 +689,168 @@ async fn store_surface_requires_admin() -> TestResult {
     assert_eq!(v["admin"], false, "{v}");
     Ok(())
 }
+
+// ---- #129: storable config files and env-override warnings ---------------
+
+/// Test-only environment mutation (edition-2024 makes `set_var`/`remove_var`
+/// unsafe): both names are unique to this test (`WALGIT_TEST_129_*`) and no
+/// other test in this binary reads them.
+#[allow(unsafe_code)]
+fn set_env(key: &str, value: &str) {
+    // SAFETY: `key` is one of the uniquely named WALGIT_TEST_129_* variables;
+    // no other test reads them, and each call is sequenced with its request.
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[allow(unsafe_code)]
+fn unset_env(key: &str) {
+    // SAFETY: same unique test-scoped names as `set_env`.
+    unsafe { std::env::remove_var(key) };
+}
+
+/// `--config /dev/null` (D39's explicit defaults+env form) accepts writes
+/// and discards them, so neither save surface may claim to have saved:
+/// both report `can_save: false` and answer the save with the same 503 a
+/// fileless instance gets.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_file_config_path_is_not_savable_on_either_surface() -> TestResult {
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "store": { "backend": "s3", "bucket": "b" } });
+
+    // The wizard (setup state).
+    let server = Server::start_setup(std::path::Path::new("/dev/null")).await?;
+    let r = client
+        .get(format!("{}/api/v1/setup/status", server.base_url))
+        .send()
+        .await?;
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["can_save"], false, "{v}");
+    let r = client
+        .post(format!("{}/api/v1/setup/save", server.base_url))
+        .json(&payload)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 503, "{}", r.status());
+    assert!(r.text().await?.contains("--config"));
+
+    // The configured-state editor.
+    let server = Server::start_configured_with_config(std::path::Path::new("/dev/null"), |c| {
+        c.store.backend = walgit_config::StoreBackend::S3;
+        c.store.bucket = "b".into();
+    })
+    .await?;
+    let r = client
+        .get(format!("{}/api/v1/store", server.base_url))
+        .send()
+        .await?;
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["can_save"], false, "{v}");
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&payload)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 503, "{}", r.status());
+    assert!(r.text().await?.contains("--config"));
+    Ok(())
+}
+
+/// A save whose file ends up without literal credentials while the
+/// environment supplies them (here via the `*_env` names) must say so:
+/// the running instance boots, a restart outside that environment will not.
+/// (The wizard-era one-shot became a repeatable operation with the editor —
+/// issue #129's B.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_edit_save_warns_when_the_file_would_hold_no_literal_credential() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cfg_path = dir.path().join("walgit.toml");
+    std::fs::write(
+        &cfg_path,
+        "[store]\nbackend = \"s3\"\nbucket = \"b\"\n\n[store.s3]\nendpoint = \"http://127.0.0.1:9000\"\nregion = \"us-east-1\"\naccess_key_env = \"WALGIT_TEST_129_AK\"\nsecret_key_env = \"WALGIT_TEST_129_SK\"\nforce_path_style = true\n",
+    )?;
+    let server = Server::start_configured_with_config(&cfg_path, |c| {
+        c.store.backend = walgit_config::StoreBackend::S3;
+        c.store.bucket = "b".into();
+        c.store.s3.access_key_env = "WALGIT_TEST_129_AK".into();
+        c.store.s3.secret_key_env = "WALGIT_TEST_129_SK".into();
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let edit = serde_json::json!({
+        "store": {
+            "backend": "s3",
+            "bucket": "new-b",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "force_path_style": true
+        }
+    });
+
+    // With the env vars set: blank credentials save (the Keep semantics) but
+    // warn that the file holds nothing durable.
+    set_env("WALGIT_TEST_129_AK", "env-ak");
+    set_env("WALGIT_TEST_129_SK", "env-sk");
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&edit)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(body["saved"], true, "{body}");
+    let warnings = body["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 2, "{body}");
+    let joined = warnings
+        .iter()
+        .map(|w| w.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("WALGIT_TEST_129_AK"), "{joined}");
+    assert!(joined.contains("WALGIT_TEST_129_SK"), "{joined}");
+    let text = std::fs::read_to_string(&cfg_path)?;
+    assert!(!text.contains("access_key = "), "no literal landed: {text}");
+
+    // With the environment gone: nothing env-supplies the save, no warning.
+    unset_env("WALGIT_TEST_129_AK");
+    unset_env("WALGIT_TEST_129_SK");
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&edit)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 200, "{}", r.text().await?);
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(
+        body["warnings"].as_array().expect("warnings array").len(),
+        0,
+        "{body}"
+    );
+
+    // A submission that writes literal credentials silences the warning even
+    // with the env set again.
+    set_env("WALGIT_TEST_129_AK", "env-ak");
+    set_env("WALGIT_TEST_129_SK", "env-sk");
+    let r = client
+        .put(format!("{}/api/v1/store", server.base_url))
+        .json(&serde_json::json!({
+            "store": {
+                "backend": "s3",
+                "bucket": "new-b",
+                "endpoint": "http://127.0.0.1:9000",
+                "access_key": "literal-ak",
+                "secret_key": "literal-sk"
+            }
+        }))
+        .send()
+        .await?;
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(
+        body["warnings"].as_array().expect("warnings array").len(),
+        0,
+        "{body}"
+    );
+    unset_env("WALGIT_TEST_129_AK");
+    unset_env("WALGIT_TEST_129_SK");
+    Ok(())
+}

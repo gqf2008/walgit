@@ -101,7 +101,7 @@ async fn status(State(st): State<Arc<AppState>>) -> Response {
         needs_setup: true,
         backend: "memory",
         auth_mode,
-        can_save: st.config_path.is_some(),
+        can_save: storable_config_path(st.config_path.as_ref()),
     })
     .into_response()
 }
@@ -131,6 +131,63 @@ pub(crate) struct SetupStore {
 
 fn default_true() -> bool {
     true
+}
+
+/// Whether a save can persist to the `--config` path (issue #129, shared by
+/// the wizard's status/save and the configured-state editor's snapshot/save,
+/// D44). Only a regular file: `--config /dev/null` is D39's explicit
+/// defaults+env form (`NUL` plays that role on Windows), and a character
+/// device or FIFO accepts every write and discards all of them — "saved"
+/// would be a lie, so both surfaces refuse it exactly like a missing file.
+pub(crate) fn storable_config_path(path: Option<&std::path::PathBuf>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    path.metadata().is_ok_and(|m| m.is_file())
+}
+
+/// A unique sibling temp name (same directory, so the rename is atomic on
+/// the filesystem that holds the config).
+fn temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("walgit.toml");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    path.with_file_name(format!("{name}.{}.{}.tmp", std::process::id(), nanos))
+}
+
+/// Write the config file **atomically** (issue #129): a same-directory temp
+/// file created 0600, filled, fsynced, then renamed over the target. The
+/// wizard save and the admin editor save (D44) share this one path.
+///
+/// `walgit.toml` is the only durable carrier of the literal credentials, and
+/// a lost file strands the instance (a missing `--config` file is exit 2,
+/// D39). `std::fs::write` truncates first — a crash or ENOSPC mid-write
+/// destroyed it. Rename is the linearization point here, like the manifest
+/// CAS for the bucket: readers see either the old file or the new one, never
+/// a half-written config. A failed write cleans up its temp file.
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = temp_sibling(path);
+    let result = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// What a **blank** credential field means, which differs by surface:
@@ -295,7 +352,11 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
     if !st.needs_setup {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(config_path) = st.config_path.clone() else {
+    let Some(config_path) = st
+        .config_path
+        .clone()
+        .filter(|p| storable_config_path(Some(p)))
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "this instance was not started from a config file (start with walgit serve --config walgit.toml); saved nothing",
@@ -425,19 +486,15 @@ async fn save(State(st): State<Arc<AppState>>, body: Body) -> Response {
             .into_response();
     }
 
-    // 4. Write atomically-ish (direct write; the wizard is the only writer on
-    //    a single-user machine) and arm the restart when the CLI armed it.
-    if let Err(e) = std::fs::write(&config_path, &edited_text) {
+    // 4. Write atomically (same-dir temp + rename, 0600; #129 — the file is
+    //    the literal credentials' only carrier, a torn write strands the
+    //    instance) and arm the restart when the CLI armed it.
+    if let Err(e) = write_atomic(&config_path, &edited_text) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("config file {} is not writable: {e}", config_path.display()),
         )
             .into_response();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
     }
     if st.setup_exit {
         // The tray watcher treats exit 75 as "restart me" (D43). The response
@@ -650,5 +707,81 @@ backend = \"memory\"
         assert!(!out.contains("access_key = \"old\""), "{out}");
         let cfg: walgit_config::Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.store.s3.access_key, None);
+    }
+
+    // ---- #129: atomic write, storable config paths ----------------------
+
+    #[test]
+    fn write_atomic_replaces_content_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walgit.toml");
+        std::fs::write(&path, "backend = \"memory\"\n").unwrap();
+        write_atomic(&path, "backend = \"s3\"\nbucket = \"b\"\n").unwrap();
+        // The target holds the new text…
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "backend = \"s3\"\nbucket = \"b\"\n"
+        );
+        // …and the directory holds exactly the config: no `.tmp` sibling
+        // survived the rename. (The crash semantics of temp+rename cannot be
+        // tested here; this pins the visible contract of the fix.)
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("walgit.toml")], "{entries:?}");
+        #[cfg(unix)]
+        {
+            // The file that carries literal credentials is 0600 (D43).
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        // Repeated saves (the editor surface made this a repeated operation)
+        // still leave a single file.
+        write_atomic(&path, "# second\n").unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# second\n");
+    }
+
+    #[test]
+    fn a_failed_atomic_write_keeps_the_old_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walgit.toml");
+        std::fs::write(&path, "old = true\n").unwrap();
+        // A missing parent directory fails the temp creation — the target
+        // must still hold the old bytes (the truncating `fs::write` of the
+        // same name would instead have destroyed a writable path, and neither
+        // may leave a half-file behind).
+        let deep = dir.path().join("nope").join("walgit.toml");
+        assert!(write_atomic(&deep, "new = true\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true\n");
+    }
+
+    #[test]
+    fn only_a_regular_config_file_is_storable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("walgit.toml");
+        std::fs::write(&file, "").unwrap();
+        assert!(storable_config_path(Some(&file)));
+        assert!(!storable_config_path(None), "no --config file at all");
+        assert!(
+            !storable_config_path(Some(&dir.path().join("absent.toml"))),
+            "a path that does not exist is not a config file"
+        );
+        assert!(
+            !storable_config_path(Some(&dir.path().to_path_buf())),
+            "a directory is not a file"
+        );
+        #[cfg(unix)]
+        assert!(
+            !storable_config_path(Some(&std::path::PathBuf::from("/dev/null"))),
+            "`--config /dev/null` (D39) accepts writes and discards them"
+        );
+        #[cfg(windows)]
+        assert!(
+            !storable_config_path(Some(&std::path::PathBuf::from("NUL"))),
+            "`--config NUL` (D39) accepts writes and discards them"
+        );
     }
 }
