@@ -134,26 +134,40 @@ fn snapshot_dir(dir: &Path) -> std::io::Result<DirSnapshot> {
     Ok(out)
 }
 
-/// Names git writes a file under while it is still in flight, and never after publishing it:
-/// `install_commit_graph_base` renames `*.tmp` targets into place and holds `*.lock` while
-/// writing. Committed state always arrives by rename, so a transient name is never part of the
-/// serving truth — skip it, gone by copy time or not.
+/// Names git and walgit write a file under while it is still in flight, and never after
+/// publishing it. Two conventions exist and both are covered:
+///
+/// - **suffix** — `*.lock` (git's own staging: `commit-graph-chain.lock`) and `*.tmp`
+///   (walgit's: `install_commit_graph_base` stages `graph-<hash>.graph.tmp` and
+///   `commit-graph-chain.tmp` before renaming);
+/// - **prefix** — `tmp_*` from git's `mkstemps`: `tmp_graph_*` for a split commit-graph
+///   layer (measured on git 2.50.1 — it does *not* use a `.tmp` suffix there), and
+///   `tmp_pack_*` / `tmp_idx_*` / `tmp_obj_*` in `objects/pack/`.
+///
+/// Committed state always arrives by rename from one of these, so a transient name is
+/// never part of the serving truth — skip it, gone by copy time or not.
 fn is_transient_git_name(name: &std::ffi::OsStr) -> bool {
     let lossy = name.to_string_lossy();
-    lossy.ends_with(".lock") || lossy.ends_with(".tmp")
+    lossy.ends_with(".lock")
+        || lossy.ends_with(".tmp")
+        || lossy.starts_with("tmp_graph_")
+        || lossy.starts_with("tmp_pack_")
+        || lossy.starts_with("tmp_idx_")
+        || lossy.starts_with("tmp_obj_")
 }
 
 /// Copy one [`snapshot_dir`] listing into `dst` (which must exist). The rules for entries the
 /// concurrent writers can take away mid-flight:
 ///
-/// - **Transient names `.lock` / `.tmp` are skipped**: committed state always arrives by
-///   rename, so a file still under a transient name is not part of the serving truth. The
-///   `.lock` half of this rule came from CI 2026-09-01
+/// - **Transient names are skipped** ([`is_transient_git_name`]: `.lock`/`.tmp` suffixes and
+///   git's `tmp_graph_*`/`tmp_pack_*`/`tmp_idx_*`/`tmp_obj_*` prefixes): committed state always
+///   arrives by rename, so a file still under a transient name is not part of the serving truth.
+///   The `.lock` half of this rule came from CI 2026-09-01
 ///   (`fetch_from_front_that_serves_the_base_remotely`: the scratch inherited a mid-flight
 ///   `commit-graph-chain.lock` and the rebuild's own `commit-graph write` died on "Unable to
 ///   create ...lock: File exists"); that fix stopped at the lock and left the source-side
 ///   rename/delete race itself open — issue #138's verdict, closed by issue #139, which
-///   extends the skip to `.tmp` and adds the tolerances below.
+///   extends the skip to `.tmp` and git's `tmp_*` staging names and adds the tolerances below.
 /// - **`NotFound` inside the commit-graph state is tolerated** ([`is_graph_state`], i.e. the
 ///   `objects/info/commit-graphs/` directory and the monolithic `objects/info/commit-graph`):
 ///   those deletions happen *after* the new chain's rename (`install_commit_graph_base`'s
@@ -639,6 +653,9 @@ mod tests {
         std::fs::create_dir_all(&graphs)?;
         std::fs::write(graphs.join("graph-3333333333444444444455555555556666666666.graph.tmp"), "mid-write")?;
         std::fs::write(graphs.join("commit-graph-chain.lock"), "stale lock")?;
+        // git 2.50.1 stages a split layer under this mkstemps *prefix*, not a `.tmp`
+        // suffix — the name the suffix rule alone would miss (issue #143's review).
+        std::fs::write(graphs.join("tmp_graph_9k2mQx"), "git's own mid-write layer")?;
         std::fs::write(
             graphs.join("commit-graph-chain"),
             "3333333333444444444455555555556666666666\n",
@@ -666,7 +683,48 @@ mod tests {
                 .all(|n| !is_transient_git_name(std::ffi::OsStr::new(n))),
             "transient names leaked into the scratch copy: {names:?}"
         );
+        // Literal, not predicate-based: asserting with `is_transient_git_name` again would
+        // pass on a predicate that simply stopped recognizing git's staging names.
+        assert!(
+            !names.iter().any(|n| n.starts_with("tmp_")),
+            "git's `tmp_*` staging names must never reach the scratch copy: {names:?}"
+        );
         Ok(())
+    }
+
+    /// The skip rule has to know both staging conventions (suffix and `mkstemps` prefix) and
+    /// must not swallow committed names — including the side-files a base publishes with its
+    /// pack (`pack-<chk>.commit-graph` lives in `objects/pack/` and is committed state).
+    #[test]
+    fn transient_names_cover_both_conventions_and_no_committed_names() {
+        for n in [
+            "graph-1.graph.tmp",
+            "commit-graph-chain.lock",
+            "tmp_graph_9k2mQx",
+            "tmp_pack_Ab12Cd",
+            "tmp_idx_Ef34Gh",
+            "tmp_obj_Ij56Kl",
+        ] {
+            assert!(
+                is_transient_git_name(std::ffi::OsStr::new(n)),
+                "{n} is in-flight state and must be skipped"
+            );
+        }
+        for n in [
+            "graph-1.graph",
+            "commit-graph-chain",
+            "pack-a553ef17.pack",
+            "pack-a553ef17.idx",
+            "pack-a553ef17.rev",
+            "pack-a553ef17.bitmap",
+            "pack-a553ef17.commit-graph",
+            "http-backend",
+        ] {
+            assert!(
+                !is_transient_git_name(std::ffi::OsStr::new(n)),
+                "{n} is committed state and must be copied"
+            );
+        }
     }
 
     /// Scope of the tolerance, inside `objects/info/` itself: the monolithic `commit-graph`
