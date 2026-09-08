@@ -108,9 +108,11 @@ fn write_marker(path: &Path, m: &Marker) -> anyhow::Result<()> {
 /// bytes duplicated until written) and which degrades to a plain copy elsewhere. Each
 /// directory is snapshotted first and the snapshot copied after, so the concurrent-writer
 /// rules live in [`copy_snapshot`] with [`snapshot_dir`] as their deterministic test seam.
-fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    std::fs::create_dir_all(dst)?;
-    copy_snapshot(dst, &snapshot_dir(src)?)
+/// `gone` collects the entries the tolerances dropped, so the caller can say so out loud
+/// (issue #139: a tolerance that leaves no trace is how #138 stayed unattributed for a week).
+fn copy_tree(src: &Path, dst: &Path, gone: &mut Vec<PathBuf>) -> std::io::Result<u64> {
+    std::fs::create_dir_all(dst).map_err(|e| at(&e, dst))?;
+    copy_snapshot(dst, &snapshot_dir(src)?, gone)
 }
 
 /// One directory as it looked at a point in time: `(name, path, kind)`, all captured
@@ -184,7 +186,7 @@ fn is_transient_git_name(name: &std::ffi::OsStr) -> bool {
 /// - **Everything else is fatal**: a vanishing entry elsewhere — above all `objects/pack/` —
 ///   is real corruption or a real bug and must fail loudly, naming the source path
 ///   ([`at`]) so the anyhow chain prints the dead file at the leaf.
-fn copy_snapshot(dst: &Path, entries: &DirSnapshot) -> std::io::Result<u64> {
+fn copy_snapshot(dst: &Path, entries: &DirSnapshot, gone: &mut Vec<PathBuf>) -> std::io::Result<u64> {
     let mut bytes = 0u64;
     for (name, from, kind) in entries {
         if is_transient_git_name(name) {
@@ -192,18 +194,22 @@ fn copy_snapshot(dst: &Path, entries: &DirSnapshot) -> std::io::Result<u64> {
         }
         let to = dst.join(name);
         if kind.is_dir() {
-            bytes += copy_tree(from, &to)?;
+            bytes += copy_tree(from, &to, gone)?;
         } else if kind.is_file() {
             match std::fs::copy(from, &to) {
                 Ok(n) => bytes += n,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_graph_state(from) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_graph_state(from) => {
+                    gone.push(from.clone());
+                }
                 Err(e) => return Err(at(&e, from)),
             }
         } else if kind.is_symlink() {
             // A mount-linked base (`pack-<sha>.pack` → store mount) is never rebuilt here:
             // the rebuild needs real files (compact_repo syncs Full first).
             let target = std::fs::read_link(from).map_err(|e| at(&e, from))?;
-            walgit_wal::platform::symlink(&target, &to).map_err(|e| at(&e, from))?;
+            // The failure here is creating `to` (privilege, existing entry), not reading
+            // `from` — name the path that actually broke.
+            walgit_wal::platform::symlink(&target, &to).map_err(|e| at(&e, &to))?;
         }
     }
     Ok(bytes)
@@ -507,7 +513,8 @@ fn start_scratch(
         );
     }
     let t = Instant::now();
-    let bytes = copy_tree(handle.local().path(), scratch_dir)
+    let mut gone: Vec<PathBuf> = Vec::new();
+    let bytes = copy_tree(handle.local().path(), scratch_dir, &mut gone)
         .context("copying the serving copy to the scratch dir")?;
     log(format!(
         "scratch copy of the serving copy at {} ({} in {:.1}s; reflinked where the filesystem allows)",
@@ -515,6 +522,23 @@ fn start_scratch(
         walgit_wal::remote::human_bytes(bytes),
         t.elapsed().as_secs_f64()
     ));
+    if !gone.is_empty() {
+        // Benign by construction (the writer deletes these only after renaming the new chain
+        // in), but say it: the alternative is a future reader staring at a scratch copy that
+        // quietly lost entries, with nothing to correlate. Capped — the set is bounded by the
+        // commit-graph layer count in practice, this is belt space.
+        let shown: Vec<String> = gone
+            .iter()
+            .take(5)
+            .map(|p| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
+            .collect();
+        log(format!(
+            "tolerated {} commit-graph entr{} deleted during the copy: {}",
+            gone.len(),
+            if gone.len() == 1 { "y" } else { "ies" },
+            shown.join(", ")
+        ));
+    }
     let m = Marker {
         started_head_seq: manifest.head_seq,
         phase: Phase::Copied,
@@ -550,7 +574,7 @@ mod tests {
         std::fs::write(src.path().join("objects/info/commit-graph-chain"), "hash\n").unwrap();
         std::fs::write(src.path().join("packed-refs"), "ref: x\n").unwrap();
 
-        copy_tree(src.path(), dst.path()).unwrap();
+        copy_tree(src.path(), dst.path(), &mut Vec::new()).unwrap();
 
         assert!(
             !dst.path()
@@ -594,8 +618,19 @@ mod tests {
 
         let into = dst.path().join("objects/info/commit-graphs");
         std::fs::create_dir_all(&into)?;
-        copy_snapshot(&into, &entries)?;
+        let mut gone: Vec<std::path::PathBuf> = Vec::new();
+        copy_snapshot(&into, &entries, &mut gone)?;
 
+        // Tolerating is not the same as being silent: the caller narrates what it dropped, so
+        // a future scratch that "lost a layer" has a line to correlate with (issue #138's
+        // week of no-attribution was bought with exactly this missing trace).
+        assert_eq!(
+            gone.iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["graph-1111111111222222222233333333334444444444.graph".to_string()],
+            "the tolerated deletion must be reported to the caller"
+        );
         assert_eq!(
             std::fs::read_to_string(into.join("commit-graph-chain"))?,
             format!("{chain}\n"),
@@ -632,7 +667,7 @@ mod tests {
 
         let into = dst.path().join("objects/pack");
         std::fs::create_dir_all(&into)?;
-        let err = copy_snapshot(&into, &entries).expect_err("a vanishing pack must not be tolerated");
+        let err = copy_snapshot(&into, &entries, &mut Vec::new()).expect_err("a vanishing pack must not be tolerated");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             err.to_string()
@@ -668,7 +703,7 @@ mod tests {
         );
         let into = dst.path().join("objects/info/commit-graphs");
         std::fs::create_dir_all(&into)?;
-        copy_snapshot(&into, &entries)?;
+        copy_snapshot(&into, &entries, &mut Vec::new())?;
 
         let names: Vec<String> = std::fs::read_dir(&into)?
             .map(|ent| Ok(ent?.file_name().to_string_lossy().into_owned()))
@@ -745,7 +780,7 @@ mod tests {
         std::fs::remove_file(info.join("commit-graph"))?;
         let into = dst.path().join("objects/info");
         std::fs::create_dir_all(&into)?;
-        copy_snapshot(&into, &entries)?;
+        copy_snapshot(&into, &entries, &mut Vec::new())?;
         assert!(!into.join("commit-graph").exists());
         assert_eq!(
             std::fs::read_to_string(into.join("http-backend"))?,
@@ -755,7 +790,7 @@ mod tests {
         // A sibling gone after the snapshot: fatal, with its path named.
         let entries = snapshot_dir(&info)?;
         std::fs::remove_file(info.join("http-backend"))?;
-        let err = copy_snapshot(&into, &entries).expect_err("objects/info siblings are not graph state");
+        let err = copy_snapshot(&into, &entries, &mut Vec::new()).expect_err("objects/info siblings are not graph state");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             err.to_string().contains("http-backend"),
