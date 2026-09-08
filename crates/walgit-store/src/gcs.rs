@@ -41,9 +41,11 @@ const LIST_PAGE_SIZE: i32 = 1000;
 /// Mid-stream resumes per bulk read before the error is surfaced.
 const BULK_RESUME_ATTEMPTS: u32 = 5;
 const META_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-const READ_OPEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-/// Per chunk of a streaming body read (not the whole stream).
-const READ_CHUNK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+// The read **open** (waiting for response headers) and per-**chunk** deadlines
+// are no longer constants: both bound *silence* on a streaming read, which is
+// `store.idle_timeout` (#130). A 30 GiB range read may stream for many
+// minutes and must never see a total deadline; a dropped tunnel must not hang
+// forever. Control-plane calls keep META_DEADLINE; uploads keep put_deadline.
 const PUT_MIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Uploads get this many bytes per second on top of `PUT_MIN_DEADLINE` (1 MiB/s floor).
 const PUT_BYTES_PER_SEC: u64 = 1024 * 1024;
@@ -159,6 +161,9 @@ pub struct GcsStore {
     /// `StorageControl` instances queue a 200-byte GET behind a 7.5 GB
     /// download (measured: control calls 3–11 s while 32 stripes stream).
     bulk_http: Vec<reqwest::Client>,
+    /// #130: `store.idle_timeout` — the silence bound for every streaming
+    /// read (open + per chunk).
+    idle_timeout: std::time::Duration,
     creds: Option<google_cloud_auth::credentials::Credentials>,
     bucket: String,
     /// Global cap on concurrent bulk requests per process (leaves headroom).
@@ -212,7 +217,7 @@ impl GcsStore {
                 reqwest::Client::builder()
                     .http1_only()
                     .pool_max_idle_per_host(64)
-                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .connect_timeout(cfg.connect_timeout)
                     .build()?,
             );
         }
@@ -234,6 +239,7 @@ impl GcsStore {
             bulk,
             bulk_next: std::sync::atomic::AtomicUsize::new(0),
             bulk_http,
+            idle_timeout: cfg.idle_timeout,
             creds,
             bucket: cfg.bucket.clone(),
             bulk_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -282,6 +288,7 @@ impl GcsStore {
             permits: self.bulk_permits.clone(),
             endpoint: std::env::var("WALGIT_GCS_HTTP_ENDPOINT")
                 .unwrap_or_else(|_| "https://storage.googleapis.com".into()),
+            idle: self.idle_timeout,
         }
     }
 
@@ -466,12 +473,14 @@ pub(crate) struct BulkHttp {
     /// JSON API endpoint (`https://storage.googleapis.com`; tests point it at
     /// a local server that cuts bodies).
     endpoint: String,
+    /// #130: silence bound for the open wait and per chunk (from config).
+    idle: std::time::Duration,
 }
 
 impl BulkHttp {
     /// Test constructor: no credentials, any endpoint.
     #[cfg(test)]
-    pub(crate) fn for_tests(endpoint: String, bucket: String) -> Self {
+    pub(crate) fn for_tests(endpoint: String, bucket: String, idle: std::time::Duration) -> Self {
         BulkHttp {
             clients: vec![reqwest::Client::new()],
             next: std::sync::Arc::default(),
@@ -479,6 +488,7 @@ impl BulkHttp {
             bucket,
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             endpoint,
+            idle,
         }
     }
 
@@ -530,9 +540,9 @@ impl BulkHttp {
                 format!("bytes={}-{}", r.start, r.end.saturating_sub(1)),
             );
         }
-        let resp = match tokio::time::timeout(READ_OPEN_DEADLINE, req.send()).await {
+        let resp = match tokio::time::timeout(self.idle, req.send()).await {
             Ok(r) => r.map_err(StoreError::other)?,
-            Err(_) => return Err(deadline_error("read", key, READ_OPEN_DEADLINE)),
+            Err(_) => return Err(deadline_error("read", key, self.idle)),
         };
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -572,22 +582,23 @@ impl BulkHttp {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<i64>().ok());
         let key_owned = key.to_owned();
+        let idle = self.idle;
         let stream = resp.bytes_stream();
         let body: ByteStream = Box::pin(futures::stream::unfold(
-            (stream, key_owned, permit),
-            |(mut stream, key, permit)| async move {
-                match tokio::time::timeout(READ_CHUNK_DEADLINE, stream.next()).await {
-                    Ok(Some(Ok(b))) => Some((Ok(b), (stream, key, permit))),
+            (stream, key_owned, permit, idle),
+            |(mut stream, key, permit, idle)| async move {
+                match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(Some(Ok(b))) => Some((Ok(b), (stream, key, permit, idle))),
                     Ok(Some(Err(e))) => Some((
                         Err(StoreError::retryable(anyhow::anyhow!(
                             "gcs bulk read {key}: {e}"
                         ))),
-                        (stream, key, permit),
+                        (stream, key, permit, idle),
                     )),
                     Ok(None) => None,
                     Err(_) => Some((
-                        Err(deadline_error("read_chunk", &key, READ_CHUNK_DEADLINE)),
-                        (stream, key, permit),
+                        Err(deadline_error("read_chunk", &key, idle)),
+                        (stream, key, permit, idle),
                     )),
                 }
             },
@@ -611,11 +622,11 @@ impl GcsStore {
         if let Some(ref r) = range {
             builder = builder.set_read_range(range_to_read_range(r));
         }
-        let resp = match tokio::time::timeout(READ_OPEN_DEADLINE, builder.send()).await {
+        let resp = match tokio::time::timeout(self.idle_timeout, builder.send()).await {
             Ok(r) => r.map_err(|e| map_error(key, e))?,
-            Err(_) => return Err(deadline_error("read", key, READ_OPEN_DEADLINE)),
+            Err(_) => return Err(deadline_error("read", key, self.idle_timeout)),
         };
-        Ok(unfold_response(key, resp, permit))
+        Ok(unfold_response(key, resp, permit, self.idle_timeout))
     }
 
     async fn put_inner(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
@@ -779,9 +790,9 @@ impl ObjectStore for GcsStore {
             builder = builder.set_read_range(range_to_read_range(range));
         }
 
-        let resp = match tokio::time::timeout(READ_OPEN_DEADLINE, builder.send()).await {
+        let resp = match tokio::time::timeout(self.idle_timeout, builder.send()).await {
             Ok(r) => r.map_err(|e| map_error(key, e))?,
-            Err(_) => return Err(deadline_error("read", key, READ_OPEN_DEADLINE)),
+            Err(_) => return Err(deadline_error("read", key, self.idle_timeout)),
         };
         let obj = resp.object();
         // ObjectHighlights carries size/generation of the read object.
@@ -793,7 +804,7 @@ impl ObjectStore for GcsStore {
 
         Ok(GetResult::Object {
             meta,
-            body: unfold_response(key, resp, permit),
+            body: unfold_response(key, resp, permit, self.idle_timeout),
         })
     }
 
@@ -1103,20 +1114,21 @@ fn unfold_response(
     key: &str,
     resp: google_cloud_storage::read_object::ReadObjectResponse,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    idle: std::time::Duration,
 ) -> ByteStream {
     let key = key.to_owned();
     let stream = futures::stream::unfold(
         (Some(resp), key, permit),
-        |(mut resp, key, permit)| async move {
+        move |(mut resp, key, permit)| async move {
             let r = resp.as_mut()?;
-            match tokio::time::timeout(READ_CHUNK_DEADLINE, r.next()).await {
+            match tokio::time::timeout(idle, r.next()).await {
                 Ok(Some(Ok(bytes))) => Some((Ok(bytes), (resp, key, permit))),
                 Ok(Some(Err(e))) => Some((Err(StoreError::other(e)), (resp, key, permit))),
                 Ok(None) => None,
                 // A stalled body ends the stream with a retryable error; the
                 // response is dropped so the next poll yields None.
                 Err(_) => Some((
-                    Err(deadline_error("read_chunk", &key, READ_CHUNK_DEADLINE)),
+                    Err(deadline_error("read_chunk", &key, idle)),
                     (None, key, permit),
                 )),
             }
@@ -1606,7 +1618,8 @@ mod resume_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let bulk = BulkHttp::for_tests(format!("http://{addr}"), "b".into());
+        let bulk =
+            BulkHttp::for_tests(format!("http://{addr}"), "b".into(), std::time::Duration::from_secs(10));
         let (size, generation, mut body) = bulk.read("k", None, None).await.unwrap();
         assert_eq!((size, generation), (3000, Some(7)));
         let mut got = Vec::new();
@@ -1619,5 +1632,34 @@ mod resume_tests {
             3,
             "first request + two resumes"
         );
+    }
+
+    /// #130 regression — the wedge shape: a peer that accepts the TCP
+    /// connection and then **never replies** (no bytes, no RST; a dropped VPN
+    /// tunnel to the bucket looks exactly this). The bulk-HTTP read lane must
+    /// surface a retryable error within `store.idle_timeout`, never hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_peer_bulk_read_times_out_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold forever: the request bytes sit in the socket, no
+        // response ever comes.
+        let mut held: Vec<_> = Vec::new();
+        let accept = tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+            held
+        });
+
+        let idle = std::time::Duration::from_millis(500);
+        let bulk = BulkHttp::for_tests(format!("http://{addr}"), "b".into(), idle);
+        let started = std::time::Instant::now();
+        let Err(err) = bulk.open("wal/pack.pack", None, None).await else {
+            panic!("dead peer must not answer");
+        };
+        assert!(err.is_retryable(), "dead peer must be retryable: {err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        accept.abort();
     }
 }

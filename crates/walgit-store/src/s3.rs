@@ -62,6 +62,10 @@ pub struct S3Store {
     bucket: String,
     /// reqwest client for streaming GETs via presigned URLs.
     http: reqwest::Client,
+    /// #130: bound on *silence*, not total time — no response head within this
+    /// on a presigned GET, and no bytes for this long mid-body (a 30 GiB range
+    /// read streams fine; a dropped tunnel errors as Retryable).
+    idle_timeout: Duration,
     multipart_threshold: u64,
     multipart_part_size: u64,
 }
@@ -95,23 +99,47 @@ impl S3Store {
         );
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
+        // #130: socket bounds on the SDK lane (HEAD/PUT/multipart/LIST — every
+        // one of them rides `client`, and every one has wedged a process at
+        // 15.5 h of sleep on a dead connection). `connect_timeout` caps TCP+TLS
+        // connect; `read_timeout` caps request→response-head *per attempt*
+        // (verified in aws-smithy-http-client 1.2.0: it wraps the connector's
+        // call future, not the body) — so it bounds control calls and bounded
+        // part uploads (≤ `multipart_part_size`) without touching streamed
+        // reads, which leave the SDK entirely: GETs go presigned through
+        // `http` below, with their own connect + idle bounds. The SDK's own
+        // retry policy (attempt cap 3) still applies; the store-level
+        // `max_retries` backoff layers on top.
+        let sdk_timeout = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .connect_timeout(cfg.connect_timeout)
+            .read_timeout(cfg.idle_timeout)
+            .build();
+
         let mut s3_config = aws_sdk_s3::Config::builder()
             .region(region)
             .credentials_provider(creds)
             .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
+            .behavior_version_latest()
+            .timeout_config(sdk_timeout);
 
         if !cfg.s3.endpoint.is_empty() {
             s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
         }
 
         let client = S3Client::from_conf(s3_config.build());
-        let http = reqwest::Client::builder().build()?;
+        // The presigned-GET lane: connect capped by `connect_timeout`, body
+        // liveness enforced per chunk below (reqwest has no read-idle
+        // timeout, and `Client::timeout` is a *total* deadline — the one
+        // thing a 24-minute clone must not inherit, §2.3).
+        let http = reqwest::Client::builder()
+            .connect_timeout(cfg.connect_timeout)
+            .build()?;
 
         Ok(S3Store {
             client,
             bucket: cfg.bucket.clone(),
             http,
+            idle_timeout: cfg.idle_timeout,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
         })
@@ -150,12 +178,20 @@ impl S3Store {
             req = req.header(name, value);
         }
 
-        req.send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 get http: {e}")))
+        // Open = connect + wait for response headers: cap the silence by the
+        // idle bound (#130 — a dead pooled connection would hang `send()`
+        // forever; bytes that flow are a different conversation, see the
+        // per-chunk bound in `get_result_from_response`).
+        match tokio::time::timeout(self.idle_timeout, req.send()).await {
+            Ok(r) => r.map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 get http: {e}"))),
+            Err(_) => Err(StoreError::retryable(anyhow::anyhow!(
+                "s3 get {key}: no response after {:?} (idle timeout)",
+                self.idle_timeout
+            ))),
+        }
     }
 
-    fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
+    fn get_result_from_response(key: &str, resp: reqwest::Response, idle: Duration) -> Result<GetResult> {
         let status = resp.status();
         let etag = resp
             .headers()
@@ -185,9 +221,22 @@ impl S3Store {
                     size: total.or(content_length).unwrap_or(0),
                     version,
                 };
-                let body = resp
-                    .bytes_stream()
-                    .map(|r| r.map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 body: {e}"))))
+                // Per-chunk idle bound, not a total deadline: a 30 GiB range
+                // read streams for as long as bytes arrive; a tunnel that went
+                // quiet mid-body errors as Retryable after `idle` of silence
+                // and the remote reader retries the segment (#130 — the 24-min
+                // clone must survive this bound, the dead connection must not).
+                let key_owned = key.to_owned();
+                let body = tokio_stream::StreamExt::timeout(resp.bytes_stream(), idle)
+                    .map(move |r| match r {
+                        Ok(Ok(b)) => Ok(b),
+                        Ok(Err(e)) => {
+                            Err(StoreError::retryable(anyhow::anyhow!("s3 body: {e}")))
+                        }
+                        Err(_) => Err(StoreError::retryable(anyhow::anyhow!(
+                            "s3 body {key_owned}: no bytes for {idle:?} (idle timeout)"
+                        ))),
+                    })
                     .boxed();
                 Ok(GetResult::Object { meta, body })
             }
@@ -251,10 +300,35 @@ where
     err.as_service_error().and_then(|e| e.meta().code())
 }
 
+/// #130: the transport shapes a wedge produces — a connect timeout, a read
+/// timeout (no response head within `store.idle_timeout`), a dead connector,
+/// a dispatch error — say nothing about the object and are exactly what the
+/// callers' retry budgets exist for: surface them as `Retryable`, never as
+/// the old catch-all `Other` that turned a dead tunnel into an
+/// un-retryable-looking hang. Returns `None` for non-transport errors so the
+/// site's own classification (CAS codes, 404 leniency) still applies.
+fn transport_retryable<E>(what: &str, err: &aws_sdk_s3::error::SdkError<E>) -> Option<StoreError> {
+    use aws_sdk_s3::error::SdkError;
+    let kind = match err {
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(d) if d.is_timeout() => "timeout",
+        SdkError::DispatchFailure(d) if d.is_io() => "io",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "incomplete response",
+        _ => return None,
+    };
+    Some(StoreError::retryable(anyhow::anyhow!(
+        "s3 {what} {kind} failure: {err}"
+    )))
+}
+
 fn classify_put_error(
     key: &str,
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 ) -> StoreError {
+    if let Some(e) = transport_retryable("put", err) {
+        return e;
+    }
     let code = err_code(err).unwrap_or("");
     match code {
         "PreconditionFailed" | "ConditionalRequestConflict" => StoreError::PreconditionFailed {
@@ -268,6 +342,9 @@ fn classify_put_error(
 fn classify_list_error(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
 ) -> StoreError {
+    if let Some(e) = transport_retryable("list", err) {
+        return e;
+    }
     StoreError::Other(anyhow::anyhow!("s3 list error: {err}"))
 }
 
@@ -279,7 +356,7 @@ impl ObjectStore for S3Store {
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let resp = self.presigned_get(key, &opts).await?;
-        Self::get_result_from_response(key, resp)
+        Self::get_result_from_response(key, resp, self.idle_timeout)
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
@@ -311,7 +388,9 @@ impl ObjectStore for S3Store {
                 {
                     return Ok(None);
                 }
-                Err(StoreError::Other(anyhow::anyhow!("s3 head error: {err}")))
+                Err(transport_retryable("head", &err).unwrap_or_else(|| {
+                    StoreError::Other(anyhow::anyhow!("s3 head error: {err}"))
+                }))
             }
         }
     }
@@ -419,7 +498,8 @@ impl ObjectStore for S3Store {
                         return Ok(());
                     }
                 }
-                Err(StoreError::Other(anyhow::anyhow!("s3 delete error: {err}")))
+                Err(transport_retryable("delete", &err)
+                    .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 delete error: {err}"))))
             }
         }
     }
@@ -614,7 +694,10 @@ impl ObjectStore for S3Store {
         let upload = create
             .send()
             .await
-            .map_err(|e| StoreError::Other(anyhow::anyhow!("s3 create multipart: {e}")))?;
+            .map_err(|e| {
+                transport_retryable("create multipart", &e)
+                    .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 create multipart: {e}")))
+            })?;
         let upload_id = upload
             .upload_id()
             .ok_or_else(|| {
@@ -663,7 +746,9 @@ impl ObjectStore for S3Store {
                         .send()
                         .await
                         .map_err(|e| {
-                            StoreError::Other(anyhow::anyhow!("s3 upload part copy: {e}"))
+                            transport_retryable("upload part copy", &e).unwrap_or_else(|| {
+                                StoreError::Other(anyhow::anyhow!("s3 upload part copy: {e}"))
+                            })
                         })?;
                     let etag = part
                         .copy_part_result()
@@ -732,7 +817,10 @@ impl ObjectStore for S3Store {
                         .content_length(len_i64)
                         .send()
                         .await
-                        .map_err(|e| StoreError::Other(anyhow::anyhow!("s3 upload part: {e}")))?;
+                        .map_err(|e| {
+                            transport_retryable("upload part", &e)
+                                .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 upload part: {e}")))
+                        })?;
                     parts.push(
                         aws_sdk_s3::types::CompletedPart::builder()
                             .e_tag(part.e_tag().unwrap_or("").to_owned())
@@ -766,9 +854,8 @@ impl ObjectStore for S3Store {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(dest, &upload_id).await;
-                return Err(StoreError::Other(anyhow::anyhow!(
-                    "s3 complete multipart: {e}"
-                )));
+                return Err(transport_retryable("complete multipart", &e)
+                    .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 complete multipart: {e}"))));
             }
         };
         let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
@@ -830,7 +917,10 @@ impl S3Store {
         let upload = create
             .send()
             .await
-            .map_err(|e| StoreError::Other(anyhow::anyhow!("s3 create multipart: {e}")))?;
+            .map_err(|e| {
+                transport_retryable("create multipart", &e)
+                    .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 create multipart: {e}")))
+            })?;
 
         let upload_id = upload
             .upload_id()
@@ -902,7 +992,8 @@ impl S3Store {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = self.abort_multipart(key, &upload_id).await;
-                    return Err(StoreError::Other(anyhow::anyhow!("s3 upload part: {e}")));
+                    return Err(transport_retryable("upload part", &e)
+                        .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 upload part: {e}"))));
                 }
             };
 
@@ -935,9 +1026,8 @@ impl S3Store {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(key, &upload_id).await;
-                return Err(StoreError::Other(anyhow::anyhow!(
-                    "s3 complete multipart: {e}"
-                )));
+                return Err(transport_retryable("complete multipart", &e)
+                    .unwrap_or_else(|| StoreError::Other(anyhow::anyhow!("s3 complete multipart: {e}"))));
             }
         };
 
@@ -988,6 +1078,145 @@ fn static_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #130 regression — the wedge shape: a peer that accepts the TCP
+    /// connection and then **never replies** (no bytes, no RST; a dropped
+    /// VPN tunnel to R2 looks exactly like this). Before the socket bounds,
+    /// `compact --base` slept 15.5 h on two such connections. With them,
+    /// every lane — the SDK (head/put/list) and the presigned-GET reqwest —
+    /// must return a **retryable** error, not hang, not `Other`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_peer_yields_retryable_errors_not_hangs() {
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Accept and keep the sockets open, never read, never answer: a
+        // request hangs exactly as it does on a silently dead tunnel.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let accepted = accepted.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    accepted.lock().unwrap().push(stream);
+                }
+            });
+        }
+
+        let cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "wedge".into(),
+            s3: walgit_config::S3Config {
+                endpoint: format!("http://{addr}"),
+                access_key: Some("ak".into()),
+                secret_key: Some("sk".into()),
+                ..Default::default()
+            },
+            connect_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let store = S3Store::new(&cfg).unwrap();
+
+        // The SDK lane (this is where `compact --base` wedged: HEADs and
+        // UploadPart on keep-alive connections that went dead).
+        let started = Instant::now();
+        let err = store.head("repos/x/y/manifest.pb").await.unwrap_err();
+        assert!(err.is_retryable(), "head: {err:?}");
+        // SDK internal retries (3 attempts) plus jittered backoff: bound it
+        // generously — minutes-waiting is the bug, seconds is the fix.
+        assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+
+        // The presigned-GET lane (ranged reads, the 24-minute clone traffic).
+        let started = Instant::now();
+        let Err(err) = ObjectStore::get(
+            &store,
+            "repos/x/y/wal/pack.pack",
+            GetOptions {
+                range: Some(0..1024),
+                ..GetOptions::default()
+            },
+        )
+        .await
+        else {
+            panic!("dead peer must not answer");
+        };
+        assert!(err.is_retryable(), "get: {err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// The idle bound must measure **silence**, not total time: a response
+    /// that trickles bytes forever is a working download (a 30 GiB base-pack
+    /// range read at §1.1 speeds is legitimate), and must not be cut off by
+    /// the deadline that kills the dead connection above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trickling_body_is_not_killed_by_the_idle_bound() {
+        use futures::TryStreamExt;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunk = b"x".repeat(1024);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let chunk = chunk.clone();
+                std::thread::spawn(move || {
+                    // Read the request (whatever it is), then drip the body:
+                    // one byte-range window of latency per 500 ms — every
+                    // gap is *below* the 2 s idle bound, the total is far
+                    // above it.
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 8192\r\netag: \"trickle\"\r\n\r\n",
+                    );
+                    let _ = s.flush();
+                    for _ in 0..8 {
+                        std::thread::sleep(Duration::from_millis(500));
+                        if s.write_all(&chunk).is_err() || s.flush().is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "trickle".into(),
+            s3: walgit_config::S3Config {
+                endpoint: format!("http://{addr}"),
+                access_key: Some("ak".into()),
+                secret_key: Some("sk".into()),
+                ..Default::default()
+            },
+            connect_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let store = S3Store::new(&cfg).unwrap();
+
+        let started = Instant::now();
+        let got = ObjectStore::get(&store, "wal/pack.pack", GetOptions::default())
+            .await
+            .expect("trickle must not trip the idle bound");
+        let GetResult::Object { body, .. } = got else {
+            panic!("object expected");
+        };
+        let bytes = body
+            .try_fold(Vec::new(), |mut acc, b| async move {
+                acc.extend_from_slice(&b);
+                Ok(acc)
+            })
+            .await
+            .expect("full body survives");
+        assert_eq!(bytes.len(), 8192, "all 8 chunks");
+        assert!(started.elapsed() > Duration::from_secs(2), "test itself must stream longer than the idle bound — otherwise it proves nothing");
+    }
 
     #[test]
     fn static_credentials_include_session_token_when_present() {

@@ -236,6 +236,19 @@ pub struct StoreConfig {
     pub gcs: GcsConfig,
     pub s3: S3Config,
     pub max_retries: u32,
+    /// TCP+TLS connect bound for every bucket client (S3 SDK, S3 presigned-GET
+    /// lane, GCS bulk HTTP lane) — issue #130.
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
+    /// **Idle** bound, not a total deadline (issue #130): a bucket request
+    /// fails once no byte has flowed for this long, so a dead connection
+    /// (no data, no RST — e.g. a dropped tunnel) surfaces as a retryable
+    /// error instead of wedging the operation forever. A legitimate large
+    /// download (a 30 GiB base-pack range read, a 24-minute clone) may run
+    /// for many minutes and must not be cut off by this value while bytes
+    /// keep arriving.
+    #[serde(with = "humantime_serde")]
+    pub idle_timeout: Duration,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
     pub multipart_part_size: ByteSize,
@@ -1093,6 +1106,8 @@ impl Default for StoreConfig {
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
             max_retries: 8,
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(120),
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
         }
