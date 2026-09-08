@@ -449,6 +449,14 @@ decision in §4 — or the PR is; never "fix later".
   submission on the *running* config, never `Config::default()`. `/api/v1/me`
   carries `admin` so the SPA can gate its entry; `/setup` renders the double
   face. One mechanism, two mounts (`crates/walgit-server/src/store_settings.rs`).
+  Hardened by #129: both saves write the file **atomically** (same-directory
+  temp + rename, 0600 — `walgit.toml` is the literal credentials' only
+  carrier and a torn write would strand the instance); `can_save` requires
+  the `--config` path to be a **regular file** (`/dev/null`/`NUL`/fifo
+  accept writes and discard them — refused like a missing file); and a save
+  whose file holds no literal credential while the environment supplies one
+  answers `warnings: [...]` instead of a silent "kept". Concurrent PUTs are
+  last-writer-wins (admin-only surface, tiny file).
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

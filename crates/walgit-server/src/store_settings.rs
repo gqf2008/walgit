@@ -40,6 +40,7 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::setup_wizard::{
     BlankCreds, SetupStore, apply_store, edit_store_table, parse_setup_store, probe_store,
+    storable_config_path, write_atomic,
 };
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -107,7 +108,7 @@ async fn snapshot(
         force_path_style: s3.force_path_style,
         has_access_key: s3.access_key.as_deref().is_some_and(|v| !v.is_empty()),
         has_secret_key: s3.secret_key.as_deref().is_some_and(|v| !v.is_empty()),
-        can_save: st.config_path.is_some(),
+        can_save: storable_config_path(st.config_path.as_ref()),
     };
     let mut r = axum::Json(snapshot).into_response();
     // Mutable admin state over a credentialed lane: nothing to cache, and a
@@ -137,6 +138,61 @@ fn scratch_from_running(
     let mut scratch = (*st.cfg).clone();
     apply_store(&mut scratch, store, BlankCreds::Keep)?;
     Ok(scratch)
+}
+
+/// Issue #129: the file is the credentials' **only durable carrier** — an
+/// environment is not. The editor's GET shows `has_access_key`/`has_secret_key`
+/// from the *running* config, which merges `WALGIT__STORE__S3__*` env
+/// overrides, and a blank credential keeps whatever the running config had —
+/// so a save can happily report "kept" while the file holds no literal
+/// value. Both env shapes then boot today and fail to boot once the
+/// environment moves on: an override merged into `running` (but absent from
+/// `file`), or a credential resolved at store-open from the variable named by
+/// `access_key_env`/`secret_key_env`. Say so in the response rather than let
+/// the admin discover it at the next restart.
+///
+/// `lookup` resolves an env var (a seam so the check is unit-testable without
+/// mutating the test process's environment).
+fn credential_env_warnings(
+    file: &walgit_config::Config,
+    running: &walgit_config::Config,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !matches!(file.store.backend, walgit_config::StoreBackend::S3) {
+        return warnings;
+    }
+    for slot in ["access_key", "secret_key"] {
+        let (file_literal, running_literal, env_name) = match slot {
+            "access_key" => (
+                file.store.s3.access_key.as_deref().unwrap_or(""),
+                running.store.s3.access_key.as_deref().unwrap_or(""),
+                file.store.s3.access_key_env.as_str(),
+            ),
+            _ => (
+                file.store.s3.secret_key.as_deref().unwrap_or(""),
+                running.store.s3.secret_key.as_deref().unwrap_or(""),
+                file.store.s3.secret_key_env.as_str(),
+            ),
+        };
+        if !file_literal.is_empty() {
+            continue; // the file carries it; nothing a restart can lose.
+        }
+        let env_override = !running_literal.is_empty();
+        let env_named =
+            !env_name.is_empty() && lookup(env_name).is_some_and(|v| !v.is_empty());
+        if env_override || env_named {
+            warnings.push(format!(
+                "the saved config has no literal {slot}: this instance gets it from the environment ({}), which the file does not capture — a restart outside that environment will fail to open the store (put the credential in the form, or move it into the file)",
+                if env_override {
+                    format!("a WALGIT__STORE__S3__{} override", slot.to_uppercase())
+                } else {
+                    format!("the `{env_name}` variable named by {slot}_env")
+                }
+            ));
+        }
+    }
+    warnings
 }
 
 /// `POST /api/v1/store/test` — probe a *candidate* (admin; 404 in setup
@@ -176,7 +232,11 @@ async fn save(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -
     if let Err(e) = st.auth.require_admin(&headers).await {
         return ApiError::from(e).into_response();
     }
-    let Some(config_path) = st.config_path.clone() else {
+    let Some(config_path) = st
+        .config_path
+        .clone()
+        .filter(|p| storable_config_path(Some(p)))
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "this instance was not started from a config file (start with walgit serve --config walgit.toml); saved nothing",
@@ -197,6 +257,7 @@ async fn save(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -
                 .into_response();
         }
     };
+    let mut warnings = Vec::new();
 
     // 1. Compose + validate a scratch (running config ⊕ submission) first —
     //    a refusal must not touch the file.
@@ -266,20 +327,19 @@ async fn save(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -
             .into_response();
     }
 
-    // 4. Write, tighten the mode (the file now holds credentials), and arm
-    //    the restart when the CLI serve path runs under a supervisor (D43).
-    if let Err(e) = std::fs::write(&config_path, &edited_text) {
+    // 4. Write atomically (same-dir temp + rename, 0600; #129), check the
+    //    env-override shape into warnings, and arm the restart when the CLI
+    //    serve path runs under a supervisor (D43).
+    if let Err(e) = write_atomic(&config_path, &edited_text) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("config file {} is not writable: {e}", config_path.display()),
         )
             .into_response();
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
-    }
+    warnings.extend(credential_env_warnings(&parsed, &st.cfg, |name| {
+        std::env::var(name).ok()
+    }));
     if st.setup_exit {
         // The tray watcher treats exit 75 as "restart me" (D43). The response
         // must flush first, so the exit lands a beat later.
@@ -294,6 +354,7 @@ async fn save(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -
         Json(serde_json::json!({
             "saved": true,
             "restart": if st.setup_exit { "supervisor" } else { "manual" },
+            "warnings": warnings,
             "file": config_path.display().to_string(),
         })),
     )
@@ -407,5 +468,54 @@ force_path_style = true
         assert!(json.contains("\"has_access_key\":true"), "{json}");
         assert!(json.contains("\"has_secret_key\":true"), "{json}");
         assert!(!json.contains("s3cr3t"), "{json}");
+    }
+
+    /// #129-B: the env-override warning — both env shapes (a merged
+    /// `WALGIT__…` override visible in the running config, and a
+    /// `*_env`-named variable resolved at store-open) warn when the saved
+    /// file holds no literal value; a file with literals never warns.
+    #[test]
+    fn env_supplied_credentials_are_warned_and_literal_ones_are_not() {
+        let mut file = walgit_config::Config::default();
+        file.store.backend = walgit_config::StoreBackend::S3;
+        file.store.s3.access_key_env = "TEST_AK_ENV".into();
+        file.store.s3.secret_key_env = "TEST_SK_ENV".into();
+        let mut running = file.clone();
+
+        // Nothing anywhere: no warning (the wizard's own GCS/ADC shape).
+        let none_lookup = |_: &str| None;
+        assert!(credential_env_warnings(&file, &running, none_lookup).is_empty());
+
+        // A WALGIT__-style override reached the running config only.
+        running.store.s3.access_key = Some("from-override".into());
+        let w = credential_env_warnings(&file, &running, none_lookup);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("access_key"), "{w:?}");
+        assert!(w[0].contains("WALGIT__STORE__S3__ACCESS_KEY"), "{w:?}");
+
+        // The `*_env`-named variable is set in the process environment.
+        running.store.s3.access_key = None;
+        let lookup = |name: &str| match name {
+            "TEST_SK_ENV" => Some("from-env".into()),
+            _ => None,
+        };
+        let w = credential_env_warnings(&file, &running, lookup);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("secret_key"), "{w:?}");
+        assert!(w[0].contains("TEST_SK_ENV"), "{w:?}");
+
+        // The file itself carries both: silence.
+        file.store.s3.access_key = Some("ak".into());
+        file.store.s3.secret_key = Some("sk".into());
+        let w = credential_env_warnings(&file, &running, |name| {
+            (!name.is_empty()).then_some("x".into())
+        });
+        assert!(w.is_empty(), "{w:?}");
+
+        // A blank literal reads as absent (it must still warn).
+        file.store.s3.access_key = Some(String::new());
+        running.store.s3.access_key = Some("from-override".into());
+        let w = credential_env_warnings(&file, &running, none_lookup);
+        assert_eq!(w.len(), 1, "{w:?}");
     }
 }

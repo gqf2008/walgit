@@ -49,7 +49,10 @@ POST /api/v1/setup/save    → {store:{...same}, admin_token?, admin_principal?}
 
 Setup state requires a loopback listen (startup refusal otherwise). S3
 credentials persist as literals (`[store.s3] access_key`/`secret_key`, they
-win over `*_env`; 0600 the file); GCS rides ADC.
+win over `*_env`; 0600 the file); GCS rides ADC. `can_save` on both this
+surface and `/api/v1/store` is true only when the `--config` path is a
+regular file — `/dev/null`/`NUL` instances refuse the save with the 503
+(#129); successful saves write atomically (same-dir temp + rename, #129).
 
 ## 0. Lanes and auth (D27)
 
@@ -291,7 +294,7 @@ GET  /api/v1/store  → 200 {backend,bucket,prefix,endpoint,region,force_path_st
 POST /api/v1/store/test → {backend:"s3"|"gcs",bucket,endpoint,region,access_key,secret_key,force_path_style}
                             → 200 {ok:true,…} / 400 {ok:false,message}; nothing persisted
 PUT  /api/v1/store  → {store:{…same fields…}}
-                            → 200 {saved:true,restart:"supervisor"|"manual",file}; 400/503 on refusal
+                            → 200 {saved:true,restart:"supervisor"|"manual",warnings:[…],file}; 400/503 on refusal
 ```
 
 Two contracts distinguish this from the wizard's surface:
@@ -308,8 +311,22 @@ Two contracts distinguish this from the wizard's surface:
 * `PUT` body is exactly `{store: {...}}` — the wizard's first-admin fields
   (`admin_token`, `admin_principal`) are refused with a `400` here. Validation
   happens **before** the file is touched: a `400` writes nothing.
-* `can_save: false` (instance not started from a config file, D39) ⇒ `PUT`
-  answers `503` with the reason.
+* `can_save: false` ⇒ `PUT` answers `503` with the reason. False when the
+  instance was not started from a config file **or the `--config` path is not
+  a regular file** — `--config /dev/null` (D39's explicit defaults+env form,
+  `NUL` on Windows) accepts writes and discards them, so saving into it is
+  refused (#129).
+* `warnings` (issue #129): a successful save reports, in addition to
+  `saved`, the ways the written file is not self-sufficient. Today one case:
+  the file holds no literal `access_key`/`secret_key` while the running
+  instance gets it from the environment (a `WALGIT__STORE__S3__*` override,
+  or the variable named by `access_key_env`/`secret_key_env`). Such an
+  instance boots today and fails to open the store on a restart outside that
+  environment — the editor's "blank = keep" kept only what the *file* can
+  see, so the response says so instead of lying silently. `[]` when the save
+  is durable on its own. The write-back is an atomic same-directory
+  temp-file + rename (#129), so a crash or ENOSPC mid-save cannot destroy
+  the credentials' only carrier; concurrent PUTs are last-writer-wins.
 
 The SPA renders this as `/setup`'s admin face (pre-filled form, the top-bar
 「存储配置」entry for `me.admin`); the SDK maps all three
