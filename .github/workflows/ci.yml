@@ -75,8 +75,8 @@ jobs:
       # PR that forgot it goes red here — hand-syncing two enumerations drifted
       # twice (c971024, then 7f18675/#136). The reverse direction self-guards: cargo
       # aborts with "no test target named" on a stale entry. Both legs consume the
-      # same variable, so this one check covers both; the windows step additionally
-      # asserts no listed suite compiled to zero tests.
+      # same variable, so this one check covers both; each leg additionally asserts
+      # no listed suite compiled to zero tests (ubuntu's Fast tier below).
       - name: Server suite list is complete
         run: |
           set -euo pipefail
@@ -84,8 +84,16 @@ jobs:
             echo "nested test target (tests/<dir>/main.rs) is outside the guard's glob: flatten it or extend this step"
             exit 1
           fi
-          grep -qF 'cargo test -p walgit-server {{SERVER_TESTS}}' justfile || {
-            echo "test-server-integration no longer interpolates SERVER_TESTS — the single source became decorative"; exit 1; }
+          # An empty/renamed tests dir would expand the glob below to a literal `*`,
+          # which the case patterns then match — a silently green guard. A server with
+          # no integration suites is not that.
+          [ -n "$(ls crates/walgit-server/tests/*.rs 2>/dev/null)" ] || {
+            echo "no suites matched crates/walgit-server/tests/*.rs — the guard would be vacuous"; exit 1; }
+          # Whole-line match on purpose: a substring match stays green if someone puts
+          # a {{tN}} back in front of the recipe line (the windows hazard the recipe's
+          # own comment warns about), which is exactly what this check must catch.
+          grep -qE '^[[:space:]]*cargo test -p walgit-server \{\{SERVER_TESTS\}\}[[:space:]]*$' justfile || {
+            echo "test-server-integration no longer interpolates SERVER_TESTS on its own line — the single source became decorative"; exit 1; }
           list="$(just --evaluate SERVER_TESTS)"
           exempt="$(just --evaluate SERVER_TEST_EXEMPT)"
           for f in crates/walgit-server/tests/*.rs; do
@@ -101,9 +109,22 @@ jobs:
       # separate `if: failure()` step would re-run after ANY earlier step
       # failure (web-build, warnings) and, when the retry succeeded, would
       # still leave the job red and get reported as a regression.
+      #
+      # The zero-test assertion re-runs the integration set once so it can be tee'd
+      # on its own (~20 s for its 80 tests): a suite gated behind #[cfg(windows)]
+      # compiles to an empty binary on ubuntu and cargo still exits 0, and the
+      # windows leg's identical assertion cannot see that direction — the pair is
+      # what makes "registered" mean "executed". It cannot fold into `just test`:
+      # the workspace bin/lib targets legitimately print `running 0 tests` there.
       - name: Fast tier (retry once on timeout)
         run: |
+          set -eo pipefail
           just test || { echo "test failed once (possibly a CI-load timeout); rerunning"; sleep 5; just test; }
+          just test-server-integration 2>&1 | tee server-integration.log || { echo "integration set failed once; rerunning"; sleep 5; just test-server-integration 2>&1 | tee server-integration.log; }
+          if grep -n '^running 0 tests' server-integration.log; then
+            echo "a listed suite ran 0 tests on ubuntu — a platform gate hid it (#137); the lines above name the binary"
+            exit 1
+          fi
       # Rerun once on failure: sim has known-flaky cases (~1 in 7 base_rebuild,
       # AGENTS.md §5); a second failure is a regression.
       - name: Simulation suite
@@ -227,7 +248,8 @@ jobs:
       # not wrap cargo lines with them (see the recipe's comment). The zero-test
       # assertion: a cfg-gated suite compiles to an empty binary and exits GREEN,
       # which is #137's silent-shrinkage failure one granularity deeper; this leg
-      # is where shrinkage was proven possible, so the assertion lives here.
+      # is where shrinkage was proven possible, so the assertion lives here too (the
+      # ubuntu leg carries the mirror-image check for #[cfg(windows)]-only suites).
       - name: Server integration
         shell: bash
         timeout-minutes: 10

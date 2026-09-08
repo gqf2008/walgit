@@ -26,3 +26,7 @@ result-*
 
 # macOS/ExFAT AppleDouble junk (see LESSON_ExFAT卷同步文件生成点下划线AppleDouble需gitignore排除)
 ._*
+
+# CI step artefact: the zero-test assertion tees the integration run here
+# (ci.yml "Fast tier" and windows "Server integration"). Locally reproducible.
+server-integration.log

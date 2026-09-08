@@ -95,7 +95,8 @@ SERVER_TESTS := "--test web_api --test web_ui --test api_v1 --test static_http -
 
 # tests/ files that are not suites: harness.rs is the shared module the suites
 # `mod` in (it has no #[test] of its own); e2e/sim are separate tiers with their
-# own recipes. Read by the ci.yml guard step.
+# own recipes. Read by the ci.yml guard step. An entry here means NO leg runs the
+# file — only files that genuinely are not suites belong on it.
 SERVER_TEST_EXEMPT := "harness e2e sim"
 
 # The probe invariant: just evaluates EVERY top-level backtick variable when any
