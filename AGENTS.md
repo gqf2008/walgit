@@ -502,11 +502,15 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,
   `WALGIT_TOKEN`). Never `cargo test --workspace --no-fail-fast` in a session; wrap ad-hoc cargo in `timeout`.
 - Known flaky (find the cause, not the assertion):
-  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`;
-  passes alone; rerun, not skip). Root cause #138, fixed by #139 (`copy_tree` tolerates the
-  concurrent `install_commit_graph_base` deletes — transient `.tmp` names skipped, NotFound inside
-  the commit-graph state tolerated, every other error names its source path); delete this entry
-  after ~1 week of windows-leg first-pass green.
+  `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (shared `TEST_ABORT_AFTER`).
+  Its "~1 in 7" was counted on **job conclusions**: the sim step's own rerun swallowed the
+  first-pass reds. #138 measured 4 reds in 24 h on windows first pass, and inside one job both
+  attempts can fail identically — the race is with this instance's own post-publish commit-graph
+  writer, not with another test, so "passes alone" is a machine-state coincidence, not a verdict.
+  Root cause #138, fixed by #139 (`copy_tree` now skips transient `.tmp` names, tolerates
+  `NotFound` inside the commit-graph state only, and puts the source path in every other error).
+  Delete this entry after ~1 week of windows-leg **first-pass** green — the per-attempt metric,
+  not the job conclusion that misled us here.
   Windows-only timing cases (issue #94; assertions widened for windows; the walgit-wal CI step
   reruns once and the sim suite already reruns once):
   `walgit_wal::tests::test_refs_sync_never_waits_behind_a_long_read_guard` and
