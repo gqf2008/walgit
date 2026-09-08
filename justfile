@@ -88,6 +88,10 @@ test:
     {{t5}} cargo test --workspace --lib --bins
     {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
     {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test budgets
+    # #134 (PR #133 audit): these five hermetic harness suites existed but
+    # were never enumerated — CI never ran them. Same shape as the line above
+    # (in-memory store, tempdir caches, real git; ~6 s for their 21 tests).
+    {{t5}} cargo test -p walgit-server --test setup_wizard --test api_cli --test follow --test policy --test policy_inbox
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:

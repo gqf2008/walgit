@@ -192,7 +192,12 @@ jobs:
           # walgit-wal tests carry the windows-timing-sensitive refs-sync case
           # (AGENTS.md §5, issue #94): rerun once, then treat a repeat as real.
           cargo test -p walgit-wal --tests || { echo "walgit-wal tests failed once (windows timing flaky); rerunning"; sleep 3; cargo test -p walgit-wal --tests; }
-          cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+          # setup_wizard (issue #134): the config write-back is the platform
+          # seam (atomic temp+rename, 0600, /dev/null-vs-NUL — #129/#135), so
+          # it earns the windows leg; its one unix-only case is #[cfg(unix)]-
+          # gated. The api_cli/follow/policy/policy_inbox family is covered
+          # on ubuntu through the justfile's `test` (AGENTS.md §5 fast tier).
+          cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test setup_wizard
       - name: Simulation suite
         # Fault-injected cluster (WALGIT_SIM_SEEDS, default 2). Known flaky:
         # base_rebuild_resumes_after_a_kill_between_any_two_phases ~1 in 7

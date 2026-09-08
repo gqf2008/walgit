@@ -330,7 +330,10 @@ Two contracts distinguish this from the wizard's surface:
 
 The SPA renders this as `/setup`'s admin face (pre-filled form, the top-bar
 「存储配置」entry for `me.admin`); the SDK maps all three
-(`client.store.get/test/save`, D20).
+(`client.store.get/test/save`, D20). The save-success phase of the same page
+lists `warnings` in a warning box (`StoreSaveResult.warnings`, #134) — on
+both faces, the wizard's `POST /api/v1/setup/save` and the editor's `PUT` —
+so an env-supplied credential never waits for the next restart to be found.
 
 ### `GET /api/v1/principals` · `PUT|DELETE /api/v1/principals/{principal}`
 
