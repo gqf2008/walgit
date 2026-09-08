@@ -503,7 +503,10 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   `WALGIT_TOKEN`). Never `cargo test --workspace --no-fail-fast` in a session; wrap ad-hoc cargo in `timeout`.
 - Known flaky (find the cause, not the assertion):
   `sim::base_rebuild_resumes_after_a_kill_between_any_two_phases` (~1 in 7, shared `TEST_ABORT_AFTER`;
-  passes alone; rerun, not skip).
+  passes alone; rerun, not skip). Root cause #138, fixed by #139 (`copy_tree` tolerates the
+  concurrent `install_commit_graph_base` deletes — transient `.tmp` names skipped, NotFound inside
+  the commit-graph state tolerated, every other error names its source path); delete this entry
+  after ~1 week of windows-leg first-pass green.
   Windows-only timing cases (issue #94; assertions widened for windows; the walgit-wal CI step
   reruns once and the sim suite already reruns once):
   `walgit_wal::tests::test_refs_sync_never_waits_behind_a_long_read_guard` and

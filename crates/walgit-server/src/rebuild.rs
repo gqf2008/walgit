@@ -105,36 +105,114 @@ fn write_marker(path: &Path, m: &Marker) -> anyhow::Result<()> {
 
 /// Recursive copy. `std::fs::copy` uses `copy_file_range` on Linux, which XFS/btrfs satisfy
 /// with a reflink when source and destination share a filesystem (seconds for 40 GB, no
-/// bytes duplicated until written) and which degrades to a plain copy elsewhere.
+/// bytes duplicated until written) and which degrades to a plain copy elsewhere. Each
+/// directory is snapshotted first and the snapshot copied after, so the concurrent-writer
+/// rules live in [`copy_snapshot`] with [`snapshot_dir`] as their deterministic test seam.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
     std::fs::create_dir_all(dst)?;
+    copy_snapshot(dst, &snapshot_dir(src)?)
+}
+
+/// One directory as it looked at a point in time: `(name, path, kind)`, all captured
+/// **before** any bytes move. The gap between taking this and running [`copy_snapshot`] is
+/// where the serving copy's concurrent writers operate — `maintain_commit_graph`, spawned
+/// after every publish (`walgit-wal/src/publish.rs:1092-1099`), installs a commit-graph base
+/// by renaming the layer and chain in and then **deleting the superseded layers**
+/// (`walgit-git/src/lib.rs`, `install_commit_graph_base`). Splitting enumeration from copying
+/// exists so the regression tests can delete entries inside that gap deterministically
+/// instead of gambling on a real race (issue #139).
+type DirSnapshot = Vec<(std::ffi::OsString, PathBuf, std::fs::FileType)>;
+
+fn snapshot_dir(dir: &Path) -> std::io::Result<DirSnapshot> {
+    let mut out = DirSnapshot::new();
+    for ent in std::fs::read_dir(dir).map_err(|e| at(&e, dir))? {
+        let ent = ent.map_err(|e| at(&e, dir))?;
+        let path = ent.path();
+        let kind = ent.file_type().map_err(|e| at(&e, &path))?;
+        out.push((ent.file_name(), path, kind));
+    }
+    Ok(out)
+}
+
+/// Names git writes a file under while it is still in flight, and never after publishing it:
+/// `install_commit_graph_base` renames `*.tmp` targets into place and holds `*.lock` while
+/// writing. Committed state always arrives by rename, so a transient name is never part of the
+/// serving truth — skip it, gone by copy time or not.
+fn is_transient_git_name(name: &std::ffi::OsStr) -> bool {
+    let lossy = name.to_string_lossy();
+    lossy.ends_with(".lock") || lossy.ends_with(".tmp")
+}
+
+/// Copy one [`snapshot_dir`] listing into `dst` (which must exist). The rules for entries the
+/// concurrent writers can take away mid-flight:
+///
+/// - **Transient names `.lock` / `.tmp` are skipped**: committed state always arrives by
+///   rename, so a file still under a transient name is not part of the serving truth. The
+///   `.lock` half of this rule came from CI 2026-09-01
+///   (`fetch_from_front_that_serves_the_base_remotely`: the scratch inherited a mid-flight
+///   `commit-graph-chain.lock` and the rebuild's own `commit-graph write` died on "Unable to
+///   create ...lock: File exists"); that fix stopped at the lock and left the source-side
+///   rename/delete race itself open — issue #138's verdict, closed by issue #139, which
+///   extends the skip to `.tmp` and adds the tolerances below.
+/// - **`NotFound` inside the commit-graph state is tolerated** ([`is_graph_state`], i.e. the
+///   `objects/info/commit-graphs/` directory and the monolithic `objects/info/commit-graph`):
+///   those deletions happen *after* the new chain's rename (`install_commit_graph_base`'s
+///   order), so dropping an entry the serving copy has just abandoned cannot misdirect the
+///   copy. Worst case the scratch carries a chain that dangles (names a layer the copy
+///   skipped, or one it never enumerated): the only readers before `Phase::CommitGraph`
+///   rewrite it are this file's `LocalRepo::repack` and `write_history_pack` git subprocesses
+///   — measured on git 2.50.1 they merely warn "unable to find all commit-graph files" and
+///   exit 0, and `git commit-graph write --reachable --split=replace` (the `CommitGraph` phase,
+///   `walgit-git/src/lib.rs` `write_pack_commit_graph`) replaces the whole chain and
+///   regenerates the layer, also exit 0. So a stale chain cannot become a second kind of red;
+///   `install_commit_graph_base` itself never runs against the scratch (its only non-test
+///   caller is `maintain_commit_graph` on the serving handle, `walgit-wal/src/sync.rs:831`).
+/// - **Everything else is fatal**: a vanishing entry elsewhere — above all `objects/pack/` —
+///   is real corruption or a real bug and must fail loudly, naming the source path
+///   ([`at`]) so the anyhow chain prints the dead file at the leaf.
+fn copy_snapshot(dst: &Path, entries: &DirSnapshot) -> std::io::Result<u64> {
     let mut bytes = 0u64;
-    for ent in std::fs::read_dir(src)? {
-        let ent = ent?;
-        let from = ent.path();
-        let to = dst.join(ent.file_name());
-        let ft = ent.file_type()?;
-        if ft.is_dir() {
-            bytes += copy_tree(&from, &to)?;
-        } else if ft.is_file() {
-            // Skip git's transient lock files: a concurrent `git commit-graph
-            // write` on the serving copy (maintain_commit_graph, spawned after
-            // every publish) leaves `*.lock` mid-flight; the scratch copy would
-            // inherit it and the rebuild's own `commit-graph write` would fail
-            // with "Unable to create ...lock: File exists" (CI 2026-09-01,
-            // fetch_from_front_that_serves_the_base_remotely).
-            if ent.file_name().to_string_lossy().ends_with(".lock") {
-                continue;
+    for (name, from, kind) in entries {
+        if is_transient_git_name(name) {
+            continue;
+        }
+        let to = dst.join(name);
+        if kind.is_dir() {
+            bytes += copy_tree(from, &to)?;
+        } else if kind.is_file() {
+            match std::fs::copy(from, &to) {
+                Ok(n) => bytes += n,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_graph_state(from) => {}
+                Err(e) => return Err(at(&e, from)),
             }
-            bytes += std::fs::copy(&from, &to)?;
-        } else if ft.is_symlink() {
+        } else if kind.is_symlink() {
             // A mount-linked base (`pack-<sha>.pack` → store mount) is never rebuilt here:
             // the rebuild needs real files (compact_repo syncs Full first).
-            let target = std::fs::read_link(&from)?;
-            walgit_wal::platform::symlink(&target, &to)?;
+            let target = std::fs::read_link(from).map_err(|e| at(&e, from))?;
+            walgit_wal::platform::symlink(&target, &to).map_err(|e| at(&e, from))?;
         }
     }
     Ok(bytes)
+}
+
+/// The graph-state entries whose concurrent deletion [`copy_snapshot`] tolerates: everything
+/// in git's split commit-graph directory (layers and the chain file) plus the monolithic
+/// `objects/info/commit-graph` that `install_commit_graph_base` removes right after naming
+/// the chain. Nothing under `objects/pack/` qualifies — there a `NotFound` stays fatal.
+fn is_graph_state(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent.ends_with("objects/info/commit-graphs")
+        || (parent.ends_with("objects/info")
+            && path.file_name().is_some_and(|n| n == "commit-graph"))
+}
+
+/// A plain `io::Error`'s Display hides the path it came from (only `get_ref()` carries it) —
+/// which is why the #138 CI red ended at a bare "The system cannot find the file specified.
+/// (os error 2)". Keep the kind and put the source path in the message.
+fn at(e: &std::io::Error, path: &Path) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{e}: {}", path.display()))
 }
 
 /// Bytes available to this (unprivileged) process on `path`'s filesystem; see
