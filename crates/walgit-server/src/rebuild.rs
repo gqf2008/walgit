@@ -515,7 +515,7 @@ fn start_scratch(
 
 #[cfg(test)]
 mod tests {
-    use super::copy_tree;
+    use super::{copy_snapshot, copy_tree, is_transient_git_name, snapshot_dir};
 
     /// The scratch copy must never inherit git's transient `.lock` files: a
     /// concurrent `git commit-graph write` on the serving copy leaves
@@ -552,5 +552,157 @@ mod tests {
             std::fs::read_to_string(dst.path().join("packed-refs")).unwrap(),
             "ref: x\n"
         );
+    }
+
+    /// Snapshot a `objects/info/commit-graphs` directory, delete the layer the way a
+    /// concurrent `install_commit_graph_base` does after renaming the new chain, then run the
+    /// copy step. Issue #138's CI red (`base_rebuild_resumes_after_a_kill_between_any_two_phases`,
+    /// os error 2 in `copying the serving copy to the scratch dir`) is exactly this window;
+    /// the scratch must survive it, and the deleted layer must not be invented.
+    #[test]
+    fn copy_snapshot_survives_a_commit_graph_layer_deleted_after_the_snapshot()
+    -> std::io::Result<()> {
+        let src = tempfile::tempdir()?;
+        let dst = tempfile::tempdir()?;
+        let graphs = src.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&graphs)?;
+        let layer = graphs.join("graph-1111111111222222222233333333334444444444.graph");
+        std::fs::write(&layer, "layer bytes")?;
+        let chain = "1111111111222222222233333333334444444444";
+        std::fs::write(
+            graphs.join("commit-graph-chain"),
+            format!("{chain}\n"),
+        )?;
+
+        let entries = snapshot_dir(&graphs)?;
+        assert_eq!(entries.len(), 2, "layer + chain enumerated");
+        std::fs::remove_file(&layer)?;
+
+        let into = dst.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&into)?;
+        copy_snapshot(&into, &entries)?;
+
+        assert_eq!(
+            std::fs::read_to_string(into.join("commit-graph-chain"))?,
+            format!("{chain}\n"),
+            "the chain that survived must arrive"
+        );
+        assert!(
+            !into.join("graph-1111111111222222222233333333334444444444.graph").exists(),
+            "the deleted layer must not be half-created"
+        );
+        Ok(())
+    }
+
+    /// The tolerance is scoped to the commit-graph state: a `objects/pack/` entry that
+    /// vanished between snapshot and copy is real corruption or a real bug and must still
+    /// fail — and the error must name the dead path (issue #139 (c): the #138 red stopped at
+    /// a bare "The system cannot find the file specified. (os error 2)" because an
+    /// `io::Error`'s Display hides its path).
+    #[test]
+    fn copy_snapshot_fails_and_names_a_pack_file_deleted_after_the_snapshot()
+    -> std::io::Result<()> {
+        let src = tempfile::tempdir()?;
+        let dst = tempfile::tempdir()?;
+        let pack_dir = src.path().join("objects/pack");
+        std::fs::create_dir_all(&pack_dir)?;
+        let pack = pack_dir.join("pack-2222222222333333333344444444445555555555.pack");
+        std::fs::write(&pack, "pack bytes")?;
+        std::fs::write(
+            pack_dir.join("pack-2222222222333333333344444444445555555555.idx"),
+            "idx bytes",
+        )?;
+
+        let entries = snapshot_dir(&pack_dir)?;
+        std::fs::remove_file(&pack)?;
+
+        let into = dst.path().join("objects/pack");
+        std::fs::create_dir_all(&into)?;
+        let err = copy_snapshot(&into, &entries).expect_err("a vanishing pack must not be tolerated");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string()
+                .contains("pack-2222222222333333333344444444445555555555.pack"),
+            "the error must name the dead file, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Both transient name families must stay out of the scratch copy: the `.lock` of the
+    /// 2026-09-01 incident and the `.tmp` rename-targets `install_commit_graph_base` writes
+    /// (layer `.tmp`, chain `.tmp`).
+    #[test]
+    fn copy_snapshot_skips_transient_names() -> std::io::Result<()> {
+        let src = tempfile::tempdir()?;
+        let dst = tempfile::tempdir()?;
+        let graphs = src.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&graphs)?;
+        std::fs::write(graphs.join("graph-3333333333444444444455555555556666666666.graph.tmp"), "mid-write")?;
+        std::fs::write(graphs.join("commit-graph-chain.lock"), "stale lock")?;
+        std::fs::write(
+            graphs.join("commit-graph-chain"),
+            "3333333333444444444455555555556666666666\n",
+        )?;
+
+        let entries = snapshot_dir(&graphs)?;
+        assert!(
+            entries.iter().any(|(n, _, _)| is_transient_git_name(n)),
+            "the snapshot must contain the transient names for this test to mean anything"
+        );
+        let into = dst.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&into)?;
+        copy_snapshot(&into, &entries)?;
+
+        let names: Vec<String> = std::fs::read_dir(&into)?
+            .map(|ent| Ok(ent?.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert!(
+            names.iter().any(|n| n == "commit-graph-chain"),
+            "the committed chain must arrive: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|n| !is_transient_git_name(std::ffi::OsStr::new(n))),
+            "transient names leaked into the scratch copy: {names:?}"
+        );
+        Ok(())
+    }
+
+    /// Scope of the tolerance, inside `objects/info/` itself: the monolithic `commit-graph`
+    /// is graph state — `install_commit_graph_base` removes it right after the chain rename —
+    /// so its disappearance is tolerated; a sibling file's is not, and must name its path.
+    #[test]
+    fn copy_snapshot_tolerates_a_monolithic_commit_graph_but_not_its_siblings()
+    -> std::io::Result<()> {
+        let src = tempfile::tempdir()?;
+        let dst = tempfile::tempdir()?;
+        let info = src.path().join("objects/info");
+        std::fs::create_dir_all(&info)?;
+        std::fs::write(info.join("commit-graph"), "monolithic layer")?;
+        std::fs::write(info.join("http-backend"), "ref: x\n")?;
+
+        // The monolithic graph gone after the snapshot: tolerated, the rest arrives.
+        let entries = snapshot_dir(&info)?;
+        std::fs::remove_file(info.join("commit-graph"))?;
+        let into = dst.path().join("objects/info");
+        std::fs::create_dir_all(&into)?;
+        copy_snapshot(&into, &entries)?;
+        assert!(!into.join("commit-graph").exists());
+        assert_eq!(
+            std::fs::read_to_string(into.join("http-backend"))?,
+            "ref: x\n"
+        );
+
+        // A sibling gone after the snapshot: fatal, with its path named.
+        let entries = snapshot_dir(&info)?;
+        std::fs::remove_file(info.join("http-backend"))?;
+        let err = copy_snapshot(&into, &entries).expect_err("objects/info siblings are not graph state");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("http-backend"),
+            "the error must name the dead file, got: {err}"
+        );
+        Ok(())
     }
 }
