@@ -28,7 +28,22 @@ unverified = false # 可选：true 时只收"至少含 1 条未验签条目"的�
 3. **`status` 语义**（`card_status`）：按线程条目顺序重放，最后一个匹配者生效——
    每条 `status` 条目以 `body.status` 设置；`merge_result` 带 `{"merged": true}` 置 `merged`；
    更晚的 `status` 可覆盖；默认 `open`。
-4. **确定性**：同一份 refs 任何客户端算出字节一致的看板（build_board 纯函数）。
+4. **工作上下文**：卡片同时投影最新 `status` 条目的
+   `owner` / `worktree` / `branch` / `work`（`work` 缺失时回退到 `note`）。
+   新 `status` 省略字段时继承上一份上下文；显式空字符串清空。示例：
+
+   ```json
+   {
+     "status": "in-progress",
+     "owner": "agent-mendel",
+     "worktree": "prod-release",
+     "branch": "feat/prod-release",
+     "work": "修复 release 预检并复跑 gate"
+   }
+   ```
+
+   这让人类监督者能从看板直接回答：当前状态、谁在处理、在哪个 worktree/branch、正在做什么。
+5. **确定性**：同一份 refs 任何客户端算出字节一致的看板（build_board 纯函数）。
 
 ## 使用
 

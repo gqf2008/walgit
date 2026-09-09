@@ -612,6 +612,15 @@ h2 {
 .overview > .box, .overview > .row { margin-bottom: 16px; }
 .row.gap { display: flex; gap: 16px; align-items: stretch; }
 .row.gap > .grow { flex: 1 1 0; min-width: 0; margin-bottom: 0; }
+.board-card-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+.board-card-work { margin-top: 6px; }
 .board-toolbar { justify-content: space-between; margin-bottom: 12px; }
 .board-grid {
   display: grid;

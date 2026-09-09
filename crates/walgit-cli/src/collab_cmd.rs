@@ -799,6 +799,14 @@ pub(crate) fn esc(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn md_cell(s: &str) -> String {
+    esc(s)
+        .replace('|', "\\|")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>")
+}
+
 fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()> {
     let reader = CollabReader::new(repo);
     let (entries, principals) = reader.load()?;
@@ -873,6 +881,21 @@ fn render_board_text(b: &Board) -> String {
                 c.actor,
                 c.last_ts
             );
+            let context = [
+                (!c.owner.is_empty()).then(|| format!("owner={}", c.owner)),
+                (!c.worktree.is_empty()).then(|| format!("worktree={}", c.worktree)),
+                (!c.branch.is_empty()).then(|| format!("branch={}", c.branch)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            if !context.is_empty() {
+                let _ = writeln!(out, "      {context}");
+            }
+            if !c.work.is_empty() {
+                let _ = writeln!(out, "      work: {}", c.work);
+            }
         }
         let _ = writeln!(out);
     }
@@ -890,15 +913,18 @@ fn render_board_markdown(b: &Board) -> String {
         }
         let _ = writeln!(
             out,
-            "| card | status | actor | entries | verified | last |\n|---|---|---|---|---|---|"
+            "| card | status | owner | worktree | branch | work | entries | verified | last |\n|---|---|---|---|---|---|---|---|---|"
         );
         for c in &col.cards {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {} | {} |",
-                esc(card_label(c)),
-                c.status,
-                c.actor,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                md_cell(card_label(c)),
+                md_cell(&c.status),
+                md_cell(&c.owner),
+                md_cell(&c.worktree),
+                md_cell(&c.branch),
+                md_cell(&c.work),
                 c.entries,
                 c.verified,
                 c.last_ts
@@ -1305,6 +1331,12 @@ mod tests {
     fn canonicalize_is_sorted_and_compact() {
         let v: serde_json::Value = serde_json::json!({"b": 1, "a": {"d": [1, 2], "c": "x"}});
         assert_eq!(canonicalize(&v), r#"{"a":{"c":"x","d":[1,2]},"b":1}"#);
+    }
+
+    #[test]
+    fn markdown_table_cells_escape_pipes_and_newlines() {
+        assert_eq!(md_cell("a|b\nc\r\nd"), "a\\|b<br>c<br>d");
+        assert_eq!(md_cell("<x>&|y"), "&lt;x&gt;&amp;\\|y");
     }
 
     #[test]

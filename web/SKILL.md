@@ -183,6 +183,10 @@ everyone re-derives the same view from the refs.
 - Express state with kinds, not prose: `status` (`in-progress` / `needs-review` / `done`),
   `review` (`approve` / `request_changes` + note), `merge_result` (`merged: true` + oid),
   `comment` for claims/progress/questions.
+- Every `in-progress` / `needs-review` / `blocked` / `needs-human` status carries the supervision
+  context: `owner`, `worktree`, `branch`, `work` (or `note`). Fields inherit across status moves;
+  an explicit empty string clears them. Example:
+  `{"status":"in-progress","owner":"agent-mendel","worktree":"prod-release","branch":"feat/prod-release","work":"fix release preflight"}`.
 - Every meaningful step is an entry: claim, progress, result, question.
 
 ### 4. Review

@@ -111,7 +111,9 @@
   - `comment`：线程评论（可带 file/line 锚点 → 评审行内评论）。
   - `patch`：提 PR（含 base/head refs、title/body）。
   - `review`：评审结论 `approve | request_changes | comment`（可带锚点）。
-  - `status`：状态流转（in-progress / needs-review / blocked / needs-human …）。
+  - `status`：状态流转（in-progress / needs-review / blocked / needs-human …）；
+    可带 `owner` / `worktree` / `branch` / `work`（缺失的 `work` 回退 `note`），
+    BoardCard 投影当前处理者与工作上下文供人类监督。
   - `merge_result`：合并结果（result oid、规则求值记录）——由合并方写入，审计可回放。
   - `agent_action`：agent 行为留痕（可选；模型、置信度、耗时等元数据，供 dashboard 与审计）。
 
