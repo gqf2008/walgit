@@ -159,6 +159,13 @@ test:
 e2e *ARGS:
     {{t10}} cargo test -p walgit-server --test e2e {{ARGS}}
 
+# The rustc zero-warning gate pattern — the ONE source both legs read
+# (ubuntu's `warnings` recipe interpolates it below; windows' ci.yml compile
+# step takes it via `just --evaluate warning_gate`). #137's lesson applied to
+# the gate itself: a second hand-copied enumeration of this lint list is
+# exactly what drifted before.
+warning_gate := "^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)"
+
 # Zero rustc warnings, workspace-wide, all targets (tests, benches, examples).
 # Done by grepping the normal build instead of RUSTFLAGS=-D warnings, which would
 # change every crate's fingerprint and force full rebuilds in every shell.
@@ -177,7 +184,7 @@ warnings:
     # a warning-bearing tree (issue #29). Strip the escapes before matching; the
     # ESC is embedded as a bash $'…' literal so BSD and GNU sed both take it.
     plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
-    if printf '%s\n' "$plain" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
+    if printf '%s\n' "$plain" | grep -qE "{{warning_gate}}"; then
         printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi

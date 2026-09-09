@@ -247,8 +247,33 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
         shell: bash
-      - name: Compile every target (lib/bins/tests)
-        run: cargo check --workspace --all-targets
+      - name: Compile every target (lib/bins/tests) and gate zero rustc warnings
+        # bash, not the default pwsh: the recipe needs bash's `$'…'` ANSI-C
+        # quoting and `set -o pipefail`. This is ALSO the windows zero-warning
+        # gate (#141 — rustc-warning classes that only exist under
+        # cfg(windows) used to reach main unguarded): this step's output is the
+        # leg's only warning-bearing cargo invocation, so the grep must live
+        # here — a later `cargo check` hits fresh cache and prints nothing,
+        # which is #140's vacuous-green shape. `check` suffices: every gated
+        # lint class fires before codegen. The pattern is the justfile's
+        # `warning_gate` via `just --evaluate` — one copy for both legs, the
+        # same single-source rule as the suite lanes.
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Without -e (the ubuntu `warnings` recipe's shape): a command
+          # substitution that fails must not fall through to a green grep.
+          if ! out="$(cargo check --workspace --all-targets 2>&1)"; then
+            printf '%s\n' "$out"
+            echo; echo "cargo check failed — fix the errors above"; exit 1
+          fi
+          plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+          gate="$(just --evaluate warning_gate)"
+          if printf '%s\n' "$plain" | grep -qE "$gate"; then
+            printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`' || true
+            echo; echo "rustc warnings present — fix them (same gate as ubuntu's just warnings, issue #141)"; exit 1
+          fi
+          printf '%s\n' "$plain" | grep -E '^(warning|error)' || echo "no rustc warnings"
       - name: Fast hermetic tier
         # bash, not the default pwsh: on Windows pwsh keeps going after a failing
         # native command and the step's exit code is the LAST line's — a broken
