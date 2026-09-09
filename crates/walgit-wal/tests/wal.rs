@@ -1003,6 +1003,22 @@ async fn reconcile_keeps_staged_pack() {
 
     let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
     let handle2 = registry2.open(&id).await.unwrap();
+
+    // A writer holding the prune lock defers the whole reconciliation; the
+    // state stays dirty instead of committing a ready state with residue.
+    let prune_lock = handle2.prune_lock();
+    let held = prune_lock.lock().await;
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            handle2.local().pack_path(&extra).exists(),
+            "a pack must survive reconciliation while a writer holds prune_lock"
+        );
+    }
+    drop(held);
+
+    // A staged pack is deferred to pending; after the guard drops (which
+    // records the non-live orphan) the next sync removes it.
     let staged = handle2
         .stage_pack_guard(&extra.to_string())
         .expect("self Arc is installed on an opened handle");
