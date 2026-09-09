@@ -799,6 +799,14 @@ pub(crate) fn esc(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn md_cell(s: &str) -> String {
+    esc(s)
+        .replace('|', "\\|")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>")
+}
+
 fn run_report(repo: &Path, format: &str, rules_path: Option<&Path>) -> Result<()> {
     let reader = CollabReader::new(repo);
     let (entries, principals) = reader.load()?;
@@ -911,12 +919,12 @@ fn render_board_markdown(b: &Board) -> String {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-                esc(card_label(c)),
-                c.status,
-                esc(&c.owner),
-                esc(&c.worktree),
-                esc(&c.branch),
-                esc(&c.work),
+                md_cell(card_label(c)),
+                md_cell(&c.status),
+                md_cell(&c.owner),
+                md_cell(&c.worktree),
+                md_cell(&c.branch),
+                md_cell(&c.work),
                 c.entries,
                 c.verified,
                 c.last_ts
@@ -1323,6 +1331,12 @@ mod tests {
     fn canonicalize_is_sorted_and_compact() {
         let v: serde_json::Value = serde_json::json!({"b": 1, "a": {"d": [1, 2], "c": "x"}});
         assert_eq!(canonicalize(&v), r#"{"a":{"c":"x","d":[1,2]},"b":1}"#);
+    }
+
+    #[test]
+    fn markdown_table_cells_escape_pipes_and_newlines() {
+        assert_eq!(md_cell("a|b\nc\r\nd"), "a\\|b<br>c<br>d");
+        assert_eq!(md_cell("<x>&|y"), "&lt;x&gt;&amp;\\|y");
     }
 
     #[test]
