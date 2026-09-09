@@ -1033,6 +1033,49 @@ async fn restart_forces_pack_reconcile_even_with_clean_state() {
 }
 
 #[tokio::test]
+async fn prune_guard_invalidates_pack_proof_before_mutation() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-proof-mutation");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-proof-mutation", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    // The publisher's sync has now reconciled the empty pre-publish cache and
+    // the published pack is live, so packs_verified is true.
+    let live = handle.manifest().packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+    let extra = gix_hash::ObjectId::from_hex(b"4444444444444444444444444444444444444444").unwrap();
+    let extra_pack = handle.local().pack_path(&extra);
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+
+    // A writer takes prune_guard before a repack/ingest. Even if it fails before
+    // creating a StagedPackGuard, the process-local pack proof must be invalid
+    // so the next Serve/Full sync rescans and removes the orphan.
+    let writer = handle.prune_guard().await;
+    drop(writer);
+    let _guard = handle.sync_full().await.unwrap();
+
+    assert!(
+        !handle.local().pack_path(&extra).exists(),
+        "prune_guard must invalidate the pack proof before any mutation"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_keeps_staged_pack() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
@@ -1072,8 +1115,7 @@ async fn reconcile_keeps_staged_pack() {
 
     // A writer holding the prune lock defers the whole reconciliation; the
     // state stays dirty instead of committing a ready state with residue.
-    let prune_lock = handle2.prune_lock();
-    let held = prune_lock.lock().await;
+    let held = handle2.prune_guard().await;
     {
         let _guard = handle2.sync_full().await.unwrap();
         assert!(
@@ -1085,17 +1127,21 @@ async fn reconcile_keeps_staged_pack() {
 
     // A staged pack is deferred to pending; after the guard drops (which
     // records the non-live orphan) the next sync removes it.
-    let staged = handle2
+    let staged1 = handle2
         .stage_pack_guard(&extra.to_string())
         .expect("self Arc is installed on an opened handle");
+    let staged2 = handle2
+        .stage_pack_guard(&extra.to_string())
+        .expect("self Arc is installed on an opened handle");
+    drop(staged1);
     {
         let _guard = handle2.sync_full().await.unwrap();
         assert!(
             handle2.local().pack_path(&extra).exists(),
-            "a staged pack must survive reconciliation while the guard is held"
+            "a staged pack must survive until the last guard is dropped"
         );
     }
-    drop(staged);
+    drop(staged2);
     {
         let _guard = handle2.sync_full().await.unwrap();
         assert!(
