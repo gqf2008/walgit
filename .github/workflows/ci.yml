@@ -125,6 +125,25 @@ jobs:
             echo "a listed suite ran 0 tests on ubuntu — a platform gate hid it (#137); the lines above name the binary"
             exit 1
           fi
+      # The walgit-cli integration suites (D1 CI runner + collab CLI) — the
+      # first execution lane these ever had (#141: compiled on both legs, run
+      # nowhere). Ubuntu-only; the per-file platform seams that bar a windows
+      # lane are argued at the justfile's CLI_TESTS. Measured: 8 tests, 13–34 s
+      # of run (two laptop measurements) + link of the two test binaries —
+      # timeout-minutes guards the lane. No built-in rerun: this set
+      # has no flake history yet, and a step that adds one MUST name itself in
+      # the summary job's rerun_once regex in the same commit. The zero-test
+      # assertion (#137's "registered means executed") keeps a future cfg-gate
+      # from shrinking it silently.
+      - name: CLI integration suites
+        timeout-minutes: 10
+        run: |
+          set -eo pipefail
+          just test-cli 2>&1 | tee cli-integration.log
+          if grep -n '^running 0 tests' cli-integration.log; then
+            echo "a registered CLI suite ran 0 tests on ubuntu — a platform gate hid it (#137 shape, #141); the lines above name the binary"
+            exit 1
+          fi
       # Rerun once on failure: sim has known-flaky cases (base_rebuild, AGENTS.md §5);
       # a second failure is a regression. The rate cannot be read off this step: the
       # rerun is why #138 had to count first-pass reds in the logs instead.

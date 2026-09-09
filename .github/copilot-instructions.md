@@ -17,8 +17,9 @@ outrank any generic convention.
   auto-merge finish after CI.
 - **Commits are Conventional Commits** (`fix(git): …`, one logical change each,
   message says why).
-- **`just ci`** = warnings + clippy + test + e2e + sim — everything a merge needs.
-  Run the relevant tiers locally before pushing (Windows notes: `docs/WINDOWS.md`).
+- **`just ci`** = warnings + clippy + test + test-cli + e2e + sim — everything a merge
+  needs. Run the relevant tiers locally before pushing (Windows notes: `docs/WINDOWS.md`;
+  the cli suites are ubuntu-only, seams at the justfile's `CLI_TESTS`).
 
 ## Reading CI
 
