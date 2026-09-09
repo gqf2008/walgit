@@ -76,9 +76,12 @@ jobs:
       # laptop) that goes red on an unregistered suite, on a vacuous glob/empty
       # lane (#140's fix), or on a recipe line that stops interpolating its
       # variable — whole-line anchored, so no prefix edit can bypass it. Both
-      # legs consume the same variables, so this one check covers both; each
-      # leg additionally asserts no listed suite compiled to zero tests
-      # (ubuntu's Fast tier and CLI steps below).
+      # legs consume the same variables, so this one check covers both; the two
+      # explicit lanes additionally assert no listed suite compiled to zero
+      # tests (ubuntu's Fast tier and CLI steps below, windows' Server
+      # integration) — the wildcard lane's whole-directory glob has no such
+      # assertion, so a cfg-gated suite there would still compile to an empty
+      # binary and exit green.
       - name: Integration suite lists are complete
         run: bash scripts/suite-guard.sh
       # The 300 s timeout in the justfile can trip under CI load (measured

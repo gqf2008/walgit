@@ -1,8 +1,9 @@
 # Windows — build, test, dev-store on a Windows host
 
 Context: **runbook** for developing walgit on Windows. The fork keeps the
-platform first-class: CI runs a windows leg (compile all targets + fast tier
-+ sim + e2e, `.github/workflows/ci.yml`), and the local workflow below is the
+platform first-class: CI runs a windows leg (compile all targets + zero-rustc-
+warning gate + web unit tests + fast tier + server integration + sim + e2e,
+`.github/workflows/ci.yml`), and the local workflow below is the
 same surface a contributor gets.
 
 ## 1. Prerequisites
@@ -29,7 +30,7 @@ just web-build        # SPA + SDK (pnpm install --frozen-lockfile + vite build)
 just test             # fast hermetic tier (< 1 min)
 just e2e              # smart-HTTP end-to-end against real git
 just sim              # fault-injection simulation suite (seeds: WALGIT_SIM_SEEDS)
-just ci               # warnings + clippy + test + e2e + sim
+just ci               # warnings + clippy + test + test-cli + e2e + sim
 ```
 
 Notes specific to Windows:
