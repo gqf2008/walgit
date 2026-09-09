@@ -967,6 +967,72 @@ async fn reconcile_prunes_local_pack_not_in_manifest() {
 }
 
 #[tokio::test]
+async fn restart_forces_pack_reconcile_even_with_clean_state() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-clean-restart");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-clean-restart", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let manifest = handle.manifest();
+    let live = manifest.packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+
+    // Simulate a clean restart cache: the persisted state says both refs and
+    // packs are at the current revision, but the cache also contains an orphan
+    // pack from a writer that crashed after making the final name visible.
+    let cache2 = tempfile::tempdir().unwrap();
+    let local = LocalRepo::init(cache2.path(), &id, ObjectFormat::Sha1).unwrap();
+    let extra = gix_hash::ObjectId::from_hex(b"3333333333333333333333333333333333333333").unwrap();
+    let extra_pack = local.pack_path(&extra);
+    std::fs::copy(&live_pack, local.pack_path(&live_oid)).unwrap();
+    std::fs::copy(&live_idx, local.pack_path(&live_oid).with_extension("idx")).unwrap();
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+    std::fs::write(
+        local.path().join("walgit-state.json"),
+        serde_json::json!({
+            "manifest_version": handle.manifest_version().map(|v| v.as_str().to_string()),
+            "applied_seq": manifest.head_seq,
+            "revision": manifest.revision,
+            "packs_revision": manifest.revision,
+            "packs_dirty": false,
+            "pending_pack_removals": [],
+            "remote_served": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drop(local);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let _guard = handle2.sync_full().await.unwrap();
+
+    assert!(
+        handle2.local().pack_path(&live_oid).is_file(),
+        "manifest-live pack must survive the restart reconcile"
+    );
+    assert!(
+        !handle2.local().pack_path(&extra).exists(),
+        "the first pack sync after restart must scan the cache even when state looks clean"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_keeps_staged_pack() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
@@ -1037,6 +1103,71 @@ async fn reconcile_keeps_staged_pack() {
             "after the guard is dropped the deferred pack is pruned on the next sync"
         );
     }
+}
+
+#[tokio::test]
+async fn cancelled_publish_keeps_pack_protected_until_publisher_finishes() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::new();
+    // Delay the publisher's manifest sync so the caller can be cancelled while
+    // the request is in flight.
+    store.latency = Some(Duration::from_millis(100));
+    let store = Arc::new(store);
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-cancelled-publish");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("cancelled-publish-1", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let c2 = work.commit("cancelled-publish-2", "two");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c2, &c1))
+        .await
+        .unwrap();
+    let checksum = ingested.checksum;
+    let pack_path = handle.local().pack_path(&checksum);
+    let publisher = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .publish_push(
+                    Some(ingested),
+                    // Deliberately stale old_oid: the publisher rejects the
+                    // transaction, leaving the ingested pack as an orphan.
+                    make_txn(vec![("refs/heads/main", &"1".repeat(40), &c2)]),
+                    HashMap::new(),
+                )
+                .await
+        })
+    };
+
+    // Let the task enqueue the request, then cancel the caller. The detached
+    // publisher must keep the pack staged until it finishes and records the
+    // rejected pack for pruning.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    publisher.abort();
+    let _ = publisher.await;
+
+    for _ in 0..50 {
+        let _guard = handle.sync_full().await.unwrap();
+        if !pack_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pack_path.exists(),
+        "a caller cancellation must not leave the orphan pack staged forever"
+    );
 }
 
 #[tokio::test]
