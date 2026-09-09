@@ -1205,7 +1205,11 @@ fn build_commit_graph_layer(git_dir: &Path, dest: &Path) -> Result<()> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .ok_or_else(|| anyhow::anyhow!("empty commit-graph-chain"))?;
-    std::fs::copy(dir.join(format!("graph-{hash}.graph")), dest)?;
+    // `dest` is the committed side-file name `pack-<checksum>.commit-graph`
+    // next to the base pack: transient sibling + rename so no concurrent
+    // reader of that pack dir can adopt a truncated layer (issue #144).
+    walgit_git::copy_into_place(&dir.join(format!("graph-{hash}.graph")), dest)
+        .map_err(|e| anyhow::anyhow!("installing {}: {e}", dest.display()))?;
     Ok(())
 }
 

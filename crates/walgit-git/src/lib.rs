@@ -2333,11 +2333,10 @@ impl LocalRepo {
             GitError::InvalidInput(format!("pack-objects printed no pack hash ({hash:?}): {e}"))
         })?;
         let _ = before; // an identical existing pack is fine: the marker makes it the history pack
-        std::fs::write(
-            self.pack_path(&oid).with_extension("history"),
-            format!("{}\n", base.to_hex()),
-        )
-        .map_err(GitError::Io)?;
+        write_history_marker(
+            &self.pack_path(&oid).with_extension("history"),
+            base.to_hex(),
+        )?;
         self.refresh_async().await?;
         self.packs()?
             .into_iter()
@@ -2360,11 +2359,7 @@ impl LocalRepo {
         checksum: &gix_hash::oid,
         base: &str,
     ) -> Result<(), GitError> {
-        std::fs::write(
-            self.pack_path(checksum).with_extension("history"),
-            format!("{base}\n"),
-        )
-        .map_err(GitError::Io)?;
+        write_history_marker(&self.pack_path(checksum).with_extension("history"), base)?;
         let now = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
         for ext in ["pack", "idx"] {
             if let Ok(f) = std::fs::File::options()
@@ -2893,18 +2888,81 @@ fn unique_suffix() -> String {
     format!("{}-{}", std::process::id(), nanos)
 }
 
-fn rename_atomic(src: &Path, dst: &Path) -> Result<(), GitError> {
+/// `dst` with `.tmp` appended to its file name — the transient-name
+/// convention (`pack-<checksum>.pack.tmp`, `<checksum>.idx.tmp`, …) that
+/// `is_transient_git_name` (walgit-server/src/rebuild.rs) skips via its
+/// `.tmp` suffix rule, so the base rebuild's scratch copy never inherits an
+/// in-flight file. The sibling lives in `dst`'s own directory, so the
+/// finishing rename stays on one filesystem and is atomic. A process killed
+/// mid-copy leaves the sibling behind — the same shape as git's own
+/// `tmp_pack_*`: readers skip it (`packs()` accepts only `pack-*.pack`, the
+/// rebuild's scratch copy skips transient names), `dir_size` counts it, and
+/// the cache LRU reclaims it with the repo's eviction.
+pub fn transient_sibling(dst: &Path) -> PathBuf {
+    let mut s = dst.as_os_str().to_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Copy `src` to `dst` without ever exposing a truncated file under `dst`'s
+/// name: the bytes go to the [`transient_sibling`] first and are renamed into
+/// place from the same directory. A concurrent reader (upload-pack, the web
+/// object endpoints, the base rebuild's scratch copy) sees `NotFound` or the
+/// complete file — never a half-written committed name (issue #144). A `dst`
+/// that appears between the copy and the rename (another writer installed the
+/// same content-addressed bytes; Windows `rename` refuses to replace) is left
+/// alone: the transient copy is dropped and the install counts as done,
+/// matching the `!dst.exists()` "someone else installed it" semantics of the
+/// callers. The finishing rename is the bare `fs::rename`, not
+/// `rename_replacing`: every caller installs a content-addressed name, so a
+/// pre-existing `dst` — read-only included — can only be those identical
+/// bytes, and leaving it alone *is* the intended outcome; there is nothing to
+/// replace. The `Ok` branch checks `is_file`, not `exists`: a `dst` that is a
+/// directory (rename fails with `EISDIR`/`ACCESS_DENIED`) is not an installed
+/// pack and must surface as the rename's error, not as a silent success.
+pub fn copy_into_place(src: &Path, dst: &Path) -> Result<(), GitError> {
+    let tmp = transient_sibling(dst);
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(GitError::Io(e));
+    }
+    #[cfg(test)]
+    copy_into_place_tests::park_before_rename_if_armed();
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if dst.is_file() {
+                Ok(())
+            } else {
+                Err(GitError::Io(e))
+            }
+        }
+    }
+}
+
+/// Write the `pack-<checksum>.history` marker via the transient sibling +
+/// rename: `packs()` readers must never adopt a torn marker (issue #144).
+fn write_history_marker(marker: &Path, base: impl std::fmt::Display) -> Result<(), GitError> {
+    let tmp = transient_sibling(marker);
+    if let Err(e) = std::fs::write(&tmp, format!("{base}\n")) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(GitError::Io(e));
+    }
+    if let Err(e) = rename_replacing(&tmp, marker) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `fs::rename` that on Windows first clears a read-only destination (every
+/// pack/idx/rev git for Windows writes is `READ_ONLY`; overwriting it fails
+/// with `ACCESS_DENIED`) and retries once.
+fn rename_replacing(src: &Path, dst: &Path) -> Result<(), GitError> {
     match std::fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            std::fs::copy(src, dst).map_err(GitError::Io)?;
-            std::fs::remove_file(src).map_err(GitError::Io)?;
-            Ok(())
-        }
         Err(e) => {
-            // Windows: overwriting a target that git for Windows marked
-            // READ_ONLY (every pack/idx/rev it writes) fails with
-            // ACCESS_DENIED; clear the attribute and retry once.
             #[cfg(windows)]
             {
                 if let Ok(md) = std::fs::metadata(dst) {
@@ -2919,6 +2977,31 @@ fn rename_atomic(src: &Path, dst: &Path) -> Result<(), GitError> {
             }
             Err(GitError::Io(e))
         }
+    }
+}
+
+fn rename_atomic(src: &Path, dst: &Path) -> Result<(), GitError> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // Never copy straight into `dst` — a concurrent reader could adopt
+            // the truncated file under its committed name (issue #144). Copy
+            // to the transient sibling in `dst`'s directory instead; the
+            // rename from there is same-filesystem and atomic.
+            let tmp = transient_sibling(dst);
+            if let Err(e) = std::fs::copy(src, &tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(GitError::Io(e));
+            }
+            match rename_replacing(&tmp, dst) {
+                Ok(()) => std::fs::remove_file(src).map_err(GitError::Io),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+        Err(_) => rename_replacing(src, dst),
     }
 }
 /// Read the number of objects from a pack .idx file (v1 or v2) by reading the
@@ -3967,5 +4050,305 @@ mod index_pack_trace_tests {
         );
         assert!(outcome.pack_path.exists());
         assert!(outcome.idx_path.exists());
+    }
+}
+
+#[cfg(test)]
+mod copy_into_place_tests {
+    use super::{copy_into_place, rename_atomic, transient_sibling};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Test hook for `copy_into_place`: when armed, the finishing rename is
+    /// held so a test can observe the tree with the bytes still under the
+    /// transient name — the deterministic shape of the outcome race test,
+    /// which can only catch a partial committed name on filesystems whose
+    /// copies expose a partial window (`std::fs::copy` is a `CoW` clone on
+    /// APFS, so the outcome race is unobservable there).
+    pub(super) static PARK_BEFORE_RENAME: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn park_before_rename_if_armed() {
+        while PARK_BEFORE_RENAME.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Release the park even when a test assertion panics mid-window —
+    /// otherwise every other test calling `copy_into_place` in this binary
+    /// would hang behind the armed flag.
+    struct ParkGuard;
+    impl ParkGuard {
+        fn arm() -> Self {
+            PARK_BEFORE_RENAME.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+    impl Drop for ParkGuard {
+        fn drop(&mut self) {
+            PARK_BEFORE_RENAME.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn read(p: &Path) -> Vec<u8> {
+        std::fs::read(p).unwrap()
+    }
+
+    #[test]
+    fn installs_the_complete_content_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("scratch").join("pack-0123abcd.pack");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let content = b"pack bytes \x00\x01\x02".repeat(1000);
+        std::fs::write(&src, &content).unwrap();
+        let dst = dir
+            .path()
+            .join("objects")
+            .join("pack")
+            .join("pack-0123abcd.pack");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+
+        copy_into_place(&src, &dst).unwrap();
+
+        assert_eq!(read(&dst), content, "committed name holds the full copy");
+        // The source stays (copy, not move) and no transient sibling remains.
+        assert!(src.exists());
+        let names: Vec<String> = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["pack-0123abcd.pack".to_string()],
+            "exactly the committed name remains — no transient sibling"
+        );
+    }
+
+    #[test]
+    fn a_dst_that_appeared_meanwhile_is_left_alone_and_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pack-0123abcd.idx");
+        let dst = dir.path().join("objects").join("pack-0123abcd.idx");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        // "Another writer" already installed the same content-addressed bytes.
+        // On Unix (and Windows over a writable file) the finishing rename
+        // simply replaces `dst` with the identical bytes — the same net
+        // outcome; the rename-failure branch itself is pinned by
+        // `a_rename_failure_over_a_directory…` (error) and, on Windows, by
+        // `a_read_only_dst_that_appeared_meanwhile…` (counts as done).
+        let content = b"index bytes".repeat(100);
+        std::fs::write(&src, &content).unwrap();
+        std::fs::write(&dst, &content).unwrap();
+
+        copy_into_place(&src, &dst).unwrap();
+
+        assert_eq!(read(&dst), content);
+        assert!(
+            !transient_sibling(&dst).exists(),
+            "the losing transient copy is dropped"
+        );
+    }
+
+    #[test]
+    fn concurrent_readers_observe_notfound_or_the_complete_file_never_a_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pack");
+        // Large enough that a direct copy into the committed name would have a
+        // long partial window; the tmp+rename structure must close it. Note
+        // the window only *exists* on filesystems without copy-on-write clones
+        // (ext4, ExFAT — the production shape): `std::fs::copy` is a clone on
+        // APFS, so this outcome race is unobservable there and the proof that
+        // the mechanism itself cannot regress lives in
+        // `the_committed_name_is_absent_until_the_finishing_rename`.
+        let content: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &content).unwrap();
+        let dst = dir.path().join("pack-0123abcd.pack");
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let copying = std::sync::Arc::new(AtomicBool::new(false));
+        let samples_during_copy = std::sync::Arc::new(AtomicU64::new(0));
+        let reader = {
+            let dst = dst.clone();
+            let stop = stop.clone();
+            let started = started.clone();
+            let copying = copying.clone();
+            let samples_during_copy = samples_during_copy.clone();
+            let total = content.len() as u64;
+            std::thread::spawn(move || {
+                started.store(true, Ordering::SeqCst);
+                while !stop.load(Ordering::Relaxed) {
+                    if copying.load(Ordering::Relaxed) {
+                        samples_during_copy.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match std::fs::metadata(&dst) {
+                        Ok(md) => assert_eq!(
+                            md.len(),
+                            total,
+                            "committed name observed mid-copy (truncated)"
+                        ),
+                        Err(e) => assert_eq!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound,
+                            "unexpected reader error: {e}"
+                        ),
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        // A race test must prove it is not spinning idle (the #146 lesson):
+        // wait for the reader to be running, then require at least one sample
+        // taken inside the copy window — a reader thread starved by the
+        // scheduler for the whole copy would otherwise let the test pass
+        // without ever exercising the race (observed on a loaded machine:
+        // the pre-fix direct copy passed here green).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !started.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader thread never scheduled"
+            );
+            std::thread::yield_now();
+        }
+        copying.store(true, Ordering::SeqCst);
+        copy_into_place(&src, &dst).unwrap();
+        copying.store(false, Ordering::SeqCst);
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert!(
+            samples_during_copy.load(Ordering::Relaxed) > 0,
+            "reader took no samples during the copy — the race went untested"
+        );
+        assert_eq!(read(&dst), content);
+    }
+
+    /// The deterministic form of the race above: park the writer between the
+    /// copy and the finishing rename, then observe — on any filesystem — that
+    /// the bytes sit under the transient sibling while the committed name
+    /// does not exist yet. Break the mechanism (copy straight into the
+    /// committed name) and no transient sibling ever appears: red everywhere.
+    #[test]
+    fn the_committed_name_is_absent_until_the_finishing_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pack");
+        let content = b"pack bytes".repeat(1000);
+        std::fs::write(&src, &content).unwrap();
+        let dst = dir.path().join("pack-0123abcd.pack");
+        let tmp = transient_sibling(&dst);
+
+        let park = ParkGuard::arm();
+        let writer = {
+            let src = src.clone();
+            let dst = dst.clone();
+            std::thread::spawn(move || copy_into_place(&src, &dst))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !tmp.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transient sibling never observed — bytes are not going through <name>.tmp"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(
+                std::fs::metadata(&dst),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ),
+            "committed name visible before the finishing rename"
+        );
+        drop(park);
+        writer.join().unwrap().unwrap();
+        assert_eq!(read(&dst), content);
+        assert!(!tmp.exists(), "no transient sibling left behind");
+    }
+
+    #[test]
+    fn a_rename_failure_over_a_directory_is_an_error_not_a_silent_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pack");
+        std::fs::write(&src, b"one").unwrap();
+        let dst = dir.path().join("pack-0123abcd.pack");
+        // A `dst` that is a directory makes the finishing rename fail
+        // (EISDIR / ACCESS_DENIED); that is not "another writer installed the
+        // same content-addressed bytes", so the error must surface — the
+        // `is_file` guard, not `exists`, is what keeps a garbage `dst` from
+        // counting as a successful install.
+        std::fs::create_dir(&dst).unwrap();
+
+        assert!(copy_into_place(&src, &dst).is_err());
+        assert!(dst.is_dir(), "the directory is left alone");
+        assert!(
+            !transient_sibling(&dst).exists(),
+            "the transient copy is cleaned up on the failure path"
+        );
+    }
+
+    /// On Windows a pre-existing read-only `dst` makes the rename fail with
+    /// ACCESS_DENIED (git for Windows writes every pack file READ_ONLY). For
+    /// the content-addressed names this function installs, that file can only
+    /// be the identical bytes, so the install counts as done and the file is
+    /// left alone — the branch `rename_replacing` clears is deliberately not
+    /// taken here.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_dst_that_appeared_meanwhile_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pack");
+        std::fs::write(&src, b"one").unwrap();
+        let dst = dir.path().join("pack-0123abcd.pack");
+        std::fs::write(&dst, b"one").unwrap();
+        let mut perm = std::fs::metadata(&dst).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&dst, perm).unwrap();
+
+        copy_into_place(&src, &dst).unwrap();
+
+        assert_eq!(read(&dst), b"one");
+        assert!(
+            !transient_sibling(&dst).exists(),
+            "the losing transient copy is dropped"
+        );
+    }
+
+    #[test]
+    fn transient_names_stay_inside_the_rebuild_skip_convention() {
+        // `is_transient_git_name` (walgit-server/src/rebuild.rs) decides what
+        // the base rebuild's scratch copy skips; it is not importable from
+        // this crate, so pin the convention literally (the anti-tautology
+        // pattern rebuild.rs's own tests use): the `.tmp` suffix is the rule
+        // every walgit-written committed name relies on (issue #144).
+        for committed in [
+            "pack-0123abcd.pack",
+            "pack-0123abcd.idx",
+            "pack-0123abcd.commit-graph",
+            "pack-0123abcd.history",
+            "0123abcd.idx",
+            "graph-0123abcd.graph",
+            "commit-graph-chain",
+        ] {
+            let tmp: PathBuf = transient_sibling(Path::new(committed));
+            let name = tmp.file_name().unwrap().to_str().unwrap();
+            assert_eq!(name, format!("{committed}.tmp"));
+            // Case-exact extension compare (the convention is lowercase
+            // `.tmp`, matching rebuild.rs's case-sensitive rule).
+            assert!(
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext == "tmp"),
+                "{name} no longer matches rebuild.rs's `.tmp` skip rule"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_atomic_still_moves_same_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.pack");
+        let dst = dir.path().join("b.pack");
+        std::fs::write(&src, b"one").unwrap();
+        rename_atomic(&src, &dst).unwrap();
+        assert!(!src.exists(), "rename_atomic moves the source away");
+        assert_eq!(read(&dst), b"one");
     }
 }

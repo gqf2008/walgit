@@ -457,6 +457,10 @@ async fn import_reusing_packs(
         };
         // Copy (not move) into a staging dir with the FINAL file names, then let
         // install_pack rename them into objects/pack (it keeps file names).
+        // The committed-looking names are safe here: `objects/import-staging/`
+        // is private to this import — no git/gix/walgit reader enumerates it —
+        // so a mid-copy file is never adopted as serving state (issue #144's
+        // audit); the atomic install is install_pack's rename.
         let dst_pack = local.pack_path(&checksum);
         let dst_idx = dst_pack.with_extension("idx");
         let staging = local.path().join("objects").join("import-staging");

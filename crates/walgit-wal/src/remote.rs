@@ -210,9 +210,16 @@ impl RemotePacks {
                 .join("pack")
                 .join(format!("pack-{}.idx", p.checksum));
             if installed.is_file()
-                && std::fs::hard_link(&installed, &dest).is_err() {
-                    let _ = std::fs::copy(&installed, &dest);
-                }
+                && std::fs::hard_link(&installed, &dest).is_err()
+                && !dest.exists()
+            {
+                // Same tmp+rename rule as the download path below
+                // (`<checksum>.idx.tmp` → rename): a direct copy would let a
+                // concurrent opener adopt a truncated committed index
+                // (issue #144; on filesystems without hard links this
+                // fallback is the normal path, not an edge case).
+                let _ = walgit_git::copy_into_place(&installed, &dest);
+            }
         }
         let done = Arc::new(AtomicU64::new(0));
         let missing: Vec<&PackRef> = manifest
