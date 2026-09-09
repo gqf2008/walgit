@@ -435,8 +435,7 @@ pub async fn rebuild_base(
     }
     // Installed packs are visible under final names before publish_compact
     // CASes them; hold the prune lock across install → publish.
-    let prune_lock = handle.prune_lock();
-    let _prune_guard = prune_lock.lock().await;
+    let _prune_guard = handle.prune_guard().await;
     for p in &to_install {
         install_pack(&scratch, handle.local(), p)?;
     }

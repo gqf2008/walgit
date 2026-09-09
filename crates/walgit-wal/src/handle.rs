@@ -70,10 +70,12 @@ pub struct RepoHandle {
     // even when the on-disk state claims packs_revision == revision, because a
     // crash can leave an orphan pack that the persisted state never recorded.
     pub(crate) packs_verified: AtomicBool,
-    // Packs ingested by this process and waiting for their manifest CAS.
-    // They are not live in the manifest yet, so pack reconciliation must not
-    // mistake them for restart residue and delete them before upload.
-    pub(crate) staged_packs: PLMutex<std::collections::HashSet<String>>,
+    // Packs ingested by this process and waiting for their manifest CAS, with
+    // one reference per live `StagedPackGuard` (receive holds an outer guard
+    // while `enqueue_publish_at` holds its detached waiter guard). They are not
+    // live in the manifest yet, so reconciliation must not mistake them for
+    // restart residue and delete them before upload.
+    pub(crate) staged_packs: PLMutex<HashMap<String, usize>>,
     // Coarse mutual exclusion between "a pack is becoming visible / is being
     // published" and prune. Ingest/repack/publish hold it for the whole
     // final-name-visible → CAS window; reconcile uses try_lock and defers
@@ -209,7 +211,7 @@ impl RepoHandle {
             state: PLMutex::new(state),
             refs_verified: AtomicBool::new(false),
             packs_verified: AtomicBool::new(false),
-            staged_packs: PLMutex::new(std::collections::HashSet::new()),
+            staged_packs: PLMutex::new(HashMap::new()),
             prune_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_freshness: PLMutex::new(None),
             last_access: PLMutex::new(Instant::now()),
@@ -463,15 +465,26 @@ impl RepoHandle {
     }
 
     pub(crate) fn stage_pack(&self, checksum: &str) {
-        self.staged_packs.lock().insert(checksum.to_string());
+        *self
+            .staged_packs
+            .lock()
+            .entry(checksum.to_string())
+            .or_default() += 1;
     }
 
     pub(crate) fn unstage_pack(&self, checksum: &str) {
-        self.staged_packs.lock().remove(checksum);
+        let mut staged = self.staged_packs.lock();
+        if let Some(count) = staged.get_mut(checksum) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                staged.remove(checksum);
+            }
+        }
     }
 
     pub(crate) fn pack_staged(&self, checksum: &str) -> bool {
-        self.staged_packs.lock().contains(checksum)
+        self.staged_packs.lock().contains_key(checksum)
     }
 
     /// Stage a pack for as long as the returned guard lives. Unlike the
@@ -484,6 +497,15 @@ impl RepoHandle {
     /// `try_lock` and defers pruning if a writer holds it.
     pub fn prune_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.prune_lock)
+    }
+
+    /// Acquire the writer side of pack reconciliation. Holding this guard means
+    /// the process-local pack proof is invalid until a later reconcile succeeds,
+    /// including when the mutation fails before any `StagedPackGuard` exists.
+    pub async fn prune_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let guard = self.prune_lock.clone().lock_owned().await;
+        self.mark_packs_unverified();
+        guard
     }
 
     pub fn stage_pack_guard(&self, checksum: &str) -> Option<StagedPackGuard> {

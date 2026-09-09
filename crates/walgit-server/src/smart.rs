@@ -1414,8 +1414,7 @@ async fn receive_pack_process(
     // Hold the prune lock across ingest → publish: the pack is visible under
     // its final name before the manifest CAS, so a concurrent prune must not
     // run in this window (issue #148 review).
-    let prune_lock = handle.prune_lock();
-    let _prune_guard = prune_lock.lock().await;
+    let _prune_guard = handle.prune_guard().await;
     let ingest = local
         .ingest_pack(pack_reader, opts)
         .instrument(tracing::info_span!("receive.ingest"))

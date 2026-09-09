@@ -1362,8 +1362,7 @@ async fn publish_collab_ref(
         .map_err(internal)?;
     let f = tokio::fs::File::open(&tmp).await.map_err(internal)?;
     // Thin collab-ref publish also installs a pack before its manifest CAS.
-    let prune_lock = handle.prune_lock();
-    let _prune_guard = prune_lock.lock().await;
+    let _prune_guard = handle.prune_guard().await;
     let pack = r
         .local
         .ingest_pack(
