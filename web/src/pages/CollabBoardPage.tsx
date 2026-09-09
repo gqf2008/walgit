@@ -6,6 +6,7 @@ import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
 import { Markdown } from "../components/Markdown";
 import { enableCollabKey } from "../components/CollabWrite";
+import { AgentFlow } from "../components/AgentFlow";
 import { signCanonical } from "../collab";
 import { useI18n, statusLabel } from "../i18n";
 
@@ -192,6 +193,10 @@ export function CollabBoardPage() {
       </div>
       <Box title={t("board.title")}>
         <div className="pad muted">{t("board.explainer")}</div>
+      </Box>
+      <Box title={t("board.flow.title")}>
+        <div className="pad muted">{t("board.flow.explainer")}</div>
+        <AgentFlow columns={board.columns} />
       </Box>
       <div className="row gap board-toolbar">
         <span className="muted">

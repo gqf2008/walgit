@@ -629,6 +629,27 @@ h2 {
   align-items: start;
 }
 .board-column { min-width: 0; }
+.agent-flow-wrap { overflow-x: auto; padding: 0 16px 16px; }
+.agent-flow-svg { display: block; width: 100%; min-width: 720px; height: auto; }
+.agent-flow-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 2;
+  stroke-dasharray: 7 7;
+  animation: agent-flow-dash 1.2s linear infinite;
+}
+.agent-flow-edge.status-in-progress { stroke: #2f81f7; }
+.agent-flow-edge.status-needs-review { stroke: #d29922; }
+.agent-flow-edge.status-blocked, .agent-flow-edge.status-needs-human { stroke: #f85149; }
+.agent-flow-edge.status-merged { stroke: #8250df; }
+.agent-flow-edge.status-closed { opacity: 0.4; animation: none; }
+.agent-flow-node rect { fill: var(--bg2); stroke: var(--border); stroke-width: 1; }
+.agent-flow-issue rect { fill: var(--bg); }
+.agent-flow-node text { fill: var(--fg); font-size: 12px; }
+.agent-flow-node .agent-flow-muted { fill: var(--muted); font-size: 10px; }
+.agent-flow-empty { padding: 16px; color: var(--muted); }
+@keyframes agent-flow-dash { to { stroke-dashoffset: -28; } }
+@media (prefers-reduced-motion: reduce) { .agent-flow-edge { animation: none; } }
 .kv { width: 100%; border-collapse: collapse; font-size: 13px; }
 .kv th { text-align: left; font-weight: 500; color: var(--muted); padding: 6px 16px; width: 40%; vertical-align: top; white-space: nowrap; }
 .kv td { padding: 6px 16px; word-break: break-all; }
