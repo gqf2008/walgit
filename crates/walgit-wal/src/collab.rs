@@ -770,6 +770,17 @@ pub struct BoardCard {
     pub actor: String,
     /// Effective work-unit status (see `card_status`).
     pub status: String,
+    /// Current owner (agent/human) from the latest `status` entry that names
+    /// one; empty when unassigned. This is separate from `actor` (the signing
+    /// principal) so a proxy principal can report the real worker.
+    pub owner: String,
+    /// Worktree name/path from the latest `status` entry that names one.
+    pub worktree: String,
+    /// Branch from the latest `status` entry that names one.
+    pub branch: String,
+    /// Current task summary from the latest `status` entry (`work`, falling
+    /// back to `note`); inherited until a later status changes or clears it.
+    pub work: String,
     pub created_ts: i64,
     pub last_ts: i64,
     pub entries: usize,
@@ -830,6 +841,43 @@ fn card_status(ordered: &[&EntryRef]) -> String {
         }
     }
     status
+}
+
+#[derive(Default)]
+struct BoardWorkContext {
+    owner: String,
+    worktree: String,
+    branch: String,
+    work: String,
+}
+
+/// Work context is inherited across status moves: a `needs-review` entry that
+/// only sets `status` keeps the owner/worktree/branch/work from the previous
+/// status. An explicit empty string clears a field; `work` falls back to the
+/// same status entry's `note` when absent.
+fn card_work_context(ordered: &[&EntryRef]) -> BoardWorkContext {
+    let mut ctx = BoardWorkContext::default();
+    for r in ordered {
+        if r.entry.kind != "status" {
+            continue;
+        }
+        let body = &r.entry.body;
+        for (key, slot) in [
+            ("owner", &mut ctx.owner),
+            ("worktree", &mut ctx.worktree),
+            ("branch", &mut ctx.branch),
+        ] {
+            if let Some(v) = body.get(key).and_then(serde_json::Value::as_str) {
+                *slot = v.to_string();
+            }
+        }
+        if let Some(v) = body.get("work").and_then(serde_json::Value::as_str) {
+            ctx.work = v.to_string();
+        } else if let Some(v) = body.get("note").and_then(serde_json::Value::as_str) {
+            ctx.work = v.to_string();
+        }
+    }
+    ctx
 }
 
 /// First-match-wins against the column predicate (D1 §8).
@@ -937,12 +985,17 @@ pub fn build_board(
                 reason: eval.reason,
             }
         });
+        let work = card_work_context(&ordered);
         let card = BoardCard {
             id: (*id).to_string(),
             title: root_title(&ordered),
             prose: root.map_or(String::new(), |r| entry_prose(&r.entry.body)),
             actor: root.map(|r| r.entry.actor.clone()).unwrap_or_default(),
             status: card_status(&ordered),
+            owner: work.owner,
+            worktree: work.worktree,
+            branch: work.branch,
+            work: work.work,
             created_ts: root.map_or(0, |r| r.entry.ts),
             last_ts: group.iter().map(|r| r.entry.ts).max().unwrap_or(0),
             entries: group.len(),
@@ -1259,6 +1312,72 @@ name = "everything else"
         let board3 = build_board(&borrowed3, &principals, &rules, &def);
         let other_col: Vec<&str> = column_of(&board3, "other").cards.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(other_col, vec!["t1", "t9"], "equal ts: id ascending");
+    }
+
+    #[test]
+    fn board_card_carries_and_inherits_work_context() {
+        let principals = HashMap::new();
+        let mut entries = vec![
+            entry("t1", "issue", "alice", "", 1, serde_json::json!({"title": "owned"})),
+            entry(
+                "t1",
+                "status",
+                "alice",
+                "a1",
+                2,
+                serde_json::json!({
+                    "status": "in-progress",
+                    "owner": "agent-a",
+                    "worktree": "wt-a",
+                    "branch": "feat/a",
+                    "work": "first"
+                }),
+            ),
+            entry(
+                "t1",
+                "status",
+                "alice",
+                "a2",
+                3,
+                serde_json::json!({
+                    "status": "needs-review",
+                    "owner": "agent-b",
+                    "work": "reviewing"
+                }),
+            ),
+        ];
+        let refs = refs_of(&entries);
+        let borrowed: Vec<&EntryRef> = refs.iter().collect();
+        let board = build_board(&borrowed, &principals, &MergeRules::default(), &default_board());
+        let card = &column_of(&board, "other").cards[0];
+        assert_eq!(card.owner, "agent-b");
+        assert_eq!(card.worktree, "wt-a", "worktree inherits across status moves");
+        assert_eq!(card.branch, "feat/a", "branch inherits across status moves");
+        assert_eq!(card.work, "reviewing");
+
+        let clear = entry(
+            "t1",
+            "status",
+            "alice",
+            "a3",
+            4,
+            serde_json::json!({
+                "status": "in-progress",
+                "owner": "",
+                "worktree": "",
+                "branch": "",
+                "note": "fixing"
+            }),
+        );
+        entries.push(clear);
+        let refs = refs_of(&entries);
+        let borrowed: Vec<&EntryRef> = refs.iter().collect();
+        let board = build_board(&borrowed, &principals, &MergeRules::default(), &default_board());
+        let card = &column_of(&board, "other").cards[0];
+        assert_eq!(card.owner, "");
+        assert_eq!(card.worktree, "");
+        assert_eq!(card.branch, "");
+        assert_eq!(card.work, "fixing", "note is the work fallback");
     }
 
     #[test]

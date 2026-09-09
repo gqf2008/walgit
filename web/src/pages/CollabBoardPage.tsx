@@ -134,6 +134,16 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
         {" · "}
         {fmtTime(card.last_ts)}
       </div>
+      <div className="board-card-context">
+        <span>{card.owner ? t("board.card.owner", { owner: card.owner }) : t("board.card.unassigned")}</span>
+        {card.worktree && <span>{t("board.card.worktree", { worktree: card.worktree })}</span>}
+        {card.branch && <span>{t("board.card.branch", { branch: card.branch })}</span>}
+      </div>
+      {card.work && (
+        <div className="muted card-prose board-card-work">
+          <Markdown source={card.work} />
+        </div>
+      )}
       {card.prose && (
         <div className="muted card-prose">
           <Markdown source={card.prose} />

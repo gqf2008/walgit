@@ -212,6 +212,14 @@ export interface CollabBoardCard {
   actor: string;
   /** Effective work-unit status: the latest `status` entry's value. */
   status: string;
+  /** Current owner from the latest status entry that names one. */
+  owner: string;
+  /** Current worktree from the latest status entry that names one. */
+  worktree: string;
+  /** Current branch from the latest status entry that names one. */
+  branch: string;
+  /** Current task summary (`work`, falling back to `note`). */
+  work: string;
   created_ts: number;
   last_ts: number;
   entries: number;

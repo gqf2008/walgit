@@ -873,6 +873,21 @@ fn render_board_text(b: &Board) -> String {
                 c.actor,
                 c.last_ts
             );
+            let context = [
+                (!c.owner.is_empty()).then(|| format!("owner={}", c.owner)),
+                (!c.worktree.is_empty()).then(|| format!("worktree={}", c.worktree)),
+                (!c.branch.is_empty()).then(|| format!("branch={}", c.branch)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            if !context.is_empty() {
+                let _ = writeln!(out, "      {context}");
+            }
+            if !c.work.is_empty() {
+                let _ = writeln!(out, "      work: {}", c.work);
+            }
         }
         let _ = writeln!(out);
     }
@@ -890,15 +905,18 @@ fn render_board_markdown(b: &Board) -> String {
         }
         let _ = writeln!(
             out,
-            "| card | status | actor | entries | verified | last |\n|---|---|---|---|---|---|"
+            "| card | status | owner | worktree | branch | work | entries | verified | last |\n|---|---|---|---|---|---|---|---|---|"
         );
         for c in &col.cards {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 esc(card_label(c)),
                 c.status,
-                c.actor,
+                esc(&c.owner),
+                esc(&c.worktree),
+                esc(&c.branch),
+                esc(&c.work),
                 c.entries,
                 c.verified,
                 c.last_ts
