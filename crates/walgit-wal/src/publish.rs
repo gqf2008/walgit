@@ -1561,8 +1561,19 @@ pub(crate) async fn add_pack_impl(
         WalError::Corrupt(format!("pack path {} has no parent", dest.display()))
     })?)?;
     for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
-        if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
-            std::fs::copy(src, &dst)?;
+        if !dst.exists() && std::fs::hard_link(src, &dst).is_err() && !dst.exists() {
+            // Cross-volume fallback (the ingest scratch and cache.dir on
+            // different filesystems): copy to the transient sibling and
+            // rename into place — never straight into the committed
+            // `pack-<checksum>.pack`/`.idx` name, or a concurrent reader
+            // (upload-pack, the web object endpoints, the base rebuild's
+            // scratch copy) can adopt a truncated-but-legally-named pack:
+            // silent wrong data (issue #144). The `.tmp` name is the
+            // convention `is_transient_git_name`
+            // (walgit-server/src/rebuild.rs) skips, so that copy is immune
+            // to the in-flight file; a `dst` another writer installed
+            // meanwhile is left alone (same content-addressed bytes).
+            walgit_git::copy_into_place(src, &dst)?;
         }
     }
     if let Some(base) = &history_of {
@@ -1689,6 +1700,34 @@ pub(crate) async fn publish_settings_impl(
                 }
             }
             Err(e) => return Err(WalError::Store(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The transient names `add_pack_impl`'s cross-volume fallback stages
+    /// under (`walgit_git::transient_sibling`, `pack-<checksum>.pack.tmp` /
+    /// `.idx.tmp`) must stay inside the skip convention of
+    /// `is_transient_git_name` (walgit-server/src/rebuild.rs) — that crate is
+    /// not importable from walgit-wal, so pin the literal convention here:
+    /// if either side drifts, the base rebuild's scratch copy inherits
+    /// in-flight packs again and issue #144's protection silently lapses.
+    #[test]
+    fn fallback_tmp_names_match_the_rebuild_skip_convention() {
+        for committed in ["pack-0123abcd.pack", "pack-0123abcd.idx"] {
+            let tmp = walgit_git::transient_sibling(std::path::Path::new(committed));
+            let name = tmp.file_name().unwrap().to_str().unwrap();
+            // Literal, not predicate-based (rebuild.rs's own test makes the
+            // same choice): the rule being pinned is the lowercase `.tmp`
+            // suffix (case-exact extension compare, like rebuild.rs).
+            assert_eq!(name, format!("{committed}.tmp"));
+            assert!(
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext == "tmp"),
+                "{name} no longer matches rebuild.rs's `.tmp` skip rule"
+            );
         }
     }
 }

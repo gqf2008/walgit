@@ -264,7 +264,11 @@ fn install_pack(
             continue;
         }
         if std::fs::hard_link(&s, &d).is_err() {
-            std::fs::copy(&s, &d).with_context(|| format!("installing {}", d.display()))?;
+            // Never copy straight into the committed name — a concurrent
+            // reader could adopt the truncated file (issue #144; on ExFAT
+            // hard links do not exist, so this fallback is the *only* path).
+            walgit_git::copy_into_place(&s, &d)
+                .with_context(|| format!("installing {}", d.display()))?;
         }
     }
     Ok(())

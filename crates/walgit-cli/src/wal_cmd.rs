@@ -306,6 +306,8 @@ pub async fn materialize_at(
 
     // Packs live at `at_seq`: copy from the local serving copy when it
     // has them, else fetch from the store (never move the live copy).
+    // `.walgit-tmp` under the output dir is this command's private staging —
+    // no reader adopts its names as serving state (issue #144's audit).
     let tmp = out.join(".walgit-tmp");
     std::fs::create_dir_all(&tmp)?;
     for p in &pack_set {

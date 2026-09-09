@@ -157,7 +157,10 @@ pub(crate) async fn download_and_install_pack(
                 continue;
             }
             if std::fs::rename(&tmp, &dest).is_err() {
-                let _ = std::fs::copy(&tmp, &dest);
+                // Cross-volume fallback into the committed side-file name:
+                // transient sibling + rename, never a truncated
+                // `pack-<checksum>.<ext>` a reader could adopt (issue #144).
+                let _ = walgit_git::copy_into_place(&tmp, &dest);
                 let _ = std::fs::remove_file(&tmp);
             }
         }
@@ -243,6 +246,10 @@ pub(crate) async fn link_and_install_pack(
     let idx_path = tmp_dir.join(format!("pack-{checksum}.idx"));
     // The remote reader may already hold this index (web API on the same
     // instance): same bytes, hard-link instead of a second 2 GB download.
+    // The copy fallback's destination is this pass's private scratch
+    // (`tmp_dir`; `install_pack` below renames it into objects/pack), which
+    // no concurrent reader adopts as serving state — so this site needs no
+    // tmp+rename of its own (issue #144's audit).
     let remote_idx = crate::remote::idx_dir(local.path()).join(format!("{checksum}.idx"));
     let mut extra = Vec::new();
     let mut side_futs = Vec::new();
@@ -585,7 +592,10 @@ pub(crate) async fn reconcile_packs_inner(
                 .instrument(span.clone())
                 .await?;
                 if std::fs::rename(&tmp, &dest).is_err() {
-                    std::fs::copy(&tmp, &dest)?;
+                    // Cross-volume fallback into the committed
+                    // `pack-<checksum>.commit-graph` name: transient sibling +
+                    // rename so no reader adopts a truncated layer (#144).
+                    walgit_git::copy_into_place(&tmp, &dest)?;
                     let _ = std::fs::remove_file(&tmp);
                 }
             }
@@ -640,7 +650,10 @@ pub(crate) async fn reconcile_packs_inner(
             {
                 Ok(()) => {
                     if std::fs::rename(&tmp, &dest).is_err() {
-                        let _ = std::fs::copy(&tmp, &dest);
+                        // Cross-volume fallback into the committed side-file
+                        // name: transient sibling + rename, never a truncated
+                        // `pack-<checksum>.<ext>` a reader could adopt (#144).
+                        let _ = walgit_git::copy_into_place(&tmp, &dest);
                         let _ = std::fs::remove_file(&tmp);
                     }
                     tracing::info!(repo = %handle.id, pack = %p.checksum, ext, "side-file installed for an installed pack");
