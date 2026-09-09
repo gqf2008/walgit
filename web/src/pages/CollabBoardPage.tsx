@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, refListStream, type CollabBoardCard } from "../api";
+import { api, refListStream, type CollabBoardCard, type CollabBoardColumn } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -20,6 +20,11 @@ import { useI18n, statusLabel } from "../i18n";
 /** The statuses the move-menu offers. Values are free-form on the wire (any
     `status` entry value works); these are the ones D1 names. */
 const STATUSES = ["open", "in-progress", "needs-review", "blocked", "needs-human", "merged", "closed"] as const;
+
+/** Columns shown by the default board view: non-empty only, unless asked. */
+export function visibleBoardColumns(columns: CollabBoardColumn[], showEmpty: boolean): CollabBoardColumn[] {
+  return showEmpty ? columns : columns.filter((col) => col.cards.length > 0);
+}
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -169,7 +174,7 @@ export function CollabBoardPage() {
   useCollabLive(full);
   const nonEmpty = board.columns.filter((col) => col.cards.length > 0);
   const emptyCount = board.columns.length - nonEmpty.length;
-  const visibleColumns = showEmpty || nonEmpty.length === 0 ? board.columns : nonEmpty;
+  const visibleColumns = visibleBoardColumns(board.columns, showEmpty);
   return (
     <>
       <div className="pad">
@@ -189,11 +194,17 @@ export function CollabBoardPage() {
           </button>
         )}
       </div>
-      <div className="board-grid">
-        {visibleColumns.map((col) => (
-          <BoardColumnView key={col.name} full={full} name={col.name} cards={col.cards} />
-        ))}
-      </div>
+      {visibleColumns.length === 0 ? (
+        <Box>
+          <div className="pad muted">{t("board.noCards")}</div>
+        </Box>
+      ) : (
+        <div className="board-grid">
+          {visibleColumns.map((col) => (
+            <BoardColumnView key={col.name} full={full} name={col.name} cards={col.cards} />
+          ))}
+        </div>
+      )}
     </>
   );
 }
