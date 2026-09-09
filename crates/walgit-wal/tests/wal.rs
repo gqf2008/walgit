@@ -967,6 +967,63 @@ async fn reconcile_prunes_local_pack_not_in_manifest() {
 }
 
 #[tokio::test]
+async fn reconcile_keeps_staged_pack() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "pack-staged");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-staged", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let live = handle.manifest().packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+
+    let cache2 = tempfile::tempdir().unwrap();
+    let local = LocalRepo::init(cache2.path(), &id, ObjectFormat::Sha1).unwrap();
+    let extra = gix_hash::ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+    let extra_pack = local.pack_path(&extra);
+    std::fs::copy(&live_pack, local.pack_path(&live_oid)).unwrap();
+    std::fs::copy(&live_idx, local.pack_path(&live_oid).with_extension("idx")).unwrap();
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+    drop(local);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let staged = handle2
+        .stage_pack_guard(&extra.to_string())
+        .expect("self Arc is installed on an opened handle");
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            handle2.local().pack_path(&extra).exists(),
+            "a staged pack must survive reconciliation while the guard is held"
+        );
+    }
+    drop(staged);
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            !handle2.local().pack_path(&extra).exists(),
+            "after the guard is dropped the deferred pack is pruned on the next sync"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_compact_replays_on_other_registry() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
