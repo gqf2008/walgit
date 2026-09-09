@@ -247,6 +247,12 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
         shell: bash
+      # The renderer security boundary (issue #112) — vitest/jsdom, pure node,
+      # same toolchain the windows-green web-build step above already installs
+      # and runs; #141 closes the "vitest only ever ran on ubuntu" gap with it.
+      - name: Web unit tests
+        run: just web-test
+        shell: bash
       - name: Compile every target (lib/bins/tests) and gate zero rustc warnings
         # bash, not the default pwsh: the recipe needs bash's `$'…'` ANSI-C
         # quoting and `set -o pipefail`. This is ALSO the windows zero-warning
