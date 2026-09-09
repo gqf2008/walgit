@@ -432,6 +432,59 @@ pub(crate) async fn download_object(
     Ok(())
 }
 
+fn refs_not_replayable(manifest: &Manifest, from_seq: u64, to_seq: u64, detail: &str) -> WalError {
+    WalError::Corrupt(format!(
+        "refs not replayable: {detail}; from_seq={from_seq} to_seq={to_seq} checkpoint.seq={} min_seq={} head_seq={}",
+        manifest.checkpoint.as_ref().map_or(0, |cp| cp.seq),
+        manifest.min_seq,
+        manifest.head_seq,
+    ))
+}
+
+/// Verify that the manifest's checkpoint plus named log segments cover the
+/// requested tail `(from_seq, to_seq]`. A checkpoint may only replace the log
+/// through its own sequence; anything older than that is folded away. Sequence
+/// numbers may contain holes: a crashed writer burns an orphaned head slot, so
+/// only the last named segment must reach `to_seq`.
+pub(crate) fn ensure_replayable(
+    manifest: &Manifest,
+    from_seq: u64,
+    to_seq: u64,
+) -> Result<(), WalError> {
+    let requested_start = from_seq.saturating_add(1);
+    if requested_start > to_seq {
+        return Ok(());
+    }
+    let coverage_start = manifest
+        .checkpoint
+        .as_ref()
+        .map_or(1, |cp| cp.seq.saturating_add(1))
+        .max(manifest.min_seq.max(1));
+    if requested_start < coverage_start {
+        return Err(refs_not_replayable(
+            manifest,
+            from_seq,
+            to_seq,
+            "checkpoint folded the requested range",
+        ));
+    }
+
+    let segments: Vec<_> = manifest
+        .log_segments
+        .iter()
+        .filter(|segment| segment.last_seq >= requested_start && segment.first_seq <= to_seq)
+        .collect();
+    if segments.iter().any(|segment| segment.last_seq >= to_seq) {
+        return Ok(());
+    }
+    Err(refs_not_replayable(
+        manifest,
+        from_seq,
+        to_seq,
+        "log segments do not cover the tail",
+    ))
+}
+
 /// Apply the delta between the current local state and the new manifest.
 /// Downloads missing packs, replays log entries, applies ref transactions.
 ///
@@ -448,12 +501,24 @@ pub(crate) async fn apply_delta(
     new_manifest: &Manifest,
     new_version: &Version,
 ) -> Result<(), WalError> {
+    apply_delta_with_rebuild(handle, new_manifest, new_version, true).await?;
+    handle.mark_refs_verified();
+    Ok(())
+}
+
+pub(crate) async fn apply_delta_with_rebuild(
+    handle: &super::handle::RepoHandle,
+    new_manifest: &Manifest,
+    new_version: &Version,
+    force_refs_rebuild: bool,
+) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
     let head_seq = new_manifest.head_seq;
-    let rebuilt =
-        current_state.applied_seq > head_seq || new_manifest.revision < current_state.revision;
+    let rebuilt = force_refs_rebuild
+        || current_state.applied_seq > head_seq
+        || new_manifest.revision < current_state.revision;
 
     if head_seq == 0 {
         // Empty manifest ⇒ empty refs, unconditionally: cheap (one small
@@ -466,8 +531,24 @@ pub(crate) async fn apply_delta(
         // was rebuilt and we must restart from it — load its refs. Its packs
         // are a subset of `Manifest.packs` and are reconciled below.
         let checkpoint_seq = new_manifest.checkpoint.as_ref().map_or(0, |c| c.seq);
+        if checkpoint_seq > head_seq {
+            return Err(refs_not_replayable(
+                new_manifest,
+                checkpoint_seq,
+                head_seq,
+                "checkpoint is ahead of head",
+            ));
+        }
         let need_checkpoint_load =
-            checkpoint_seq > 0 && (current_state.applied_seq < checkpoint_seq || rebuilt);
+            checkpoint_seq > 0 && (rebuilt || current_state.applied_seq < checkpoint_seq);
+        let replay_from = if need_checkpoint_load {
+            checkpoint_seq
+        } else if rebuilt {
+            0
+        } else {
+            current_state.applied_seq
+        };
+        ensure_replayable(new_manifest, replay_from, head_seq)?;
 
         // The checkpoint's times feed `first_state_time` / `refs_as_of`; old refs
         // carry none, the object always does.
@@ -477,6 +558,13 @@ pub(crate) async fn apply_delta(
             if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
                 local.load_ref_snapshot(&snap)?;
                 handle.state.lock().applied_seq = checkpoint_seq;
+            } else {
+                return Err(refs_not_replayable(
+                    new_manifest,
+                    replay_from,
+                    head_seq,
+                    "checkpoint refs object is missing",
+                ));
             }
         } else if rebuilt {
             // No checkpoint to rebuild from: start empty and replay the whole
@@ -598,8 +686,10 @@ pub(crate) async fn reconcile_packs_inner(
         let mut st = handle.state.lock();
         st.remote_served.clone_from(&remote_served);
     }
-    let remote_set: std::collections::HashSet<&str> =
-        remote_served.iter().map(std::string::String::as_str).collect();
+    let remote_set: std::collections::HashSet<&str> = remote_served
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
 
     // History packs (D18) are an accelerator, not a requirement: a fetch can
     // be served from the linked/remote base right away. They are installed by
@@ -755,20 +845,31 @@ pub(crate) async fn reconcile_packs_inner(
     }
     maintain_commit_graph(handle, manifest, &downloaded).await;
 
-    // Remove packs superseded by compactions (never a pack that is still
-    // live: a later PUSH/COMPACT may have re-listed it). Removal needs no
-    // active readers (they hold `rw.read()` through their ReadGuard), so it
-    // **tries** the write lock: if any reader is active (a clone streaming
-    // for minutes), the removal simply waits for a later pass — never queue
-    // as a writer, which would block every new reader on the instance.
+    // Remove every local pack that is not live in this manifest: superseded
+    // packs from COMPACT entries, plus residue from interrupted installs or an
+    // older process whose state file looked current. Removal needs no active
+    // readers (they hold `rw.read()` through their ReadGuard), so it **tries**
+    // the write lock: if any reader is active (a clone streaming for minutes),
+    // the removal simply waits for a later pass — never queue as a writer,
+    // which would block every new reader on the instance.
     let live: std::collections::HashSet<&str> =
         manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
     let pending = std::mem::take(&mut handle.state.lock().pending_pack_removals);
     let mut removed = 0usize;
     let mut still_pending: Vec<String> = Vec::new();
-    let to_remove: Vec<(String, gix_hash::ObjectId)> = pending
+    let mut candidates: std::collections::BTreeSet<String> = pending
         .iter()
-        .filter(|s| !live.contains(s.as_str()))
+        .filter(|s| !live.contains(s.as_str()) && !handle.pack_staged(s))
+        .cloned()
+        .collect();
+    for pack in local.packs()? {
+        let checksum = pack.checksum.to_string();
+        if !live.contains(checksum.as_str()) && !handle.pack_staged(&checksum) {
+            candidates.insert(checksum);
+        }
+    }
+    let to_remove: Vec<(String, gix_hash::ObjectId)> = candidates
+        .into_iter()
         .map(|s| {
             gix_hash::ObjectId::from_hex(s.as_bytes())
                 .map(|o| (s.clone(), o))
@@ -788,10 +889,11 @@ pub(crate) async fn reconcile_packs_inner(
                 .collect();
             if !existing.is_empty() {
                 local.remove_packs(&existing)?;
+                tracing::info!(repo = %handle.id, packs = existing.len(), "local packs outside the manifest removed");
             }
             removed = existing.len();
         } else {
-            tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
+            tracing::info!(repo = %handle.id, packs = to_remove.len(), "packs outside the manifest kept for now: readers active; retried on the next sync");
             still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
         }
     }
@@ -883,6 +985,7 @@ pub(crate) async fn replay_log(
     from_seq: u64,
     to_seq: u64,
 ) -> Result<(), WalError> {
+    ensure_replayable(manifest, from_seq, to_seq)?;
     let store = &handle.store;
 
     // Find segments that overlap (from_seq, to_seq]
@@ -954,6 +1057,14 @@ pub(crate) async fn replay_log(
         );
     }
     all.sort_by_key(|e| e.seq);
+    if from_seq < to_seq && all.last().is_none_or(|entry| entry.seq < to_seq) {
+        return Err(refs_not_replayable(
+            manifest,
+            from_seq,
+            to_seq,
+            "decoded log entries do not reach the tail",
+        ));
+    }
     if let Some(last) = all
         .last()
         .and_then(|e| e.created_at.as_ref())
@@ -1059,7 +1170,10 @@ static BULK_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::O
 fn bulk_runtime() -> &'static tokio::runtime::Runtime {
     // The builder fails only on OS resource exhaustion; this runtime is
     // required for every pack-materialization path, so there is no fallback.
-    #[allow(clippy::expect_used, reason = "required runtime; build fails only under OS resource exhaustion with no recoverable fallback")]
+    #[allow(
+        clippy::expect_used,
+        reason = "required runtime; build fails only under OS resource exhaustion with no recoverable fallback"
+    )]
     BULK_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
