@@ -65,6 +65,11 @@ pub struct RepoHandle {
     // contiguous log tail. Never persisted: a restart must re-verify even when
     // the on-disk state claims applied_seq == head_seq.
     pub(crate) refs_verified: AtomicBool,
+    // Process-local proof that the local pack set was reconciled against the
+    // manifest by this process. Never persisted: a restart must scan the cache
+    // even when the on-disk state claims packs_revision == revision, because a
+    // crash can leave an orphan pack that the persisted state never recorded.
+    pub(crate) packs_verified: AtomicBool,
     // Packs ingested by this process and waiting for their manifest CAS.
     // They are not live in the manifest yet, so pack reconciliation must not
     // mistake them for restart residue and delete them before upload.
@@ -203,6 +208,7 @@ impl RepoHandle {
             manifest_version: PLMutex::new(version),
             state: PLMutex::new(state),
             refs_verified: AtomicBool::new(false),
+            packs_verified: AtomicBool::new(false),
             staged_packs: PLMutex::new(std::collections::HashSet::new()),
             prune_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_freshness: PLMutex::new(None),
@@ -443,6 +449,19 @@ impl RepoHandle {
         self.refs_verified.store(false, Ordering::Release);
     }
 
+    /// Whether this process reconciled the local pack set against the manifest.
+    pub(crate) fn packs_verified(&self) -> bool {
+        self.packs_verified.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_packs_verified(&self) {
+        self.packs_verified.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_packs_unverified(&self) {
+        self.packs_verified.store(false, Ordering::Release);
+    }
+
     pub(crate) fn stage_pack(&self, checksum: &str) {
         self.staged_packs.lock().insert(checksum.to_string());
     }
@@ -630,7 +649,10 @@ impl RepoHandle {
         true
     }
 
-    /// True when the local pack set matches the last applied manifest.
+    /// True when the persisted state says the local pack set matches the last
+    /// applied manifest. Object-serving paths also require `packs_verified`:
+    /// on a fresh process the state may look clean while the cache contains an
+    /// orphan pack from a crash, so `level_satisfied` forces one scan.
     pub fn packs_ready(&self) -> bool {
         self.state.lock().packs_ready()
     }
@@ -1062,8 +1084,12 @@ impl RepoHandle {
             // A base remote-served only because the mount was not yet
             // readable (gcsfuse comes up after the container) is re-planned
             // on the next sync once the file is visible.
-            SyncLevel::Serve => self.packs_ready() && !self.remote_served_but_mountable(),
-            SyncLevel::Full => self.packs_ready() && !self.has_linked_packs(),
+            SyncLevel::Serve => {
+                self.packs_verified() && self.packs_ready() && !self.remote_served_but_mountable()
+            }
+            SyncLevel::Full => {
+                self.packs_verified() && self.packs_ready() && !self.has_linked_packs()
+            }
         }
     }
 
@@ -1228,9 +1254,22 @@ impl RepoHandle {
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
         let staged_checksum = pack.as_ref().map(|p| p.checksum.to_string());
-        if let Some(checksum) = &staged_checksum {
+        // Keep the pack protected until the publisher has produced its final
+        // result. The guard is owned by a detached task below, not by the
+        // caller's future: cancelling the caller must not drop the protection
+        // while the publisher is still about to CAS the manifest.
+        let waiter = self
+            .self_arc
+            .get()
+            .cloned()
+            .ok_or_else(|| WalError::Corrupt("publish requires a self Arc".into()))?;
+        let staged_guard = staged_checksum.as_ref().map(|checksum| {
             self.stage_pack(checksum);
-        }
+            StagedPackGuard {
+                handle: waiter.clone(),
+                checksum: checksum.clone(),
+            }
+        });
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = PublishRequest {
@@ -1245,23 +1284,25 @@ impl RepoHandle {
         let sender = self.get_or_init_publisher();
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
-            if let Some(checksum) = &staged_checksum {
-                self.unstage_pack(checksum);
-            }
+            drop(staged_guard);
             return Err(WalError::Corrupt("publisher channel closed".into()));
         }
 
-        let Ok(result) = rx.await else {
-            if let Some(checksum) = &staged_checksum {
-                self.unstage_pack(checksum);
-            }
-            return Err(WalError::Corrupt("publisher dropped response".into()));
-        };
-        self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
-        if let Some(checksum) = &staged_checksum {
-            self.unstage_pack(checksum);
-        }
-        result
+        let (caller_tx, caller_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(WalError::Corrupt("publisher dropped response".into())),
+            };
+            waiter.publish_waiters.fetch_sub(1, Ordering::Relaxed);
+            drop(staged_guard);
+            let _ = caller_tx.send(result);
+        });
+        caller_rx.await.unwrap_or_else(|_| {
+            Err(WalError::Corrupt(
+                "publish waiter task dropped response".into(),
+            ))
+        })
     }
     /// Publish a ref-only update (no pack).
     pub async fn publish_ref_update(
@@ -1280,10 +1321,10 @@ impl RepoHandle {
         tier: u32,
     ) -> Result<u64, WalError> {
         let checksum = new_pack.checksum.to_string();
-        self.stage_pack(&checksum);
-        let result = crate::publish::publish_compact_impl(self, new_pack, supersedes, tier).await;
-        self.unstage_pack(&checksum);
-        result
+        let _guard = self
+            .stage_pack_guard(&checksum)
+            .ok_or_else(|| WalError::Corrupt("publish_compact requires a self Arc".into()))?;
+        crate::publish::publish_compact_impl(self, new_pack, supersedes, tier).await
     }
 
     /// D24: the repository's settings as last applied (manifest-inline).
@@ -1367,14 +1408,14 @@ impl RepoHandle {
             .and_then(|name| name.strip_prefix("pack-"))
             .and_then(|name| name.strip_suffix(".pack"))
             .map(str::to_string);
-        if let Some(checksum) = &checksum {
-            self.stage_pack(checksum);
-        }
-        let result = crate::publish::add_pack_impl(self, pack, idx, tier, history_of).await;
-        if let Some(checksum) = &checksum {
-            self.unstage_pack(checksum);
-        }
-        result
+        let _guard = checksum
+            .as_ref()
+            .map(|checksum| {
+                self.stage_pack_guard(checksum)
+                    .ok_or_else(|| WalError::Corrupt("add_pack requires a self Arc".into()))
+            })
+            .transpose()?;
+        crate::publish::add_pack_impl(self, pack, idx, tier, history_of).await
     }
 
     /// Whether the last known manifest wants a checkpoint, and why.

@@ -636,6 +636,10 @@ pub(crate) async fn reconcile_packs_inner(
 ) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
+    // Pack reconciliation is the proof itself: invalidate the previous
+    // process-local result before touching the cache. Only a complete pass
+    // (including the state write below) may mark it verified again.
+    handle.mark_packs_unverified();
     // Test hook: simulate an unknown blocking call inside the install path
     // (what prod had: 2.6–43 s runtime stalls during materialization). With
     // the bulk runtime this only delays bulk work.
@@ -971,6 +975,9 @@ pub(crate) async fn reconcile_packs_inner(
         state.packs_dirty = false;
     }
     crate::state::save_state(local.path(), &handle.state.lock().clone())?;
+    if handle.state.lock().packs_ready() {
+        handle.mark_packs_verified();
+    }
     Ok(())
 }
 
@@ -1202,6 +1209,7 @@ pub(crate) async fn materialize_from_scratch(
     // Instrument the awaited materialization future; do not hold an enter guard.
 
     // Reset state
+    handle.mark_packs_unverified();
     handle.state.lock().applied_seq = 0;
     // "From scratch" must be honest about refs too: with no checkpoint to
     // load, apply_delta replays the whole log on top of the *existing* local
