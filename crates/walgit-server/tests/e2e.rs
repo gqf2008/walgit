@@ -3105,7 +3105,8 @@ async fn bare_push_gets_a_basic_challenge_and_then_sends_url_userinfo() -> TestR
 /// and a reader spins on `ls-remote`, every read after a push's `ok` must show that push's tip —
 /// the advertisement caches are keyed by the manifest version, and a publish that advertised the
 /// new version before applying the refs locally let a reader cache the OLD refs under the NEW
-/// version (reproduced roughly once in six rounds). 12 rounds × 6 pushers.
+/// version (reproduced roughly once in six rounds). 4 rounds × 6 pushers, prepared same-base
+/// before any push is spawned (issue #146).
 #[allow(unsafe_code)] // SAFETY: test-only env hooks for the publish-gap knob; each site below names its own guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestResult {
@@ -3151,8 +3152,14 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             ));
         }
         let mut contender_shas = Vec::new();
-        // 6 contenders from the same base, each with its own commit.
-        let mut handles = Vec::new();
+        // 6 contenders, all cloned and committed from the same base BEFORE any
+        // push is spawned (issue #146). The previous single-loop shape cloned
+        // contender i only after contender 0..i-1's pushes were already in
+        // flight, so the contenders formed a fast-forward chain instead of
+        // forks from one base: several pushes won, and the reader below
+        // misjudged the chain's intermediate committed tips — correct server
+        // advertisements at the time — as "foreign".
+        let mut prepared = Vec::new();
         for i in 0..6 {
             let d = tempfile::tempdir()?;
             git(
@@ -3167,6 +3174,10 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             git_in(d.path(), &["commit", "-q", "-m", &format!("r{round} c{i}")])?;
             let sha = git_in(d.path(), &["rev-parse", "HEAD"])?.trim().to_string();
             contender_shas.push(sha.clone());
+            prepared.push((d, sha));
+        }
+        let mut handles = Vec::new();
+        for (d, sha) in prepared {
             let url2 = url.clone();
             let cwd = d.path().to_path_buf();
             handles.push((
@@ -3207,13 +3218,22 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             }
             seen
         });
-        let mut winner = None;
+        // Exactly one push must win: every contender forks from the same base,
+        // so the first CAS lands and the rest are non-fast-forward rejects. A
+        // count other than one means the same-base premise above broke — that
+        // is the bug to fix, never something to accommodate here.
+        let mut winners = Vec::new();
         for (_d, sha, h) in handles {
             if h.join().unwrap() {
-                winner = Some(sha);
+                winners.push(sha);
             }
         }
-        let winner = winner.expect("exactly one push wins each round");
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: expected exactly one winning push from same-base contenders, got {winners:?} (base {base})"
+        );
+        let winner = winners[0].clone();
         // Read-your-writes: the first read after the last push returned must be the winner, and so
         // must every read after it.
         let mut after: Vec<String> = Vec::new();
@@ -3229,13 +3249,19 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
         }
         // The concurrent reader may see base or winner, never base again after
         // winner (the original bug's signature: old refs cached under the new
-        // version). A foreign value (neither base nor winner) is evidence the
-        // server advertised a contender's commit as refs/heads/main — main's
+        // version). With the two-phase contender setup above, base and the one
+        // winner are the ONLY committed states this repo ever has during the
+        // race, so a foreign value (neither base nor winner) is evidence the
+        // server advertised a tip it never committed — main's
         // 2026-09-01 05:40Z windows run saw one foreign sha for ~40 consecutive
         // samples (~1 s of sustained advertisement), so this is a real signal,
-        // not noise. A single stray sample could be a client artifact, so a
-        // sustained run of >=3 identical foreign values is a hard failure; 1-2
-        // samples are reported as a diagnostic for forensics.
+        // not noise. (Pre-#146 the single-loop setup made the contenders a
+        // fast-forward chain and this judgement false-positived on the chain's
+        // committed intermediate tips — run 34225650473's "c549696" red was
+        // that misjudgement, not a server race; see issue #4's adjudication.)
+        // A single stray sample could be a client artifact, so a sustained run
+        // of >=3 identical foreign values is a hard failure; 1-2 samples are
+        // reported as a diagnostic for forensics.
         let mut saw_winner = false;
         let mut foreign: Vec<String> = Vec::new();
         for h in &seen {

@@ -518,7 +518,12 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   hardened (PR #28): a sustained run of ≥3 consecutive identical foreign tips is a hard failure with a
   full DIAG dump (contenders/prev_winner/base/winner/after/seen) — a red means the read-side race of
   issue #4 re-fired; attach the dump to issue #4, never rerun-and-forget. 1–2 stray foreign samples
-  print the same dump without failing.
+  print the same dump without failing. (2026-09-09, #146: the test's contender loop used to clone and
+  spawn serially, so contenders formed a fast-forward chain and the foreign judgement false-positived
+  on the chain's committed intermediate tips — run 34225650473's "c549696" red was that
+  misjudgement, not a server race; adjudication on issue #4. The loop is now two-phase: all six
+  contenders cloned from the same base before any push spawns, with exactly-one-winner asserted, so a
+  foreign red is again unambiguous server evidence.)
 - **The clippy gate is green** (issue #1 debt cleared 2026-09-03): `just clippy`
   (`cargo clippy --workspace --all-targets -- -D warnings`) exits 0. New warnings are a
   regression — fix them in the PR; never by weakening the lint table. The `clippy` CI job
