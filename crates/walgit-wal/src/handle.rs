@@ -157,7 +157,10 @@ pub struct StagedPackGuard {
 
 impl Drop for StagedPackGuard {
     fn drop(&mut self) {
-        self.handle.unstage_pack(&self.checksum);
+        if !self.handle.unstage_pack(&self.checksum) {
+            // Another guard still owns the pack (receive + publisher waiter).
+            return;
+        }
         // A guard that drops before its pack became live means the ingest or
         // publish failed/was cancelled. Record the orphan so a later reconcile
         // removes it even when the manifest revision did not change.
@@ -472,14 +475,18 @@ impl RepoHandle {
             .or_default() += 1;
     }
 
-    pub(crate) fn unstage_pack(&self, checksum: &str) {
+    pub(crate) fn unstage_pack(&self, checksum: &str) -> bool {
         let mut staged = self.staged_packs.lock();
         if let Some(count) = staged.get_mut(checksum) {
             if *count > 1 {
                 *count -= 1;
+                false
             } else {
                 staged.remove(checksum);
+                true
             }
+        } else {
+            false
         }
     }
 
