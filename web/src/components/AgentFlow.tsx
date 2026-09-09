@@ -12,6 +12,8 @@ export interface AgentFlowGroup {
 }
 
 const ARCHIVED = new Set(["closed", "merged", "done"]);
+export const MAX_FLOW_CARDS = 60;
+const MAX_ANIMATED_EDGES = 30;
 
 /** Group current board cards by their explicit owner; empty owner is unassigned. */
 export function agentFlowGroups(columns: CollabBoardColumn[]): AgentFlowGroup[] {
@@ -26,6 +28,19 @@ export function agentFlowGroups(columns: CollabBoardColumn[]): AgentFlowGroup[] 
     }
   }
   return [...groups.values()].toSorted((a, b) => a.owner.localeCompare(b.owner));
+}
+
+/** Keep the SVG bounded; callers show a truncation notice when this drops cards. */
+export function limitAgentFlowGroups(groups: AgentFlowGroup[], maxCards: number): AgentFlowGroup[] {
+  const limited: AgentFlowGroup[] = [];
+  let remaining = maxCards;
+  for (const group of groups) {
+    if (remaining <= 0) break;
+    const cards = group.cards.slice(0, remaining);
+    if (cards.length > 0) limited.push({ owner: group.owner, cards });
+    remaining -= cards.length;
+  }
+  return limited;
 }
 
 function short(s: string, n: number): string {
@@ -43,7 +58,9 @@ function statusClass(status: string): string {
  */
 export function AgentFlow({ columns }: { columns: CollabBoardColumn[] }) {
   const { t } = useI18n();
-  const groups = agentFlowGroups(columns);
+  const allGroups = agentFlowGroups(columns);
+  const totalCards = allGroups.reduce((n, group) => n + group.cards.length, 0);
+  const groups = limitAgentFlowGroups(allGroups, MAX_FLOW_CARDS);
   const cards = groups.flatMap((g) => g.cards);
   if (cards.length === 0) return <div className="agent-flow-empty">{t("board.flow.empty")}</div>;
 
@@ -67,7 +84,12 @@ export function AgentFlow({ columns }: { columns: CollabBoardColumn[] }) {
   }
 
   return (
-    <div className="agent-flow-wrap">
+    <div className={`agent-flow-wrap ${totalCards > MAX_ANIMATED_EDGES ? "agent-flow-static" : ""}`}>
+      {totalCards > MAX_FLOW_CARDS && (
+        <div className="agent-flow-truncated">
+          {t("board.flow.truncated", { shown: MAX_FLOW_CARDS, total: totalCards })}
+        </div>
+      )}
       <svg className="agent-flow-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("board.flow.aria")}>
         {groups.flatMap((group) =>
           group.cards.map((item) => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CollabBoardCard, CollabBoardColumn } from "../api";
-import { agentFlowGroups } from "./AgentFlow";
+import { agentFlowGroups, limitAgentFlowGroups, MAX_FLOW_CARDS } from "./AgentFlow";
 
 const card = (id: string, owner: string, status = "in-progress"): CollabBoardCard =>
   ({ id, title: id, owner, status, work: `work ${id}` }) as unknown as CollabBoardCard;
@@ -34,5 +34,12 @@ describe("agentFlowGroups", () => {
       column("in-progress", [card("active", "agent-a")]),
     ]);
     expect(groups[0]?.cards.map((item) => item.card.id)).toEqual(["active"]);
+  });
+
+  it("caps the rendered graph while preserving owner groups", () => {
+    const cards = Array.from({ length: 100 }, (_, i) => card(`i${i}`, i % 2 ? "agent-a" : "agent-b"));
+    const limited = limitAgentFlowGroups(agentFlowGroups([column("in-progress", cards)]), MAX_FLOW_CARDS);
+    expect(limited.reduce((n, group) => n + group.cards.length, 0)).toBe(MAX_FLOW_CARDS);
+    expect(limited.map((group) => group.owner)).toEqual(["agent-a", "agent-b"]);
   });
 });
