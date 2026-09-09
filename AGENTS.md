@@ -493,12 +493,18 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   old readers within the retention window.
 - Web: pnpm + Vite, `pnpm run build` must pass oxlint/tsc. Config: `walgit.example.toml` documents every key;
   change it with the code.
-- Test tiers: `just test` (fast, < 1 min), `just e2e`, `just sim`, `just warnings`, `just clippy` (the
-  `[workspace.lints]` set, `-D warnings`), `just ci` = all five; the **simulation
+- Test tiers: `just test` (fast, < 1 min: lib/bins, the wildcard crates, the server integration set),
+  `just test-cli` (the walgit-cli suites), `just e2e`, `just sim`, `just warnings`, `just clippy` (the
+  `[workspace.lints]` set, `-D warnings`), `just ci` = all of them; the **simulation
   suite** `cargo test -p walgit-server --test sim` (fault links per instance over one truth store: crash,
   partition, stale, lost response, orphan scenarios + randomized seeds `WALGIT_SIM_SEEDS`/`WALGIT_SIM_SEED`);
   CI runs sim on both ubuntu (build-test) and the windows leg, e2e on ubuntu and the windows leg,
-  and the server integration suites on both — one list, the justfile's SERVER_TESTS (issue #137);
+  and the server integration suites and the wildcard crates on both — one list per lane in the
+  justfile (`SERVER_TESTS`, `WILDCARD_TEST_PKGS`; issues #137/#141). The **walgit-cli suites
+  (`CLI_TESTS`) run on ubuntu only** — the per-file platform seams are argued at the justfile
+  (issue #141). `scripts/suite-guard.sh` (a CI step) asserts every `crates/*/tests/*.rs` is in a lane
+  or a listed exemption; the windows leg also runs `just web-test` and greps the same
+  `warning_gate` pattern ubuntu's `just warnings` uses (issue #141).
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,
   `WALGIT_TOKEN`). Never `cargo test --workspace --no-fail-fast` in a session; wrap ad-hoc cargo in `timeout`.
 - Known flaky (find the cause, not the assertion):
@@ -592,8 +598,9 @@ The CI workflow posts a **summary comment** on every PR (posted by the `summary`
   debt)` job means the PR itself introduced warnings — fix before merging. The job's
   `continue-on-error` is historical and stays only until the ruleset requires the check.
 - **Expected flaky — rerun once**: tests on the known-flaky list (§5) may fail once;
-  the sim/e2e/fast-tier/server-integration steps auto-rerun once, and a second failure is a
-  regression.
+  the sim/e2e/fast-tier/server-integration steps auto-rerun once (the windows leg's
+  fast-hermetic and server-integration steps included, issue #141), and a second failure
+  is a regression.
   A summary line reading `real red (already rerun once): <step>` means the failing step
   already survived its built-in retry: rerun by hand, don't treat it as a flake.
 - **Real red**: anything else — investigate before merging.

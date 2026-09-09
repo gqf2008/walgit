@@ -76,9 +76,14 @@ dev-store-stop:
 # --- tests -------------------------------------------------------------------
 # Tiers (all hermetic: in-memory store, tempdir caches, real `git` binary):
 #   test       fast tier, < 30 s: every unit/integration test not marked #[ignore]
+#   test-wildcard-crates  the `--tests` lanes below, one list both CI legs read
+#   test-cli   walgit-cli integration suites — ubuntu only, see CLI_TESTS
 #   test-slow  benches/soak: #[ignore]d tests (20k-ref push, 466k-ref render, ...)
 #   test-s3    store contract against local rustfs (just dev-store)
 #   test-gcs   store contract against a real bucket (writes under a unique prefix)
+# Which files exist under crates/*/tests is asserted complete by
+# scripts/suite-guard.sh (every suite in an execution lane or a listed exemption;
+# issue #137 for the server, #141 for all crates).
 
 # The server integration suites — THE list (issue #137). Both CI legs run exactly
 # this set: ubuntu through `test` below, windows through the "Server integration"
@@ -95,8 +100,8 @@ SERVER_TESTS := "--test web_api --test web_ui --test api_v1 --test static_http -
 
 # tests/ files that are not suites: harness.rs is the shared module the suites
 # `mod` in (it has no #[test] of its own); e2e/sim are separate tiers with their
-# own recipes. Read by the ci.yml guard step. An entry here means NO leg runs the
-# file — only files that genuinely are not suites belong on it.
+# own recipes. Read by scripts/suite-guard.sh. An entry here means NO leg runs
+# the file — only files that genuinely are not suites belong on it.
 SERVER_TEST_EXEMPT := "harness e2e sim"
 
 # The walgit-cli integration suites (issue #141) — the first execution lane
@@ -125,6 +130,14 @@ CLI_TESTS := "--test ci_e2e --test collab_e2e"
 # Empty today: both files are suites. An entry means NO leg runs the file.
 CLI_TEST_EXEMPT := ""
 
+# Every crate whose whole tests/ directory runs through a single `--tests`
+# invocation — no per-suite registration (a file added there runs the moment it
+# is committed). Both legs consume this one list: ubuntu via `test` below,
+# windows via the "Fast hermetic tier" step in ci.yml (issue #141 retired that
+# leg's hand-enumerated `-p` lines; the walgit-wal timing case, issue #94, is
+# covered by the step's set-level rerun, the Server-integration precedent).
+WILDCARD_TEST_PKGS := "-p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle"
+
 # The probe invariant: just evaluates EVERY top-level backtick variable when any
 # recipe runs (probed on just 1.48.0), so the windows leg already loads t5/t10/t15
 # today via `just web-build` and must keep loading them — the probes always exit 0.
@@ -146,13 +159,18 @@ test-server-integration:
 test-cli:
     cargo test -p walgit-cli {{CLI_TESTS}}
 
+# The wildcard crates' integration suites, unwrapped; both legs call this
+# (issue #141). Anchored by scripts/suite-guard.sh — keep the line shape.
+test-wildcard-crates:
+    cargo test {{WILDCARD_TEST_PKGS}} --tests
+
 # Fast hermetic tier (< 30 s): every test not marked #[ignore].
 # Fast tier (default, < 1 min): unit tests + the quick integration suites.
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
     {{t5}} cargo test --workspace --lib --bins
-    {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+    {{t5}} just test-wildcard-crates
     {{t10}} just test-server-integration
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
