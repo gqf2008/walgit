@@ -19,10 +19,11 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use walgit_git::{IngestOptions, ObjectFormat, RepoId};
+use prost::Message;
+use walgit_git::{IngestOptions, LocalRepo, ObjectFormat, RepoId};
 use walgit_proto::v1::{EntryKind, RefTransaction, RefUpdate};
-use walgit_store::ObjectStore;
 use walgit_store::memory::MemoryStore;
+use walgit_store::{ObjectStore, ObjectStoreExt};
 use walgit_wal::Registry;
 
 use std::io::Write;
@@ -43,7 +44,8 @@ fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output
         .stderr(Stdio::piped())
         .output()
         .expect("run upstream git");
-    assert!(up.status.success(), 
+    assert!(
+        up.status.success(),
         "git {first:?} failed: {} — stderr: {}",
         up.status,
         String::from_utf8_lossy(&up.stderr)
@@ -63,7 +65,8 @@ fn git_pipe(cwd: &Path, first: &[&str], second: &[&str]) -> std::process::Output
         let _ = stdin.write_all(&up.stdout);
     }
     let out = down.wait_with_output().expect("wait downstream git");
-    assert!(out.status.success(), 
+    assert!(
+        out.status.success(),
         "git {second:?} failed: {} — stderr: {}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
@@ -276,6 +279,33 @@ async fn ingest_pack_data(
 
 fn repo_id(owner: &str, name: &str) -> RepoId {
     RepoId::new(owner, name).unwrap()
+}
+
+async fn load_manifest(store: &MemoryStore, id: &RepoId) -> walgit_proto::v1::Manifest {
+    let key = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    let (_, bytes) = store.get_bytes(&key).await.unwrap().unwrap();
+    walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap()
+}
+
+async fn put_manifest(store: &MemoryStore, id: &RepoId, manifest: &walgit_proto::v1::Manifest) {
+    let key = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    store
+        .put_bytes(
+            &key,
+            manifest.encode_to_vec(),
+            walgit_store::PutMode::Overwrite,
+        )
+        .await
+        .unwrap();
+}
+
+async fn make_checkpoint_fold_gap(store: &MemoryStore, id: &RepoId, head_seq: u64) {
+    let mut manifest = load_manifest(store, id).await;
+    manifest
+        .log_segments
+        .retain(|segment| segment.last_seq >= head_seq);
+    manifest.min_seq = head_seq;
+    put_manifest(store, id, &manifest).await;
 }
 
 // ---- tests ----
@@ -598,7 +628,16 @@ async fn test_checkpoint_materialize() {
             work.create_incremental_pack(&c, &prev)
         };
         let ingested = ingest_pack_data(&handle, pack).await.unwrap();
-        let txn = make_txn(vec![("refs/heads/main", &prev, &c)]);
+        let mut txn = make_txn(vec![("refs/heads/main", &prev, &c)]);
+        if i == 0 {
+            txn.updates.push(RefUpdate {
+                name: "HEAD".to_string(),
+                old_oid: String::new(),
+                new_oid: String::new(),
+                new_symbolic_target: "refs/heads/main".to_string(),
+                new_peeled: String::new(),
+            });
+        }
         handle
             .publish_push(Some(ingested), txn, HashMap::new())
             .await
@@ -638,12 +677,542 @@ async fn test_checkpoint_materialize() {
         "Fresh registry should see refs/heads/main"
     );
     assert_eq!(main_ref.unwrap().oid, c4);
+    assert_eq!(refs.head_target, "refs/heads/main");
 
     // Should have objects
     let oid = gix_hash::ObjectId::from_hex(c4.as_bytes()).unwrap();
     assert!(
         handle2.local().has_object(&oid),
         "Should have the latest commit"
+    );
+}
+
+#[tokio::test]
+async fn replay_gap_fails_not_stale() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "replay-gap");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("gap-1", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    handle.write_checkpoint().await.unwrap();
+
+    let c2 = work.commit("gap-2", "two");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c2, &c1))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let c3 = work.commit("gap-3", "three");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c3, &c2))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", &c2, &c3)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let head_seq = handle.manifest().head_seq;
+    assert_eq!(head_seq, 3);
+
+    make_checkpoint_fold_gap(&store, &id, head_seq).await;
+
+    let cache2 = tempfile::tempdir().unwrap();
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let Err(err) = registry2.open(&id).await else {
+        panic!("a gap in (checkpoint, head] must not replay successfully");
+    };
+    let message = err.to_string();
+    assert!(matches!(err, walgit_wal::WalError::Corrupt(_)));
+    assert!(message.contains("refs not replayable"), "{message}");
+    assert!(message.contains("from_seq=1"), "{message}");
+    assert!(message.contains("to_seq=3"), "{message}");
+    assert!(message.contains("checkpoint.seq=1"), "{message}");
+    assert!(message.contains("min_seq=3"), "{message}");
+    assert!(message.contains("head_seq=3"), "{message}");
+
+    let state_path = cache2
+        .path()
+        .join("test")
+        .join("replay-gap.git")
+        .join("walgit-state.json");
+    assert!(
+        !state_path.exists(),
+        "failed replay must not persist applied_seq=head_seq"
+    );
+}
+
+#[tokio::test]
+async fn first_sync_rebuilds_stale_local_refs() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "stale-refs");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("stale-1", "one");
+    let mut txn = make_txn(vec![("refs/heads/main", "", &c1)]);
+    txn.updates.push(RefUpdate {
+        name: "HEAD".to_string(),
+        old_oid: String::new(),
+        new_oid: String::new(),
+        new_symbolic_target: "refs/heads/main".to_string(),
+        new_peeled: String::new(),
+    });
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(Some(ingested), txn, HashMap::new())
+        .await
+        .unwrap();
+    handle.write_checkpoint().await.unwrap();
+
+    let c2 = work.commit("stale-2", "two");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c2, &c1))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let head_seq = handle.manifest().head_seq;
+    assert_eq!(head_seq, 2);
+
+    // Simulate a process that died after persisting applied_seq=head but before
+    // committing the matching refs/HEAD (or with a stale local ref cache).
+    handle
+        .local()
+        .load_ref_snapshot(&walgit_proto::v1::RefSnapshot::default())
+        .unwrap();
+    std::fs::write(
+        handle.local().path().join("HEAD"),
+        "ref: refs/heads/stale\n",
+    )
+    .unwrap();
+    drop(handle);
+    drop(registry);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let _guard = handle2.sync_refs().await.unwrap();
+    let refs = handle2.local().refs().unwrap();
+    assert_eq!(refs.head_target, "refs/heads/main");
+    assert_eq!(
+        refs.refs
+            .iter()
+            .find(|r| r.name == "refs/heads/main")
+            .map(|r| r.oid.as_str()),
+        Some(c2.as_str()),
+        "first sync must rebuild refs from checkpoint + tail, not trust state.applied_seq"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_refuses_unreplayable_or_stale_refs() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "checkpoint-gap");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("cp-gap-1", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let first_checkpoint = handle.write_checkpoint().await.unwrap();
+    assert_eq!(first_checkpoint.seq, 1);
+
+    let c2 = work.commit("cp-gap-2", "two");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c2, &c1))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let c3 = work.commit("cp-gap-3", "three");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c3, &c2))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", &c2, &c3)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let head_seq = handle.manifest().head_seq;
+    assert_eq!(head_seq, 3);
+
+    handle
+        .local()
+        .load_ref_snapshot(&walgit_proto::v1::RefSnapshot::default())
+        .unwrap();
+    make_checkpoint_fold_gap(&store, &id, head_seq).await;
+    drop(handle);
+    drop(registry);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let err = handle2.write_checkpoint().await.unwrap_err();
+    let message = err.to_string();
+    assert!(matches!(err, walgit_wal::WalError::Corrupt(_)));
+    assert!(message.contains("refs not replayable"), "{message}");
+
+    let manifest = load_manifest(&store, &id).await;
+    assert_eq!(
+        manifest.checkpoint.as_ref().map(|cp| cp.seq),
+        Some(first_checkpoint.seq),
+        "a refused checkpoint must not advance the manifest checkpoint"
+    );
+    let cp_key = format!(
+        "{}{}",
+        id.store_prefix(),
+        walgit_proto::keys::checkpoint_key(head_seq)
+    );
+    assert!(
+        store.head(&cp_key).await.unwrap().is_none(),
+        "a refused checkpoint must not PUT a checkpoint object"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_prunes_local_pack_not_in_manifest() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "pack-prune");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-prune", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let live = handle.manifest().packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+
+    // A restart that only has a leftover cache: initialize the local repo,
+    // seed the live pack and a pack whose checksum is absent from the manifest.
+    let cache2 = tempfile::tempdir().unwrap();
+    let local = LocalRepo::init(cache2.path(), &id, ObjectFormat::Sha1).unwrap();
+    let extra = gix_hash::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+    let extra_pack = local.pack_path(&extra);
+    std::fs::copy(&live_pack, local.pack_path(&live_oid)).unwrap();
+    std::fs::copy(&live_idx, local.pack_path(&live_oid).with_extension("idx")).unwrap();
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+    drop(local);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let _guard = handle2.sync_full().await.unwrap();
+
+    assert!(
+        handle2.local().pack_path(&live_oid).is_file(),
+        "manifest-live pack must survive reconciliation"
+    );
+    assert!(
+        !handle2.local().pack_path(&extra).exists(),
+        "pack outside manifest.packs must be pruned from cache"
+    );
+}
+
+#[tokio::test]
+async fn restart_forces_pack_reconcile_even_with_clean_state() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-clean-restart");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-clean-restart", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let manifest = handle.manifest();
+    let live = manifest.packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+
+    // Simulate a clean restart cache: the persisted state says both refs and
+    // packs are at the current revision, but the cache also contains an orphan
+    // pack from a writer that crashed after making the final name visible.
+    let cache2 = tempfile::tempdir().unwrap();
+    let local = LocalRepo::init(cache2.path(), &id, ObjectFormat::Sha1).unwrap();
+    let extra = gix_hash::ObjectId::from_hex(b"3333333333333333333333333333333333333333").unwrap();
+    let extra_pack = local.pack_path(&extra);
+    std::fs::copy(&live_pack, local.pack_path(&live_oid)).unwrap();
+    std::fs::copy(&live_idx, local.pack_path(&live_oid).with_extension("idx")).unwrap();
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+    std::fs::write(
+        local.path().join("walgit-state.json"),
+        serde_json::json!({
+            "manifest_version": handle.manifest_version().map(|v| v.as_str().to_string()),
+            "applied_seq": manifest.head_seq,
+            "revision": manifest.revision,
+            "packs_revision": manifest.revision,
+            "packs_dirty": false,
+            "pending_pack_removals": [],
+            "remote_served": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drop(local);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+    let _guard = handle2.sync_full().await.unwrap();
+
+    assert!(
+        handle2.local().pack_path(&live_oid).is_file(),
+        "manifest-live pack must survive the restart reconcile"
+    );
+    assert!(
+        !handle2.local().pack_path(&extra).exists(),
+        "the first pack sync after restart must scan the cache even when state looks clean"
+    );
+}
+
+#[tokio::test]
+async fn prune_guard_invalidates_pack_proof_before_mutation() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-proof-mutation");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-proof-mutation", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    // The publisher's sync has now reconciled the empty pre-publish cache and
+    // the published pack is live, so packs_verified is true.
+    let live = handle.manifest().packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+    let extra = gix_hash::ObjectId::from_hex(b"4444444444444444444444444444444444444444").unwrap();
+    let extra_pack = handle.local().pack_path(&extra);
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+
+    // A writer takes prune_guard before a repack/ingest. Even if it fails before
+    // creating a StagedPackGuard, the process-local pack proof must be invalid
+    // so the next Serve/Full sync rescans and removes the orphan.
+    let writer = handle.prune_guard().await;
+    drop(writer);
+    let _guard = handle.sync_full().await.unwrap();
+
+    assert!(
+        !handle.local().pack_path(&extra).exists(),
+        "prune_guard must invalidate the pack proof before any mutation"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_keeps_staged_pack() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "pack-staged");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("pack-staged", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let live = handle.manifest().packs[0].checksum.clone();
+    let live_oid = gix_hash::ObjectId::from_hex(live.as_bytes()).unwrap();
+    let live_pack = handle.local().pack_path(&live_oid);
+    let live_idx = live_pack.with_extension("idx");
+
+    let cache2 = tempfile::tempdir().unwrap();
+    let local = LocalRepo::init(cache2.path(), &id, ObjectFormat::Sha1).unwrap();
+    let extra = gix_hash::ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+    let extra_pack = local.pack_path(&extra);
+    std::fs::copy(&live_pack, local.pack_path(&live_oid)).unwrap();
+    std::fs::copy(&live_idx, local.pack_path(&live_oid).with_extension("idx")).unwrap();
+    std::fs::copy(&live_pack, &extra_pack).unwrap();
+    std::fs::copy(&live_idx, extra_pack.with_extension("idx")).unwrap();
+    drop(local);
+
+    let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let handle2 = registry2.open(&id).await.unwrap();
+
+    // A writer holding the prune lock defers the whole reconciliation; the
+    // state stays dirty instead of committing a ready state with residue.
+    let held = handle2.prune_guard().await;
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            handle2.local().pack_path(&extra).exists(),
+            "a pack must survive reconciliation while a writer holds prune_lock"
+        );
+    }
+    drop(held);
+
+    // A staged pack is deferred to pending; after the guard drops (which
+    // records the non-live orphan) the next sync removes it.
+    let staged1 = handle2
+        .stage_pack_guard(&extra.to_string())
+        .expect("self Arc is installed on an opened handle");
+    let staged2 = handle2
+        .stage_pack_guard(&extra.to_string())
+        .expect("self Arc is installed on an opened handle");
+    drop(staged1);
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            handle2.local().pack_path(&extra).exists(),
+            "a staged pack must survive until the last guard is dropped"
+        );
+    }
+    drop(staged2);
+    {
+        let _guard = handle2.sync_full().await.unwrap();
+        assert!(
+            !handle2.local().pack_path(&extra).exists(),
+            "after the guard is dropped the deferred pack is pruned on the next sync"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_publish_keeps_pack_protected_until_publisher_finishes() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::new();
+    // Delay the publisher's manifest sync so the caller can be cancelled while
+    // the request is in flight.
+    store.latency = Some(Duration::from_millis(100));
+    let store = Arc::new(store);
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "pack-cancelled-publish");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let work = WorkRepo::new();
+    let c1 = work.commit("cancelled-publish-1", "one");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let c2 = work.commit("cancelled-publish-2", "two");
+    let ingested = ingest_pack_data(&handle, work.create_incremental_pack(&c2, &c1))
+        .await
+        .unwrap();
+    let checksum = ingested.checksum;
+    let pack_path = handle.local().pack_path(&checksum);
+    let publisher = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .publish_push(
+                    Some(ingested),
+                    // Deliberately stale old_oid: the publisher rejects the
+                    // transaction, leaving the ingested pack as an orphan.
+                    make_txn(vec![("refs/heads/main", &"1".repeat(40), &c2)]),
+                    HashMap::new(),
+                )
+                .await
+        })
+    };
+
+    // Let the task enqueue the request, then cancel the caller. The detached
+    // publisher must keep the pack staged until it finishes and records the
+    // rejected pack for pruning.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    publisher.abort();
+    let _ = publisher.await;
+
+    for _ in 0..50 {
+        let _guard = handle.sync_full().await.unwrap();
+        if !pack_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pack_path.exists(),
+        "a caller cancellation must not leave the orphan pack staged forever"
     );
 }
 
@@ -2188,7 +2757,7 @@ async fn test_publish_at_explicit_monotonic_created_at() {
         std::time::UNIX_EPOCH
             + Duration::from_secs(
                 u64::try_from(chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp())
-                    .expect("test dates are all after 1970")
+                    .expect("test dates are all after 1970"),
             )
     };
     // Slot 1: main = c1 at Aug 10.
@@ -2367,7 +2936,7 @@ async fn test_checkpoint_carries_first_state_and_as_of() {
         std::time::UNIX_EPOCH
             + Duration::from_secs(
                 u64::try_from(chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp())
-                    .expect("test dates are all after 1970")
+                    .expect("test dates are all after 1970"),
             )
     };
     let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
@@ -2470,7 +3039,7 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
         std::time::UNIX_EPOCH
             + Duration::from_secs(
                 u64::try_from(chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp())
-                    .expect("test dates are all after 1970")
+                    .expect("test dates are all after 1970"),
             )
     };
     let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
@@ -2576,7 +3145,7 @@ async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
         std::time::UNIX_EPOCH
             + Duration::from_secs(
                 u64::try_from(chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp())
-                    .expect("test dates are all after 1970")
+                    .expect("test dates are all after 1970"),
             )
     };
     let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
@@ -2785,7 +3354,10 @@ async fn test_recreate_after_bucket_wipe_on_leftover_cache_has_empty_refs() {
     // receive-pack's first contact: open_or_create recreates the repo, and
     // the advertisement built from the local refs must be empty — upload-pack
     // and receive-pack agree on the repository's state again.
-    let handle2 = registry2.open_or_create(&id, ObjectFormat::Sha1).await.unwrap();
+    let handle2 = registry2
+        .open_or_create(&id, ObjectFormat::Sha1)
+        .await
+        .unwrap();
     let refs = handle2.local().refs().unwrap();
     assert!(
         refs.refs.is_empty(),

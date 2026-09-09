@@ -187,11 +187,17 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
                 let mut params = HashMap::new();
                 params.insert("prefetched".to_string(), "1".to_string());
                 if let Some(v) = run_op(state, &id, params).await {
-                    let n = v.get("published").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let n = v
+                        .get("published")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                     if n > 0 {
                         report.published += 1;
                     }
-                    let seq = v.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let seq = v
+                        .get("seq")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                     let refused: Vec<String> = v
                         .get("refused")
                         .and_then(|r| r.as_array())
@@ -337,7 +343,9 @@ pub(crate) async fn op(
     }
 
     // Objects: the fetched pack goes through the same ingest as a push (the scratch
-    // completed it from our own objects, so it is not thin).
+    // completed it from our own objects, so it is not thin). Hold the prune
+    // lock from ingest through publish: the pack is visible before its CAS.
+    let _prune_guard = handle.prune_guard().await;
     let ingested = match &delta.pack {
         Some(p) => {
             let bytes = tokio::fs::metadata(p).await.map_or(0, |m| m.len());

@@ -78,9 +78,9 @@ pub fn checkpoint_due(
                 .duration_since(t)
                 .unwrap_or_default()
                 >= cfg.checkpoint_interval
-            {
-                return Some(CheckpointTrigger::Age);
-            }
+        {
+            return Some(CheckpointTrigger::Age);
+        }
     }
     None
 }
@@ -90,7 +90,8 @@ pub fn checkpoint_due(
 /// Needs only a **refs-level** sync (manifest + ref state): it works on an
 /// instance that could never hold the repo's packs.
 pub(crate) async fn write_checkpoint_impl(handle: &RepoHandle) -> Result<CheckpointRef, WalError> {
-    let trigger = checkpoint_due(&handle.manifest(), &handle.cfg.wal).map_or_else(|| "manual".into(), |t| t.to_string());
+    let trigger = checkpoint_due(&handle.manifest(), &handle.cfg.wal)
+        .map_or_else(|| "manual".into(), |t| t.to_string());
     let span = tracing::info_span!("wal.checkpoint", repo = %handle.id, trigger = %trigger, seq = tracing::field::Empty, refs = tracing::field::Empty, folded = tracing::field::Empty, outcome = tracing::field::Empty);
     let t0 = std::time::Instant::now();
     let r = write_checkpoint_inner(handle)
@@ -114,14 +115,34 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
 
     // Sync to get current state (refs only; packs are taken from the manifest).
     handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
-    let manifest = handle.manifest.read().clone();
+    let mut manifest = handle.manifest.read().clone();
+
+    // A checkpoint may only fold refs that were rebuilt from a verified
+    // checkpoint + contiguous log tail in this process. The persisted
+    // `applied_seq` alone is not proof: a previous process may have crashed
+    // after recording it but before committing refs/HEAD (issue #148).
+    if handle.applied_seq() != manifest.head_seq || !handle.refs_verified() {
+        handle.rebuild_refs().await?;
+        manifest = handle.manifest.read().clone();
+    }
+    if handle.applied_seq() != manifest.head_seq || !handle.refs_verified() {
+        return Err(WalError::Corrupt(format!(
+            "refs not replayable: refusing to checkpoint unverified refs; applied_seq={} head_seq={} refs_verified={} checkpoint.seq={} min_seq={}",
+            handle.applied_seq(),
+            manifest.head_seq,
+            handle.refs_verified(),
+            manifest.checkpoint.as_ref().map_or(0, |cp| cp.seq),
+            manifest.min_seq,
+        )));
+    }
 
     // If checkpoint already at head, return it (idempotent)
     if let Some(ref cp) = manifest.checkpoint
-        && cp.seq == manifest.head_seq {
-            tracing::Span::current().record("folded", 0u64);
-            return Ok(cp.clone());
-        }
+        && cp.seq == manifest.head_seq
+    {
+        tracing::Span::current().record("folded", 0u64);
+        return Ok(cp.clone());
+    }
 
     let seq = manifest.head_seq;
     tracing::Span::current().record(
@@ -216,9 +237,10 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
 
         // If checkpoint already at or past head, done
         if let Some(ref cp) = current_manifest.checkpoint
-            && cp.seq >= current_manifest.head_seq {
-                return Ok(cp.clone());
-            }
+            && cp.seq >= current_manifest.head_seq
+        {
+            return Ok(cp.clone());
+        }
 
         let mut updated: Manifest = (*current_manifest).clone();
         updated.checkpoint = Some(cp_ref.clone());

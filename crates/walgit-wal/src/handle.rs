@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -13,9 +13,7 @@ use tracing::Instrument;
 use walgit_git::{LocalRepo, RepoId};
 use walgit_proto::v1::Manifest;
 use walgit_proto::{keys, v1::PackRef};
-use walgit_store::{
-    ObjectStore, Prefixed, Version,
-};
+use walgit_store::{ObjectStore, Prefixed, Version};
 
 use crate::error::WalError;
 use crate::progress::{ProgressRx, ProgressTx, Reporter};
@@ -63,6 +61,27 @@ pub struct RepoHandle {
 
     // Persistent local state.
     pub(crate) state: PLMutex<RepoState>,
+    // Process-local proof that refs were rebuilt from a verified checkpoint +
+    // contiguous log tail. Never persisted: a restart must re-verify even when
+    // the on-disk state claims applied_seq == head_seq.
+    pub(crate) refs_verified: AtomicBool,
+    // Process-local proof that the local pack set was reconciled against the
+    // manifest by this process. Never persisted: a restart must scan the cache
+    // even when the on-disk state claims packs_revision == revision, because a
+    // crash can leave an orphan pack that the persisted state never recorded.
+    pub(crate) packs_verified: AtomicBool,
+    // Packs ingested by this process and waiting for their manifest CAS, with
+    // one reference per live `StagedPackGuard` (receive holds an outer guard
+    // while `enqueue_publish_at` holds its detached waiter guard). They are not
+    // live in the manifest yet, so reconciliation must not mistake them for
+    // restart residue and delete them before upload.
+    pub(crate) staged_packs: PLMutex<HashMap<String, usize>>,
+    // Coarse mutual exclusion between "a pack is becoming visible / is being
+    // published" and prune. Ingest/repack/publish hold it for the whole
+    // final-name-visible → CAS window; reconcile uses try_lock and defers
+    // pruning when a writer is active. This closes the install→stage race
+    // that a set membership check alone cannot (issue #148 review).
+    pub(crate) prune_lock: Arc<tokio::sync::Mutex<()>>,
 
     // Freshness TTL.
     pub(crate) last_freshness: PLMutex<Option<Instant>>,
@@ -129,12 +148,47 @@ impl ObjectAccess {
     }
 }
 
+/// RAII protection for an ingested pack that is not in the manifest yet.
+/// The reconciler must not prune it while a publish/CAS is in flight.
+pub struct StagedPackGuard {
+    handle: Arc<RepoHandle>,
+    checksum: String,
+}
+
+impl Drop for StagedPackGuard {
+    fn drop(&mut self) {
+        if !self.handle.unstage_pack(&self.checksum) {
+            // Another guard still owns the pack (receive + publisher waiter).
+            return;
+        }
+        // A guard that drops before its pack became live means the ingest or
+        // publish failed/was cancelled. Record the orphan so a later reconcile
+        // removes it even when the manifest revision did not change.
+        let live = self
+            .handle
+            .manifest()
+            .packs
+            .iter()
+            .any(|p| p.checksum == self.checksum);
+        if !live {
+            let mut state = self.handle.state.lock();
+            if !state.pending_pack_removals.contains(&self.checksum) {
+                state.pending_pack_removals.push(self.checksum.clone());
+            }
+            state.packs_dirty = true;
+        }
+    }
+}
+
 impl RepoHandle {
     // The one constructor of RepoHandle: its parameters are exactly the
     // externally supplied fields of the struct (the rest are internal
     // plumbing initialized inline); registry has two mechanical call sites.
     // A params struct would duplicate the struct's own field list.
-    #[allow(clippy::too_many_arguments, reason = "constructor mirroring RepoHandle's fields; registry call sites are mechanical")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor mirroring RepoHandle's fields; registry call sites are mechanical"
+    )]
     pub(crate) fn new(
         id: RepoId,
         local: LocalRepo,
@@ -158,6 +212,10 @@ impl RepoHandle {
             manifest: PLRwLock::new(Arc::new(manifest)),
             manifest_version: PLMutex::new(version),
             state: PLMutex::new(state),
+            refs_verified: AtomicBool::new(false),
+            packs_verified: AtomicBool::new(false),
+            staged_packs: PLMutex::new(HashMap::new()),
+            prune_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_freshness: PLMutex::new(None),
             last_access: PLMutex::new(Instant::now()),
             self_arc: std::sync::OnceLock::new(),
@@ -274,9 +332,10 @@ impl RepoHandle {
         }
         // Remote: reuse the reader for this manifest revision, else (re)open.
         if let Some(r) = self.remote.lock().clone()
-            && r.revision == manifest.revision {
-                return Ok((guard, ObjectAccess::Remote(r)));
-            }
+            && r.revision == manifest.revision
+        {
+            return Ok((guard, ObjectAccess::Remote(r)));
+        }
         let remote = self.open_remote(&manifest).await?;
         Ok((guard, ObjectAccess::Remote(remote)))
     }
@@ -377,6 +436,92 @@ impl RepoHandle {
     /// Last applied log entry sequence (local replay progress).
     pub fn applied_seq(&self) -> u64 {
         self.state.lock().applied_seq
+    }
+
+    /// Whether this process rebuilt refs from a verified checkpoint + log tail.
+    pub(crate) fn refs_verified(&self) -> bool {
+        self.refs_verified.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_refs_verified(&self) {
+        self.refs_verified.store(true, Ordering::Release);
+    }
+
+    /// Invalidate the process-local refs proof before any path that resets or
+    /// rewrites refs (force rebuild / rematerialize). A failed rebuild must not
+    /// leave a previously-true flag behind (issue #148 review).
+    pub(crate) fn mark_refs_unverified(&self) {
+        self.refs_verified.store(false, Ordering::Release);
+    }
+
+    /// Whether this process reconciled the local pack set against the manifest.
+    pub(crate) fn packs_verified(&self) -> bool {
+        self.packs_verified.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_packs_verified(&self) {
+        self.packs_verified.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_packs_unverified(&self) {
+        self.packs_verified.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn stage_pack(&self, checksum: &str) {
+        *self
+            .staged_packs
+            .lock()
+            .entry(checksum.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn unstage_pack(&self, checksum: &str) -> bool {
+        let mut staged = self.staged_packs.lock();
+        if let Some(count) = staged.get_mut(checksum) {
+            if *count > 1 {
+                *count -= 1;
+                false
+            } else {
+                staged.remove(checksum);
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn pack_staged(&self, checksum: &str) -> bool {
+        self.staged_packs.lock().contains_key(checksum)
+    }
+
+    /// Stage a pack for as long as the returned guard lives. Unlike the
+    /// manual stage/unstage pair this is cancellation-safe: a dropped future
+    /// releases the protection. Returns `None` when the handle has no
+    /// self-`Arc` yet (unit construction), in which case callers keep the
+    /// existing manual pairing.
+    /// Shared lock used by ingest/repack/publish while a pack is visible but
+    /// not yet in the manifest. `reconcile_packs_inner` takes it with
+    /// `try_lock` and defers pruning if a writer holds it.
+    pub fn prune_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.prune_lock)
+    }
+
+    /// Acquire the writer side of pack reconciliation. Holding this guard means
+    /// the process-local pack proof is invalid until a later reconcile succeeds,
+    /// including when the mutation fails before any `StagedPackGuard` exists.
+    pub async fn prune_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let guard = self.prune_lock.clone().lock_owned().await;
+        self.mark_packs_unverified();
+        guard
+    }
+
+    pub fn stage_pack_guard(&self, checksum: &str) -> Option<StagedPackGuard> {
+        let handle = self.self_arc.get().cloned()?;
+        self.stage_pack(checksum);
+        Some(StagedPackGuard {
+            handle,
+            checksum: checksum.to_string(),
+        })
     }
 
     /// Issue #4 reverse-direction diagnostics (`WALGIT_TEST_REFS_DIAG`): the
@@ -533,7 +678,10 @@ impl RepoHandle {
         true
     }
 
-    /// True when the local pack set matches the last applied manifest.
+    /// True when the persisted state says the local pack set matches the last
+    /// applied manifest. Object-serving paths also require `packs_verified`:
+    /// on a fresh process the state may look clean while the cache contains an
+    /// orphan pack from a crash, so `level_satisfied` forces one scan.
     pub fn packs_ready(&self) -> bool {
         self.state.lock().packs_ready()
     }
@@ -678,7 +826,7 @@ impl RepoHandle {
     /// Manifest freshness check + ref state apply (never packs, never
     /// `rw.write()`: ref files and the gix handle are replaced atomically).
     async fn sync_refs_phase(&self, span: &tracing::Span) -> Result<(), WalError> {
-        if self.freshness_ttl_active() {
+        if self.refs_verified() && self.freshness_ttl_active() {
             return Ok(());
         }
         let _sync_guard = crate::lockwait::timed(
@@ -689,10 +837,11 @@ impl RepoHandle {
             self.sync_mutex.lock(),
         )
         .await;
-        if self.freshness_ttl_active() {
+        if self.refs_verified() && self.freshness_ttl_active() {
             return Ok(());
         }
-        self.sync_locked_inner(span).await
+        let force_refs_rebuild = !self.refs_verified();
+        self.sync_locked_inner(span, force_refs_rebuild).await
     }
 
     /// Make the local pack set match the plan for `level` (download / link /
@@ -862,19 +1011,39 @@ impl RepoHandle {
     pub async fn remote_reader(&self) -> Result<Arc<RemotePacks>, WalError> {
         let manifest = self.manifest();
         if let Some(r) = self.remote.lock().clone()
-            && r.revision == manifest.revision {
-                return Ok(r);
-            }
+            && r.revision == manifest.revision
+        {
+            return Ok(r);
+        }
         self.open_remote(&manifest).await
     }
 
     /// Freshness check + refs apply, with `sync_mutex` and the write lock held
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
-    async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
+    async fn sync_locked_inner(
+        &self,
+        span: &tracing::Span,
+        force_refs_rebuild: bool,
+    ) -> Result<(), WalError> {
         let known = self.manifest_version.lock().clone();
         let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
+        let force_refs_rebuild = force_refs_rebuild || !self.refs_verified();
         match outcome {
-            crate::sync::SyncOutcome::Unchanged => self.update_freshness(),
+            crate::sync::SyncOutcome::Unchanged => {
+                if force_refs_rebuild {
+                    let manifest = self.manifest();
+                    let version = known.ok_or_else(|| {
+                        WalError::Corrupt(
+                            "manifest version missing while rebuilding refs".to_string(),
+                        )
+                    })?;
+                    let before = self.state.lock().applied_seq;
+                    crate::sync::apply_delta_with_rebuild(self, &manifest, &version, true).await?;
+                    span.record("entries_applied", manifest.head_seq.saturating_sub(before));
+                    self.mark_refs_verified();
+                }
+                self.update_freshness();
+            }
             crate::sync::SyncOutcome::Changed {
                 meta_version,
                 manifest,
@@ -890,22 +1059,48 @@ impl RepoHandle {
                 let initialised = self.manifest_version.lock().is_some();
                 if manifest.revision < cur.revision {
                     tracing::debug!(repo = %self.id, read_rev = manifest.revision, held_rev = cur.revision, "stale manifest read ignored (a local publish is ahead)");
+                    if force_refs_rebuild {
+                        let version = self.manifest_version.lock().clone().ok_or_else(|| {
+                            WalError::Corrupt(
+                                "manifest version missing while rebuilding refs".to_string(),
+                            )
+                        })?;
+                        let before = self.state.lock().applied_seq;
+                        crate::sync::apply_delta_with_rebuild(self, &cur, &version, true).await?;
+                        span.record("entries_applied", cur.head_seq.saturating_sub(before));
+                        self.mark_refs_verified();
+                    }
                     self.update_freshness();
                     return Ok(());
                 }
                 if initialised && manifest.revision == cur.revision {
+                    if force_refs_rebuild {
+                        let before = self.state.lock().applied_seq;
+                        crate::sync::apply_delta_with_rebuild(self, &manifest, &meta_version, true)
+                            .await?;
+                        span.record("entries_applied", manifest.head_seq.saturating_sub(before));
+                        self.mark_refs_verified();
+                    }
                     // Same content under a version we did not record (a publish that learned the version
-                    // by HEAD): adopt the version so the next check is a 304, apply nothing.
+                    // by HEAD): adopt the version so the next check is a 304.
+                    *self.manifest.write() = Arc::new(*manifest);
                     *self.manifest_version.lock() = Some(meta_version);
                     self.update_freshness();
                     return Ok(());
                 }
                 span.record("changed", true);
                 let before = self.state.lock().applied_seq;
-                crate::sync::apply_delta(self, &manifest, &meta_version).await?;
+                crate::sync::apply_delta_with_rebuild(
+                    self,
+                    &manifest,
+                    &meta_version,
+                    force_refs_rebuild,
+                )
+                .await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
                 *self.manifest.write() = Arc::new(*manifest);
                 *self.manifest_version.lock() = Some(meta_version);
+                self.mark_refs_verified();
                 self.update_freshness();
             }
         }
@@ -918,8 +1113,12 @@ impl RepoHandle {
             // A base remote-served only because the mount was not yet
             // readable (gcsfuse comes up after the container) is re-planned
             // on the next sync once the file is visible.
-            SyncLevel::Serve => self.packs_ready() && !self.remote_served_but_mountable(),
-            SyncLevel::Full => self.packs_ready() && !self.has_linked_packs(),
+            SyncLevel::Serve => {
+                self.packs_verified() && self.packs_ready() && !self.remote_served_but_mountable()
+            }
+            SyncLevel::Full => {
+                self.packs_verified() && self.packs_ready() && !self.has_linked_packs()
+            }
         }
     }
 
@@ -939,12 +1138,10 @@ impl RepoHandle {
 
     /// Any local pack that is a symlink into the store mount.
     fn has_linked_packs(&self) -> bool {
-        self.local
-            .packs()
-            .is_ok_and(|ps| {
-                ps.iter()
-                    .any(|p| self.local.pack_path(&p.checksum).is_symlink())
-            })
+        self.local.packs().is_ok_and(|ps| {
+            ps.iter()
+                .any(|p| self.local.pack_path(&p.checksum).is_symlink())
+        })
     }
 
     /// Internal serving sync (no read guard). Used by `publish/checkpoint/read_log`.
@@ -961,6 +1158,22 @@ impl RepoHandle {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Force a verified full refs rebuild, bypassing the freshness TTL and the
+    /// persisted `applied_seq` shortcut. Checkpointing uses this before it may
+    /// fold the log into a new snapshot.
+    pub(crate) async fn rebuild_refs(&self) -> Result<(), WalError> {
+        let span = tracing::info_span!("wal.sync", repo = %self.id, level = ?SyncLevel::Refs, changed = false, entries_applied = 0u64);
+        let _sync_guard = crate::lockwait::timed(
+            "sync_mutex",
+            &self.id,
+            self.cfg.telemetry.lock_wait_warn,
+            || self.sync_mutex.try_lock().ok(),
+            self.sync_mutex.lock(),
+        )
+        .await;
+        self.sync_locked_inner(&span, true).await
     }
 
     /// Force full re-materialize from store (repair).
@@ -983,16 +1196,16 @@ impl RepoHandle {
         .await;
 
         // Read manifest fresh
-        let Some((meta, manifest)) = crate::store_proto::get_message::<Manifest>(
-            &self.store,
-            walgit_proto::keys::MANIFEST,
-        )
-        .await?
+        let Some((meta, manifest)) =
+            crate::store_proto::get_message::<Manifest>(&self.store, walgit_proto::keys::MANIFEST)
+                .await?
         else {
             return Err(WalError::NotFound);
         };
 
-        // Reset state and re-materialize
+        // Reset state and re-materialize. A previous process-local proof is
+        // invalid from here: only a complete rebuild may set it again.
+        self.mark_refs_unverified();
         crate::sync::materialize_from_scratch(self, &manifest, &meta.version).await?;
 
         *self.manifest.write() = Arc::new(manifest);
@@ -1069,6 +1282,23 @@ impl RepoHandle {
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
+        let staged_checksum = pack.as_ref().map(|p| p.checksum.to_string());
+        // Keep the pack protected until the publisher has produced its final
+        // result. The guard is owned by a detached task below, not by the
+        // caller's future: cancelling the caller must not drop the protection
+        // while the publisher is still about to CAS the manifest.
+        let waiter = self
+            .self_arc
+            .get()
+            .cloned()
+            .ok_or_else(|| WalError::Corrupt("publish requires a self Arc".into()))?;
+        let staged_guard = staged_checksum.as_ref().map(|checksum| {
+            self.stage_pack(checksum);
+            StagedPackGuard {
+                handle: waiter.clone(),
+                checksum: checksum.clone(),
+            }
+        });
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = PublishRequest {
@@ -1083,14 +1313,25 @@ impl RepoHandle {
         let sender = self.get_or_init_publisher();
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
+            drop(staged_guard);
             return Err(WalError::Corrupt("publisher channel closed".into()));
         }
 
-        let result = rx
-            .await
-            .map_err(|_| WalError::Corrupt("publisher dropped response".into()))?;
-        self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
-        result
+        let (caller_tx, caller_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(WalError::Corrupt("publisher dropped response".into())),
+            };
+            waiter.publish_waiters.fetch_sub(1, Ordering::Relaxed);
+            drop(staged_guard);
+            let _ = caller_tx.send(result);
+        });
+        caller_rx.await.unwrap_or_else(|_| {
+            Err(WalError::Corrupt(
+                "publish waiter task dropped response".into(),
+            ))
+        })
     }
     /// Publish a ref-only update (no pack).
     pub async fn publish_ref_update(
@@ -1108,6 +1349,10 @@ impl RepoHandle {
         supersedes: Vec<gix_hash::ObjectId>,
         tier: u32,
     ) -> Result<u64, WalError> {
+        let checksum = new_pack.checksum.to_string();
+        let _guard = self
+            .stage_pack_guard(&checksum)
+            .ok_or_else(|| WalError::Corrupt("publish_compact requires a self Arc".into()))?;
         crate::publish::publish_compact_impl(self, new_pack, supersedes, tier).await
     }
 
@@ -1127,9 +1372,10 @@ impl RepoHandle {
             return self.cfg.clone();
         }
         if let Some((r, c)) = self.effective.lock().as_ref()
-            && *r == rev {
-                return c.clone();
-            }
+            && *r == rev
+        {
+            return c.clone();
+        }
         let toml = settings.as_ref().map_or("", |s| s.toml.as_str());
         let cfg = match self.cfg.with_settings(toml) {
             Ok(c) => Arc::new(c),
@@ -1185,6 +1431,19 @@ impl RepoHandle {
         tier: u32,
         history_of: Option<String>,
     ) -> Result<u64, WalError> {
+        let checksum = pack
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("pack-"))
+            .and_then(|name| name.strip_suffix(".pack"))
+            .map(str::to_string);
+        let _guard = checksum
+            .as_ref()
+            .map(|checksum| {
+                self.stage_pack_guard(checksum)
+                    .ok_or_else(|| WalError::Corrupt("add_pack requires a self Arc".into()))
+            })
+            .transpose()?;
         crate::publish::add_pack_impl(self, pack, idx, tier, history_of).await
     }
 
@@ -1385,7 +1644,10 @@ impl RepoHandle {
         // `self_arc` is set by the registry right after construction, before the
         // handle is ever handed out; every publish path runs through such a
         // handle, so the OnceLock is always filled here.
-        #[allow(clippy::expect_used, reason = "self_arc is set at construction (registry::RepoRegistry::open) before any handle is published")]
+        #[allow(
+            clippy::expect_used,
+            reason = "self_arc is set at construction (registry::RepoRegistry::open) before any handle is published"
+        )]
         let arc = self
             .self_arc
             .get()
