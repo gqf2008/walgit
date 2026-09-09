@@ -1,8 +1,9 @@
 # Windows — build, test, dev-store on a Windows host
 
 Context: **runbook** for developing walgit on Windows. The fork keeps the
-platform first-class: CI runs a windows leg (compile all targets + fast tier
-+ sim + e2e, `.github/workflows/ci.yml`), and the local workflow below is the
+platform first-class: CI runs a windows leg (compile all targets + zero-rustc-
+warning gate + web unit tests + fast tier + server integration + sim + e2e,
+`.github/workflows/ci.yml`), and the local workflow below is the
 same surface a contributor gets.
 
 ## 1. Prerequisites
@@ -29,7 +30,7 @@ just web-build        # SPA + SDK (pnpm install --frozen-lockfile + vite build)
 just test             # fast hermetic tier (< 1 min)
 just e2e              # smart-HTTP end-to-end against real git
 just sim              # fault-injection simulation suite (seeds: WALGIT_SIM_SEEDS)
-just ci               # warnings + clippy + test + e2e + sim
+just ci               # warnings + clippy + test + test-cli + e2e + sim
 ```
 
 Notes specific to Windows:
@@ -102,18 +103,30 @@ the skip message, enable Developer Mode:
 The repo itself may live on any filesystem (tests use `%TEMP%`, NTFS by
 default); a symlink-capable volume is only needed for the mount-link case.
 
-## 5. What CI covers (fork, issue #2)
+## 5. What CI covers (fork, issue #2; lanes re-drawn by issues #137/#141)
 
-- **ubuntu** build-test: `just warnings`, `just test` and `just sim` (clippy and
-  e2e are separate jobs; `just ci` bundles all five for the laptop). Its
-  "Server suite list is complete" step asserts every file in
-  `crates/walgit-server/tests/` is registered in the justfile's `SERVER_TESTS`
-  or exempted (issue #137) — a suite nobody runs goes red instead of staying silent.
-- **windows** leg: compiles every target, runs the fast tier, the server
-  integration suites, sim and e2e. The integration set is the justfile's
-  `SERVER_TESTS` — one list, both legs, so the two cannot drift (issue #137);
-  the leg calls `just` only for probe-free recipes and plain cargo elsewhere —
-  the job exists so platform seams drift loudly.
+- **ubuntu** build-test: `just warnings` (zero rustc warnings, all targets),
+  `just test`, the CLI suites and `just sim` (clippy and e2e are separate jobs;
+  `just ci` bundles them all for the laptop). Its "Integration suite lists are
+  complete" step runs `scripts/suite-guard.sh`: every file in
+  `crates/*/tests/` must sit in an execution lane of the justfile
+  (`SERVER_TESTS`, `CLI_TESTS`, `WILDCARD_TEST_PKGS`) or a read-back exemption —
+  a suite nobody runs goes red instead of staying silent (issues #137/#141).
+- **windows** leg: compiles every target **and gates its rustc warnings**
+  (same `warning_gate` pattern as ubuntu, read from the justfile — issue #141),
+  runs `just web-test`, the fast tier (its crate set is the justfile's
+  `WILDCARD_TEST_PKGS` — one list, both legs), the server integration suites
+  (`SERVER_TESTS` — also both legs), sim and e2e. The leg calls `just` only for
+  probe-free lines and plain cargo elsewhere — the job exists so platform seams
+  drift loudly.
+- **ubuntu-only by seam, not by speed**: the walgit-cli suites (`ci_e2e`,
+  `collab_e2e`) hardcode `--config /dev/null` (the windows form is `NUL`,
+  D39), run POSIX-shell task fixtures (`sleep`, `test "$V" = …`) that the
+  windows runner would execute through `cmd /C`, and `collab watch --exec`
+  spawns `sh -c` in the product itself — every seam is named with file:line at
+  the justfile's `CLI_TESTS`. Making them windows-runnable is a product
+  change (`NUL`/`sh` twins), not a test change.
 - Known flaky on both platforms (rerun, not skip): `sim::base_rebuild…`
-  ~1 in 7 (shared `TEST_ABORT_AFTER`), `fetch_from_front_…` ~1 in 3 under the
+  (shared `TEST_ABORT_AFTER`; first-pass rate per AGENTS.md §5's entry — #138
+  measured it on windows), `fetch_from_front_…` ~1 in 3 under the
   full e2e suite; both pass alone.

@@ -9,5 +9,10 @@
   job 不再是 known-red——ruleset 将其列入 required checks 前，红即该 PR 引入回归、
   按约定阻塞合并。
 - e2e 与 sim 套件已在 Windows 上跑通（issue #2 已合并）；CI 的 windows leg 覆盖
-  快速层 + server 集成套件 + sim + e2e（集成套件清单两处同源：justfile 的
-  SERVER_TESTS，issue #137）。测试偶发红先查 AGENTS.md §5 known-flaky 名单与 §6.3 CI 信号。
+  快速层 + server 集成套件 + sim + e2e + web-test 与零 rustc 警告门（各 lane 清单
+  单一来源在 justfile：SERVER_TESTS / WILDCARD_TEST_PKGS / CLI_TESTS，完备性守卫
+  scripts/suite-guard.sh 推广到全部 crate，issue #137/#141）。walgit-cli 集成套件
+  （ci_e2e/collab_e2e）**仅 ubuntu 跑**——平台缝逐文件注在 justfile CLI_TESTS 上方。
+  跑 `just test` 若断言 SPA 资产（api_v1 的 /repos.js）须先 `just web-build`，否则
+  占位 web/dist 造成环境性假红。测试偶发红先查 AGENTS.md §5 known-flaky 名单与
+  §6.3 CI 信号。

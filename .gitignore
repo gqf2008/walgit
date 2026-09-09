@@ -28,5 +28,7 @@ result-*
 ._*
 
 # CI step artefact: the zero-test assertion tees the integration run here
-# (ci.yml "Fast tier" and windows "Server integration"). Locally reproducible.
+# (ci.yml "Fast tier", "CLI integration suites" and windows "Server integration").
+# Locally reproducible.
 server-integration.log
+cli-integration.log

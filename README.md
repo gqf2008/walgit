@@ -168,6 +168,7 @@ and turns on `transfer.bundleURI`. `?repo=owner/name` clones right after.
 
 ```sh
 just test          # fast hermetic tier (< 1 min): unit + quick integration, in-memory store, real git
+just test-cli      # walgit-cli integration suites (ci_e2e/collab_e2e against a real server)
 just e2e           # real git against the server (~20 s)
 just warnings      # zero rustc warnings across all targets
 just ci            # all of the above

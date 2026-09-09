@@ -69,40 +69,21 @@ jobs:
         run: just web-test
 
       - run: just warnings
-      # #137's structural anti-drift guard: the filesystem is the truth, the list is
-      # the claim. Every suite in crates/walgit-server/tests/ must be enumerated in
-      # the justfile's SERVER_TESTS (both CI legs consume that one variable), or the
-      # PR that forgot it goes red here — hand-syncing two enumerations drifted
-      # twice (c971024, then 7f18675/#136). The reverse direction self-guards: cargo
-      # aborts with "no test target named" on a stale entry. Both legs consume the
-      # same variable, so this one check covers both; each leg additionally asserts
-      # no listed suite compiled to zero tests (ubuntu's Fast tier below).
-      - name: Server suite list is complete
-        run: |
-          set -euo pipefail
-          if [ -n "$(find crates/walgit-server/tests -mindepth 2 -name '*.rs')" ]; then
-            echo "nested test target (tests/<dir>/main.rs) is outside the guard's glob: flatten it or extend this step"
-            exit 1
-          fi
-          # An empty/renamed tests dir would expand the glob below to a literal `*`,
-          # which the case patterns then match — a silently green guard. A server with
-          # no integration suites is not that.
-          [ -n "$(ls crates/walgit-server/tests/*.rs 2>/dev/null)" ] || {
-            echo "no suites matched crates/walgit-server/tests/*.rs — the guard would be vacuous"; exit 1; }
-          # Whole-line match on purpose: a substring match stays green if someone puts
-          # a {{tN}} back in front of the recipe line (the windows hazard the recipe's
-          # own comment warns about), which is exactly what this check must catch.
-          grep -qE '^[[:space:]]*cargo test -p walgit-server \{\{SERVER_TESTS\}\}[[:space:]]*$' justfile || {
-            echo "test-server-integration no longer interpolates SERVER_TESTS on its own line — the single source became decorative"; exit 1; }
-          list="$(just --evaluate SERVER_TESTS)"
-          exempt="$(just --evaluate SERVER_TEST_EXEMPT)"
-          for f in crates/walgit-server/tests/*.rs; do
-            n="$(basename "$f" .rs)"
-            case " $exempt " in *" $n "*) continue ;; esac
-            case " $list " in *" --test $n "*) ;;
-              *) echo "unregistered suite: $n — add --test $n to SERVER_TESTS in the justfile (or to SERVER_TEST_EXEMPT if it is not a suite)"; exit 1 ;;
-            esac
-          done
+      # #137's structural anti-drift guard, generalized to every crate by #141:
+      # the filesystem (crates/*/tests/*.rs) is the truth, the justfile's lane
+      # variables (SERVER_TESTS / CLI_TESTS / WILDCARD_TEST_PKGS) are the claim;
+      # scripts/suite-guard.sh is the one script (runnable identically on a
+      # laptop) that goes red on an unregistered suite, on a vacuous glob/empty
+      # lane (#140's fix), or on a recipe line that stops interpolating its
+      # variable — whole-line anchored, so no prefix edit can bypass it. Both
+      # legs consume the same variables, so this one check covers both; the two
+      # explicit lanes additionally assert no listed suite compiled to zero
+      # tests (ubuntu's Fast tier and CLI steps below, windows' Server
+      # integration) — the wildcard lane's whole-directory glob has no such
+      # assertion, so a cfg-gated suite there would still compile to an empty
+      # binary and exit green.
+      - name: Integration suite lists are complete
+        run: bash scripts/suite-guard.sh
       # The 300 s timeout in the justfile can trip under CI load (measured
       # exit 124 on 2026-08-28); a rerun after a timeout is a retry, not a
       # regression signal. The retry lives inside this step, like sim/e2e: a
@@ -123,6 +104,25 @@ jobs:
           just test-server-integration 2>&1 | tee server-integration.log || { echo "integration set failed once; rerunning"; sleep 5; just test-server-integration 2>&1 | tee server-integration.log; }
           if grep -n '^running 0 tests' server-integration.log; then
             echo "a listed suite ran 0 tests on ubuntu — a platform gate hid it (#137); the lines above name the binary"
+            exit 1
+          fi
+      # The walgit-cli integration suites (D1 CI runner + collab CLI) — the
+      # first execution lane these ever had (#141: compiled on both legs, run
+      # nowhere). Ubuntu-only; the per-file platform seams that bar a windows
+      # lane are argued at the justfile's CLI_TESTS. Measured: 8 tests, 13–34 s
+      # of run (two laptop measurements) + link of the two test binaries —
+      # timeout-minutes guards the lane. No built-in rerun: this set
+      # has no flake history yet, and a step that adds one MUST name itself in
+      # the summary job's rerun_once regex in the same commit. The zero-test
+      # assertion (#137's "registered means executed") keeps a future cfg-gate
+      # from shrinking it silently.
+      - name: CLI integration suites
+        timeout-minutes: 10
+        run: |
+          set -eo pipefail
+          just test-cli 2>&1 | tee cli-integration.log
+          if grep -n '^running 0 tests' cli-integration.log; then
+            echo "a registered CLI suite ran 0 tests on ubuntu — a platform gate hid it (#137 shape, #141); the lines above name the binary"
             exit 1
           fi
       # Rerun once on failure: sim has known-flaky cases (base_rebuild, AGENTS.md §5);
@@ -195,13 +195,19 @@ jobs:
         run: |
           just e2e || { echo "e2e failed once (possibly known-flaky); rerunning"; sleep 5; just e2e; }
 
-  # Reachability for every cfg(windows) branch (issue #16): this leg compiles all
-  # targets and runs the test tiers on a real Windows host. Plain cargo for the
-  # fast/sim/e2e lines; `just` only for recipes whose body references no bash-only
-  # probe — issue #137 moved the server-integration set into the justfile's
-  # SERVER_TESTS, one list both legs consume (the no-probe invariant is stated at
-  # `test-server-integration`). This job exists exactly so platform seams stop
-  # drifting unnoticed; the clippy leg waits on its ruleset check (AGENTS.md §5).
+  # Reachability for every cfg(windows) branch (issue #16): this leg compiles
+  # all targets and runs the test tiers on a real Windows host. Plain cargo for
+  # the lib/bins, sim and e2e lines; `just` for everything whose lists live in
+  # the justfile — issue #137 moved the server-integration set into
+  # SERVER_TESTS and #141 the wildcard crates into WILDCARD_TEST_PKGS, one list
+  # per lane both legs consume (the no-probe invariant is stated at
+  # `test-server-integration`). #141 also put this leg's two former gaps to
+  # bed: the web unit tests and a zero-rustc-warnings grep (the compile step,
+  # same gate pattern as ubuntu's `just warnings`). What this leg does NOT run
+  # is decided by seams, not speed: the walgit-cli suites are ubuntu-only,
+  # argued per-file at the justfile's CLI_TESTS. This job exists exactly so
+  # platform seams stop drifting unnoticed; the clippy leg waits on its
+  # ruleset check (AGENTS.md §5).
   windows:
     name: windows fast tier
     runs-on: windows-latest
@@ -228,8 +234,39 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
         shell: bash
-      - name: Compile every target (lib/bins/tests)
-        run: cargo check --workspace --all-targets
+      # The renderer security boundary (issue #112) — vitest/jsdom, pure node,
+      # same toolchain the windows-green web-build step above already installs
+      # and runs; #141 closes the "vitest only ever ran on ubuntu" gap with it.
+      - name: Web unit tests
+        run: just web-test
+        shell: bash
+      - name: Compile every target (lib/bins/tests) and gate zero rustc warnings
+        # bash, not the default pwsh: the recipe needs bash's `$'…'` ANSI-C
+        # quoting and `set -o pipefail`. This is ALSO the windows zero-warning
+        # gate (#141 — rustc-warning classes that only exist under
+        # cfg(windows) used to reach main unguarded): this step's output is the
+        # leg's only warning-bearing cargo invocation, so the grep must live
+        # here — a later `cargo check` hits fresh cache and prints nothing,
+        # which is #140's vacuous-green shape. `check` suffices: every gated
+        # lint class fires before codegen. The pattern is the justfile's
+        # `warning_gate` via `just --evaluate` — one copy for both legs, the
+        # same single-source rule as the suite lanes.
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Without -e (the ubuntu `warnings` recipe's shape): a command
+          # substitution that fails must not fall through to a green grep.
+          if ! out="$(cargo check --workspace --all-targets 2>&1)"; then
+            printf '%s\n' "$out"
+            echo; echo "cargo check failed — fix the errors above"; exit 1
+          fi
+          plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+          gate="$(just --evaluate warning_gate)"
+          if printf '%s\n' "$plain" | grep -qE "$gate"; then
+            printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`' || true
+            echo; echo "rustc warnings present — fix them (same gate as ubuntu's just warnings, issue #141)"; exit 1
+          fi
+          printf '%s\n' "$plain" | grep -E '^(warning|error)' || echo "no rustc warnings"
       - name: Fast hermetic tier
         # bash, not the default pwsh: on Windows pwsh keeps going after a failing
         # native command and the step's exit code is the LAST line's — a broken
@@ -238,10 +275,13 @@ jobs:
         run: |
           set -e
           cargo test --workspace --lib --bins
-          cargo test -p walgit-store -p walgit-git -p walgit-bundle --tests
-          # walgit-wal tests carry the windows-timing-sensitive refs-sync case
-          # (AGENTS.md §5, issue #94): rerun once, then treat a repeat as real.
-          cargo test -p walgit-wal --tests || { echo "walgit-wal tests failed once (windows timing flaky); rerunning"; sleep 3; cargo test -p walgit-wal --tests; }
+          # The wildcard crates set — the justfile's WILDCARD_TEST_PKGS, one
+          # list both legs consume (#141; this leg's hand-enumerated `-p` lines
+          # are gone — the ubuntu `test` recipe now runs the same recipe).
+          # Set-level rerun once (windows timing; AGENTS.md §5 — the walgit-wal
+          # refs-sync case, issue #94; the same shape as Server integration
+          # below), then a repeat is real.
+          just test-wildcard-crates || { echo "wildcard crates failed once (windows timing flaky); rerunning"; sleep 3; just test-wildcard-crates; }
       # The server integration suites: the justfile's SERVER_TESTS — the same 15
       # both legs run (issue #137; this leg's hand-copied enumeration is gone).
       # Suite-set-level rerun once (windows timing; AGENTS.md §5), then a repeat
@@ -301,10 +341,11 @@ jobs:
             // failure there already survived one retry, so it is a regression, not a
             // flake. This matches step-name LITERALS: a step that reruns itself must
             // add its name here in the SAME commit (windows' "Fast hermetic tier"
-            // predates this regex and has never matched it — do not create another
-            // such pair). Job names are ruleset-pinned (AGENTS.md §6.4): never rename
-            // those.
-            const rerun_once = /Simulation suite|Smart-HTTP end-to-end|Fast tier|Server integration/;
+            // predates this regex and has never matched it — #141 folded its
+            // wal-only retry into a set-level retry and paid the naming debt; do
+            // not create another such pair). Job names are ruleset-pinned
+            // (AGENTS.md §6.4): never rename those.
+            const rerun_once = /Simulation suite|Smart-HTTP end-to-end|Fast tier|Fast hermetic tier|Server integration/;
             for (const j of jobs) {
               if (j.name === 'CI summary') continue; // don't report on ourselves
               const failed = j.steps.filter(s => s.conclusion === 'failure').map(s => s.name);
