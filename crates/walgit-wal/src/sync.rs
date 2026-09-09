@@ -876,6 +876,15 @@ pub(crate) async fn reconcile_packs_inner(
     // which would block every new reader on the instance.
     let live: std::collections::HashSet<&str> =
         manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
+    // Serialize the candidate scan + removal + state commit with writers that
+    // make a pack visible before its manifest CAS. If a writer holds the lock
+    // we cannot know whether its pack is visible yet, so keep the state dirty
+    // and retry on the next sync.
+    let prune_lock = handle.prune_lock();
+    let Ok(_prune_guard) = prune_lock.try_lock() else {
+        handle.state.lock().packs_dirty = true;
+        return Ok(());
+    };
     let pending = std::mem::take(&mut handle.state.lock().pending_pack_removals);
     let mut removed = 0usize;
     let mut still_pending: Vec<String> = Vec::new();
@@ -912,15 +921,6 @@ pub(crate) async fn reconcile_packs_inner(
         })
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
-        let prune_lock = handle.prune_lock();
-        let Some(_prune) = prune_lock.try_lock() else {
-            // A writer is making a pack visible / publishing it. Defer this
-            // pass; pending keeps packs_ready() false so a later sync retries.
-            still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
-            still_pending.extend(deferred_staged);
-            handle.state.lock().pending_pack_removals = still_pending;
-            return Ok(());
-        };
         if let Ok(_w) = handle.rw.try_write() {
             // The candidate set was built before the write lock; a publish
             // may have staged (or a concurrent sync may have re-listed) one of

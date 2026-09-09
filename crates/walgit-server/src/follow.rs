@@ -346,7 +346,7 @@ pub(crate) async fn op(
     // completed it from our own objects, so it is not thin). Hold the prune
     // lock from ingest through publish: the pack is visible before its CAS.
     let prune_lock = handle.prune_lock();
-    let _prune_guard = prune_lock.lock();
+    let _prune_guard = prune_lock.lock().await;
     let ingested = match &delta.pack {
         Some(p) => {
             let bytes = tokio::fs::metadata(p).await.map_or(0, |m| m.len());

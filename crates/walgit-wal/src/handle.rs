@@ -74,7 +74,7 @@ pub struct RepoHandle {
     // final-name-visible → CAS window; reconcile uses try_lock and defers
     // pruning when a writer is active. This closes the install→stage race
     // that a set membership check alone cannot (issue #148 review).
-    pub(crate) prune_lock: Arc<PLMutex<()>>,
+    pub(crate) prune_lock: Arc<tokio::sync::Mutex<()>>,
 
     // Freshness TTL.
     pub(crate) last_freshness: PLMutex<Option<Instant>>,
@@ -151,6 +151,22 @@ pub struct StagedPackGuard {
 impl Drop for StagedPackGuard {
     fn drop(&mut self) {
         self.handle.unstage_pack(&self.checksum);
+        // A guard that drops before its pack became live means the ingest or
+        // publish failed/was cancelled. Record the orphan so a later reconcile
+        // removes it even when the manifest revision did not change.
+        let live = self
+            .handle
+            .manifest()
+            .packs
+            .iter()
+            .any(|p| p.checksum == self.checksum);
+        if !live {
+            let mut state = self.handle.state.lock();
+            if !state.pending_pack_removals.contains(&self.checksum) {
+                state.pending_pack_removals.push(self.checksum.clone());
+            }
+            state.packs_dirty = true;
+        }
     }
 }
 
@@ -188,7 +204,7 @@ impl RepoHandle {
             state: PLMutex::new(state),
             refs_verified: AtomicBool::new(false),
             staged_packs: PLMutex::new(std::collections::HashSet::new()),
-            prune_lock: Arc::new(PLMutex::new(())),
+            prune_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_freshness: PLMutex::new(None),
             last_access: PLMutex::new(Instant::now()),
             self_arc: std::sync::OnceLock::new(),
@@ -447,7 +463,7 @@ impl RepoHandle {
     /// Shared lock used by ingest/repack/publish while a pack is visible but
     /// not yet in the manifest. `reconcile_packs_inner` takes it with
     /// `try_lock` and defers pruning if a writer holds it.
-    pub fn prune_lock(&self) -> Arc<PLMutex<()>> {
+    pub fn prune_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.prune_lock)
     }
 
