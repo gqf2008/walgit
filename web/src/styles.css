@@ -621,6 +621,14 @@ h2 {
   font-size: 0.85em;
 }
 .board-card-work { margin-top: 6px; }
+.board-toolbar { justify-content: space-between; margin-bottom: 12px; }
+.board-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.board-column { min-width: 0; }
 .kv { width: 100%; border-collapse: collapse; font-size: 13px; }
 .kv th { text-align: left; font-weight: 500; color: var(--muted); padding: 6px 16px; width: 40%; vertical-align: top; white-space: nowrap; }
 .kv td { padding: 6px 16px; word-break: break-all; }
