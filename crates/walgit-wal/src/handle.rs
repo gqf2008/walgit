@@ -69,6 +69,12 @@ pub struct RepoHandle {
     // They are not live in the manifest yet, so pack reconciliation must not
     // mistake them for restart residue and delete them before upload.
     pub(crate) staged_packs: PLMutex<std::collections::HashSet<String>>,
+    // Coarse mutual exclusion between "a pack is becoming visible / is being
+    // published" and prune. Ingest/repack/publish hold it for the whole
+    // final-name-visible → CAS window; reconcile uses try_lock and defers
+    // pruning when a writer is active. This closes the install→stage race
+    // that a set membership check alone cannot (issue #148 review).
+    pub(crate) prune_lock: Arc<PLMutex<()>>,
 
     // Freshness TTL.
     pub(crate) last_freshness: PLMutex<Option<Instant>>,
@@ -182,6 +188,7 @@ impl RepoHandle {
             state: PLMutex::new(state),
             refs_verified: AtomicBool::new(false),
             staged_packs: PLMutex::new(std::collections::HashSet::new()),
+            prune_lock: Arc::new(PLMutex::new(())),
             last_freshness: PLMutex::new(None),
             last_access: PLMutex::new(Instant::now()),
             self_arc: std::sync::OnceLock::new(),
@@ -437,6 +444,13 @@ impl RepoHandle {
     /// releases the protection. Returns `None` when the handle has no
     /// self-`Arc` yet (unit construction), in which case callers keep the
     /// existing manual pairing.
+    /// Shared lock used by ingest/repack/publish while a pack is visible but
+    /// not yet in the manifest. `reconcile_packs_inner` takes it with
+    /// `try_lock` and defers pruning if a writer holds it.
+    pub fn prune_lock(&self) -> Arc<PLMutex<()>> {
+        Arc::clone(&self.prune_lock)
+    }
+
     pub fn stage_pack_guard(&self, checksum: &str) -> Option<StagedPackGuard> {
         let handle = self.self_arc.get().cloned()?;
         self.stage_pack(checksum);

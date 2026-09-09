@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::WalError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoState {
     /// Opaque version string of the last manifest we applied.
     pub manifest_version: Option<String>,
@@ -21,6 +20,11 @@ pub struct RepoState {
     /// sync) but packs still need reconciling before serving objects.
     #[serde(default)]
     pub packs_revision: u64,
+    /// Explicit dirty bit for cases `packs_revision` cannot express (e.g. a
+    /// leftover non-manifest pack at the same revision). Cleared by a
+    /// successful pack reconcile.
+    #[serde(default)]
+    pub packs_dirty: bool,
     /// Pack checksums superseded by COMPACT entries that were applied at the
     /// refs level only; removed locally on the next full (packs) sync.
     #[serde(default)]
@@ -36,10 +40,11 @@ pub struct RepoState {
 impl RepoState {
     /// True when the local pack set matches the applied manifest.
     pub fn packs_ready(&self) -> bool {
-        self.packs_revision == self.revision && self.pending_pack_removals.is_empty()
+        !self.packs_dirty
+            && self.packs_revision == self.revision
+            && self.pending_pack_removals.is_empty()
     }
 }
-
 
 impl RepoState {}
 
@@ -64,4 +69,24 @@ pub fn save_state(repo_dir: &Path, state: &RepoState) -> Result<(), WalError> {
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RepoState;
+
+    #[test]
+    fn packs_ready_honours_dirty_bit() {
+        let mut state = RepoState {
+            revision: 7,
+            packs_revision: 7,
+            ..RepoState::default()
+        };
+        assert!(state.packs_ready());
+        state.packs_dirty = true;
+        assert!(
+            !state.packs_ready(),
+            "a leftover non-manifest pack at the same revision must keep packs dirty"
+        );
+    }
 }

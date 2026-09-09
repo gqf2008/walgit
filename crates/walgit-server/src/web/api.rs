@@ -34,7 +34,7 @@ use walgit_store::{GetOptions, ObjectStore, Prefixed, PutBody, PutMode};
 use walgit_wal::{
     ObjectAccess, RepoHandle, Reporter,
     collab::{
-        Board, BoardDef, Entry, EntryRef, MergeRules, BOARD_PATH, build_board, build_report,
+        BOARD_PATH, Board, BoardDef, Entry, EntryRef, MergeRules, build_board, build_report,
         default_board, merge_rule_eval, parse_board_def, pr_view, thread,
     },
 };
@@ -97,7 +97,11 @@ impl From<CommitMeta> for Commit {
         let (body, trailers) = super::trailers::split_trailers(&m.body);
         Commit {
             sha: m.id.to_string(),
-            parents: m.parents.iter().map(std::string::ToString::to_string).collect(),
+            parents: m
+                .parents
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: m.author,
             author_email: m.author_email,
             author_date: m.author_date,
@@ -400,16 +404,20 @@ where
             metrics::counter!("walgit_api_immutable_hit", "tier" => "memory").increment(1);
             return Ok(Rendered::json(hit, IMMUTABLE, None).into_response(headers));
         }
-        if slow && st.cfg.cache.shared_render_cache
+        if slow
+            && st.cfg.cache.shared_render_cache
             && let Ok(walgit_store::GetResult::Object { body, meta }) = handle
                 .store()
                 .get(&shared_key(key), GetOptions::default())
                 .await
-                && let Ok(b) = walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX)).await {
-                    metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
-                    st.caches.api_immutable.insert(key.clone(), b.clone());
-                    return Ok(Rendered::json(b, IMMUTABLE, None).into_response(headers));
-                }
+            && let Ok(b) =
+                walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
+                    .await
+        {
+            metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
+            st.caches.api_immutable.insert(key.clone(), b.clone());
+            return Ok(Rendered::json(b, IMMUTABLE, None).into_response(headers));
+        }
     }
     if slow && crate::sse::wants_sse(headers) {
         let (tx, rx) = tokio::sync::broadcast::channel(256);
@@ -1227,7 +1235,11 @@ async fn collab_entries(
     // Transition 门禁 (issue #75 ①, 方案 A):status=done 需前置 needs-review
     // + verified approve review;其余流转自由。非法流转 400 机器可读错误。
     if entry.get("kind").and_then(|v| v.as_str()) == Some("status")
-        && entry.get("body").and_then(|b| b.get("status")).and_then(|v| v.as_str()) == Some("done")
+        && entry
+            .get("body")
+            .and_then(|b| b.get("status"))
+            .and_then(|v| v.as_str())
+            == Some("done")
     {
         let state = collab_load(&st, &r).await?;
         let thread_refs: Vec<&walgit_wal::collab::EntryRef> = state
@@ -1238,10 +1250,9 @@ async fn collab_entries(
         // 线程序先行(issue #104 观察 A):card_status 按给定顺序重放,
         // 未 thread() 的多 status 条目线程会误判当前状态。
         let thread_refs = walgit_wal::collab::thread(&thread_refs);
-        if let Err(e) = walgit_wal::collab::validate_status_transition(
-            &thread_refs,
-            &state.principals,
-        ) {
+        if let Err(e) =
+            walgit_wal::collab::validate_status_transition(&thread_refs, &state.principals)
+        {
             return Err(ApiError::BadRequest(e));
         }
     }
@@ -1350,6 +1361,9 @@ async fn publish_collab_ref(
         .await
         .map_err(internal)?;
     let f = tokio::fs::File::open(&tmp).await.map_err(internal)?;
+    // Thin collab-ref publish also installs a pack before its manifest CAS.
+    let _prune_lock = handle.prune_lock();
+    let _prune_guard = _prune_lock.lock();
     let pack = r
         .local
         .ingest_pack(
@@ -1636,8 +1650,10 @@ async fn collab_thread(
                 .iter()
                 .map(|e| {
                     let referenced = walgit_wal::collab::referenced_oids(&e.entry.body);
-                    let broken: Vec<&String> =
-                        referenced.iter().filter(|o| !known.contains(o.as_str())).collect();
+                    let broken: Vec<&String> = referenced
+                        .iter()
+                        .filter(|o| !known.contains(o.as_str()))
+                        .collect();
                     serde_json::json!({
                         "oid": e.oid,
                         "principal": e.principal,
@@ -1710,13 +1726,16 @@ async fn load_board_def(r: &Repo) -> Result<BoardDef, ApiError> {
         if let Some(remote) = r.remote() {
             let oid = gix_hash::ObjectId::from_hex(sha.as_bytes())
                 .map_err(|_| not_found("HEAD revision"))?;
-            let (_, blob_oid, mode) = remote
-                .fault_path(&oid, BOARD_PATH)
-                .await
-                .map_err(|e| match e {
-                    ApiError::NotFound(_) => ApiError::NotFound(format!("{BOARD_PATH} at HEAD")),
-                    other => other,
-                })?;
+            let (_, blob_oid, mode) =
+                remote
+                    .fault_path(&oid, BOARD_PATH)
+                    .await
+                    .map_err(|e| match e {
+                        ApiError::NotFound(_) => {
+                            ApiError::NotFound(format!("{BOARD_PATH} at HEAD"))
+                        }
+                        other => other,
+                    })?;
             if !mode.is_blob() {
                 return Err(ApiError::BadRequest(format!("{BOARD_PATH} is not a blob")));
             }
@@ -1802,14 +1821,15 @@ async fn resolve_rest(r: &Repo, rest: &str) -> Result<Resolved, ApiError> {
 /// Resolve a single revision name (no path): branch, tag, then git rev-parse.
 async fn resolve_name(r: &Repo, name: &str) -> Result<Resolved, ApiError> {
     if (name.is_empty() || name == "HEAD")
-        && let Some((n, sha)) = r.index.head() {
-            return Ok(Resolved {
-                ref_name: n,
-                sha,
-                path: String::new(),
-                kind: "branch",
-            });
-        }
+        && let Some((n, sha)) = r.index.head()
+    {
+        return Ok(Resolved {
+            ref_name: n,
+            sha,
+            path: String::new(),
+            kind: "branch",
+        });
+    }
     if let Some(sha) = r.index.branch(name) {
         return Ok(Resolved {
             ref_name: name.into(),
@@ -2004,10 +2024,9 @@ async fn tree(
         move |r| async move {
             let (res, immutable) = resolve_addr(&r, &rest).await?;
             let key = tree_key(&r.id, &res.sha, &res.path);
-            if immutable
-                && let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
+            }
             let body = match r.remote() {
                 Some(remote) => render_tree_remote(&remote, &res).await?,
                 None => render_tree(&r.local, &res).await?,
@@ -2075,12 +2094,13 @@ async fn render_tree(
     let mut readme = None;
     if let Some(e) = readme_entry(&entries)
         && let Ok(content) = git(local, vec!["cat-file".into(), "blob".into(), e.sha.clone()]).await
-            && let Ok(s) = String::from_utf8(content) {
-                readme = Some(Readme {
-                    name: e.name.clone(),
-                    contents: s,
-                });
-            }
+        && let Ok(s) = String::from_utf8(content)
+    {
+        readme = Some(Readme {
+            name: e.name.clone(),
+            contents: s,
+        });
+    }
     Ok(json_bytes(&Tree {
         ref_name: res.ref_name.clone(),
         sha: res.sha.clone(),
@@ -2173,13 +2193,14 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
     let mut readme = None;
     if let Some(e) = readme_entry(&entries)
         && let Ok(oid) = gix_hash::ObjectId::from_hex(e.sha.as_bytes())
-            && let Ok(o) = remote.get(&oid).await
-                && let Ok(s) = String::from_utf8(o.data.to_vec()) {
-                    readme = Some(Readme {
-                        name: e.name.clone(),
-                        contents: s,
-                    });
-                }
+        && let Ok(o) = remote.get(&oid).await
+        && let Ok(s) = String::from_utf8(o.data.to_vec())
+    {
+        readme = Some(Readme {
+            name: e.name.clone(),
+            contents: s,
+        });
+    }
     Ok(json_bytes(&Tree {
         ref_name: res.ref_name.clone(),
         sha: res.sha.clone(),
@@ -2378,10 +2399,9 @@ async fn commits(
                 (resolve_name(&r, &reference).await?, false)
             };
             let key = commits_key(&r.id, &res.sha, &path, skip, n);
-            if immutable
-                && let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
+            }
             let mut cs: Vec<Commit> = if let Some(remote) = r.remote() {
                 let start = gix_hash::ObjectId::from_hex(res.sha.as_bytes())
                     .map_err(|_| not_found("revision"))?;
@@ -2463,10 +2483,9 @@ async fn commit_detail(
                 resolve_name(&r, &rev).await?.sha
             };
             let key = commit_key(&r.id, &sha);
-            if immutable
-                && let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
+            }
             if let Some(remote) = r.remote() {
                 // Fault the commit, its first parent and every object the diff
                 // touches into the loose store; `git show` below then runs as-is.
@@ -2574,21 +2593,22 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
 /// return the new path.
 fn normalize_rename(s: &str) -> String {
     if let (Some(open), Some(close)) = (s.find('{'), s.rfind('}'))
-        && open < close {
-            // '{' and '}' are ASCII, so open/close sit on char boundaries and
-            // open < close ≤ len - 1 bounds every split below.
-            let (before_brace, from_brace) = s.split_at(open);
-            let (_, after_open) = from_brace.split_at(1); // skip '{'
-            let (inner, after_close) = after_open.split_at(close - open - 1);
-            let (_, suffix) = after_close.split_at(1); // skip '}'
-            if let Some((_, new)) = inner.split_once(" => ") {
-                let mut out = String::with_capacity(s.len());
-                out.push_str(before_brace);
-                out.push_str(new);
-                out.push_str(suffix);
-                return out.replace("//", "/");
-            }
+        && open < close
+    {
+        // '{' and '}' are ASCII, so open/close sit on char boundaries and
+        // open < close ≤ len - 1 bounds every split below.
+        let (before_brace, from_brace) = s.split_at(open);
+        let (_, after_open) = from_brace.split_at(1); // skip '{'
+        let (inner, after_close) = after_open.split_at(close - open - 1);
+        let (_, suffix) = after_close.split_at(1); // skip '}'
+        if let Some((_, new)) = inner.split_once(" => ") {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(before_brace);
+            out.push_str(new);
+            out.push_str(suffix);
+            return out.replace("//", "/");
         }
+    }
     if let Some((_, new)) = s.split_once(" => ") {
         return new.to_string();
     }

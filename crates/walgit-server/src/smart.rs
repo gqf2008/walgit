@@ -1411,6 +1411,11 @@ async fn receive_pack_process(
         thin: true,
     };
     let local = handle.local().clone();
+    // Hold the prune lock across ingest → publish: the pack is visible under
+    // its final name before the manifest CAS, so a concurrent prune must not
+    // run in this window (issue #148 review).
+    let _prune_lock = handle.prune_lock();
+    let _prune_guard = _prune_lock.lock();
     let ingest = local
         .ingest_pack(pack_reader, opts)
         .instrument(tracing::info_span!("receive.ingest"))

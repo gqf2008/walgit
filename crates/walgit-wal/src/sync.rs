@@ -525,12 +525,10 @@ pub(crate) async fn apply_delta_with_rebuild(
     let rebuilt = force_refs_rebuild
         || current_state.applied_seq > head_seq
         || new_manifest.revision < current_state.revision;
-    if rebuilt {
-        // A force rebuild may fail after loading the checkpoint; never leave
-        // the process-local "verified" proof from an earlier successful sync
-        // behind (issue #148 review).
-        handle.mark_refs_unverified();
-    }
+    // Any path through apply_delta may rewrite refs (checkpoint load, full
+    // replay, incremental replay, or the empty-repo reset). Invalidate the
+    // process-local proof first; only a complete success marks it verified.
+    handle.mark_refs_unverified();
 
     if head_seq == 0 {
         // Empty manifest ⇒ empty refs, unconditionally: cheap (one small
@@ -545,6 +543,7 @@ pub(crate) async fn apply_delta_with_rebuild(
             // this revision: otherwise the first refs sync marks packs dirty
             // and prefetches, spending an extra manifest round trip on a
             // healthy empty-repo push (CI budget test).
+            state.packs_dirty = !packs_empty;
             if new_manifest.packs.is_empty() && packs_empty {
                 state.packs_revision = new_manifest.revision;
             }
@@ -913,6 +912,15 @@ pub(crate) async fn reconcile_packs_inner(
         })
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
+        let prune_lock = handle.prune_lock();
+        let Some(_prune) = prune_lock.try_lock() else {
+            // A writer is making a pack visible / publishing it. Defer this
+            // pass; pending keeps packs_ready() false so a later sync retries.
+            still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
+            still_pending.extend(deferred_staged);
+            handle.state.lock().pending_pack_removals = still_pending;
+            return Ok(());
+        };
         if let Ok(_w) = handle.rw.try_write() {
             // The candidate set was built before the write lock; a publish
             // may have staged (or a concurrent sync may have re-listed) one of
@@ -960,6 +968,7 @@ pub(crate) async fn reconcile_packs_inner(
     {
         let mut state = handle.state.lock();
         state.packs_revision = manifest.revision;
+        state.packs_dirty = false;
     }
     crate::state::save_state(local.path(), &handle.state.lock().clone())?;
     Ok(())

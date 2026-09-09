@@ -793,6 +793,10 @@ pub async fn compact_repo(
     let tier = 1u32;
     log("lease acquired; running git repack -d --geometric --write-midx".to_string());
     let t = Instant::now();
+    // repack installs packs under final names before publish_compact CASes
+    // them; keep the prune lock for the whole install → publish window.
+    let _prune_lock = handle.prune_lock();
+    let _prune_guard = _prune_lock.lock();
     let result = match handle.local().repack(repack_opts).await {
         Ok(r) => r,
         Err(e) => {
