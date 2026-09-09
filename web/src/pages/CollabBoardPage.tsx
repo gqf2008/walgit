@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, refListStream, type CollabBoardCard } from "../api";
+import { api, refListStream, type CollabBoardCard, type CollabBoardColumn } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -20,6 +20,11 @@ import { useI18n, statusLabel } from "../i18n";
 /** The statuses the move-menu offers. Values are free-form on the wire (any
     `status` entry value works); these are the ones D1 names. */
 const STATUSES = ["open", "in-progress", "needs-review", "blocked", "needs-human", "merged", "closed"] as const;
+
+/** Columns shown by the default board view: non-empty only, unless asked. */
+export function visibleBoardColumns(columns: CollabBoardColumn[], showEmpty: boolean): CollabBoardColumn[] {
+  return showEmpty ? columns : columns.filter((col) => col.cards.length > 0);
+}
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -69,7 +74,7 @@ function useCollabLive(full: string) {
 /** One lane; the card menu posts the `status` entry that moves it. */
 function BoardColumnView({ full, name, cards }: { full: string; name: string; cards: CollabBoardCard[] }) {
   return (
-    <div className="grow" style={{ minWidth: 260 }}>
+    <div className="board-column">
       <Box title={`${name} (${cards.length})`}>
         {cards.length === 0 && <div className="pad muted">—</div>}
         {cards.map((c) => (
@@ -164,8 +169,12 @@ function BoardCard({ full, card }: { full: string; card: CollabBoardCard }) {
 export function CollabBoardPage() {
   const { t } = useI18n();
   const { full } = useRepo();
+  const [showEmpty, setShowEmpty] = useState(false);
   const board = useData(`collab:${full}:board`, () => api.collab(full).board());
   useCollabLive(full);
+  const nonEmpty = board.columns.filter((col) => col.cards.length > 0);
+  const emptyCount = board.columns.length - nonEmpty.length;
+  const visibleColumns = visibleBoardColumns(board.columns, showEmpty);
   return (
     <>
       <div className="pad">
@@ -174,11 +183,28 @@ export function CollabBoardPage() {
       <Box title={t("board.title")}>
         <div className="pad muted">{t("board.explainer")}</div>
       </Box>
-      <div className="row gap" style={{ alignItems: "flex-start" }}>
-        {board.columns.map((col) => (
-          <BoardColumnView key={col.name} full={full} name={col.name} cards={col.cards} />
-        ))}
+      <div className="row gap board-toolbar">
+        <span className="muted">
+          {t("board.visible", { visible: visibleColumns.length, total: board.columns.length })}
+        </span>
+        <span className="spacer" />
+        {emptyCount > 0 && (
+          <button className="btn" aria-pressed={showEmpty} onClick={() => setShowEmpty((v) => !v)}>
+            {showEmpty ? t("board.hideEmpty") : t("board.showEmpty", { n: emptyCount })}
+          </button>
+        )}
       </div>
+      {visibleColumns.length === 0 ? (
+        <Box>
+          <div className="pad muted">{t("board.noCards")}</div>
+        </Box>
+      ) : (
+        <div className="board-grid">
+          {visibleColumns.map((col) => (
+            <BoardColumnView key={col.name} full={full} name={col.name} cards={col.cards} />
+          ))}
+        </div>
+      )}
     </>
   );
 }
