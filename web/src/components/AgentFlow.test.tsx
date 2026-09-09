@@ -27,4 +27,12 @@ describe("agentFlowGroups", () => {
     expect(groups[0]?.owner).toBe("unassigned");
     expect(groups[0]?.cards.map((item) => item.card.id)).toEqual(["a", "b"]);
   });
+
+  it("omits archived cards", () => {
+    const groups = agentFlowGroups([
+      column("closed", [card("old", "agent-a", "closed")]),
+      column("in-progress", [card("active", "agent-a")]),
+    ]);
+    expect(groups[0]?.cards.map((item) => item.card.id)).toEqual(["active"]);
+  });
 });

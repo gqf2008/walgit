@@ -11,11 +11,14 @@ export interface AgentFlowGroup {
   cards: AgentFlowCard[];
 }
 
+const ARCHIVED = new Set(["closed", "merged", "done"]);
+
 /** Group current board cards by their explicit owner; empty owner is unassigned. */
 export function agentFlowGroups(columns: CollabBoardColumn[]): AgentFlowGroup[] {
   const groups = new Map<string, AgentFlowGroup>();
   for (const col of columns) {
     for (const card of col.cards) {
+      if (ARCHIVED.has(card.status)) continue;
       const owner = card.owner.trim() || "unassigned";
       const group = groups.get(owner) ?? { owner, cards: [] };
       group.cards.push({ card, lane: col.name });
