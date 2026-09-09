@@ -135,6 +135,19 @@ impl ObjectAccess {
     }
 }
 
+/// RAII protection for an ingested pack that is not in the manifest yet.
+/// The reconciler must not prune it while a publish/CAS is in flight.
+pub struct StagedPackGuard {
+    handle: Arc<RepoHandle>,
+    checksum: String,
+}
+
+impl Drop for StagedPackGuard {
+    fn drop(&mut self) {
+        self.handle.unstage_pack(&self.checksum);
+    }
+}
+
 impl RepoHandle {
     // The one constructor of RepoHandle: its parameters are exactly the
     // externally supplied fields of the struct (the rest are internal
@@ -400,6 +413,13 @@ impl RepoHandle {
         self.refs_verified.store(true, Ordering::Release);
     }
 
+    /// Invalidate the process-local refs proof before any path that resets or
+    /// rewrites refs (force rebuild / rematerialize). A failed rebuild must not
+    /// leave a previously-true flag behind (issue #148 review).
+    pub(crate) fn mark_refs_unverified(&self) {
+        self.refs_verified.store(false, Ordering::Release);
+    }
+
     pub(crate) fn stage_pack(&self, checksum: &str) {
         self.staged_packs.lock().insert(checksum.to_string());
     }
@@ -410,6 +430,20 @@ impl RepoHandle {
 
     pub(crate) fn pack_staged(&self, checksum: &str) -> bool {
         self.staged_packs.lock().contains(checksum)
+    }
+
+    /// Stage a pack for as long as the returned guard lives. Unlike the
+    /// manual stage/unstage pair this is cancellation-safe: a dropped future
+    /// releases the protection. Returns `None` when the handle has no
+    /// self-`Arc` yet (unit construction), in which case callers keep the
+    /// existing manual pairing.
+    pub fn stage_pack_guard(&self, checksum: &str) -> Option<StagedPackGuard> {
+        let handle = self.self_arc.get().cloned()?;
+        self.stage_pack(checksum);
+        Some(StagedPackGuard {
+            handle,
+            checksum: checksum.to_string(),
+        })
     }
 
     /// Issue #4 reverse-direction diagnostics (`WALGIT_TEST_REFS_DIAG`): the
@@ -1084,7 +1118,9 @@ impl RepoHandle {
             return Err(WalError::NotFound);
         };
 
-        // Reset state and re-materialize
+        // Reset state and re-materialize. A previous process-local proof is
+        // invalid from here: only a complete rebuild may set it again.
+        self.mark_refs_unverified();
         crate::sync::materialize_from_scratch(self, &manifest, &meta.version).await?;
 
         *self.manifest.write() = Arc::new(manifest);

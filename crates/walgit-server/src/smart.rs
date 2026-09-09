@@ -66,10 +66,9 @@ pub async fn info_refs(
         }
         return Err(ApiError::from(e).git_lane());
     }
-    if is_receive
-        && let Some(msg) = push_url_must_be_git(st, route, headers) {
-            return Ok(git_err_response("git-receive-pack", &msg));
-        }
+    if is_receive && let Some(msg) = push_url_must_be_git(st, route, headers) {
+        return Ok(git_err_response("git-receive-pack", &msg));
+    }
 
     let service = match service_param.as_str() {
         "git-upload-pack" => walgit_git::Service::UploadPack,
@@ -132,7 +131,10 @@ pub async fn info_refs(
     // local ref_view under the same keyed manifest version.
     if !matches!(
         (protocol, service),
-        (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack)
+        (
+            walgit_git::pkt::Protocol::V2,
+            walgit_git::Service::UploadPack
+        )
     ) && std::env::var("WALGIT_TEST_REFS_DIAG").is_ok()
     {
         let (heads, main_tip) = v0_advert_heads(&buf);
@@ -160,10 +162,7 @@ fn v0_advert_heads(buf: &[u8]) -> (Vec<String>, Option<String>) {
     let mut main_tip = None;
     let mut i = 0usize;
     while i + 4 <= buf.len() {
-        let Some(len_hex) = buf
-            .get(i..i + 4)
-            .and_then(|b| std::str::from_utf8(b).ok())
-        else {
+        let Some(len_hex) = buf.get(i..i + 4).and_then(|b| std::str::from_utf8(b).ok()) else {
             break;
         };
         let Ok(len) = usize::from_str_radix(len_hex, 16) else {
@@ -182,13 +181,11 @@ fn v0_advert_heads(buf: &[u8]) -> (Vec<String>, Option<String>) {
         let Some(payload) = buf.get(i + 4..i + len) else {
             break;
         };
-        let line = std::str::from_utf8(payload)
-            .unwrap_or_default()
-            .trim_end();
+        let line = std::str::from_utf8(payload).unwrap_or_default().trim_end();
         let mut it = line.split_whitespace();
         if let (Some(oid), Some(name)) = (it.next(), it.next()) {
-            let hex_ok = oid.bytes().all(|b| b.is_ascii_hexdigit())
-                && (oid.len() == 40 || oid.len() == 64);
+            let hex_ok =
+                oid.bytes().all(|b| b.is_ascii_hexdigit()) && (oid.len() == 40 || oid.len() == 64);
             // The first ref line carries the NUL + capability list
             // appended to its ref name; strip it.
             let name = name.split('\0').next().unwrap_or(name);
@@ -257,7 +254,9 @@ async fn refs_diag_advert_observe(
         "DIAG-ADVERT proto={proto} repo={} keyed={} ver={} cached={cached} adv_main={} view_main={view_main} disk_main={disk_main} head={} applied={} rev={} gen={} cache_key_gen={cache_key_gen} cache_current={cache_current} heads=[{}]",
         handle.id(),
         keyed.as_ref().map_or("none", walgit_store::Version::as_str),
-        current.as_ref().map_or("none", walgit_store::Version::as_str),
+        current
+            .as_ref()
+            .map_or("none", walgit_store::Version::as_str),
         advert_main.as_deref().unwrap_or("none"),
         m.head_seq,
         handle.applied_seq(),
@@ -288,9 +287,10 @@ async fn refs_diag_advert_observe(
 fn parse_query(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=')
-            && k == key {
-                return Some(v.to_string());
-            }
+            && k == key
+        {
+            return Some(v.to_string());
+        }
     }
     None
 }
@@ -323,9 +323,10 @@ async fn v2_capability_advert(
     };
     pktline::encode_text(buf, &format!("object-format={fmt}\n"));
     if st.cfg.bundles.advertise
-        && let Ok(Some(_list)) = st.bundles.list(id).await {
-            pktline::encode_text(buf, "bundle-uri\n");
-        }
+        && let Ok(Some(_list)) = st.bundles.list(id).await
+    {
+        pktline::encode_text(buf, "bundle-uri\n");
+    }
     pktline::encode_flush(buf);
     Ok(())
 }
@@ -387,24 +388,23 @@ async fn upload_pack_v2(
             let repo_key = route.id.to_string();
             let version = handle.manifest_version();
             let mut v2_served_from_cache = false;
-            let lines =
-                if let Some(lines) = st
-                    .caches
+            let lines = if let Some(lines) =
+                st.caches
                     .ref_advert
                     .get_v2_ls_refs(&repo_key, version.as_ref(), &args)
-                {
-                    v2_served_from_cache = true;
-                    lines
-                } else {
-                    let lines = handle.local().ls_refs(&args).map_err(|e| git_err(&e))?;
-                    st.caches.ref_advert.insert_v2_ls_refs(
-                        &repo_key,
-                        version.as_ref(),
-                        &args,
-                        lines.clone(),
-                    );
-                    lines
-                };
+            {
+                v2_served_from_cache = true;
+                lines
+            } else {
+                let lines = handle.local().ls_refs(&args).map_err(|e| git_err(&e))?;
+                st.caches.ref_advert.insert_v2_ls_refs(
+                    &repo_key,
+                    version.as_ref(),
+                    &args,
+                    lines.clone(),
+                );
+                lines
+            };
             // Issue #4 P1 instrumentation: what this ls-refs answer shows vs
             // the manifest version it was keyed on — and, when the served tip
             // diverges from the local view, the deep read-side dump. Readers'
@@ -671,12 +671,9 @@ fn bundle_narration(
         let bytes: u64 = applied.iter().map(|b| b.size).sum();
         let newest = applied.last().map_or(0, |b| b.creation_token);
         // creation_token is a calendar-slot epoch — far below i64::MAX.
-        let when = chrono::DateTime::from_timestamp(
-            i64::try_from(newest).unwrap_or(i64::MAX),
-            0,
-        )
-        .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
-        .unwrap_or_default();
+        let when = chrono::DateTime::from_timestamp(i64::try_from(newest).unwrap_or(i64::MAX), 0)
+            .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
+            .unwrap_or_default();
         let names: Vec<String> = applied.iter().map(|b| b.strategy.clone()).collect();
         out.push(format!(
             "bundle-uri: your git applied {} bundle(s) = {} ({}) — history as of {when}; what follows is everything since",
@@ -838,7 +835,8 @@ async fn narrated_fetch(
         .auth
         .require_read(headers)
         .await
-        .ok().map_or_else(|| "anonymous".into(), |p| p.name);
+        .ok()
+        .map_or_else(|| "anonymous".into(), |p| p.name);
     // Nothing that can wait (store reads, syncs) happens before the stream
     // is open and the first band-2 line is out: the bundle facts are read
     // inside the task, after the greeting.
@@ -1391,7 +1389,10 @@ pub async fn receive_pack(
 // caps, byte stream, identity); the guard must outlive unpack/connectivity
 // and be dropped before publish, so folding them into one context struct
 // would obscure that ordering for no gain.
-#[allow(clippy::too_many_arguments, reason = "receive-pack pipeline stages; the sync guard's drop-before-publish ordering argues against a context struct")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "receive-pack pipeline stages; the sync guard's drop-before-publish ordering argues against a context struct"
+)]
 async fn receive_pack_process(
     st: &AppState,
     handle: &Arc<walgit_wal::RepoHandle>,
@@ -1421,31 +1422,32 @@ async fn receive_pack_process(
     };
 
     // Connectivity check for pushed tips (before we publish anything).
-    if unpack_err.is_none() && st.cfg.wal.check_connectivity
-        && let Ok(Some(_)) = &ingest {
-            let tips: Vec<gix_hash::ObjectId> = txn
-                .updates
-                .iter()
-                .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
-                .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
-                .collect();
-            if !tips.is_empty()
-                && let Err(e) = local
-                    .check_connectivity_async(&tips, true)
-                    .instrument(tracing::info_span!(
-                        "receive.connectivity",
-                        tips = tips.len()
-                    ))
-                    .await
-                {
-                    // Every refusal names the reason on each ref: `unpack ng`
-                    // alone makes git print "remote failed to report status".
-                    tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
-                    metrics::counter!("walgit_push_refused_total", "reason" => "connectivity")
-                        .increment(1);
-                    return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
-                }
+    if unpack_err.is_none()
+        && st.cfg.wal.check_connectivity
+        && let Ok(Some(_)) = &ingest
+    {
+        let tips: Vec<gix_hash::ObjectId> = txn
+            .updates
+            .iter()
+            .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
+            .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
+            .collect();
+        if !tips.is_empty()
+            && let Err(e) = local
+                .check_connectivity_async(&tips, true)
+                .instrument(tracing::info_span!(
+                    "receive.connectivity",
+                    tips = tips.len()
+                ))
+                .await
+        {
+            // Every refusal names the reason on each ref: `unpack ng`
+            // alone makes git print "remote failed to report status".
+            tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
+            metrics::counter!("walgit_push_refused_total", "reason" => "connectivity").increment(1);
+            return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
         }
+    }
 
     // On unpack failure, report and abort (nothing was published).
     if let Some(msg) = unpack_err {
@@ -1453,6 +1455,15 @@ async fn receive_pack_process(
         metrics::counter!("walgit_push_refused_total", "reason" => "unpack").increment(1);
         return Ok(refusal_report(&caps, &txn, &msg).await);
     }
+
+    // The ingested pack is already visible under its final name, but it is
+    // not in the manifest until publish/CAS succeeds. Protect it from a
+    // concurrent reconcile for the whole window; the guard also covers every
+    // early return below and is dropped on cancellation (issue #148 review).
+    let _staged_pack = match &ingest {
+        Ok(Some(p)) => handle.stage_pack_guard(&p.checksum.to_string()),
+        _ => None,
+    };
 
     let unpack_result: Result<(), String> = Ok(());
 
@@ -1753,10 +1764,16 @@ pub(crate) fn build_response<B: axum::response::IntoResponse>(
     // formatting `application/x-<service>-advertisement`), and every `extra`
     // value is a `&'static str` literal from no_cache_headers() — all of them
     // valid header values, so the parse cannot fail.
-    #[allow(clippy::unwrap_used, reason = "content types are fixed internal strings and extra values are &'static str literals")]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "content types are fixed internal strings and extra values are &'static str literals"
+    )]
     h.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
     for (k, v) in extra {
-        #[allow(clippy::unwrap_used, reason = "extra values are &'static str literals, valid header values by construction")]
+        #[allow(
+            clippy::unwrap_used,
+            reason = "extra values are &'static str literals, valid header values by construction"
+        )]
         h.insert(k, v.parse().unwrap());
     }
     resp
@@ -2026,11 +2043,18 @@ mod issue4_diag_tests {
     fn v0_advert_heads_reads_frames_past_the_header_flush() {
         let mut buf = pkt(b"# service=git-upload-pack\n");
         buf.extend_from_slice(b"0000");
-        buf.extend_from_slice(&pkt(b"1111111111111111111111111111111111111111 refs/heads/main\0multi_ack thin-pack\n"));
-        buf.extend_from_slice(&pkt(b"2222222222222222222222222222222222222222 refs/heads/dev\n"));
+        buf.extend_from_slice(&pkt(
+            b"1111111111111111111111111111111111111111 refs/heads/main\0multi_ack thin-pack\n",
+        ));
+        buf.extend_from_slice(&pkt(
+            b"2222222222222222222222222222222222222222 refs/heads/dev\n",
+        ));
         buf.extend_from_slice(b"0000");
         let (heads, main_tip) = super::v0_advert_heads(&buf);
-        assert_eq!(main_tip.as_deref(), Some("1111111111111111111111111111111111111111"));
+        assert_eq!(
+            main_tip.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
         assert_eq!(heads.len(), 2);
     }
 }

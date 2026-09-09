@@ -446,6 +446,12 @@ fn refs_not_replayable(manifest: &Manifest, from_seq: u64, to_seq: u64, detail: 
 /// through its own sequence; anything older than that is folded away. Sequence
 /// numbers may contain holes: a crashed writer burns an orphaned head slot, so
 /// only the last named segment must reach `to_seq`.
+///
+/// This deliberately checks the *fold boundary* and tail presence, not dense
+/// seq coverage: without burned-range metadata an orphan slot and a missing
+/// committed segment are indistinguishable. The fold boundary is the bug
+/// #148 exercised; denser validation needs a manifest representation for
+/// burned ranges (tracked as follow-up).
 pub(crate) fn ensure_replayable(
     manifest: &Manifest,
     from_seq: u64,
@@ -519,13 +525,30 @@ pub(crate) async fn apply_delta_with_rebuild(
     let rebuilt = force_refs_rebuild
         || current_state.applied_seq > head_seq
         || new_manifest.revision < current_state.revision;
+    if rebuilt {
+        // A force rebuild may fail after loading the checkpoint; never leave
+        // the process-local "verified" proof from an earlier successful sync
+        // behind (issue #148 review).
+        handle.mark_refs_unverified();
+    }
 
     if head_seq == 0 {
         // Empty manifest ⇒ empty refs, unconditionally: cheap (one small
         // packed-refs write) and the only way to also cover a leftover dir
         // whose state file was lost (`applied_seq == 0` yet refs present).
+        let packs_empty = local.packs()?.is_empty();
         local.load_ref_snapshot(&RefSnapshot::default())?;
-        handle.state.lock().applied_seq = 0;
+        {
+            let mut state = handle.state.lock();
+            state.applied_seq = 0;
+            // An empty manifest with no local packs is fully reconciled at
+            // this revision: otherwise the first refs sync marks packs dirty
+            // and prefetches, spending an extra manifest round trip on a
+            // healthy empty-repo push (CI budget test).
+            if new_manifest.packs.is_empty() && packs_empty {
+                state.packs_revision = new_manifest.revision;
+            }
+        }
     } else {
         // If we have a checkpoint and haven't loaded it yet — or the bucket
         // was rebuilt and we must restart from it — load its refs. Its packs
@@ -857,15 +880,28 @@ pub(crate) async fn reconcile_packs_inner(
     let pending = std::mem::take(&mut handle.state.lock().pending_pack_removals);
     let mut removed = 0usize;
     let mut still_pending: Vec<String> = Vec::new();
+    let mut deferred_staged: Vec<String> = Vec::new();
     let mut candidates: std::collections::BTreeSet<String> = pending
         .iter()
-        .filter(|s| !live.contains(s.as_str()) && !handle.pack_staged(s))
+        .filter(|s| !live.contains(s.as_str()))
+        .filter(|s| {
+            if handle.pack_staged(s) {
+                deferred_staged.push((*s).clone());
+                false
+            } else {
+                true
+            }
+        })
         .cloned()
         .collect();
     for pack in local.packs()? {
         let checksum = pack.checksum.to_string();
-        if !live.contains(checksum.as_str()) && !handle.pack_staged(&checksum) {
-            candidates.insert(checksum);
+        if !live.contains(checksum.as_str()) {
+            if handle.pack_staged(&checksum) {
+                deferred_staged.push(checksum);
+            } else {
+                candidates.insert(checksum);
+            }
         }
     }
     let to_remove: Vec<(String, gix_hash::ObjectId)> = candidates
@@ -878,6 +914,24 @@ pub(crate) async fn reconcile_packs_inner(
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
         if let Ok(_w) = handle.rw.try_write() {
+            // The candidate set was built before the write lock; a publish
+            // may have staged (or a concurrent sync may have re-listed) one of
+            // these packs in the meantime. Re-check both facts under the lock.
+            let live_now: std::collections::HashSet<String> = handle
+                .manifest()
+                .packs
+                .iter()
+                .map(|p| p.checksum.clone())
+                .collect();
+            let mut recheck: Vec<(String, gix_hash::ObjectId)> = Vec::new();
+            for (checksum, oid) in to_remove {
+                if live_now.contains(&checksum) || handle.pack_staged(&checksum) {
+                    deferred_staged.push(checksum);
+                } else {
+                    recheck.push((checksum, oid));
+                }
+            }
+            let to_remove = recheck;
             // One call for the whole superseded set: on Windows the cold
             // handle swap inside remove_packs releases this process's own
             // pack-index mmaps once, not once per pack (K swaps would drop
@@ -898,6 +952,7 @@ pub(crate) async fn reconcile_packs_inner(
         }
     }
     span.record("removed", removed);
+    still_pending.extend(deferred_staged);
     if !still_pending.is_empty() {
         handle.state.lock().pending_pack_removals = still_pending;
     }

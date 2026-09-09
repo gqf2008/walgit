@@ -186,7 +186,11 @@ fn is_transient_git_name(name: &std::ffi::OsStr) -> bool {
 /// - **Everything else is fatal**: a vanishing entry elsewhere — above all `objects/pack/` —
 ///   is real corruption or a real bug and must fail loudly, naming the source path
 ///   ([`at`]) so the anyhow chain prints the dead file at the leaf.
-fn copy_snapshot(dst: &Path, entries: &DirSnapshot, gone: &mut Vec<PathBuf>) -> std::io::Result<u64> {
+fn copy_snapshot(
+    dst: &Path,
+    entries: &DirSnapshot,
+    gone: &mut Vec<PathBuf>,
+) -> std::io::Result<u64> {
     let mut bytes = 0u64;
     for (name, from, kind) in entries {
         if is_transient_git_name(name) {
@@ -446,6 +450,12 @@ pub async fn rebuild_base(
     let superseded = supersedes.len();
     let mut supersedes_left = Some(supersedes);
     let mut published = Vec::new();
+    // Installed packs are visible before publish_compact CASes them into the
+    // manifest; keep them protected from a concurrent prune.
+    let _staged_packs: Vec<_> = to_install
+        .iter()
+        .filter_map(|c| handle.stage_pack_guard(&c.to_hex().to_string()))
+        .collect();
     for c in &to_install {
         let hex = c.to_hex().to_string();
         let Some(info) = local_packs.iter().find(|p| &p.checksum == c).cloned() else {
@@ -530,7 +540,10 @@ fn start_scratch(
         let shown: Vec<String> = gone
             .iter()
             .take(5)
-            .map(|p| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
+            .map(|p| {
+                p.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            })
             .collect();
         log(format!(
             "tolerated {} commit-graph entr{} deleted during the copy: {}",
@@ -607,10 +620,7 @@ mod tests {
         let layer = graphs.join("graph-1111111111222222222233333333334444444444.graph");
         std::fs::write(&layer, "layer bytes")?;
         let chain = "1111111111222222222233333333334444444444";
-        std::fs::write(
-            graphs.join("commit-graph-chain"),
-            format!("{chain}\n"),
-        )?;
+        std::fs::write(graphs.join("commit-graph-chain"), format!("{chain}\n"))?;
 
         let entries = snapshot_dir(&graphs)?;
         assert_eq!(entries.len(), 2, "layer + chain enumerated");
@@ -637,7 +647,9 @@ mod tests {
             "the chain that survived must arrive"
         );
         assert!(
-            !into.join("graph-1111111111222222222233333333334444444444.graph").exists(),
+            !into
+                .join("graph-1111111111222222222233333333334444444444.graph")
+                .exists(),
             "the deleted layer must not be half-created"
         );
         Ok(())
@@ -649,8 +661,8 @@ mod tests {
     /// a bare "The system cannot find the file specified. (os error 2)" because an
     /// `io::Error`'s Display hides its path).
     #[test]
-    fn copy_snapshot_fails_and_names_a_pack_file_deleted_after_the_snapshot()
-    -> std::io::Result<()> {
+    fn copy_snapshot_fails_and_names_a_pack_file_deleted_after_the_snapshot() -> std::io::Result<()>
+    {
         let src = tempfile::tempdir()?;
         let dst = tempfile::tempdir()?;
         let pack_dir = src.path().join("objects/pack");
@@ -667,7 +679,8 @@ mod tests {
 
         let into = dst.path().join("objects/pack");
         std::fs::create_dir_all(&into)?;
-        let err = copy_snapshot(&into, &entries, &mut Vec::new()).expect_err("a vanishing pack must not be tolerated");
+        let err = copy_snapshot(&into, &entries, &mut Vec::new())
+            .expect_err("a vanishing pack must not be tolerated");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             err.to_string()
@@ -686,7 +699,10 @@ mod tests {
         let dst = tempfile::tempdir()?;
         let graphs = src.path().join("objects/info/commit-graphs");
         std::fs::create_dir_all(&graphs)?;
-        std::fs::write(graphs.join("graph-3333333333444444444455555555556666666666.graph.tmp"), "mid-write")?;
+        std::fs::write(
+            graphs.join("graph-3333333333444444444455555555556666666666.graph.tmp"),
+            "mid-write",
+        )?;
         std::fs::write(graphs.join("commit-graph-chain.lock"), "stale lock")?;
         // git 2.50.1 stages a split layer under this mkstemps *prefix*, not a `.tmp`
         // suffix — the name the suffix rule alone would miss (issue #143's review).
@@ -790,7 +806,8 @@ mod tests {
         // A sibling gone after the snapshot: fatal, with its path named.
         let entries = snapshot_dir(&info)?;
         std::fs::remove_file(info.join("http-backend"))?;
-        let err = copy_snapshot(&into, &entries, &mut Vec::new()).expect_err("objects/info siblings are not graph state");
+        let err = copy_snapshot(&into, &entries, &mut Vec::new())
+            .expect_err("objects/info siblings are not graph state");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             err.to_string().contains("http-backend"),

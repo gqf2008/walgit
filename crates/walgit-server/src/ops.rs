@@ -277,7 +277,10 @@ async fn run(
                 .await
                 .map_err(|e| format!("writing fsck.pb: {e}"))?;
             // f64 is the metrics-gauge contract; missing-object counts are ≪ 2^53.
-            #[allow(clippy::cast_precision_loss, reason = "f64 is the metrics-gauge contract; missing-object counts ≪ 2^53")]
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "f64 is the metrics-gauge contract; missing-object counts ≪ 2^53"
+            )]
             metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string())
                 .set(missing.len() as f64);
             tracing::info!(repo = %id, seq, missing = missing.len(), problems = report.problems, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "fsck recorded");
@@ -818,6 +821,13 @@ pub async fn compact_repo(
     let mut supersedes_left = Some(supersedes);
     let mut packs = Vec::new();
     let mut first_err = None;
+    // Repack installed these packs under final names before publish_compact
+    // CASes them into the manifest; protect them from a concurrent prune.
+    let _staged_packs: Vec<_> = result
+        .new_packs
+        .iter()
+        .filter_map(|p| handle.stage_pack_guard(&p.checksum.to_hex().to_string()))
+        .collect();
     for p in &result.new_packs {
         let hex = p.checksum.to_hex().to_string();
         let size = p.pack_size;
