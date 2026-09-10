@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Subcommand;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::io::Write as _;
@@ -1084,8 +1084,15 @@ struct ExecOutcome {
 
 #[derive(Default)]
 struct CapturedLog {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
     truncated: bool,
+}
+
+impl CapturedLog {
+    /// Flatten the ring once, after the child has closed both pipes.
+    fn into_vec(mut self) -> Vec<u8> {
+        self.bytes.make_contiguous().to_vec()
+    }
 }
 
 /// §8.2: one collected artifact, ready to upload.
@@ -2047,12 +2054,13 @@ impl Runner {
                     let _ = r.join();
                 }
                 let captured = take_log(&log);
+                let log_truncated = captured.truncated;
                 return ExecOutcome {
                     conclusion: Conclusion::Timeout,
                     exit_code: None,
                     duration_ms: millis_since(started),
-                    log: captured.bytes,
-                    log_truncated: captured.truncated,
+                    log: captured.into_vec(),
+                    log_truncated,
                     artifacts: Vec::new(),
                 };
             }
@@ -2069,12 +2077,13 @@ impl Runner {
             Conclusion::Failure
         };
         let captured = take_log(&log);
+        let log_truncated = captured.truncated;
         ExecOutcome {
             conclusion,
             exit_code: code.map(i64::from),
             duration_ms: millis_since(started),
-            log: captured.bytes,
-            log_truncated: captured.truncated,
+            log: captured.into_vec(),
+            log_truncated,
             artifacts: Vec::new(),
         }
     }
@@ -2156,18 +2165,21 @@ fn append_capped(captured: &mut CapturedLog, chunk: &[u8], limit: usize) {
         captured.bytes.clear();
         let start = chunk.len().saturating_sub(limit);
         if let Some(tail) = chunk.get(start..) {
-            captured.bytes.extend_from_slice(tail);
+            captured.bytes.extend(tail);
         }
         captured.truncated = true;
         return;
     }
     if captured.bytes.len() + chunk.len() > limit {
-        let keep = limit.saturating_sub(chunk.len());
-        let drop = captured.bytes.len().saturating_sub(keep);
+        let drop = captured
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(limit);
         captured.bytes.drain(..drop);
         captured.truncated = true;
     }
-    captured.bytes.extend_from_slice(chunk);
+    captured.bytes.extend(chunk);
 }
 
 /// Pipe one child stream into the shared, capped log tail (§8.2).
@@ -2358,11 +2370,11 @@ command = "cargo test"
         let mut captured = CapturedLog::default();
         append_capped(&mut captured, b"123456", 10);
         append_capped(&mut captured, b"7890", 10);
-        assert_eq!(captured.bytes, b"1234567890");
+        assert_eq!(captured.bytes.make_contiguous(), b"1234567890");
         assert!(!captured.truncated);
 
         append_capped(&mut captured, b"abcdefghijkl", 10);
-        assert_eq!(captured.bytes, b"cdefghijkl");
+        assert_eq!(captured.bytes.make_contiguous(), b"cdefghijkl");
         assert!(captured.truncated);
     }
 
