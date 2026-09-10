@@ -1268,10 +1268,17 @@ async fn collab_entries(
 }
 
 /// Upper bound on the collab namespace one aggregation request may read: the
-/// inbox is append-only (D1 §11 open question 4) and the report/thread views
-/// load it whole — past this size the answer is a 503 pointing at the CLI,
-/// not an unbounded fan-out of faults and objects.
+/// inbox is folded by `walgit collab gc` (D45 / D1 §11.4), so this counts only
+/// the **unfolded** tail plus the principals registry — past this size the
+/// answer is a 503 pointing at gc / the CLI, not an unbounded fan-out of
+/// faults and objects. The snapshot itself is one ref + one bounded blob
+/// (`COLLAB_SNAPSHOT_MAX_BYTES`).
 const COLLAB_MAX_ENTRIES: usize = 20_000;
+
+/// Bound on the folded-history blob at `refs/collab/meta/snapshot` (D45): the
+/// fold turns N historical refs into one ref + one blob, and this cap keeps
+/// the blob bounded work for the remote reader and the parser.
+const COLLAB_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// One `git cat-file --batch` for many oids: a process per entry made the
 /// aggregation O(refs) subprocesses per request. Requests go out in small
@@ -1500,6 +1507,7 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
     let mut plan: Vec<(&str, String, String)> = Vec::new(); // (kind, rest, oid)
     let mut rules = MergeRules::default();
     let mut rules_oid: Option<String> = None;
+    let mut snapshot_oid: Option<String> = None;
     for (name, oid) in &r.index.all {
         if let Some(rest) = name.strip_prefix("refs/collab/meta/principals/") {
             plan.push(("principal", rest.to_string(), oid.clone()));
@@ -1507,11 +1515,13 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
             plan.push(("entry", rest.to_string(), oid.clone()));
         } else if name == "refs/collab/meta/rules" {
             rules_oid = Some(oid.clone());
+        } else if name == walgit_wal::collab::SNAPSHOT_REF {
+            snapshot_oid = Some(oid.clone());
         }
     }
     if plan.len() > COLLAB_MAX_ENTRIES {
         return Err(ApiError::ServiceUnavailable(format!(
-            "collab namespace has more than {COLLAB_MAX_ENTRIES} refs; aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
+            "collab namespace has more than {COLLAB_MAX_ENTRIES} unfolded refs; fold the inbox with `walgit collab gc` (D1 §11.4) or aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
         )));
     }
     if let Some(remote) = r.remote() {
@@ -1519,11 +1529,10 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
             .iter()
             .filter_map(|(_, _, oid)| gix_hash::ObjectId::from_hex(oid.as_bytes()).ok())
             .collect();
-        if let Some(oid) = rules_oid
-            .as_deref()
-            .and_then(|o| gix_hash::ObjectId::from_hex(o.as_bytes()).ok())
-        {
-            oids.push(oid);
+        for oid in rules_oid.iter().chain(snapshot_oid.iter()) {
+            if let Ok(oid) = gix_hash::ObjectId::from_hex(oid.as_bytes()) {
+                oids.push(oid);
+            }
         }
         remote.fault_many(&oids).await?;
         // The batched cat-file below must see the faulted loose objects.
@@ -1536,8 +1545,35 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
     if let Some(oid) = &rules_oid {
         want.push(oid.clone());
     }
+    if let Some(oid) = &snapshot_oid {
+        want.push(oid.clone());
+    }
     let blobs = git_cat_file_batch(&r.local, &want).await?;
-    let mut entries = Vec::new();
+    // D45 read semantics: the folded history (snapshot) ∪ the unfolded tail,
+    // deduped by oid — a mid-fold state (snapshot moved, deletes pending)
+    // aggregates identically to either side of it.
+    let mut set = walgit_wal::collab::EntrySet::new();
+    if let Some(oid) = &snapshot_oid
+        && let Some(bytes) = blobs.get(oid)
+    {
+        if bytes.len() > COLLAB_SNAPSHOT_MAX_BYTES {
+            return Err(ApiError::ServiceUnavailable(format!(
+                "collab snapshot exceeds {} MiB; aggregate offline with the `walgit collab` CLI",
+                COLLAB_SNAPSHOT_MAX_BYTES / (1024 * 1024)
+            )));
+        }
+        // Fail closed on a corrupt document: silently skipping it would drop
+        // every folded entry from history. (Per-record corruption is skipped
+        // inside, like a corrupt inbox blob.)
+        let snap = walgit_wal::collab::parse_snapshot(bytes)
+            .map_err(|e| internal(format!("{}: {e}", walgit_wal::collab::SNAPSHOT_REF)))?;
+        for rec in &snap.entries {
+            if let Some(er) = rec.entry_ref() {
+                set.insert(er);
+            }
+        }
+    }
+    let mut entries_deferred: Vec<EntryRef> = Vec::new();
     for (kind, rest, oid) in plan {
         let Some(bytes) = blobs.get(&oid) else {
             continue; // pruned between index and read: skip like an unparsable entry
@@ -1556,7 +1592,7 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
                         .rsplit_once('/')
                         .map(|(p, _)| p.to_string())
                         .unwrap_or_default();
-                    entries.push(EntryRef {
+                    entries_deferred.push(EntryRef {
                         oid,
                         principal,
                         entry,
@@ -1565,6 +1601,10 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
             }
         }
     }
+    for er in entries_deferred {
+        set.insert(er);
+    }
+    let entries = set.into_entries();
     // Cross-repo identity (issue #76): a principal absent from this repo's local
     // registry may still be registered at host level. Best-effort: a host store
     // failure degrades to repo-local verification (old behavior).

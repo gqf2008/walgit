@@ -16,8 +16,10 @@ use ed25519_dalek::SigningKey;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use walgit_wal::collab::{
-    BOARD_PATH, Board, BoardDef, Entry, EntryRef, EntryRefs, MergeRules, Report, build_board,
-    build_report, default_board, merge_rule_eval, parse_board_def, pr_view, sign_entry, thread,
+    BOARD_PATH, Board, BoardDef, Entry, EntryRef, EntryRefs, EntrySet, MergeRules, Report,
+    SNAPSHOT_REF, SnapshotRecord, build_board, build_report, build_snapshot, default_board,
+    merge_rule_eval, parse_board_def, parse_snapshot, pr_view, sign_entry, thread,
+    verify_snapshot,
 };
 
 // ---- CLI commands --------------------------------------------------------------
@@ -153,6 +155,23 @@ pub enum CollabAction {
         #[arg(long)]
         rules: Option<PathBuf>,
     },
+    /// Fold the append-only inbox into the signed aggregate snapshot
+    /// (D45 / D1 §11.4): `refs/collab/meta/snapshot` moves first, then the
+    /// folded inbox refs are deleted. Aggregation reads snapshot ∪ tail and
+    /// is byte-identical across the fold. Idempotent; safe to re-run.
+    Gc {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Principal recorded as the folder (its key signs the snapshot).
+        #[arg(long)]
+        actor: String,
+        /// Ed25519 signing key of the folder: 32 raw bytes as hex.
+        #[arg(long)]
+        key: PathBuf,
+        /// Remote to push the fold to (omit for a local-only fold).
+        #[arg(long)]
+        push: Option<String>,
+    },
     /// Resident watcher: fetch `refs/collab/*` from a remote, report new or
     /// changed refs, and invoke `--exec` for each with the entry JSON on
     /// stdin (the agent's decision logic; walgit only does notify+sync).
@@ -246,6 +265,9 @@ pub async fn run(action: CollabAction) -> Result<()> {
             principal,
             push,
         } => run_principal_revoke(&repo, &principal, push.as_deref())?,
+        CollabAction::Gc { repo, actor, key, push } => {
+            run_gc(&repo, &actor, &key, push.as_deref())?;
+        }
         CollabAction::PrincipalFetch {
             repo,
             remote,
@@ -660,6 +682,122 @@ fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Res
         git_push(repo, remote, &ref_name)?;
     }
     println!("{ref_name} revoked");
+    Ok(())
+}
+
+// ---- gc: fold the inbox into the signed snapshot (D45 / D1 §11.4) -------------
+
+/// Delete refspecs per push call — keeps argv far below `ARG_MAX` even for a
+/// 20k-ref fold. Non-atomic batches: inbox refs never move, so a delete either
+/// matches or was already done; a rejected batch is converged by re-running.
+const GC_DELETE_CHUNK: usize = 500;
+
+fn git_push_refspecs(repo: &Path, remote: &str, refspecs: &[String], atomic: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C"]).arg(repo).arg("push");
+    if atomic {
+        cmd.arg("--atomic");
+    }
+    cmd.arg(remote).args(refspecs);
+    let out = cmd.output().context("git push")?;
+    if !out.status.success() {
+        bail!(
+            "git push {remote} ({} refspec(s)) failed: {}",
+            refspecs.len(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// `collab gc`: fold every parseable inbox entry into the signed snapshot at
+/// `refs/collab/meta/snapshot` and prune the folded refs. The new snapshot
+/// composes the existing one (records carried verbatim — an oid addresses the
+/// original bytes, so records are never re-serialized) with the current tail.
+/// Unparseable inbox blobs are left in place (the read side skips them too).
+///
+/// Push order is the safety boundary: the snapshot lands first (forced
+/// blob→blob update client-side; the server still CASes the advertised old
+/// value, so a concurrent fold loses with stale-info — fetch and retry), then
+/// the folded refs are deleted in batches. A crash or a reader mid-fold sees
+/// duplicates, never a loss; the read side dedups by oid.
+fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Result<()> {
+    ref_segment("gc.actor", actor)?;
+    let reader = CollabReader::new(repo);
+    let mut records: Vec<SnapshotRecord> = match reader.snapshot_blob()? {
+        Some(bytes) => parse_snapshot(&bytes)
+            .map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?
+            .entries,
+        None => Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<String> =
+        records.iter().map(|r| r.oid.clone()).collect();
+    let mut folded: Vec<String> = Vec::new(); // inbox ref names to prune
+    let mut left = 0usize; // unparseable blobs left in place
+    for (name, oid) in reader.inbox_refs()? {
+        if seen.contains(&oid) {
+            // Already folded (an earlier gc crashed mid-prune) — prune the
+            // duplicate ref without re-recording the entry.
+            folded.push(name);
+            continue;
+        }
+        let blob = reader.git(&["cat-file", "blob", &oid])?;
+        let Ok(json) = String::from_utf8(blob) else {
+            left += 1;
+            continue;
+        };
+        if serde_json::from_str::<Entry>(&json).is_err() {
+            left += 1;
+            continue;
+        }
+        let Some(principal) = name
+            .strip_prefix("refs/collab/inbox/")
+            .and_then(|p| p.rsplit_once('/'))
+            .map(|(p, _)| p.to_string())
+        else {
+            left += 1;
+            continue;
+        };
+        seen.insert(oid.clone());
+        records.push(SnapshotRecord { oid, principal, json });
+        folded.push(name);
+    }
+    if folded.is_empty() {
+        println!("collab gc: nothing to fold ({left} unparseable inbox blob(s) left in place)");
+        return Ok(());
+    }
+    let key = read_signing_key(key_path)?;
+    let snap = build_snapshot(actor, chrono::Utc::now().timestamp(), records, &key);
+    let snap_oid = git_write_blob(repo, &serde_json::to_string(&snap)?)?;
+    match push {
+        None => {
+            git_update_ref(repo, SNAPSHOT_REF, Some(&snap_oid))?;
+            for name in &folded {
+                git_update_ref(repo, name, None)?;
+            }
+        }
+        Some(remote) => {
+            // Snapshot first, then the deletes.
+            git_push_refspecs(repo, remote, &[format!("+{snap_oid}:{SNAPSHOT_REF}")], true)
+                .context("push the snapshot (a concurrent fold? fetch and retry)")?;
+            for chunk in folded.chunks(GC_DELETE_CHUNK) {
+                let specs: Vec<String> = chunk.iter().map(|n| format!(":{n}")).collect();
+                git_push_refspecs(repo, remote, &specs, false).context(
+                    "delete folded inbox refs; re-run `walgit collab gc` to converge (idempotent)",
+                )?;
+            }
+            // Mirror the fold locally so this checkout aggregates the folded
+            // shape immediately.
+            git_update_ref(repo, SNAPSHOT_REF, Some(&snap_oid))?;
+            for name in &folded {
+                git_update_ref(repo, name, None)?;
+            }
+        }
+    }
+    println!(
+        "collab gc: folded {} inbox ref(s) into {SNAPSHOT_REF} ({snap_oid}); {left} unparseable left in place",
+        folded.len()
+    );
     Ok(())
 }
 
@@ -1080,6 +1218,27 @@ fn describe_ref(repo: &Path, name: &str, oid: &str) -> Result<RefEvent> {
     let blob = CollabReader::new(repo).git(&["cat-file", "blob", oid])?;
     let principals = CollabReader::new(repo).principals()?;
     let text = String::from_utf8_lossy(&blob).to_string();
+    // The fold (D45): a snapshot move is one watch event. `verified` is the
+    // snapshot's own signature against the folder's registered key — provenance
+    // of the fold; the contained entries still verify individually.
+    if name == SNAPSHOT_REF {
+        let (actor, verified) = match parse_snapshot(text.as_bytes()) {
+            Ok(snap) => {
+                let verified = principals
+                    .get(&snap.actor)
+                    .is_some_and(|k| verify_snapshot(&snap, k).is_ok());
+                (snap.actor, verified)
+            }
+            Err(_) => (String::new(), false),
+        };
+        return Ok(RefEvent {
+            kind: "snapshot".into(),
+            actor,
+            thread: String::new(),
+            verified,
+            text,
+        });
+    }
     if let Some(principal) = name.strip_prefix("refs/collab/meta/principals/") {
         return Ok(RefEvent {
             kind: "principal".into(),
@@ -1263,10 +1422,32 @@ impl CollabReader {
         Ok(map)
     }
 
-    /// Load every inbox entry with its oid/principal and the principals registry.
+    /// The raw snapshot blob at `refs/collab/meta/snapshot`, when present
+    /// (D45 fold).
+    fn snapshot_blob(&self) -> Result<Option<Vec<u8>>> {
+        let out = self.git(&["for-each-ref", "--format=%(objectname)", SNAPSHOT_REF])?;
+        let oid = String::from_utf8_lossy(&out).trim().to_string();
+        if oid.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.git(&["cat-file", "blob", &oid])?))
+    }
+
+    /// Load the aggregation input: the folded history at
+    /// `refs/collab/meta/snapshot` ∪ the unfolded inbox tail, deduped by oid
+    /// (D45 — the same set the server's `collab_load` builds), plus the
+    /// principals registry.
     pub fn load(&self) -> Result<(Vec<EntryRef>, HashMap<String, String>)> {
         let principals = self.principals()?;
-        let mut entries = Vec::new();
+        let mut set = EntrySet::new();
+        if let Some(bytes) = self.snapshot_blob()? {
+            let snap = parse_snapshot(&bytes).map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?;
+            for rec in &snap.entries {
+                if let Some(er) = rec.entry_ref() {
+                    set.insert(er);
+                }
+            }
+        }
         for (name, oid) in self.inbox_refs()? {
             let Some(principal) = name
                 .strip_prefix("refs/collab/inbox/")
@@ -1278,13 +1459,13 @@ impl CollabReader {
             let blob = self.git(&["cat-file", "blob", &oid])?;
             let entry: Entry = serde_json::from_slice(&blob)
                 .with_context(|| format!("parse entry at {name} ({oid})"))?;
-            entries.push(EntryRef {
+            set.insert(EntryRef {
                 oid,
                 principal,
                 entry,
             });
         }
-        Ok((entries, principals))
+        Ok((set.into_entries(), principals))
     }
 }
 
@@ -1730,6 +1911,214 @@ mod entry_refs_tests {
         // 非 done 状态自由流转。
         let open = mk("status", "e4", 4, serde_json::json!({"status": "open"}));
         assert!(check_status_transition(&open.entry, &thread_entries, &principals).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    //! D45: a local fold (`collab gc` without `--push`) must not move the
+    //! aggregation — same entries, same verification states — and must leave
+    //! unparseable inbox blobs in place.
+    use super::*;
+
+    fn keypair_file(dir: &Path, seed: u8) -> (PathBuf, String, SigningKey) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let pk = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        let path = dir.join(format!("key{seed}"));
+        std::fs::write(&path, hex::encode([seed; 32])).unwrap();
+        (path, pk, sk)
+    }
+
+    fn mk_entry(kind: &str, id: &str, actor: &str, parent: &str, ts: i64, body: serde_json::Value) -> Entry {
+        Entry {
+            version: 1,
+            kind: kind.into(),
+            id: id.into(),
+            actor: actor.into(),
+            ts,
+            parent: parent.into(),
+            refs: None,
+            body,
+            sig: String::new(),
+        }
+    }
+
+    /// Write an entry blob + inbox ref the way `collab entry` does; returns
+    /// the oid for chaining.
+    fn push_entry(repo: &Path, e: &Entry) -> String {
+        let oid = git_write_blob(repo, &serde_json::to_string_pretty(e).unwrap()).unwrap();
+        git_update_ref(
+            repo,
+            &format!("refs/collab/inbox/{}/{}", e.actor, entry_uuid()),
+            Some(&oid),
+        )
+        .unwrap();
+        oid
+    }
+
+    fn register(repo: &Path, principal: &str, pk: &str) {
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "principal": principal,
+            "public_key": pk,
+            "registered_at": 0,
+        }))
+        .unwrap();
+        let oid = git_write_blob(repo, &content).unwrap();
+        git_update_ref(repo, &format!("refs/collab/meta/principals/{principal}"), Some(&oid)).unwrap();
+    }
+
+    /// The aggregation fingerprint: the report's bytes plus every entry's
+    /// (oid, principal, verified, canonical entry) — the fold must not move it.
+    fn fingerprint(repo: &Path) -> Vec<u8> {
+        let (entries, principals) = CollabReader::new(repo).load().unwrap();
+        let refs: Vec<&EntryRef> = entries.iter().collect();
+        let mut out =
+            serde_json::to_vec(&build_report(&refs, &principals, &MergeRules::default(), i64::MAX))
+                .unwrap();
+        let mut rows: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {} {} {}",
+                    e.oid,
+                    e.principal,
+                    e.is_verified(&principals),
+                    serde_json::to_string(&e.entry).unwrap()
+                )
+            })
+            .collect();
+        rows.sort();
+        out.extend_from_slice(rows.join("\n").as_bytes());
+        out
+    }
+
+    fn inbox_ref_count(repo: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["for-each-ref", "--format=%(refname)", "refs/collab/inbox"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).lines().count()
+    }
+
+    #[test]
+    fn gc_local_fold_preserves_the_aggregation_and_the_tail_stays_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r");
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        let (alice_key, alice_pk, alice_sk) = keypair_file(tmp.path(), 7);
+        let (_bob_key, bob_pk, bob_sk) = keypair_file(tmp.path(), 8);
+        register(&repo, "alice", &alice_pk);
+        register(&repo, "bob", &bob_pk);
+
+        let mut issue = mk_entry("issue", "t1", "alice", "", 1, serde_json::json!({"title": "fold me"}));
+        issue.sig = sign_entry(&mut issue, &alice_sk);
+        let o1 = push_entry(&repo, &issue);
+        let mut comment = mk_entry("comment", "t1", "bob", &o1, 2, serde_json::json!({"text": " chained"}));
+        comment.sig = sign_entry(&mut comment, &bob_sk);
+        let o2 = push_entry(&repo, &comment);
+        // carol is unregistered: her entry is and stays unverified.
+        let o3 = push_entry(&repo, &mk_entry("comment", "t1", "carol", &o2, 3, serde_json::json!({"text": "drive-by"})));
+        // An unparseable inbox blob: gc must leave its ref alone.
+        let garbage = git_write_blob(&repo, "not an entry").unwrap();
+        git_update_ref(&repo, "refs/collab/inbox/carol/garbage0", Some(&garbage)).unwrap();
+
+        // The garbage blob fails the CLI's strict inbox parse (pre-existing
+        // behavior); gc must still fold around it, so fold first.
+        run_gc(&repo, "alice", &alice_key, None).unwrap();
+        assert_eq!(inbox_ref_count(&repo), 1, "only the unparseable blob's ref survives");
+        let out = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["for-each-ref", "--format=%(refname) %(objectname)", "refs/collab/inbox"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("garbage0"));
+        git_update_ref(&repo, "refs/collab/inbox/carol/garbage0", None).unwrap();
+
+        let before = {
+            // Reconstruct the pre-fold fingerprint from the snapshot: it IS
+            // the fold — so compare against a fresh aggregation instead.
+            let snap_oid = String::from_utf8_lossy(
+                &CollabReader::new(&repo)
+                    .git(&["rev-parse", SNAPSHOT_REF])
+                    .unwrap(),
+            )
+            .trim()
+            .to_string();
+            assert!(!snap_oid.is_empty());
+            fingerprint(&repo)
+        };
+
+        // The fold carried every entry: 3 records, carol's unverified.
+        let (entries, principals) = CollabReader::new(&repo).load().unwrap();
+        assert_eq!(entries.len(), 3);
+        let carol = entries.iter().find(|e| e.entry.actor == "carol").unwrap();
+        assert!(!carol.is_verified(&principals));
+        assert_eq!(entries.iter().filter(|e| e.is_verified(&principals)).count(), 2);
+
+        // A second gc with an empty tail is a no-op...
+        run_gc(&repo, "alice", &alice_key, None).unwrap();
+        assert_eq!(fingerprint(&repo), before, "no-op gc moves nothing");
+
+        // ...and the tail stays live: a new entry chains onto a folded tip
+        // (its parent oid lives only inside the snapshot now).
+        let mut follow = mk_entry("status", "t1", "alice", &o3, 4, serde_json::json!({"status": "in-progress"}));
+        follow.sig = sign_entry(&mut follow, &alice_sk);
+        push_entry(&repo, &follow);
+        let (entries, principals) = CollabReader::new(&repo).load().unwrap();
+        assert_eq!(entries.len(), 4);
+        let refs: Vec<&EntryRef> = entries.iter().filter(|e| e.entry.id == "t1").collect();
+        let ordered = thread(&refs);
+        assert_eq!(ordered.len(), 4, "the chain resolves across the fold boundary");
+        assert_eq!(ordered[3].entry.kind, "status");
+        assert!(ordered.iter().all(|e| e.entry.actor != "carol" || !e.is_verified(&principals)));
+
+        // A second real fold composes with the existing snapshot.
+        run_gc(&repo, "alice", &alice_key, None).unwrap();
+        assert_eq!(inbox_ref_count(&repo), 0);
+        let (entries, _) = CollabReader::new(&repo).load().unwrap();
+        assert_eq!(entries.len(), 4, "second fold loses nothing");
+    }
+
+    #[test]
+    fn watch_describes_the_snapshot_ref_with_fold_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r");
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        let (alice_key, alice_pk, _) = keypair_file(tmp.path(), 7);
+        register(&repo, "alice", &alice_pk);
+        let mut e = mk_entry("issue", "t1", "alice", "", 1, serde_json::json!({"title": "x"}));
+        e.sig = sign_entry(&mut e, &SigningKey::from_bytes(&[7u8; 32]));
+        push_entry(&repo, &e);
+        run_gc(&repo, "alice", &alice_key, None).unwrap();
+        let snap_oid = String::from_utf8_lossy(
+            &CollabReader::new(&repo)
+                .git(&["rev-parse", SNAPSHOT_REF])
+                .unwrap(),
+        )
+        .trim()
+        .to_string();
+        let ev = describe_ref(&repo, SNAPSHOT_REF, &snap_oid).unwrap();
+        assert_eq!(ev.kind, "snapshot");
+        assert_eq!(ev.actor, "alice");
+        assert!(ev.verified, "snapshot verifies against the folder's registered key");
+        assert!(ev.thread.is_empty());
     }
 }
 
