@@ -154,6 +154,163 @@ pub fn sign_entry(entry: &mut Entry, key: &SigningKey) -> String {
     )
 }
 
+// ---- §11.4 the fold: a signed snapshot of the inbox (D45) ---------------------
+//
+// The append-only inbox namespace hits two walls as it grows (the per-request
+// aggregation budget and the clone/fetch advertisement size), so the inbox
+// folds the way the WAL log folds: one CAS-moved ref,
+// `refs/collab/meta/snapshot`, carries every folded entry verbatim, and every
+// aggregation reads snapshot ∪ unfolded tail, deduped by oid. The fold is a
+// pure function of the entry set, so aggregation before and after is
+// byte-identical. Normative text: `docs/D1_COLLAB_DESIGN.md` §11.4.
+
+/// Where the folded collab state lives: one ref per repository, moved forward
+/// by `walgit collab gc` (snapshot first, then the pruned inbox refs are
+/// deleted — a mid-fold reader sees duplicates, never a loss).
+pub const SNAPSHOT_REF: &str = "refs/collab/meta/snapshot";
+
+/// One folded entry: its blob oid (recomputable from `json`), the inbox it was
+/// found in, and the raw entry bytes, verbatim. The record is the digest
+/// manifest that keeps the per-entry signature chain verifiable after the
+/// inbox ref is pruned — entry trust never derives from the snapshot's own
+/// signature; every folded entry still verifies per §4.2.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SnapshotRecord {
+    pub oid: String,
+    pub principal: String,
+    pub json: String,
+}
+
+impl SnapshotRecord {
+    /// The record as an aggregation input, or `None` when the bytes do not
+    /// hash to the declared oid or do not parse as an entry — skipped exactly
+    /// like a corrupt inbox blob: visible degradation (the totals move), never
+    /// silent trust.
+    pub fn entry_ref(&self) -> Option<EntryRef> {
+        if git_blob_oid(self.json.as_bytes()) != self.oid {
+            return None;
+        }
+        let entry: Entry = serde_json::from_str(&self.json).ok()?;
+        Some(EntryRef {
+            oid: self.oid.clone(),
+            principal: self.principal.clone(),
+            entry,
+        })
+    }
+}
+
+/// The snapshot document at `SNAPSHOT_REF`: the folded entries plus fold
+/// provenance (`actor`, `ts`, `sig`). The signature covers the canonical form
+/// of the document without `sig` (the §4.2 canonical contract) and attests who
+/// folded, when; readers verify contained entries independently.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Snapshot {
+    pub version: u32,
+    pub kind: String,
+    pub actor: String,
+    pub ts: i64,
+    pub entries: Vec<SnapshotRecord>,
+    #[serde(default)]
+    pub sig: String,
+}
+
+/// The git blob id of raw bytes: `sha1("blob <len>\0" + bytes)` — how a
+/// record's declared oid is pinned to its bytes.
+pub fn git_blob_oid(bytes: &[u8]) -> String {
+    use sha1::Digest as _;
+    let mut h = sha1::Sha1::new();
+    h.update(format!("blob {}\0", bytes.len()).as_bytes());
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+/// Parse and validate a snapshot document. Fails closed on a wrong
+/// version/kind — a corrupt snapshot document errors the read (silently
+/// dropping every folded entry would rewrite history); per-record integrity is
+/// enforced in `SnapshotRecord::entry_ref`.
+pub fn parse_snapshot(bytes: &[u8]) -> Result<Snapshot, String> {
+    let snap: Snapshot =
+        serde_json::from_slice(bytes).map_err(|e| format!("collab snapshot: {e}"))?;
+    if snap.version != 1 {
+        return Err(format!(
+            "collab snapshot: unsupported version {} (only 1 exists)",
+            snap.version
+        ));
+    }
+    if snap.kind != "collab_snapshot" {
+        return Err(format!("collab snapshot: kind {:?} is not collab_snapshot", snap.kind));
+    }
+    Ok(snap)
+}
+
+/// The canonical bytes the snapshot's signature covers: the document without
+/// `sig`, under the §4.2 canonical contract.
+pub fn snapshot_canonical(snap: &Snapshot) -> String {
+    let mut unsigned = snap.clone();
+    unsigned.sig.clear();
+    let value = serde_json::to_value(unsigned).unwrap_or_default();
+    canonicalize(&value)
+}
+
+/// Sign a snapshot document; returns `ed25519:<base64>`. Symmetric to
+/// `sign_entry`; used by the fold's write path (`walgit collab gc`).
+#[allow(dead_code)]
+pub fn sign_snapshot(snap: &mut Snapshot, key: &SigningKey) -> String {
+    let canonical = snapshot_canonical(snap);
+    let sig = key.sign(canonical.as_bytes());
+    format!(
+        "ed25519:{}",
+        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+    )
+}
+
+/// Verify a snapshot's own signature against a public key (base64) — fold
+/// provenance for audit and the watch notification; never a trust input for
+/// the contained entries.
+pub fn verify_snapshot(snap: &Snapshot, public_key_b64: &str) -> Result<(), String> {
+    let sig_b64 = snap
+        .sig
+        .strip_prefix("ed25519:")
+        .ok_or_else(|| "sig must be `ed25519:<base64>`".to_string())?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .map_err(|e| format!("bad sig base64: {e}"))?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|e| format!("bad signature: {e}"))?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64.trim())
+        .map_err(|e| format!("bad public key base64: {e}"))?;
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| "public key must be 32 raw Ed25519 bytes".to_string())?;
+    let vk = VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("bad public key: {e}"))?;
+    vk.verify_strict(snapshot_canonical(snap).as_bytes(), &sig)
+        .map_err(|e| format!("signature verification failed: {e}"))
+}
+
+/// Build the fold: records deduped by oid and sorted oid-ascending (a pure
+/// function of the set — the same inbox folds to the same snapshot bytes),
+/// signed by `actor`. Carries existing snapshot records verbatim: an oid
+/// addresses the original bytes, so records are never re-serialized.
+pub fn build_snapshot(
+    actor: &str,
+    ts: i64,
+    mut entries: Vec<SnapshotRecord>,
+    key: &SigningKey,
+) -> Snapshot {
+    entries.sort_by(|a, b| a.oid.cmp(&b.oid));
+    entries.dedup_by(|a, b| a.oid == b.oid);
+    let mut snap = Snapshot {
+        version: 1,
+        kind: "collab_snapshot".to_string(),
+        actor: actor.to_string(),
+        ts,
+        entries,
+        sig: String::new(),
+    };
+    snap.sig = sign_snapshot(&mut snap, key);
+    snap
+}
+
 // ---- §4.3 deterministic aggregation ------------------------------------------
 
 /// One issue/thread: entries referencing the same `id`, topologically ordered
@@ -1523,6 +1680,263 @@ name = "everything else"
             ["pr-open-new", "pr-open-old", "pr-merged", "pr-cold"],
             "open before merged before closed, then newest activity"
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! D45 / D1 §11.4: the fold. A snapshot carries every folded entry
+    //! verbatim (oid + inbox principal + raw signed bytes); aggregation over
+    //! `snapshot ∪ tail` must be byte-identical to aggregation over the
+    //! unfolded inbox — that equality is the acceptance property.
+    use super::*;
+
+    fn keypair(seed: u8) -> (SigningKey, String) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        (sk, base64::engine::general_purpose::STANDARD.encode(pk))
+    }
+
+    /// Serialize an entry the two write paths use (pretty like the CLI,
+    /// compact like the thin API) and derive the record the fold would write:
+    /// the oid is the git blob id of the exact bytes.
+    fn record(e: &Entry, principal: &str, pretty: bool) -> SnapshotRecord {
+        let json = if pretty {
+            serde_json::to_string_pretty(e).unwrap()
+        } else {
+            serde_json::to_string(e).unwrap()
+        };
+        SnapshotRecord {
+            oid: git_blob_oid(json.as_bytes()),
+            principal: principal.to_string(),
+            json,
+        }
+    }
+
+    fn entry(id: &str, kind: &str, actor: &str, parent: &str, ts: i64, body: serde_json::Value) -> Entry {
+        Entry {
+            version: 1,
+            kind: kind.into(),
+            id: id.into(),
+            actor: actor.into(),
+            ts,
+            parent: parent.into(),
+            refs: None,
+            body,
+            sig: String::new(),
+        }
+    }
+
+    fn signed(sk: &SigningKey, mut e: Entry) -> Entry {
+        e.sig = sign_entry(&mut e, sk);
+        e
+    }
+
+    /// The aggregation fingerprint: every projection's bytes over the same
+    /// input set. Pre/post fold, this fingerprint must not move.
+    fn fingerprint(refs: &[&EntryRef], principals: &HashMap<String, String>) -> Vec<u8> {
+        let rules = MergeRules {
+            protect: vec!["refs/heads/main".into()],
+            require_human_approvals: 1,
+        };
+        let mut out = serde_json::to_vec(&build_report(refs, principals, &rules, i64::MAX)).unwrap();
+        out.extend_from_slice(&serde_json::to_vec(&build_board(refs, principals, &rules, &default_board())).unwrap());
+        let mut ids: Vec<&str> = refs.iter().map(|r| r.entry.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            let group: Vec<&EntryRef> = refs.iter().filter(|r| r.entry.id == id).copied().collect();
+            for r in thread(&group) {
+                out.extend_from_slice(
+                    serde_json::to_string(&serde_json::json!({
+                        "oid": r.oid,
+                        "principal": r.principal,
+                        "verified": r.is_verified(principals),
+                        "entry": r.entry,
+                    }))
+                    .unwrap()
+                    .as_bytes(),
+                );
+            }
+            if group.iter().any(|r| r.entry.kind == "patch") {
+                out.extend_from_slice(&serde_json::to_vec(&pr_view(&group, principals)).unwrap());
+            }
+        }
+        out
+    }
+
+    /// A realistic mixed history: signed + unsigned entries, issue/patch/
+    /// review/status/comment + `ci_claim`/`ci_result`, cross-thread references,
+    /// entries written by both write paths (pretty and compact bytes).
+    /// Parents chain on real blob oids, bottom-up like git, and the signature
+    /// covers the final bytes — parent pointers must survive the fold.
+    fn history() -> (Vec<SnapshotRecord>, HashMap<String, String>) {
+        let (alice_sk, alice_pk) = keypair(7);
+        let (bob_sk, bob_pk) = keypair(8);
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), alice_pk);
+        principals.insert("bob".to_string(), bob_pk.clone());
+        principals.insert("ci-runner-a".to_string(), bob_pk);
+
+        let mut records: Vec<SnapshotRecord> = Vec::new();
+        // Append an entry to the history: resolve `parent` is already an oid
+        // (or ""), sign unless told not to, derive the record's oid from the
+        // exact stored bytes. Returns the oid for chaining.
+        let mut push = |principal: &str,
+                        pretty: bool,
+                        sign_with: Option<&SigningKey>,
+                        e: Entry|
+         -> String {
+            let mut e = e;
+            if let Some(sk) = sign_with {
+                e.sig = sign_entry(&mut e, sk);
+            }
+            let rec = record(&e, principal, pretty);
+            let oid = rec.oid.clone();
+            records.push(rec);
+            oid
+        };
+
+        // pr1: issue -> comment -> status(needs-review) -> review(approve) ->
+        // patch -> an unsigned comment by the unregistered carol.
+        let o1 = push("alice", true, Some(&alice_sk), entry("pr1", "issue", "alice", "", 1, serde_json::json!({"title": "add thing"})));
+        let o2 = push("bob", true, Some(&bob_sk), entry("pr1", "comment", "bob", &o1, 2, serde_json::json!({"text": "looks right"})));
+        let o3 = push("alice", false, Some(&alice_sk), entry("pr1", "status", "alice", &o2, 3, serde_json::json!({"status": "needs-review", "owner": "svc-a"})));
+        let o4 = push("bob", true, Some(&bob_sk), entry("pr1", "review", "bob", &o3, 4, serde_json::json!({"decision": "approve"})));
+        let mut patch = entry("pr1", "patch", "alice", &o4, 5, serde_json::json!({"message": "the change"}));
+        patch.refs = Some(EntryRefs {
+            base: Some("refs/heads/main".into()),
+            head: Some("refs/heads/topic".into()),
+        });
+        let o5 = push("alice", true, Some(&alice_sk), patch);
+        let _o6 = push("carol", true, None, entry("pr1", "comment", "carol", &o5, 6, serde_json::json!({"text": "unsigned"})));
+        // t2: references pr1's comment via `related` (issue #75 ③) and closes.
+        let t2 = push("alice", true, None, entry("t2", "issue", "alice", "", 7, serde_json::json!({"title": "second", "related": [o2]})));
+        let _t2s = push("alice", true, Some(&alice_sk), entry("t2", "status", "alice", &t2, 8, serde_json::json!({"status": "closed"})));
+        // A CI run thread (docs/D1_CI_PROTOCOL.md): claim -> result.
+        let claim = push(
+            "ci-runner-a",
+            true,
+            Some(&bob_sk),
+            entry(
+                "ci-deadbeef",
+                crate::ci::CI_CLAIM_KIND,
+                "ci-runner-a",
+                "",
+                40,
+                serde_json::json!({"task": "test", "ref": "refs/heads/main", "commit": "c0ffee", "ttl": 300, "attempt": 1}),
+            ),
+        );
+        let _result = push(
+            "ci-runner-a",
+            true,
+            Some(&bob_sk),
+            entry(
+                "ci-deadbeef",
+                crate::ci::CI_RESULT_KIND,
+                "ci-runner-a",
+                &claim,
+                41,
+                serde_json::json!({"task": "test", "conclusion": "success", "claim": claim, "exit_code": 0, "duration_ms": 5, "log_summary": "ok", "log_sha256": ""}),
+            ),
+        );
+        (records, principals)
+    }
+
+    #[test]
+    fn git_blob_oid_matches_git_known_answers() {
+        // `printf <bytes> | git hash-object --stdin`
+        assert_eq!(git_blob_oid(b"hello"), "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
+        assert_eq!(git_blob_oid(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+        assert_eq!(git_blob_oid(b"{\"a\":1}"), "daa5053ecf5f9a37b2de733d0751cc1ab53ac010");
+    }
+
+    #[test]
+    fn fold_and_snapshot_plus_tail_are_byte_identical_to_the_unfolded_inbox() {
+        let (records, principals) = history();
+        let unfolded: Vec<EntryRef> = records.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let before: Vec<&EntryRef> = unfolded.iter().collect();
+        let fp_before = fingerprint(&before, &principals);
+
+        let (sk, _) = keypair(9);
+        // Full fold: every entry into the snapshot, empty tail.
+        let snap = build_snapshot("alice", 100, records.clone(), &sk);
+        let parsed = parse_snapshot(&serde_json::to_vec(&snap).unwrap()).expect("snapshot parses");
+        let folded: Vec<EntryRef> = parsed.entries.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let after: Vec<&EntryRef> = folded.iter().collect();
+        assert_eq!(
+            fp_before,
+            fingerprint(&after, &principals),
+            "a full fold must not move any projection (incl. verified flags)"
+        );
+
+        // Partial fold: snapshot covers a prefix of the set, the rest is tail —
+        // the union dedups by oid and the answer is the same set.
+        let cut = records.len() / 2;
+        let snap = build_snapshot("alice", 100, records[..cut].to_vec(), &sk);
+        let parsed = parse_snapshot(&serde_json::to_vec(&snap).unwrap()).expect("snapshot parses");
+        let mut union: Vec<EntryRef> = parsed.entries.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let mut seen: std::collections::HashSet<String> = union.iter().map(|e| e.oid.clone()).collect();
+        for r in &unfolded {
+            if seen.insert(r.oid.clone()) {
+                union.push(r.clone());
+            }
+        }
+        let after: Vec<&EntryRef> = union.iter().collect();
+        assert_eq!(fp_before, fingerprint(&after, &principals), "snapshot ∪ tail == unfolded");
+
+        // The fold is a pure function of the set: same records, any input
+        // order, produce the same snapshot bytes.
+        let mut permuted = records.clone();
+        permuted.reverse();
+        let a = serde_json::to_vec(&build_snapshot("alice", 100, records, &sk)).unwrap();
+        let b = serde_json::to_vec(&build_snapshot("alice", 100, permuted, &sk)).unwrap();
+        assert_eq!(a, b, "the fold is deterministic");
+    }
+
+    #[test]
+    fn snapshot_records_with_lying_oids_or_unparseable_bytes_are_skipped() {
+        let (records, _) = history();
+        let good = records[0].clone();
+        let lying = SnapshotRecord {
+            oid: "0".repeat(40),
+            ..good.clone()
+        };
+        let garbage = SnapshotRecord {
+            oid: git_blob_oid(b"not json"),
+            principal: good.principal.clone(),
+            json: "not json".to_string(),
+        };
+        assert!(good.entry_ref().is_some());
+        assert!(lying.entry_ref().is_none(), "oid must recompute from the bytes");
+        assert!(garbage.entry_ref().is_none(), "unparseable entries skip like corrupt inbox blobs");
+    }
+
+    #[test]
+    fn snapshot_document_fails_closed_on_wrong_version_or_kind() {
+        let (sk, _) = keypair(9);
+        let snap = build_snapshot("alice", 1, vec![], &sk);
+        let mut doc = serde_json::to_value(&snap).unwrap();
+        doc["version"] = serde_json::json!(2);
+        assert!(parse_snapshot(doc.to_string().as_bytes()).is_err(), "unknown version");
+        doc["version"] = serde_json::json!(1);
+        doc["kind"] = serde_json::json!("something_else");
+        assert!(parse_snapshot(doc.to_string().as_bytes()).is_err(), "unknown kind");
+        assert!(parse_snapshot(b"{{{{").is_err(), "not json at all");
+    }
+
+    #[test]
+    fn snapshot_signature_verifies_against_the_folder_key() {
+        let (sk, pk) = keypair(9);
+        let (records, _) = history();
+        let snap = build_snapshot("alice", 42, records, &sk);
+        assert!(verify_snapshot(&snap, &pk).is_ok());
+        let mut tampered = snap.clone();
+        tampered.actor = "mallory".into();
+        assert!(verify_snapshot(&tampered, &pk).is_err());
+        let (other_sk, _) = keypair(10);
+        let signed_by_other = build_snapshot("alice", 42, snap.entries.clone(), &other_sk);
+        assert!(verify_snapshot(&signed_by_other, &pk).is_err(), "wrong key");
     }
 }
 
