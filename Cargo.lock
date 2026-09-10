@@ -6062,6 +6062,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "tempfile",
  "thiserror",
  "tokio",

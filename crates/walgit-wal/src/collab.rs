@@ -311,6 +311,50 @@ pub fn build_snapshot(
     snap
 }
 
+/// The aggregation input as a *set* keyed by oid (D45 read semantics): the
+/// same blob under two refs — a retried push, or a snapshot record overlapping
+/// a not-yet-deleted inbox ref mid-fold — is one entry, so the answer never
+/// depends on how the refs were read or whether a fold is in flight. Shared by
+/// the CLI's `CollabReader` and the server's `collab_load` so both aggregate
+/// the identical set.
+#[derive(Default)]
+pub struct EntrySet {
+    entries: Vec<EntryRef>,
+    by_oid: HashMap<String, usize>,
+}
+
+impl EntrySet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert one occurrence of an entry. A duplicate oid does not double
+    /// count; when the copies disagree on the inbox (a signed entry planted in
+    /// someone else's inbox next to the legitimate copy), the occurrence whose
+    /// principal is the entry's own actor wins — a planted copy never
+    /// displaces the legitimate one.
+    pub fn insert(&mut self, er: EntryRef) {
+        match self.by_oid.get(&er.oid) {
+            None => {
+                self.by_oid.insert(er.oid.clone(), self.entries.len());
+                self.entries.push(er);
+            }
+            Some(&i) => {
+                let replace = self.entries.get(i).is_some_and(|cur| {
+                    cur.principal != cur.entry.actor && er.principal == er.entry.actor
+                });
+                if replace && let Some(slot) = self.entries.get_mut(i) {
+                    *slot = er;
+                }
+            }
+        }
+    }
+
+    pub fn into_entries(self) -> Vec<EntryRef> {
+        self.entries
+    }
+}
+
 // ---- §4.3 deterministic aggregation ------------------------------------------
 
 /// One issue/thread: entries referencing the same `id`, topologically ordered
@@ -1937,6 +1981,31 @@ mod snapshot_tests {
         let (other_sk, _) = keypair(10);
         let signed_by_other = build_snapshot("alice", 42, snap.entries.clone(), &other_sk);
         assert!(verify_snapshot(&signed_by_other, &pk).is_err(), "wrong key");
+    }
+
+    #[test]
+    fn entry_set_dedups_by_oid_and_prefers_the_legitimate_inbox() {
+        let (sk, pk) = keypair(7);
+        let mut principals = HashMap::new();
+        principals.insert("alice".to_string(), pk);
+        let e = signed(&sk, entry("t", "issue", "alice", "", 1, serde_json::json!({"title": "x"})));
+        let legit = record(&e, "alice", true);
+        let planted = SnapshotRecord {
+            principal: "bob".into(),
+            ..legit.clone()
+        };
+        // Whichever order the refs were read in, the set holds the entry once,
+        // attributed to its own actor's inbox (so it verifies).
+        for order in [[legit.clone(), planted.clone()], [planted, legit]] {
+            let mut set = EntrySet::new();
+            for r in order {
+                set.insert(r.entry_ref().unwrap());
+            }
+            let entries = set.into_entries();
+            assert_eq!(entries.len(), 1, "same oid = one entry");
+            assert_eq!(entries[0].principal, "alice");
+            assert!(entries[0].is_verified(&principals));
+        }
     }
 }
 
