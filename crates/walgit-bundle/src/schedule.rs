@@ -66,6 +66,64 @@ pub fn unix_now(now: SystemTime) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Coalescing bound for [`due_slot`]: at most this many fires are walked per
+/// evaluation; a deeper backlog advances the bookkeeping without firing (a
+/// runner that was down for days must not burst-run every missed slot).
+const COALESCE_SCAN_MAX: u32 = 4096;
+
+/// What a periodic trigger owes at `now`, given the last slot it processed
+/// (D1-CI §4.3 — the same coalescing philosophy as refs-level polling: missed
+/// slots fold into the newest due one, never a replay of history).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DueSlot {
+    /// No fire in `(last_slot, now]`.
+    NotDue,
+    /// The newest fire in `(last_slot, now]` — run exactly this slot.
+    Run(i64),
+    /// Fires remain due even past this one (backlog deeper than the scan
+    /// bound): advance the bookkeeping to this slot without running.
+    Skip(i64),
+}
+
+/// The slot a periodic trigger should process at `now`, or the bookkeeping
+/// advance for a backlog too deep to run through. `last_slot` is a fire epoch
+/// previously processed (first sight is handled by the caller seeding
+/// `last_slot = now`).
+pub fn due_slot(schedule: &Schedule, last_slot: i64, now: i64) -> DueSlot {
+    let after = UNIX_EPOCH + Duration::from_secs(u64::try_from(last_slot).unwrap_or(0));
+    let mut latest: Option<i64> = None;
+    let mut fire = next_fire_after(schedule, after);
+    let mut steps = 0u32;
+    while let Some(f) = fire {
+        let epoch = i64::try_from(unix_now(f)).unwrap_or(i64::MAX);
+        if epoch > now {
+            break;
+        }
+        latest = Some(epoch);
+        steps += 1;
+        if steps >= COALESCE_SCAN_MAX {
+            break;
+        }
+        fire = next_fire_after(schedule, f);
+    }
+    match latest {
+        None => DueSlot::NotDue,
+        Some(slot) => {
+            // Is anything still due past this slot (either the scan hit its
+            // bound or the next fire is already in the past)? Then this pass
+            // only advances the bookkeeping.
+            let after_slot = UNIX_EPOCH + Duration::from_secs(u64::try_from(slot).unwrap_or(0));
+            let more = next_fire_after(schedule, after_slot)
+                .is_some_and(|f| i64::try_from(unix_now(f)).unwrap_or(i64::MAX) <= now);
+            if more {
+                DueSlot::Skip(slot)
+            } else {
+                DueSlot::Run(slot)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +190,52 @@ mod tests {
         assert!(next > t);
         // And within 1 hour (hourly schedule).
         assert!(next <= t + Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn due_slot_runs_only_the_newest_due_fire() {
+        let every_5s = parse_schedule("*/5 * * * * *").unwrap();
+        // Not due: the next fire is in the future.
+        assert_eq!(
+            due_slot(&every_5s, 1_700_000_000, 1_700_000_004),
+            DueSlot::NotDue
+        );
+        // Due: exactly one fire in the window — run it.
+        assert_eq!(
+            due_slot(&every_5s, 1_700_000_000, 1_700_000_006),
+            DueSlot::Run(1_700_000_005)
+        );
+        // Coalesce: three fires due — run only the newest.
+        assert_eq!(
+            due_slot(&every_5s, 1_700_000_000, 1_700_000_016),
+            DueSlot::Run(1_700_000_015)
+        );
+        // A daily schedule evaluated right at the fire is due exactly then.
+        let daily = parse_schedule("0 0 0 * * *").unwrap();
+        let midnight = 1_700_092_800i64; // 2023-11-16T00:00:00Z (86400-aligned)
+        assert_eq!(
+            due_slot(&daily, midnight - 86_400, midnight),
+            DueSlot::Run(midnight)
+        );
+        assert_eq!(due_slot(&daily, midnight, midnight), DueSlot::NotDue);
+    }
+
+    #[test]
+    fn due_slot_skips_a_backlog_deeper_than_the_scan_bound() {
+        // Every-second schedule, last processed 5000 s ago: more fires remain
+        // due past the scan bound, so the pass only advances the bookkeeping.
+        let per_second = parse_schedule("* * * * * *").unwrap();
+        let last = 1_700_000_000i64;
+        let now = last + 5000;
+        let due = due_slot(&per_second, last, now);
+        let slot = match due {
+            DueSlot::Skip(s) => s,
+            other => panic!("deep backlog must skip, got {other:?}"),
+        };
+        assert_eq!(slot, last + i64::from(COALESCE_SCAN_MAX));
+        // After the skip, the remaining backlog drains one scan per pass and
+        // the final pass runs the newest slot (per-second fire: `now` itself).
+        let due = due_slot(&per_second, slot, now);
+        assert_eq!(due, DueSlot::Run(now), "{due:?}");
     }
 }

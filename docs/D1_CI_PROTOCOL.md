@@ -64,6 +64,7 @@ command  = "cargo test --quiet"            # 必填；经 shell 执行（≤ 409
 timeout  = "30m"                           # 覆盖管道级
 max_attempts = 2                           # 覆盖管道级
 env_allow = ["RUSTFLAGS", "CARGO_NET_GIT_FETCH_WITH_CLI"]  # 透传给任务的环境变量名（§9）
+schedule  = "0 0 2 * * *"                  # 可选：6/7 字段 UTC cron 或 @hourly/@daily/@weekly（§4.3）
 ```
 
 ### 3.1 校验规则（normative，`walgit ci validate` 逐条实现）
@@ -79,6 +80,7 @@ env_allow = ["RUSTFLAGS", "CARGO_NET_GIT_FETCH_WITH_CLI"]  # 透传给任务的�
 | V7 | `max_attempts` ∈ [1, 10] | — |
 | V8 | `env_allow` 每项匹配 `[A-Za-z_][A-Za-z0-9_]*`，≤ 64 项；**禁止 `WALGIT_CI_*`**（runner 注入保留名，§8.2） | — |
 | V9 | 文件本身 ≤ 64 KiB | — |
+| V10 | `schedule` ≤ 255 字节且可解析：6/7 字段 UTC cron（秒 分 时 日 月 周 [年]）或 `@hourly`/`@daily`/`@weekly` 简写——与 bundle 策略的 `schedule`（D22）同一解析器（`walgit-bundle` 的 `parse_schedule`） | — |
 
 ### 3.2 触发匹配语义
 
@@ -112,6 +114,29 @@ env_allow = ["RUSTFLAGS", "CARGO_NET_GIT_FETCH_WITH_CLI"]  # 透传给任务的�
 （结果生效或任务被跳过）才写入 processed。未到终态（让位、等待他人认领）则**不写**——
 下个 pass 重估（这使 TTL 过期重认领无需任何额外机制，§6.3）。
 
+### 4.3 cron 定时触发（`schedule`，issue #161 已实现）
+
+带 `schedule` 的任务除 ref 触发外，还对**不动的 ref** 周期性评估。语义与 bundle 策略的
+`schedule`（D22）同构：fire 时刻即槽位（slot），同一解析器、同一文法（V10）。
+
+- **定时不是新的协议对象**：触发事实仍是 ref 内容。runner 的每个 pass 在 ref 触发处理完
+  后做 cron 扫描——只考察 **tip 未移动且已 processed** 的 ref，读其 tip 的 ci.toml，对每个
+  带 `schedule` 且 `refs` 匹配的任务求值到期槽位。所有检查在本地完成（对象在处理该 tip
+  时已经 fetch），槽位真正到期前没有网络往返。
+- **槽位进入运行标识**：槽位 `S`（fire 时刻的 unix 秒）触发的运行是 `(task, ref, commit,
+  S)` 的执行单元，run id 用 §5 的定时变体——与同一 tip 的 ref 触发运行是**两个平行线程**。
+  条目 schema、认领算法、收敛规则、状态机一概不变（§6–§8 对 run id 的来源不可知）。
+- **合并（coalesce），不补跑**：错过的槽位折叠为最新到期的一个——离线一周回来只对当前
+  tip 跑一次，与 §4.1 轮询的合并哲学一致。积压深过扫描界（4096 个 fire）时该 pass 只推进
+  簿记不触发（burst 防护），后续 pass 每轮消化一段直到最新槽位。
+- **簿记（runner 侧）**：状态文件增加 `"cron": {"<ref>\u{1f}<task>": <slot epoch>}`。
+  首次见到某 (ref, task) 的 schedule 以**当前时刻为基线**（first sight = now）——给旧 ref
+  新加 schedule 不会把历史槽位全部补跑。槽位运行到达终态才把簿记推进到该槽位；未到终态
+  （让位）则下个 pass 重估同一槽位——与 §4 的 processed 规则同构。
+- **`--once` 即 cron 友好形态**：一次 pass = ref 触发 + 定时扫描；外部调度器（systemd
+  timer、crontab、平台 cron）以 `walgit ci run --once` 周期唤起即可，常驻 runner 则在
+  每个轮询间隔顺带完成扫描。
+
 ## 5. 运行（run）与运行标识
 
 - 一次 run = `(task, ref, commit)` 的一个执行单元；同一三元组多次重试是同一 run 的多个
@@ -126,6 +151,15 @@ env_allow = ["RUSTFLAGS", "CARGO_NET_GIT_FETCH_WITH_CLI"]  # 透传给任务的�
   安全、确定性、无碰撞现实风险（2^32 次运行才到生日界）；可读字段（task/ref/commit）
   在条目 body 里。run id 就是协作线程 id（D1 §4.2 `id`），claim 与 result 因此落在同一
   线程，`walgit collab thread <run_id>` 直接可看。
+- **定时运行的 id 变体（§4.3，issue #161）**：槽位 `S` 触发的运行把槽位混进标识——
+
+  ```
+  scheduled_run_id = "ci-" + hex16(fnv1a64( utf8(task) || 0x1f || utf8(ref) || 0x1f || utf8(commit) || 0x1f || utf8(decimal(S)) ))
+  ```
+
+  与 `run_id` 同一公式、多一段输入；段数不同且 `0x1f` 不可能出现在任何字段里（task 名
+  受 V3 约束、ref 名受 git 约束、commit 是 hex），两种 id 不会文本相混。定时运行与
+  ref 触发运行是平行的两个线程，各自的 claim/result 在各自线程内收敛。
 
 ## 6. 认领（claim）：`ci_claim`
 
@@ -363,6 +397,8 @@ done    : effective 存在                               → Settled(conclusion)
   （`walgit-wal::ci` + `walgit ci status` + `collab report` CI 段 + SPA 线程徽标）、
   e2e（`crates/walgit-cli/tests/ci_e2e.rs`：端到端验签回放、双 runner 竞争收敛、
   kill 后 TTL 重认领、秘密边界负向、超时结论）。
+- **issue #161 落地**：§11 读侧 size cap（`CI_BODY_MAX_BYTES`）；§4.3 cron 定时触发
+  （ci.toml `schedule` + V10 + run id 定时变体 + 状态文件 cron 簿记 + e2e 用例
+  `a_scheduled_task_fires_on_an_unmoved_ref`）。
 - **开放项**（不影响协议对象与状态机）：events 桥 webhook 传输（§4.2，托管 runner 场景）；
-  完整日志/产物的标准化存放位置（现在是引用 + 哈希，放哪由部署定）；按 cron 的定时
-  触发（现在只有 ref 触发；定时 = 对一个不动的 ref 周期性评估，留给后续批次）。
+  完整日志/产物的标准化存放位置（现在是引用 + 哈希，放哪由部署定）。

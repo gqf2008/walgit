@@ -599,3 +599,114 @@ timeout = "1s"
     assert_eq!(attempts[0]["effective"]["log_summary"], "", "{st}");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scheduled_task_fires_on_an_unmoved_ref() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit").to_string();
+    let keydir = tempfile::tempdir()?;
+    let key = write_key(keydir.path(), 0x61)?;
+
+    // A per-second schedule (§4.3): after the first-sight baseline, every
+    // whole-second boundary crossed owes the ref one slot run.
+    let ci_toml = r#"
+version = 1
+[[task]]
+name = "tick"
+command = "echo tick"
+schedule = "* * * * * *"
+"#;
+    let work = work_repo(&base, ci_toml)?;
+    // The declaration with the new field validates end-to-end.
+    let validated = run(&bin, &["ci", "validate", "--repo", path_s(&work)])?;
+    assert!(
+        validated.contains("schedule \"* * * * * *\""),
+        "validate prints the schedule: {validated}"
+    );
+    let r1 = clone_repo(&base)?;
+    let r1s = path_s(&r1).to_string();
+    let started = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?;
+
+    // Pass 1: the ref moved (never seen) — the ref trigger runs the task with
+    // the plain run identity; the sweep then seeds the cron baseline.
+    let out = ci_run(&bin, &r1s, "ci-a", &key, &[], &[])?;
+    assert!(
+        out.status.success(),
+        "pass 1: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = status_json(&bin, &r1s)?;
+    let runs = st["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "ref trigger only, no backlog burst: {st}");
+    let ref_run_id = runs[0]["id"].as_str().unwrap().to_string();
+
+    // Cross at least one slot boundary, then pass 2: the schedule fires on the
+    // unmoved ref — a NEW run identity (the slot is in the hash, §5).
+    std::thread::sleep(Duration::from_millis(1200));
+    let out = ci_run(&bin, &r1s, "ci-a", &key, &[], &[])?;
+    assert!(
+        out.status.success(),
+        "pass 2: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = status_json(&bin, &r1s)?;
+    let runs = st["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "the slot fired a fresh run: {st}");
+    let scheduled = runs
+        .iter()
+        .find(|r| r["id"].as_str().unwrap() != ref_run_id)
+        .expect("a second, scheduled run exists");
+    assert_eq!(scheduled["task"], "tick", "{st}");
+    assert_eq!(scheduled["state"], "done", "{st}");
+    assert_eq!(scheduled["conclusion"], "success", "{st}");
+    assert_eq!(effective_count(scheduled), 1, "{st}");
+    // Same task/ref/commit as the ref-triggered run — only the slot differs.
+    assert_eq!(scheduled["repo_ref"], runs[0]["repo_ref"], "{st}");
+    assert_eq!(scheduled["commit"], runs[0]["commit"], "{st}");
+
+    // Pass 3, immediately: whatever the clock did, every run is a distinct
+    // identity, the unmoved ref never re-triggers, everything settles.
+    let out = ci_run(&bin, &r1s, "ci-a", &key, &[], &[])?;
+    assert!(
+        out.status.success(),
+        "pass 3: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = status_json(&bin, &r1s)?;
+    let runs = st["runs"].as_array().unwrap();
+    let ids: std::collections::BTreeSet<&str> =
+        runs.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids.len(),
+        runs.len(),
+        "every slot is a fresh identity: {st}"
+    );
+    assert_eq!(
+        runs.iter()
+            .filter(|r| r["id"].as_str().unwrap() == ref_run_id)
+            .count(),
+        1,
+        "the unmoved ref never re-triggers: {st}"
+    );
+    assert!(
+        runs.iter().all(|r| r["state"] == "done"),
+        "everything settles: {st}"
+    );
+
+    // The bookkeeping landed in the runner's state file (§4.3): one cron
+    // entry for (ref, task), a whole-second slot at or after the baseline.
+    let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        r1.path().join(".git/ci-run.json"),
+    )?)?;
+    let slot = state["cron"]["refs/heads/main\u{1f}tick"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("cron bookkeeping missing: {state}"));
+    assert!(slot >= started, "slot after the baseline: {state}");
+    Ok(())
+}
