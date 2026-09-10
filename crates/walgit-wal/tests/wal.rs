@@ -3098,7 +3098,11 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
     let cache2 = tempfile::tempdir().unwrap();
     let registry2 = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
     let h2 = registry2.open(&id).await.unwrap();
-    h2.sync_refs().await.unwrap();
+    // Materialize the serving copy here. `sync_refs()` starts a background
+    // prefetch that can race the later ingest, observe the not-yet-published
+    // c3 pack as an orphan, and delete it before publish; this test is about
+    // checkpoint times, so keep the pack lifecycle deterministic.
+    h2.sync().await.unwrap();
     assert_eq!(h2.first_state_time(), Some(t("2026-08-02T00:00:00Z")));
 
     // A later timestamped entry must not move it forward.
