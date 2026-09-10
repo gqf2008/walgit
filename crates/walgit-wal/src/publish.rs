@@ -574,7 +574,10 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // 1. Sync to get current manifest + refs. CAS retries must re-sync;
         // the first attempt may reuse receive-pack's request sync.
         if (attempts > 0 || needs_initial_sync)
-            && let Err(e) = handle.sync_impl().instrument(span.clone()).await
+            && let Err(e) = handle
+                .sync_impl_level(crate::sync::SyncLevel::Refs)
+                .instrument(span.clone())
+                .await
         {
             return finish_all_errors(batch, e);
         }
