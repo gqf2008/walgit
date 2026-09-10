@@ -27,24 +27,45 @@ pub const ATTEMPT_MAX: u32 = 10;
 /// not a second schema.
 pub const CI_BODY_MAX_BYTES: usize = 256 * 1024;
 
-/// §5: `run_id = "ci-" + hex16(fnv1a64(task || 0x1f || ref || 0x1f || commit))`.
-/// Deterministic and computable by any client; the collab thread id of both
-/// the claim and the result entries of a run.
-pub fn run_id(task: &str, repo_ref: &str, commit: &str) -> String {
-    fn fnv1a64(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in bytes {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
+/// 64-bit FNV-1a — the §5 run-id digest.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    h
+}
+
+/// The §5 identity byte stream: `utf8(task) || 0x1f || utf8(ref) || 0x1f ||
+/// utf8(commit)`.
+fn run_id_bytes(task: &str, repo_ref: &str, commit: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(task.len() + repo_ref.len() + commit.len() + 2);
     buf.extend_from_slice(task.as_bytes());
     buf.push(0x1f);
     buf.extend_from_slice(repo_ref.as_bytes());
     buf.push(0x1f);
     buf.extend_from_slice(commit.as_bytes());
+    buf
+}
+
+/// §5: `run_id = "ci-" + hex16(fnv1a64(task || 0x1f || ref || 0x1f || commit))`.
+/// Deterministic and computable by any client; the collab thread id of both
+/// the claim and the result entries of a run.
+pub fn run_id(task: &str, repo_ref: &str, commit: &str) -> String {
+    format!("ci-{:016x}", fnv1a64(&run_id_bytes(task, repo_ref, commit)))
+}
+
+/// §5 scheduled variant (§4.3, issue #161): a cron-triggered run of the same
+/// `(task, ref, commit)` is a **new** run — the slot's fire epoch keeps the
+/// identity deterministic and recomputable by any client that knows the
+/// schedule, without touching the entry schema or the state machine:
+/// `scheduled_run_id = "ci-" + hex16(fnv1a64(task || 0x1f || ref || 0x1f ||
+/// commit || 0x1f || decimal(slot_epoch)))`.
+pub fn scheduled_run_id(task: &str, repo_ref: &str, commit: &str, slot_epoch: i64) -> String {
+    let mut buf = run_id_bytes(task, repo_ref, commit);
+    buf.push(0x1f);
+    buf.extend_from_slice(slot_epoch.to_string().as_bytes());
     format!("ci-{:016x}", fnv1a64(&buf))
 }
 
@@ -166,9 +187,10 @@ fn json_fits(v: &serde_json::Value, budget: usize) -> bool {
                 2 + s
                     .chars()
                     .map(|c| match c {
-                        '"' | '\\' => 2,
-                        '\u{8}' | '\u{9}' | '\u{a}' | '\u{c}' | '\u{d}' => 2,
-                        c if (c as u32) < 0x20 => 6, // \u00XX
+                        // serde_json escapes `"`, `\` and the short forms
+                        // \b \t \n \f \r as two bytes…
+                        '"' | '\\' | '\u{8}' | '\u{9}' | '\u{a}' | '\u{c}' | '\u{d}' => 2,
+                        c if (c as u32) < 0x20 => 6, // …other controls as \u00XX
                         c => c.len_utf8(),
                     })
                     .sum::<usize>()
@@ -185,7 +207,7 @@ fn json_fits(v: &serde_json::Value, budget: usize) -> bool {
                     .and(o.keys().try_for_each(|k| {
                         // Each key serializes as a JSON string.
                         walk(&Value::String(k.clone()), remaining)
-                    }))?
+                    }))?;
             }
             _ => {}
         }
@@ -1066,6 +1088,29 @@ mod tests {
             "smuggled claim is not a claim"
         );
         assert_eq!(view.unverified, 1);
+    }
+
+    #[test]
+    fn scheduled_run_id_is_a_fresh_identity_per_slot() {
+        // §5 scheduled variant: same (task, ref, commit), different slot → a
+        // different run; same slot → the same run; and a scheduled id never
+        // collides with the ref-triggered id.
+        let plain = run_id("test", "refs/heads/main", "abc");
+        let s1 = scheduled_run_id("test", "refs/heads/main", "abc", 1_700_000_000);
+        let s2 = scheduled_run_id("test", "refs/heads/main", "abc", 1_700_000_001);
+        assert_ne!(plain, s1, "slot in the identity");
+        assert_ne!(s1, s2, "one run per slot");
+        assert_eq!(
+            s1,
+            scheduled_run_id("test", "refs/heads/main", "abc", 1_700_000_000)
+        );
+        assert!(s1.starts_with("ci-") && s1.len() == 19, "{s1}");
+        // The slot is decimal ASCII in the stream: "…+1s" ≠ "…+10s" ≠ another
+        // tuple that could textually collide through the separator.
+        assert_ne!(
+            scheduled_run_id("test", "refs/heads/main", "abc1", 700_000_000),
+            scheduled_run_id("test", "refs/heads/main", "abc", 1_700_000_000)
+        );
     }
 
     #[test]

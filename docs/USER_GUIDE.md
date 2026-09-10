@@ -201,6 +201,11 @@ version = 1
 name = "fmt"
 command = "cargo fmt --all -- --check"
 timeout = "10m"
+
+[[task]]
+name = "nightly"
+command = "cargo test --release"
+schedule = "0 0 2 * * *"   # 可选：6/7 字段 UTC cron（秒 分 时 日 月 周 [年]）或 @daily
 ```
 运行 runner（任意机器）：
 ```bash
@@ -210,6 +215,9 @@ walgit ci status --repo <checkout>
 ```
 - runner 认领任务、执行、把结果签成 `ci_result` 条目回传；
 - 同一 run 的多次尝试收敛到唯一生效结果；秘密只进 runner 环境，不进仓库。
+- `schedule` = 对不动的 ref 周期性评估：runner 每个 pass 顺带做 cron 扫描，错过的
+  槽位合并为最新一个（不补跑）；`--once` 配外部调度器（crontab / systemd timer）
+  即可当定时 CI 用。定时运行与 ref 触发运行是两个并行线程，各自收敛。
 
 ---
 

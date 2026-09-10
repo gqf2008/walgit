@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use walgit_wal::ci::{CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id};
+use walgit_bundle::schedule::DueSlot;
+use walgit_wal::ci::{
+    CI_CLAIM_KIND, CI_RESULT_KIND, Conclusion, Decision, RunView, run_id, scheduled_run_id,
+};
 use walgit_wal::collab::{Entry, EntryRef, sign_entry};
 
 // ---- schema limits (docs/D1_CI_PROTOCOL.md §3.1, normative bounds) -------------
@@ -119,12 +122,16 @@ pub fn run(action: CiAction) -> Result<()> {
             );
             for t in &resolved.tasks {
                 println!(
-                    "  {} refs [{}] timeout {}s attempts {} env_allow [{}]\n    {}",
+                    "  {} refs [{}] timeout {}s attempts {} env_allow [{}]{}\n    {}",
                     t.name,
                     t.refs.join(", "),
                     t.timeout_secs,
                     t.max_attempts,
                     t.env_allow.join(", "),
+                    t.schedule
+                        .as_deref()
+                        .map(|s| format!(" schedule \"{s}\""))
+                        .unwrap_or_default(),
                     t.command
                 );
             }
@@ -233,6 +240,10 @@ struct CiTask {
     max_attempts: Option<u32>,
     #[serde(default)]
     env_allow: Option<Vec<String>>,
+    /// §4.3: a 6/7-field UTC cron or `@hourly`/`@daily`/`weekly` alias —
+    /// the task fires per slot even while its refs do not move.
+    #[serde(default)]
+    schedule: Option<String>,
 }
 
 /// A validated task with pipeline defaults applied — what the runner executes.
@@ -244,6 +255,8 @@ pub struct CiResolvedTask {
     pub timeout_secs: u64,
     pub max_attempts: u32,
     pub env_allow: Vec<String>,
+    /// The validated cron expression (V10), when the task is also periodic.
+    pub schedule: Option<String>,
 }
 
 /// A validated `.walgit/ci.toml`.
@@ -411,6 +424,19 @@ pub fn parse_and_validate(raw: &[u8]) -> Result<CiResolved, String> {
                 ),
             );
         }
+        // V10 (§4.3): the schedule must be a cron expression the runner can
+        // evaluate — the same grammar as bundle strategies (walgit-config).
+        if let Some(expr) = &t.schedule {
+            check(
+                &mut errors,
+                !expr.is_empty()
+                    && expr.len() <= 255
+                    && walgit_bundle::schedule::parse_schedule(expr).is_ok(),
+                format!(
+                    "V10: task {name:?} schedule {expr:?} must be a 6/7-field UTC cron (sec min hour dom mon dow) or @hourly/@daily/@weekly"
+                ),
+            );
+        }
         tasks.push(CiResolvedTask {
             name: name.clone(),
             refs,
@@ -418,6 +444,7 @@ pub fn parse_and_validate(raw: &[u8]) -> Result<CiResolved, String> {
             timeout_secs,
             max_attempts,
             env_allow,
+            schedule: t.schedule.clone(),
         });
     }
     if errors.is_empty() {
@@ -661,23 +688,30 @@ impl Runner {
     }
 
     /// One subscription pass (§4): fetch collab refs, diff the remote's tips
-    /// against the state file, work every changed ref to a terminal state.
-    /// Returns a process exit code: 0, or 1 when something settled non-success.
+    /// against the state file, work every changed ref to a terminal state —
+    /// then the cron sweep (§4.3): refs standing still still owe their
+    /// scheduled tasks a periodic evaluation. Returns a process exit code:
+    /// 0, or 1 when something settled non-success.
     fn run_pass(&self, ttl_override: Option<u64>) -> Result<i32> {
         if let Err(e) = crate::collab_cmd::git_fetch_collab(&self.repo, &self.remote) {
             eprintln!("ci: fetching collab refs failed ({e:#}); continuing with local state");
         }
-        let mut processed = read_processed(&self.state_file)?;
+        let mut state = read_state(&self.state_file)?;
         let mut exit = 0i32;
         let mut dirty = false;
-        for (ref_name, tip) in self.ls_tips()? {
-            if processed.get(&ref_name).is_some_and(|seen| seen == &tip) {
+        let tips = self.ls_tips()?;
+        for (ref_name, tip) in &tips {
+            if state
+                .processed
+                .get(ref_name)
+                .is_some_and(|seen| seen == tip)
+            {
                 continue;
             }
-            match self.process_ref(&ref_name, ttl_override) {
+            match self.process_ref(ref_name, ttl_override) {
                 Ok((terminal, failed)) => {
                     if terminal {
-                        processed.insert(ref_name, tip);
+                        state.processed.insert(ref_name.clone(), tip.clone());
                         dirty = true;
                     }
                     if failed {
@@ -690,10 +724,126 @@ impl Runner {
                 }
             }
         }
+        // §4.3: sweep every ref whose tip is fully processed — an unmoved ref
+        // is exactly what a schedule fires on. A deferred ref (a task still
+        // held elsewhere) is not swept; the trigger path revisits it first.
+        let now = chrono::Utc::now().timestamp();
+        for (ref_name, tip) in &tips {
+            if !state
+                .processed
+                .get(ref_name)
+                .is_some_and(|seen| seen == tip)
+            {
+                continue;
+            }
+            match self.cron_sweep_ref(ref_name, tip, &mut state, ttl_override, now, &mut exit) {
+                Ok(swept) => dirty |= swept,
+                Err(e) => {
+                    eprintln!("ci: {ref_name}: cron sweep: {e:#}");
+                    exit = 1;
+                }
+            }
+        }
         if dirty {
-            write_processed(&self.state_file, &processed)?;
+            write_state(&self.state_file, &state)?;
         }
         Ok(exit)
+    }
+
+    /// §4.3: evaluate every scheduled task of an unmoved ref against the cron
+    /// bookkeeping in the state file. First sight seeds the baseline (a task
+    /// added to an old ref must not burst-run its backlog); a due slot runs
+    /// once as a fresh run identity (`scheduled_run_id`); a backlog deeper
+    /// than the scan bound advances the bookkeeping without running. All
+    /// checks are local until a slot actually fires. Returns whether the
+    /// state changed.
+    fn cron_sweep_ref(
+        &self,
+        ref_name: &str,
+        tip: &str,
+        state: &mut RunnerState,
+        ttl_override: Option<u64>,
+        now: i64,
+        exit: &mut i32,
+    ) -> Result<bool> {
+        let mut dirty = false;
+        // The tip was fetched when the ref was processed; if the objects went
+        // away since (fresh clone over a copied state file), fetch once —
+        // exactly what a changed ref would cost.
+        let have = Command::new("git")
+            .args(["-C"])
+            .arg(&self.repo)
+            .args(["cat-file", "-e", &format!("{tip}^{{commit}}")])
+            .output()
+            .context("git cat-file -e")?
+            .status
+            .success();
+        if !have {
+            self.fetch_commit(ref_name)?;
+        }
+        let Some(raw) = self.read_ci_toml(tip)? else {
+            return Ok(dirty);
+        };
+        let cfg = match parse_and_validate(&raw) {
+            Ok(c) => c,
+            // An invalid declaration was already reported (and the pass
+            // failed) by the trigger path; the sweep has nothing to add.
+            Err(_) => return Ok(dirty),
+        };
+        let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
+        let short: String = tip.chars().take(8).collect();
+        for t in cfg.matching(ref_name) {
+            let Some(expr) = &t.schedule else {
+                continue;
+            };
+            if self.task_filter.as_deref().is_some_and(|n| n != t.name) {
+                continue;
+            }
+            let key = format!("{ref_name}\u{1f}{}", t.name);
+            let Some(&last) = state.cron.get(&key) else {
+                state.cron.insert(key, now);
+                dirty = true;
+                continue;
+            };
+            let Ok(schedule) = walgit_bundle::schedule::parse_schedule(expr) else {
+                continue; // V10 already rejected a bad expression; defensive.
+            };
+            match walgit_bundle::schedule::due_slot(&schedule, last, now) {
+                DueSlot::NotDue => {}
+                DueSlot::Skip(slot) => {
+                    state.cron.insert(key, slot);
+                    dirty = true;
+                }
+                DueSlot::Run(slot) => {
+                    let id = scheduled_run_id(&t.name, ref_name, tip, slot);
+                    println!(
+                        "ci: {ref_name} @ {short} task {}: schedule fired (slot {slot}), run {id}",
+                        t.name
+                    );
+                    match self.process_task(t, ref_name, tip, ttl, &id)? {
+                        TaskOutcome::Settled(Conclusion::Success) => {
+                            state.cron.insert(key, slot);
+                            dirty = true;
+                        }
+                        TaskOutcome::Settled(other) => {
+                            println!(
+                                "ci: {ref_name} @ {short} task {}: settled {}",
+                                t.name,
+                                other.as_str()
+                            );
+                            state.cron.insert(key, slot);
+                            dirty = true;
+                            *exit = 1;
+                        }
+                        // Held elsewhere or gave up: leave the slot pending so
+                        // the next pass re-decides the same run (§4, same rule
+                        // as the trigger path's unprocessed tip).
+                        TaskOutcome::Deferred => {}
+                    }
+                }
+            }
+        }
+        Ok(dirty)
     }
 
     /// The trigger surface (§3.2): `refs/heads/*` and `refs/tags/*` of the
@@ -756,7 +906,8 @@ impl Runner {
             if self.task_filter.as_deref().is_some_and(|n| n != t.name) {
                 continue;
             }
-            match self.process_task(t, ref_name, &commit, ttl)? {
+            let id = run_id(&t.name, ref_name, &commit);
+            match self.process_task(t, ref_name, &commit, ttl, &id)? {
                 TaskOutcome::Settled(Conclusion::Success) => {}
                 TaskOutcome::Settled(other) => {
                     println!(
@@ -777,14 +928,16 @@ impl Runner {
     /// One task of one ref tip: decide, claim, execute, publish — repeat until
     /// a terminal state or a hand-off (§6.2). Bounded: attempts ≤ `max_attempts`
     /// (V7, enforced by `decide`) and error re-claims ≤ `ERROR_RECLAIMS_MAX`.
+    /// `id` is the run identity — `run_id` for a ref trigger, `scheduled_run_id`
+    /// for a cron slot (§4.3); everything downstream is identity-agnostic.
     fn process_task(
         &self,
         task: &CiResolvedTask,
         ref_name: &str,
         commit: &str,
         ttl: u64,
+        id: &str,
     ) -> Result<TaskOutcome> {
-        let id = run_id(&task.name, ref_name, commit);
         let mut error_reclaims = 0u32;
         loop {
             let decision = match self.run_view(&id)? {
@@ -1343,32 +1496,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// `<gitdir>/ci-run.json` (§4): `{"processed": {"<ref>": "<tip oid>"}}`.
-/// Missing file = nothing processed yet.
-fn read_processed(path: &Path) -> Result<HashMap<String, String>> {
+/// `<gitdir>/ci-run.json` (§4/§4.3), the runner's local bookkeeping — a cache
+/// of what the collab log already says, never a second source of truth:
+/// `{"processed": {"<ref>": "<tip oid>"}, "cron": {"<ref>\u{1f}<task>":
+/// <slot epoch>}}`. Missing file = nothing processed yet.
+#[derive(Default)]
+struct RunnerState {
+    /// Ref tips whose every task reached a terminal state (§4).
+    processed: HashMap<String, String>,
+    /// The newest slot each scheduled (ref, task) pair has accounted for
+    /// (§4.3) — seeded at first sight, advanced past each due slot.
+    cron: HashMap<String, i64>,
+}
+
+fn read_state(path: &Path) -> Result<RunnerState> {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return Ok(HashMap::new());
+        return Ok(RunnerState::default());
     };
     let v: serde_json::Value = serde_json::from_str(&raw)?;
-    let mut map = HashMap::new();
+    let mut state = RunnerState::default();
     if let Some(obj) = v.get("processed").and_then(serde_json::Value::as_object) {
         for (k, val) in obj {
             if let Some(oid) = val.as_str() {
-                map.insert(k.clone(), oid.to_string());
+                state.processed.insert(k.clone(), oid.to_string());
             }
         }
     }
-    Ok(map)
+    if let Some(obj) = v.get("cron").and_then(serde_json::Value::as_object) {
+        for (k, val) in obj {
+            if let Some(slot) = val.as_i64() {
+                state.cron.insert(k.clone(), slot);
+            }
+        }
+    }
+    Ok(state)
 }
 
-fn write_processed(path: &Path, map: &HashMap<String, String>) -> Result<()> {
-    let processed: serde_json::Map<String, serde_json::Value> = map
+fn write_state(path: &Path, state: &RunnerState) -> Result<()> {
+    let processed: serde_json::Map<String, serde_json::Value> = state
+        .processed
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
+    let cron: serde_json::Map<String, serde_json::Value> = state
+        .cron
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
+        .collect();
     std::fs::write(
         path,
-        serde_json::to_string_pretty(&serde_json::json!({ "processed": processed }))?,
+        serde_json::to_string_pretty(&serde_json::json!({ "processed": processed, "cron": cron }))?,
     )
     .with_context(|| format!("write state {}", path.display()))?;
     Ok(())
@@ -1507,6 +1684,40 @@ secrets = ["x"]
     }
 
     #[test]
+    fn schedule_is_validated_and_carried() {
+        // V10 (§4.3): a 6/7-field UTC cron or a shorthand alias, isomorphic to
+        // the bundle strategies' schedule (walgit-bundle/src/schedule.rs).
+        for expr in [
+            "0 0 2 * * *",
+            "0 30 9 * * 1-5",
+            "@daily",
+            "@hourly",
+            "@weekly",
+        ] {
+            let r = ok(&format!(
+                "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nschedule=\"{expr}\"\n"
+            ));
+            assert_eq!(r.tasks[0].schedule.as_deref(), Some(expr));
+        }
+        // No schedule = the default: ref-triggered only.
+        let r = ok(MINIMAL);
+        assert_eq!(r.tasks[0].schedule, None);
+        // Bad expressions are validation failures naming V10.
+        for bad in ["not a cron", "*/2 * * *", "", "61 * * * * *"] {
+            let e = errs(&format!(
+                "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nschedule=\"{bad}\"\n"
+            ));
+            assert!(e.contains("V10"), "{bad:?}: {e}");
+        }
+        // Overlong is rejected even if the prefix parses.
+        let long = format!(
+            "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nschedule=\"{}\"\n",
+            "0 ".repeat(200)
+        );
+        assert!(errs(&long).contains("V10"));
+    }
+
+    #[test]
     fn pipeline_defaults_are_inherited_by_omitting_tasks() {
         let r = ok(r#"
 version = 1
@@ -1588,18 +1799,50 @@ max_attempts = 2
     }
 
     #[test]
-    fn processed_state_round_trips() {
+    fn runner_state_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("ci-run.json");
-        assert!(
-            read_processed(&p).expect("read").is_empty(),
-            "missing = empty"
+        let empty = read_state(&p).expect("read");
+        assert!(empty.processed.is_empty(), "missing = empty");
+        assert!(empty.cron.is_empty(), "missing = empty");
+        let mut state = RunnerState::default();
+        state
+            .processed
+            .insert("refs/heads/main".to_string(), "abc".to_string());
+        state
+            .processed
+            .insert("refs/tags/v1".to_string(), "def".to_string());
+        state
+            .cron
+            .insert("refs/heads/main\u{1f}nightly".to_string(), 1_700_092_800);
+        write_state(&p, &state).expect("write");
+        let back = read_state(&p).expect("read");
+        assert_eq!(back.processed, state.processed);
+        assert_eq!(back.cron, state.cron);
+    }
+
+    #[test]
+    fn runner_state_reads_a_trigger_only_file() {
+        // The §4 shape (no "cron" key) is still read — it is what every
+        // pre-§4.3 runner wrote; first sight re-seeds the baseline (§4.3).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("ci-run.json");
+        std::fs::write(&p, r#"{"processed": {"refs/heads/main": "abc"}}"#).expect("write");
+        let state = read_state(&p).expect("read");
+        assert_eq!(
+            state.processed.get("refs/heads/main").map(String::as_str),
+            Some("abc")
         );
-        let mut m = HashMap::new();
-        m.insert("refs/heads/main".to_string(), "abc".to_string());
-        m.insert("refs/tags/v1".to_string(), "def".to_string());
-        write_processed(&p, &m).expect("write");
-        assert_eq!(read_processed(&p).expect("read"), m);
+        assert!(state.cron.is_empty());
+        // Junk entries in either map are dropped, not fatal.
+        std::fs::write(
+            &p,
+            r#"{"processed": {"refs/heads/main": 7}, "cron": {"k": "not-a-number"}}"#,
+        )
+        .expect("write");
+        let state = read_state(&p).expect("read");
+        assert!(state.processed.is_empty());
+        assert!(state.cron.is_empty());
     }
 
     #[test]
@@ -1721,6 +1964,7 @@ max_attempts = 2
                 timeout_secs,
                 max_attempts: 1,
                 env_allow: env_allow.iter().map(|s| (*s).to_string()).collect(),
+                schedule: None,
             }
         }
 
