@@ -694,7 +694,11 @@ list by `commit_date` day and shows `subject` + `author`.
 The decentralized collaboration layer (`docs/D1_COLLAB_DESIGN.md`) writes to
 `refs/collab/*` (inbox entries + principals registry) and aggregates them
 deterministically; these endpoints back the Collab tab and mirror what the
-`walgit collab` CLI computes locally. Auth: same as every repo-scoped write
+`walgit collab` CLI computes locally. Since D45 (issue #160) the aggregation
+input is **snapshot ∪ inbox tail**: a signed fold at
+`refs/collab/meta/snapshot` (written by `walgit collab gc`, which then deletes
+the folded inbox refs) plus every inbox ref not yet folded — deduped by oid,
+so a fold never changes any answer below. Auth: same as every repo-scoped write
 (write tokens / signed-in principal; `actor == principal` is enforced).
 
 #### `POST /{owner}/{repo}/api/collab/entries`
