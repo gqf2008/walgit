@@ -371,7 +371,7 @@ done    : effective 存在                               → Settled(conclusion)
     跳过；`name` 只取基名（永不写出 `--out` 之外）。fresh clone 先对 http(s) walgit remote
     发带精确 actor 的 `HEAD /…/ci-artifacts/<sha256>?actor=<actor>`；只有 `200` 才执行
     `git fetch`，`413/404` 直接跳过；没有 HTTP size 元数据通道的 remote 在 fetch 前 fail
-    closed，避免为了拒绝超限对象而先完整下载。需要认证时使用 `WALGIT_TOKEN`。
+    closed，避免为了拒绝超限对象而先完整下载。认证使用 Git credential helper 对当前 remote 的 host-scoped 凭据，不转发进程级 token。
   - HTTP：`GET /{o}/{r}/api/collab/ci-artifacts/<sha256>` → `application/octet-stream` +
     immutable/ETag；地址必须是 64 位小写 hex，服务端先查 size、再读取并验哈希后发字节。
     同地址可能有恶意遮蔽 ref，服务端只在 `ci-artifacts` 前缀范围内遍历候选直到找到哈希正确的
