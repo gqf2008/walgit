@@ -492,3 +492,329 @@ async fn board_projection_is_byte_identical_across_clients_and_moves_with_status
     );
     Ok(())
 }
+
+/// D45 / D1 §11.4 (issue #160): the fold. A mixed history (issue/patch/
+/// review/status/comment + `ci_claim`/`ci_result`, with an unregistered actor and
+/// a wrong-key signature among them) is folded by `walgit collab gc --push`:
+/// the inbox refs are deleted, `refs/collab/meta/snapshot` carries every entry
+/// verbatim, and every aggregation — CLI offline and server API alike — is
+/// **byte-identical** to before the fold, verification states included. The
+/// tail then stays live: new entries chain onto folded oids, and a second gc
+/// composes with the existing snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_fold_keeps_aggregation_byte_identical_and_the_tail_stays_live() -> TestResult {
+    use base64::Engine as _;
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit");
+    let keydir = tempfile::tempdir()?;
+    let alice_key = keydir.path().join("alice");
+    let bob_key = keydir.path().join("bob");
+    std::fs::write(&alice_key, "07".repeat(32))?;
+    std::fs::write(&bob_key, "08".repeat(32))?;
+    let alice_k = alice_key.to_str().unwrap();
+    let bob_k = bob_key.to_str().unwrap();
+
+    let run = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "walgit {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let git_stdin = |dir: &Path, args: &[&str], input: &str| -> TestResult<String> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(input.as_bytes())?;
+        let out = child.wait_with_output()?;
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    // Repo A: the author. main needs one commit so HEAD-backed reads (the
+    // board definition lookup) work everywhere.
+    let a = tempfile::tempdir()?;
+    git_in(a.path(), &["init", "-q", "-b", "main"])?;
+    git_in(a.path(), &["config", "user.email", "t@t"])?;
+    git_in(a.path(), &["config", "user.name", "T"])?;
+    git_in(
+        a.path(),
+        &["remote", "add", "origin", &format!("{base}/o/r.git")],
+    )?;
+    git_in(a.path(), &["commit", "-q", "--allow-empty", "-m", "init"])?;
+    git_in(a.path(), &["push", "-q", "origin", "main"])?;
+    let repo_a = a.path().to_str().unwrap();
+
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "alice", "--key", alice_k,
+        "--push", "origin",
+    ])?;
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "bob", "--key", bob_k,
+        "--push", "origin",
+    ])?;
+    // ci-runner-a's principal is bound to bob's key file (any principal may
+    // self-register any key; the registry is the trust anchor).
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "ci-runner-a", "--key",
+        bob_k, "--push", "origin",
+    ])?;
+
+    // t1: issue -> comment -> status(needs-review) -> review(approve) ->
+    // patch -> an unsigned comment by the unregistered carol.
+    let oid_of = |out: &str| out.split_whitespace().nth(1).unwrap().to_string();
+    let issue = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t1", "--actor", "alice",
+        "--body", r#"{"title":"fold me"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+    let comment = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "comment", "--id", "t1", "--actor", "bob",
+        "--parent", &issue, "--body", r#"{"text":"looks right"}"#, "--key", bob_k, "--push",
+        "origin",
+    ])?);
+    let status = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "status", "--id", "t1", "--actor", "alice",
+        "--parent", &comment, "--body", r#"{"status":"needs-review","owner":"svc-a"}"#, "--key",
+        alice_k, "--push", "origin",
+    ])?);
+    let review = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "review", "--id", "t1", "--actor", "bob",
+        "--parent", &status, "--body", r#"{"decision":"approve"}"#, "--key", bob_k, "--push",
+        "origin",
+    ])?);
+    let patch = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "patch", "--id", "t1", "--actor", "alice",
+        "--parent", &review, "--body", r#"{"message":"the change"}"#, "--base", "refs/heads/main",
+        "--head", "refs/heads/topic", "--key", alice_k, "--push", "origin",
+    ])?);
+    // carol's entry never touches a signing key: written by hand and pushed
+    // as a bare blob ref — the aggregation must carry it as unverified,
+    // across the fold.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let carol_json = format!(
+        r#"{{"version":1,"kind":"comment","id":"t1","actor":"carol","ts":{ts},"parent":"{patch}","body":{{"text":"drive-by"}},"sig":""}}"#
+    );
+    let carol_oid = git_stdin(a.path(), &["hash-object", "-w", "--stdin"], &carol_json)?;
+    git_in(
+        a.path(),
+        &["update-ref", "refs/collab/inbox/carol/driveby1", &carol_oid],
+    )?;
+    git_in(a.path(), &["push", "-q", "origin", "refs/collab/inbox/carol/driveby1"])?;
+
+    // t2: issue -> status(closed), plus a comment signed by bob's key but
+    // naming alice — the signature fails against alice's registered key:
+    // unverified, and must stay unverified after the fold.
+    let t2 = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t2", "--actor", "alice",
+        "--body", r#"{"title":"second unit"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+    let t2s = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "status", "--id", "t2", "--actor", "alice",
+        "--parent", &t2, "--body", r#"{"status":"closed"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+    run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "comment", "--id", "t2", "--actor", "alice",
+        "--parent", &t2s, "--body", r#"{"text":"wrong key"}"#, "--key", bob_k, "--push", "origin",
+    ])?;
+
+    // A CI run thread (docs/D1_CI_PROTOCOL.md): claim -> result, signed by
+    // ci-runner-a's key, ttl far from expiry so `now` never flips the state
+    // between the two report captures.
+    let claim = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "ci_claim", "--id", "ci-aaaabbbbccccdddd",
+        "--actor", "ci-runner-a", "--body",
+        r#"{"task":"test","ref":"refs/heads/main","commit":"c0ffee","ttl":86400,"attempt":1}"#,
+        "--key", bob_k, "--push", "origin",
+    ])?);
+    run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "ci_result", "--id", "ci-aaaabbbbccccdddd",
+        "--actor", "ci-runner-a", "--parent", &claim, "--body",
+        &format!(r#"{{"task":"test","ref":"refs/heads/main","commit":"c0ffee","attempt":1,"claim":"{claim}","conclusion":"success","exit_code":0,"duration_ms":12,"log_summary":"ok","log_sha256":""}}"#),
+        "--key", bob_k, "--push", "origin",
+    ])?;
+
+    // Client 1 (pre-fold): a fresh clone aggregates offline.
+    let b = tempfile::tempdir()?;
+    git_in(
+        b.path(),
+        &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."],
+    )?;
+    git_in(b.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let repo_b = b.path().to_str().unwrap();
+    let collab_refs = |dir: &Path| -> TestResult<Vec<String>> {
+        let out = git_in(dir, &["ls-remote", "origin", "refs/collab/*"])?;
+        Ok(out.lines().map(str::to_string).collect())
+    };
+    assert_eq!(
+        collab_refs(b.path())?.iter().filter(|l| l.contains("refs/collab/inbox/")).count(),
+        11,
+        "every entry is one advertised ref before the fold (the wall this test removes)"
+    );
+
+    let pre_board_cli = run(&["collab", "board", "--repo", repo_b, "--format", "json"])?;
+    let pre_board_srv = reqwest::get(format!("{base}/o/r/api/collab/board")).await?.bytes().await?;
+    assert_eq!(pre_board_cli.as_bytes(), &pre_board_srv[..], "pre-fold: CLI == server");
+    let pre_thread_cli = run(&["collab", "thread", "t1", "--repo", repo_b])?;
+    let pre_thread_srv = reqwest::get(format!("{base}/o/r/api/collab/threads/t1")).await?.bytes().await?;
+    let pre_report_srv = reqwest::get(format!("{base}/o/r/api/collab/report")).await?.bytes().await?;
+    // Sanity on the fixture: 11 entries, carol + the wrong-key comment
+    // unverified, carol's key missing, the CI run projected.
+    let pre_report: serde_json::Value = serde_json::from_slice(&pre_report_srv)?;
+    assert_eq!(pre_report["total_entries"], 11);
+    assert_eq!(pre_report["verified_entries"], 9);
+    assert_eq!(pre_report["unverified_entries"], 2);
+    assert_eq!(pre_report["missing_principals"], 1);
+    // `build_report` feeds every entry to `ci::collect_runs`, so non-CI
+    // threads show up as Pending runs too (pre-existing projection, pinned
+    // here so a fold cannot quietly change it); the real CI run is the one
+    // carrying the ci-* id.
+    let runs = pre_report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 3, "t1, t2 and the ci thread: {runs:?}");
+    let ci_run = runs
+        .iter()
+        .find(|r| r["id"] == "ci-aaaabbbbccccdddd")
+        .expect("the CI run is projected");
+    assert_eq!(ci_run["state"], "done");
+    let pre_thread: serde_json::Value = serde_json::from_str(&pre_thread_cli)?;
+    assert_eq!(pre_thread.as_array().unwrap().len(), 6, "t1 entries");
+
+    // The fold, run from the clone (it has every ref). Afterwards the
+    // namespace is one snapshot ref + the singleton meta refs.
+    let gc_out = run(&[
+        "collab", "gc", "--repo", repo_b, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc_out.contains("folded 11 inbox ref(s)"), "{gc_out}");
+    let after = collab_refs(b.path())?;
+    assert_eq!(
+        after.iter().filter(|l| l.contains("refs/collab/inbox/")).count(),
+        0,
+        "the fold pruned every inbox ref: {after:?}"
+    );
+    assert!(
+        after.iter().any(|l| l.contains("refs/collab/meta/snapshot")),
+        "the snapshot ref exists: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        4,
+        "snapshot + 3 principals: the advertisement stopped growing: {after:?}"
+    );
+
+    // Client 2 (post-fold): another fresh clone sees exactly the pre-fold
+    // bytes — every projection, both clients, verification states included.
+    let c = tempfile::tempdir()?;
+    git_in(
+        c.path(),
+        &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."],
+    )?;
+    git_in(c.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let repo_c = c.path().to_str().unwrap();
+    let post_board_cli = run(&["collab", "board", "--repo", repo_c, "--format", "json"])?;
+    assert_eq!(post_board_cli, pre_board_cli, "fold must not move the board");
+    let post_thread_cli = run(&["collab", "thread", "t1", "--repo", repo_c])?;
+    assert_eq!(post_thread_cli, pre_thread_cli, "fold must not move the thread view");
+    let post_board_srv = reqwest::get(format!("{base}/o/r/api/collab/board")).await?.bytes().await?;
+    assert_eq!(&post_board_srv[..], &pre_board_srv[..], "server board identical across the fold");
+    assert_eq!(post_board_cli.as_bytes(), &post_board_srv[..], "post-fold: CLI == server");
+    let post_thread_srv = reqwest::get(format!("{base}/o/r/api/collab/threads/t1")).await?.bytes().await?;
+    assert_eq!(&post_thread_srv[..], &pre_thread_srv[..], "server thread identical across the fold");
+    let post_report_srv = reqwest::get(format!("{base}/o/r/api/collab/report")).await?.bytes().await?;
+    assert_eq!(&post_report_srv[..], &pre_report_srv[..], "server report identical across the fold");
+
+    // The snapshot itself is the audit manifest: every record's oid
+    // recomputes from its bytes and every entry still verifies (or not)
+    // exactly as it did in the inbox.
+    let snap_text = git_in(c.path(), &["cat-file", "blob", "refs/collab/meta/snapshot"])?;
+    let snap = walgit_wal::collab::parse_snapshot(snap_text.as_bytes()).expect("snapshot parses");
+    assert_eq!(snap.actor, "alice");
+    assert_eq!(snap.entries.len(), 11);
+    let mut principals_c = std::collections::HashMap::new();
+    for (name, seed) in [("alice", 7u8), ("bob", 8u8), ("ci-runner-a", 8u8)] {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        principals_c.insert(
+            name.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes()),
+        );
+    }
+    let cli_report = run(&["collab", "report", "--repo", repo_c])?;
+    assert!(
+        cli_report.contains("9/11"),
+        "cli report shows the same verification health: {cli_report}"
+    );
+    let parsed: Vec<_> = snap
+        .entries
+        .iter()
+        .map(|r| r.entry_ref().expect("every record pins its bytes to its oid"))
+        .collect();
+    let verified_count = parsed.iter().filter(|e| e.is_verified(&principals_c)).count();
+    assert_eq!(verified_count, 9, "9 verified, carol + wrong-key unverified");
+    let carol = parsed.iter().find(|e| e.entry.actor == "carol").expect("carol's entry folded");
+    assert!(!carol.is_verified(&principals_c), "carol stays unverified");
+    let wrong_key = parsed
+        .iter()
+        .find(|e| e.entry.body.get("text").and_then(|v| v.as_str()) == Some("wrong key"))
+        .expect("the wrong-key comment is in the snapshot");
+    assert!(!wrong_key.is_verified(&principals_c), "wrong-key signature stays unverified");
+
+    // The tail stays live: a new entry chains onto a folded tip (its parent
+    // oid now exists only inside the snapshot).
+    let follow = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "comment", "--id", "t1", "--actor", "alice",
+        "--parent", &carol_oid, "--body", r#"{"text":"after the fold"}"#, "--key", alice_k,
+        "--push", "origin",
+    ])?);
+    let _ = follow;
+    git_in(c.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let tail_thread_cli = run(&["collab", "thread", "t1", "--repo", repo_c])?;
+    let tail_thread: serde_json::Value = serde_json::from_str(&tail_thread_cli)?;
+    let arr = tail_thread.as_array().unwrap();
+    assert_eq!(arr.len(), 7, "the new entry joins the folded thread");
+    assert_eq!(arr[6]["entry"]["body"]["text"], "after the fold");
+    assert_eq!(arr[6]["entry"]["parent"], carol_oid, "chained onto a folded oid");
+    assert!(
+        arr.iter().all(|e| e["verified"] == serde_json::Value::Bool(true)
+            || e["entry"]["actor"] == "carol"),
+        "verification across the snapshot boundary: {tail_thread_cli}"
+    );
+    let tail_thread_srv = reqwest::get(format!("{base}/o/r/api/collab/threads/t1")).await?.bytes().await?;
+    let tail_board_cli = run(&["collab", "board", "--repo", repo_c, "--format", "json"])?;
+    let tail_board_srv = reqwest::get(format!("{base}/o/r/api/collab/board")).await?.bytes().await?;
+    assert_eq!(tail_board_cli.as_bytes(), &tail_board_srv[..], "post-append: CLI == server");
+    let tail_thread_srv_v: serde_json::Value = serde_json::from_slice(&tail_thread_srv)?;
+    assert_eq!(tail_thread_srv_v["entries"].as_array().unwrap().len(), 7);
+
+    // A second fold composes with the existing snapshot (records carried
+    // verbatim) and prunes the one-entry tail.
+    git_in(b.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let gc2 = run(&[
+        "collab", "gc", "--repo", repo_b, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc2.contains("folded 1 inbox ref(s)"), "{gc2}");
+    let after2 = collab_refs(b.path())?;
+    assert_eq!(after2.iter().filter(|l| l.contains("refs/collab/inbox/")).count(), 0);
+    let snap2_text = git_in(b.path(), &["cat-file", "blob", "refs/collab/meta/snapshot"])?;
+    let snap2 = walgit_wal::collab::parse_snapshot(snap2_text.as_bytes()).expect("snapshot parses");
+    assert_eq!(snap2.entries.len(), 12, "the second fold accumulated the tail");
+    // And the aggregation is byte-stable across the second fold on both
+    // clients (same shapes on each side of the comparison).
+    git_in(c.path(), &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+    let final_thread_cli = run(&["collab", "thread", "t1", "--repo", repo_c])?;
+    assert_eq!(final_thread_cli, tail_thread_cli, "second fold: CLI thread stable");
+    let final_thread_srv = reqwest::get(format!("{base}/o/r/api/collab/threads/t1")).await?.bytes().await?;
+    assert_eq!(&final_thread_srv[..], &tail_thread_srv[..], "second fold: server thread stable");
+    Ok(())
+}
+
