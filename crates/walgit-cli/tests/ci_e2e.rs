@@ -699,6 +699,31 @@ schedule = "* * * * * *"
         "everything settles: {st}"
     );
 
+    // Upgrade path: pre-state files had `cron` but no persisted `schedules`.
+    // Removing the map must trigger one schedule-discovery pass instead of
+    // permanently stranding an unchanged ref.
+    let state_path = r1.path().join(".git").join("ci-run.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path)?)?;
+    legacy
+        .as_object_mut()
+        .expect("state object")
+        .remove("schedules");
+    std::fs::write(&state_path, serde_json::to_vec(&legacy)?)?;
+    let before = runs.len();
+    std::thread::sleep(Duration::from_millis(1200));
+    let out = ci_run(&bin, &r1s, "ci-a", &key, &[], &[])?;
+    assert!(
+        out.status.success(),
+        "legacy-state pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = status_json(&bin, &r1s)?;
+    assert!(
+        st["runs"].as_array().unwrap().len() > before,
+        "legacy cron state rediscovers schedules: {st}"
+    );
+
     // The bookkeeping landed in the runner's state file (§4.3): one cron
     // entry for (ref, task), a whole-second slot at or after the baseline.
     let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(

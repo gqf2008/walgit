@@ -1129,11 +1129,14 @@ fn apply_schedule_snapshot(
     ref_name: &str,
     schedules: &[(String, Option<String>)],
     task_filter: Option<&str>,
+    preserve_cron: bool,
 ) {
     if let Some(task_name) = task_filter {
         let key = schedule_key(ref_name, task_name);
         state.schedules.remove(&key);
-        state.cron.remove(&key);
+        if !preserve_cron {
+            state.cron.remove(&key);
+        }
         if let Some((_, Some(expr))) = schedules
             .iter()
             .find(|(name, _)| name == task_name)
@@ -1144,7 +1147,9 @@ fn apply_schedule_snapshot(
     }
     let prefix = schedule_prefix(ref_name);
     state.schedules.retain(|key, _| !key.starts_with(&prefix));
-    state.cron.retain(|key, _| !key.starts_with(&prefix));
+    if !preserve_cron {
+        state.cron.retain(|key, _| !key.starts_with(&prefix));
+    }
     for (task_name, schedule) in schedules {
         if let Some(expr) = schedule {
             state
@@ -1217,6 +1222,7 @@ impl Runner {
             let prefix = schedule_prefix(&ref_name);
             state.schedules.retain(|key, _| !key.starts_with(&prefix));
             state.cron.retain(|key, _| !key.starts_with(&prefix));
+            state.schedule_migration.remove(&ref_name);
             dirty = true;
         }
         for (ref_name, tip) in &tips {
@@ -1224,17 +1230,27 @@ impl Runner {
                 .processed
                 .get(ref_name)
                 .is_some_and(|seen| seen == tip)
+                && !state.schedule_migration.contains(ref_name)
             {
                 continue;
             }
             match self.process_ref(ref_name, ttl_override) {
                 Ok(outcome) => {
+                    let preserve_cron = state.schedule_migration.contains(ref_name)
+                        && state
+                            .processed
+                            .get(ref_name)
+                            .is_some_and(|seen| seen == tip);
                     apply_schedule_snapshot(
                         &mut state,
                         ref_name,
                         &outcome.schedules,
                         self.task_filter.as_deref(),
+                        preserve_cron,
                     );
+                    if state.schedule_migration.remove(ref_name) {
+                        dirty = true;
+                    }
                     if outcome.terminal {
                         state.processed.insert(ref_name.clone(), tip.clone());
                         dirty = true;
@@ -2247,6 +2263,10 @@ struct RunnerState {
     /// Validated cron expressions by `<ref>\u{1f}<task>`. Populated while the
     /// tip is processed, so a quiet pass never re-reads ci.toml per ref.
     schedules: HashMap<String, String>,
+    /// One-shot migration for pre-`schedules` state files: refs whose cron
+    /// entries need one schedule-discovery pass before the quiet sweep can
+    /// resume. Never serialized.
+    schedule_migration: HashSet<String>,
 }
 
 fn read_state(path: &Path) -> Result<RunnerState> {
@@ -2269,10 +2289,18 @@ fn read_state(path: &Path) -> Result<RunnerState> {
             }
         }
     }
+    let schedules_present = v.get("schedules").is_some_and(serde_json::Value::is_object);
     if let Some(obj) = v.get("schedules").and_then(serde_json::Value::as_object) {
         for (k, val) in obj {
             if let Some(expr) = val.as_str() {
                 state.schedules.insert(k.clone(), expr.to_string());
+            }
+        }
+    }
+    if !schedules_present {
+        for key in state.cron.keys() {
+            if let Some((ref_name, _)) = key.split_once('\u{1f}') {
+                state.schedule_migration.insert(ref_name.to_string());
             }
         }
     }
@@ -2415,6 +2443,7 @@ command = "cargo test"
                 ("test".into(), None),
             ],
             None,
+            false,
         );
         assert_eq!(
             state
@@ -2430,6 +2459,29 @@ command = "cargo test"
         write_state(&path, &state).unwrap();
         let loaded = read_state(&path).unwrap();
         assert_eq!(loaded.schedules, state.schedules);
+    }
+
+    #[test]
+    fn old_state_without_schedules_requests_one_discovery_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ci-run.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "processed": {"refs/heads/main": "abc"},
+                "cron": {"refs/heads/main\u{1f}tick": 123}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = read_state(&path).unwrap();
+        assert_eq!(state.schedules.len(), 0);
+        assert!(
+            state
+                .schedule_migration
+                .contains("refs/heads/main"),
+            "legacy cron state must rediscover its schedules"
+        );
     }
 
     #[test]
