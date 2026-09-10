@@ -818,3 +818,211 @@ async fn gc_fold_keeps_aggregation_byte_identical_and_the_tail_stays_live() -> T
     Ok(())
 }
 
+/// §11.4 fold CAS: the snapshot push leases against the baseline the gc
+/// actually read (`--force-with-lease`, never a `+` refspec — which silently
+/// short-circuits the lease). Two checks:
+/// ① a stale-baseline fold (a second gc whose checkout predates the first
+///   fold's snapshot) is refused, and the first fold's snapshot survives —
+///   the empirical overwrite the review reproduced;
+/// ② the crash-resume branch: a ref whose entry is already folded (an earlier
+///   gc died between the snapshot move and the prune) is pruned WITHOUT
+///   re-recording it, and the surviving record keeps its original principal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_fold_baseline_loses_the_lease_and_the_crash_resume_prunes_deduped() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit");
+    let keydir = tempfile::tempdir()?;
+    let alice_key = keydir.path().join("alice");
+    std::fs::write(&alice_key, "07".repeat(32))?;
+    let alice_k = alice_key.to_str().unwrap();
+
+    let run = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "walgit {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let run_expect_fail = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            !out.status.success(),
+            "walgit {} unexpectedly succeeded:\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let git_in = |dir: &Path, args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()?;
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let a = tempfile::tempdir()?;
+    git_in(a.path(), &["init", "-q", "-b", "main"])?;
+    git_in(a.path(), &["config", "user.email", "t@t"])?;
+    git_in(a.path(), &["config", "user.name", "T"])?;
+    git_in(a.path(), &["remote", "add", "origin", &format!("{base}/o/r.git")])?;
+    git_in(a.path(), &["commit", "-q", "--allow-empty", "-m", "init"])?;
+    git_in(a.path(), &["push", "-q", "origin", "main"])?;
+    let repo_a = a.path().to_str().unwrap();
+    run(&[
+        "collab", "principal-register", "--repo", repo_a, "--principal", "alice", "--key", alice_k,
+        "--push", "origin",
+    ])?;
+    let oid_of = |out: &str| out.split_whitespace().nth(1).unwrap().to_string();
+    let issue1 = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t1", "--actor", "alice",
+        "--body", r#"{"title":"first"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+    let _issue2 = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "issue", "--id", "t2", "--actor", "alice",
+        "--body", r#"{"title":"second"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+
+    let fetch_all = |dir: &Path| -> TestResult<()> {
+        git_in(dir, &["fetch", "-q", "origin", "+refs/collab/*:refs/collab/*"])?;
+        Ok(())
+    };
+    let remote_snapshot = |dir: &Path| -> TestResult<String> {
+        let out = git_in(dir, &["ls-remote", "origin", "refs/collab/meta/snapshot"])?;
+        Ok(out.split_whitespace().next().unwrap_or_default().to_string())
+    };
+
+    // Client b and client c both see the pre-fold world (two entries, no
+    // snapshot).
+    let b = tempfile::tempdir()?;
+    git_in(b.path(), &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."])?;
+    fetch_all(b.path())?;
+    let repo_b = b.path().to_str().unwrap();
+    let c = tempfile::tempdir()?;
+    git_in(c.path(), &["clone", "-q", "--no-checkout", &format!("{base}/o/r.git"), "."])?;
+    fetch_all(c.path())?;
+    let repo_c = c.path().to_str().unwrap();
+
+    // Fold ① from b: snapshot S1 lands, the inbox is pruned on the remote.
+    let gc1 = run(&[
+        "collab", "gc", "--repo", repo_b, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc1.contains("folded 2 inbox ref(s)"), "{gc1}");
+    let s1 = remote_snapshot(b.path())?;
+    assert_eq!(s1.len(), 40, "the snapshot ref is advertised: {s1}");
+    // `build_snapshot` is otherwise a pure function of (records, second).
+    // Cross a second boundary so c's stale candidate has a different oid from
+    // S1: an identical candidate would be a harmless no-op push and would not
+    // exercise the lease at all.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // ① Stale baseline: c folds without fetching — its baseline is "no
+    // snapshot" (an empty lease <expect>) while the remote holds S1. The lease must
+    // refuse this push; S1 survives.
+    let c_local_snapshot = git_in(
+        c.path(),
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/collab/meta/snapshot",
+        ],
+    )?;
+    assert!(
+        c_local_snapshot.trim().is_empty(),
+        "c must still have no local snapshot before the stale fold: {c_local_snapshot}"
+    );
+    assert_eq!(remote_snapshot(c.path())?, s1, "c sees S1 on the remote");
+    let receive_advert = reqwest::get(format!("{base}/o/r.git/info/refs?service=git-receive-pack"))
+        .await?
+        .text()
+        .await?;
+    assert!(
+        receive_advert.contains(&s1),
+        "the receive-pack advertisement must include S1 {s1}"
+    );
+    let stale = run_expect_fail(&[
+        "collab", "gc", "--repo", repo_c, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(
+        stale.to_lowercase().contains("stale") || stale.to_lowercase().contains("baseline"),
+        "the refusal names the stale fold baseline: {stale}"
+    );
+    assert_eq!(remote_snapshot(c.path())?, s1, "S1 was not overwritten");
+
+    // After fetching, c's fold converges as a prune-only fold: everything is
+    // already in S1 (the stale local copies are duplicates), the snapshot is
+    // NOT rebuilt (nothing new to record — no churn), and the deletes target
+    // only refs the remote still advertises (none — the retry prunes only the
+    // stale local copies instead of failing on already-deleted remote refs).
+    fetch_all(c.path())?;
+    let gc_retry = run(&[
+        "collab", "gc", "--repo", repo_c, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc_retry.contains("folded 2 inbox ref(s)"), "{gc_retry}");
+    assert_eq!(remote_snapshot(c.path())?, s1, "the retry did not move the snapshot");
+
+    // ② Crash-resume: a gc died between moving the snapshot and pruning the
+    // refs — the remote still advertises a ref whose entry S1 already
+    // carries. Re-create that state: fold a fresh tail entry, then plant a
+    // duplicate ref for an entry that is already folded (under a *different*
+    // inbox principal, so a re-derived copy would be distinguishable).
+    let tail = oid_of(&run(&[
+        "collab", "entry", "--repo", repo_a, "--kind", "comment", "--id", "t1", "--actor", "alice",
+        "--parent", &issue1, "--body", r#"{"text":"tail"}"#, "--key", alice_k, "--push", "origin",
+    ])?);
+    fetch_all(b.path())?;
+    let gc2 = run(&[
+        "collab", "gc", "--repo", repo_b, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc2.contains("folded 1 inbox ref(s)"), "{gc2}");
+    let s2 = remote_snapshot(b.path())?;
+    assert_ne!(s2, s1, "the tail fold moved the snapshot");
+    git_in(b.path(), &["update-ref", "refs/collab/inbox/mallory/crashed", &issue1])?;
+    git_in(b.path(), &["push", "-q", "origin", "refs/collab/inbox/mallory/crashed"])?;
+
+    // The resume fold: the duplicate is pruned, NOT re-recorded; the snapshot
+    // keeps exactly the three records and the planted copy never displaces
+    // the legitimate one (the record keeps its original principal). The
+    // snapshot itself is not rebuilt — nothing new was recorded.
+    let gc3 = run(&[
+        "collab", "gc", "--repo", repo_b, "--actor", "alice", "--key", alice_k, "--push", "origin",
+    ])?;
+    assert!(gc3.contains("folded 1 inbox ref(s)"), "{gc3}");
+    // Counted from a full ls-remote (no glob: pattern semantics must not be
+    // load-bearing in what this assertion proves).
+    let remote_inbox = |dir: &Path| -> TestResult<usize> {
+        let out = git_in(dir, &["ls-remote", "origin"])?;
+        Ok(out.lines().filter(|l| l.contains("refs/collab/inbox/")).count())
+    };
+    assert_eq!(remote_inbox(b.path())?, 0, "the crash-resumed duplicate was pruned");
+    assert_eq!(remote_inbox(c.path())?, 0, "c's stale copies never reappear remotely");
+    fetch_all(b.path())?;
+    let snap3_text = git_in(b.path(), &["cat-file", "blob", "refs/collab/meta/snapshot"])?;
+    let snap3 = walgit_wal::collab::parse_snapshot(snap3_text.as_bytes()).expect("snapshot parses");
+    assert_eq!(snap3.entries.len(), 3, "the duplicate was not re-recorded");
+    assert_eq!(snap3.actor, "alice");
+    let root = snap3
+        .entries
+        .iter()
+        .find(|r| r.oid == issue1)
+        .expect("the folded root entry survives the resume");
+    assert_eq!(root.principal, "alice", "the planted copy never displaces the legitimate record");
+    assert!(
+        snap3.entries.iter().any(|r| r.oid == tail),
+        "the tail entry's record is in the snapshot"
+    );
+    Ok(())
+}

@@ -383,14 +383,29 @@ receive-pack，manifest CAS 是唯一提交点）；任何客户端都能跑，�
    本地 `refs/collab/inbox/*` 中**可解析**的条目（不可解析的收件箱 blob 不折叠、ref
    留在原地，与读侧"跳过损坏条目"语义一致）。oid 去重。
 2. 构造并签名新快照，`git hash-object -w` 落本地。
-3. **先落快照**：`git push --atomic origin +<oid>:refs/collab/meta/snapshot`
-   （blob→blob 更新客户端需要 force；服务端仍以通告的 old 值做 CAS——并发折叠者
-   必有一方 stale-info 失败，重取重折）。快照先落地是安全性边界：此后任何被删
+3. **先落快照（CAS，基线 lease）**：`git push origin --force-with-lease=refs/collab/meta/snapshot:<基线oid> <oid>:refs/collab/meta/snapshot`
+   （blob→blob 更新无 `+` 前缀，靠 lease 表达覆盖；基线 = 第 1 步读到的快照 ref 值，
+   无快照时使用**空 `<expect>`**（`--force-with-lease=refs/collab/meta/snapshot:`）表达
+   “必须不存在”；零 OID 在 Git 2.55 不再等价。**绝不加 `+`**——它会静默短路 lease，让过期折叠静默覆盖
+   并发折叠者的新快照。服务端 announce→commit 的 CAS 窗口只有亚秒级，管不住分钟级
+   的陈旧基线；lease 把比较拉长到"基线至今未动"——并发折叠者必有一方 lease 失败，
+   重取重折）。快照先落地是安全性边界：此后任何被删
    条目都已在快照中可见。repo policy 视角（§6 / docs/POLICY.md）：这一步是
    `update` + `force-push`，第 4 步是 `delete`——受保护的仓库里 gc 主体需要
    相应的允许/绕行（D1 参考策略下即 admin）。
 4. **再删收件箱**：分批 `git push origin :refs/collab/inbox/...`（每批 ≤500 条，
    规避 ARG_MAX；非原子——收件箱 ref 从不移动，删除天然幂等，部分失败重跑即可）。
+   删除清单先对远端通告（一次全量 `git ls-remote`，客户端按
+   `refs/collab/inbox/` 前缀过滤——不用 glob pattern，剪枝不依赖 ls-remote 的
+   通配语义）过滤——只删远端仍在通告的
+   ref：并发 gc 可能已经剪掉其中一些，而 stock git 对"通告里没有的 ref"的删除
+   请求会报 `unable to delete …: remote ref does not exist`（客户端侧拒绝，退出码
+   非零）——直接把这种拒绝当错误会让"重跑收敛"的承诺失效（本地残留 ref 永远删
+   不掉）。这次通告读取不额外付费：后续每个删除 push 本就各自重取一遍通告。
+   残余的本地陈旧副本由第 5 步/本地镜像清理。
+   **纯剪枝折叠**：当本次一条新记录都没加（本地收件箱全是快照已携带的重复——
+   崩溃或竞态 gc 的未剪尾巴）时，快照**不重建**也不重推——重建只在 `ts` 字段上
+   不同，是纯 ref churn（还会多发一条 snapshot 事件）；折叠退化为只做剪枝。
 5. 以服务器为准 reconcile 本地命名空间（删本地已不在远端的收件箱 ref）。
 
 **剪枝语义与可回放性（红线交代）**。删除就是普通 receive-pack ref 删除，经 WAL
@@ -410,3 +425,17 @@ principals/rules 单例 + 未折叠尾部：info/refs 通告行数与聚合读�
 （verified = 快照签名对 actor 注册 key 的验证结果）。**获取字节换通告行数**：
 fetch 该命名空间的客户端会拉取快照 blob（≈ 折叠历史的体积），这是设计取向——
 不关心协作层的克隆不取这个命名空间。
+
+**已知边界（记录在案，非缺陷）**：
+
+- **旧读取方的双计**。不认识快照的旧版 CLI 只读 `refs/collab/inbox/*`，本不受影响；
+  但任何"读过快照又把收件箱全量并入、且不做 oid 去重"的第三方读取方，在折叠后
+  会把同一 entry 计两次（快照一份 + 尾部残留 ref 一份）。Server 与 CLI 走同一份
+  `EntrySet`（oid 去重），无此问题；旧版 CLI 的预算计数按"全部收件箱 ref"算，
+  折叠后收件箱变空，只会低估不会双计。二者都无害——快照的存在以
+  `refs/collab/meta/snapshot` 是否出现在 ref 索引为准，读取方要么整读要么整略。
+- **不可解析 blob 永久占预算**。解析失败的收件箱 blob：gc 跳过（留在原地）、读侧
+  跳过、不折叠也不剔除——每条都永久占一个 20k 预算名额。这是有意的保守（自动
+  剔除会把可修复的暂时性损坏变成永久丢失）；修复需人工
+  `git update-ref -d refs/collab/inbox/<name>`。监控口径：gc 输出里的
+  `{left} unparseable` 计数。
