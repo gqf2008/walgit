@@ -54,6 +54,11 @@ pushed as ordinary refs, so a local write becomes visible with one `--push`.
     a new signed entry whose parent chain anyone can replay and verify.
 - Automate: `walgit collab watch --exec <cmd>` — resident loop: fetch
   `refs/collab/*`, invoke `cmd` with each new/changed entry's JSON on stdin.
+- Housekeeping (D45): `walgit collab gc --actor <principal> --key <key>
+  --push <remote>` folds the append-only inbox into the signed snapshot at
+  `refs/collab/meta/snapshot` and prunes the folded refs — every aggregation
+  (snapshot ∪ tail) is byte-identical across a fold, so run it whenever the
+  inbox grows large; it is idempotent and safe to re-run.
 
 ### Decentralized CI (`walgit ci …`)
 
