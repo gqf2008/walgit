@@ -138,6 +138,10 @@ artifacts = ["target/dist/app.tar.gz"]     # 可选：任务结束后收集的�
   首次见到某 (ref, task) 的 schedule 以**当前时刻为基线**（first sight = now）——给旧 ref
   新加 schedule 不会把历史槽位全部补跑。槽位运行到达终态才把簿记推进到该槽位；未到终态
   （让位）则下个 pass 重估同一槽位——与 §4 的 processed 规则同构。
+- **静默 pass 不读 ref 对象**：处理某个 tip 时把已验证的 `"schedules"`（键仍为
+  `<ref>\u{1f}<task>`）写入状态文件；后续 quiet pass 只遍历这个 map，未到期的 ref 不执行
+  `cat-file`/`ls-tree`，cron 检查不随全仓 ref 数产生子进程风暴。真正到槽位时才读取该 tip
+  的 `ci.toml` 并执行。
 - **`--once` 即 cron 友好形态**：一次 pass = ref 触发 + 定时扫描；外部调度器（systemd
   timer、crontab、平台 cron）以 `walgit ci run --once` 周期唤起即可，常驻 runner 则在
   每个轮询间隔顺带完成扫描。
@@ -333,7 +337,8 @@ done    : effective 存在                               → Settled(conclusion)
   "exit_code": 0,
   "duration_ms": 1234,
   "log_summary": "…输出末尾 ≤ 4096 字节…",
-  "log_sha256": "<完整捕获输出的 sha256 hex；无输出为空串>",
+  "log_sha256": "<所存日志字节的 sha256 hex；无输出为空串>",
+  "log_truncated": false,
   "artifacts": [
     { "name": "coverage", "path": "target/coverage", "sha256": "<hex>", "bytes": 12345,
       "url": "https://…" }
@@ -345,22 +350,29 @@ done    : effective 存在                               → Settled(conclusion)
   取得时为 `null`。
 - **日志摘要**：`log_summary` 是完整捕获输出（stdout+stderr 合并）的**末尾** ≤ 4096 字节
   （写入侧截断，UTF-8 字符边界对齐）。
-- **日志与产物存放约定（issue #161 已实现）**：完整日志与声明的产物都是**普通 git blob**，
+- **日志保留**：写入侧最多在内存保留合并输出的末尾 16 MiB（与单对象上限一致）。未超限时
+  这就是完整日志；超限时 `log_truncated=true`，`log_sha256` 是该保留尾部字节的哈希，读取方
+  必须显式提示日志已截断，不能把它冒充完整捕获。
+- **日志与产物存放约定（issue #161 已实现）**：所存日志与声明的产物都是**普通 git blob**，
   与协作条目同一条 receive-pack 通道入仓，ref 形如
   `refs/collab/ci-artifacts/<actor>/<sha256>`——按内容寻址，一个 runner 一次 run 推一批
-  （同一 sha256 去重）。单个对象 ≤ 16 MiB（`CI_ARTIFACT_MAX_BYTES`，超出则该产物跳过、
-  结果照常发布）；每个结果 ≤ 32 个 artifact（`CI_ARTIFACTS_PER_RESULT_MAX`）。读取方
+  （同一 sha256 去重）。单个对象 ≤ 16 MiB（`CI_ARTIFACT_MAX_BYTES`）；runner 超限时跳过该
+  产物、结果照常发布，读取端也**先查 object header size、后读 body**，避免为拒绝超限对象而
+  下载/分配完整内存。每个结果 ≤ 32 个 artifact（`CI_ARTIFACTS_PER_RESULT_MAX`）。读取方
   **必须**在交付字节前按 sha256 校验内容——内容寻址的意义就在于名为 X 的 ref 里不是 X
   的内容视为不存在（hostile/corrupt）。
   - runner：任务结束（非 `error` 结论）后、发布结果前上传；上传失败降级为只发引用。
     日志 blob 只在捕获非空时上传，空捕获的 `log_sha256` 为 sha256(空串) 且不推 ref。
   - 拉取：**按需**，绝不在每个 watcher 的 `git fetch refs/collab/*` 里带上 16 MiB blob——
     常规 collab fetch 收窄到 `inbox/* + meta/*`，产物命名空间单独 fetch。
-  - CLI：`walgit ci log [--repo .] [--remote origin] [run]` 打印完整捕获（取不到 blob 时
-    退回 `log_summary`）；`walgit ci artifacts [--out <dir>] [run]` 逐个 sha256 校验落盘，
-    `name` 只取基名（永不写出 `--out` 之外）。
+  - CLI：`walgit ci log [--repo .] [--remote origin] [run]` 打印所存日志（`log_truncated=true`
+    时明确告警；取不到 blob 时退回 `log_summary`）；`walgit ci artifacts [--out <dir>] [run]`
+    逐个 sha256 校验并以 `create_new` 落盘（拒绝覆盖、拒绝跟随已有 symlink），重复 basename
+    跳过；`name` 只取基名（永不写出 `--out` 之外）。
   - HTTP：`GET /{o}/{r}/api/collab/ci-artifacts/<sha256>` → `application/octet-stream` +
-    immutable/ETag，服务端先验哈希再发字节；SDK `repo.ci.artifact(sha256)` → ArrayBuffer。
+    immutable/ETag；地址必须是 64 位小写 hex，服务端先查 size、再读取并验哈希后发字节。
+    同地址可能有恶意遮蔽 ref，服务端只在 `ci-artifacts` 前缀范围内遍历候选直到找到哈希正确的
+    对象。SDK `repo.ci.artifact(sha256)` → ArrayBuffer。
   - `url` 字段保留给 runner 自行放外部对象存储的产物（任何取用方自行验哈希；walgit
     不解释 url）；桶内通道是默认约定，外部 url 是显式 opt-out。
 - `artifacts` 数组项 shape-check：`name` 非空 ≤ 128 字节、`path` 任务工作区内相对路径

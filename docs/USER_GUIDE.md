@@ -219,7 +219,7 @@ walgit ci run --repo <checkout> --remote origin --actor ci-runner --key <keyfile
 walgit ci run --repo <checkout> --remote origin --actor ci-runner --key <keyfile> \
   --listen 127.0.0.1:8099          # 常驻模式：events webhook 可立即唤醒一次 pass
 walgit ci status --repo <checkout>
-walgit ci log --repo <checkout> [<run-id>]              # 打印该 run 的完整捕获日志
+walgit ci log --repo <checkout> [<run-id>]              # 打印该 run 所存日志（超限时告警）
 walgit ci artifacts --repo <checkout> [<run-id>] --out out/  # 逐个 sha256 校验下载产物
 ```
 - runner 认领任务、执行、把结果签成 `ci_result` 条目回传；
@@ -232,7 +232,8 @@ walgit ci artifacts --repo <checkout> [<run-id>] --out out/  # 逐个 sha256 校
   留在 runner 进程，不进入仓库；唤醒只是提示，真正触发仍以 `ls-remote` 的 tip diff 为准。
 - 日志与产物存放在仓库自身的 git 对象里（`refs/collab/ci-artifacts/<actor>/<sha256>`，
   按内容寻址）：普通 clone/fetch 不会带上它们，`ci log`/`ci artifacts` 按需拉取并
-  先验哈希再交付；浏览器/SDK 走 `GET /{o}/{r}/api/collab/ci-artifacts/<sha256>`
+  先验哈希再交付；日志超过 16 MiB 时只保留末尾并置 `log_truncated`。浏览器/SDK 走
+  `GET /{o}/{r}/api/collab/ci-artifacts/<sha256>`
   （`repo.ci.artifact(sha256)`）。
 
 ---

@@ -157,6 +157,9 @@ pub struct CiResult {
     pub duration_ms: Option<u64>,
     pub log_summary: String,
     pub log_sha256: String,
+    /// True when the published log blob is the retained tail of output larger
+    /// than `CI_ARTIFACT_MAX_BYTES`; the hash covers the retained bytes only.
+    pub log_truncated: bool,
     /// §8.2: declared output files (bytes in the repo's object store under
     /// `CI_ARTIFACT_REF_PREFIX`, or at an external `url` the writer set).
     pub artifacts: Vec<CiArtifact>,
@@ -297,6 +300,10 @@ pub fn parse_result(r: &EntryRef) -> Option<CiResult> {
         duration_ms: body.get("duration_ms").and_then(serde_json::Value::as_u64),
         log_summary: body_str(body, "log_summary").unwrap_or_default(),
         log_sha256: body_str(body, "log_sha256").unwrap_or_default(),
+        log_truncated: body
+            .get("log_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         artifacts: parse_artifacts(body)?,
     })
 }
@@ -813,6 +820,19 @@ mod tests {
         let parsed = parse_result(&res).expect("parses");
         assert_eq!(parsed.conclusion, Conclusion::Success);
         assert_eq!(parsed.exit_code, Some(0));
+        assert!(!parsed.log_truncated);
+        let mut truncated = result_body("test", "refs/heads/main", "abc", 1, "c1", "success");
+        truncated["log_truncated"] = serde_json::json!(true);
+        let e = signed_entry(
+            &sk,
+            "r",
+            CI_RESULT_KIND,
+            "ci-1",
+            "x-truncated",
+            NOW,
+            truncated,
+        );
+        assert!(parse_result(&e).expect("parses").log_truncated);
         let bad = signed_entry(
             &sk,
             "r",

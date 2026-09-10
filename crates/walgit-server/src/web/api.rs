@@ -1354,6 +1354,27 @@ async fn git_cat_file_batch(
     Ok(out)
 }
 
+/// Git object size without reading its body. Remote objects are probed through
+/// the store; local objects use `git cat-file -s`. Both paths let callers
+/// enforce a byte cap before any materialization.
+async fn object_size(r: &Repo, oid: &str) -> Result<Option<u64>, ApiError> {
+    if let Some(remote) = r.remote() {
+        let oid = gix_hash::ObjectId::from_hex(oid.as_bytes())
+            .map_err(|_| internal(format!("invalid object id {oid:?}")))?;
+        return Ok(remote.kind_and_size(&oid).await?.map(|(_, size)| size));
+    }
+    let out = r.local.git(&["cat-file", "-s", oid]).await.map_err(internal)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let size = std::str::from_utf8(&out.stdout)
+        .map_err(|e| internal(format!("cat-file -s {oid}: {e}")))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| internal(format!("cat-file -s {oid}: {e}")))?;
+    Ok(Some(size))
+}
+
 /// Materialize a JSON blob as a one-object bucket pack and publish one ref
 /// through the WAL (D1 §11 thin API). Shared by inbox entries and principal
 /// registration; returns `(oid, seq)`.
@@ -1528,12 +1549,12 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
             "collab namespace has more than {COLLAB_MAX_ENTRIES} unfolded refs; fold the inbox with `walgit collab gc` (D1 §11.4) or aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
         )));
     }
-    // D45 size precheck: refuse an oversized snapshot from one header read
-    // before faulting — never download 64 MiB just to reject it.
-    if let (Some(remote), Some(oid)) = (r.remote(), snapshot_oid.as_ref())
-        && let Ok(hex) = gix_hash::ObjectId::from_hex(oid.as_bytes())
-        && let Some((_, size)) = remote.kind_and_size(&hex).await?
-        && usize::try_from(size).map_or(true, |size| size > COLLAB_SNAPSHOT_MAX_BYTES)
+    // D45 size precheck: refuse an oversized snapshot before materializing its
+    // body, on both remote and local/mounted object paths.
+    if let Some(oid) = snapshot_oid.as_ref()
+        && object_size(r, oid).await?.is_some_and(|size| {
+            size > u64::try_from(COLLAB_SNAPSHOT_MAX_BYTES).unwrap_or(u64::MAX)
+        })
     {
         return Err(ApiError::ServiceUnavailable(format!(
             "collab snapshot exceeds {} MiB; aggregate offline with the `walgit collab` CLI",
@@ -1592,7 +1613,7 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
         let snap = walgit_wal::collab::parse_snapshot(bytes)
             .map_err(|e| internal(format!("{}: {e}", walgit_wal::collab::SNAPSHOT_REF)))?;
         for rec in &snap.entries {
-            if let Some(er) = rec.entry_ref() {
+            if let Some(er) = rec.entry_ref(r.local.object_format()) {
                 set.insert(er);
             }
         }
@@ -1753,9 +1774,13 @@ async fn collab_ci_artifact(
     headers: HeaderMap,
     Path((owner, repo_name, sha256)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(ApiError::BadRequest(
-            "ci-artifacts key must be a 64-char hex sha256".into(),
+            "ci-artifacts key must be a 64-char lowercase hex sha256".into(),
         ));
     }
     run(
@@ -1767,43 +1792,59 @@ async fn collab_ci_artifact(
         None,
         move |r| async move {
             let suffix = format!("/{sha256}");
-            let mut oid: Option<String> = None;
-            for (name, o) in &r.index.all {
-                if name.starts_with(walgit_wal::ci::CI_ARTIFACT_REF_PREFIX)
-                    && name.ends_with(&suffix)
-                {
-                    oid = Some(o.clone());
-                    break;
+            let prefix = walgit_wal::ci::CI_ARTIFACT_REF_PREFIX;
+            let start = r
+                .index
+                .all
+                .partition_point(|(name, _)| name.as_str() < prefix);
+            let candidates = r
+                .index
+                .all
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|(name, _)| name.starts_with(prefix))
+                .filter(|(name, _)| name.ends_with(&suffix));
+            let mut saw_oversize = false;
+            for (_, oid) in candidates {
+                let Some(size) = object_size(&r, oid).await? else {
+                    continue;
+                };
+                if size > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+                    saw_oversize = true;
+                    continue;
                 }
-            }
-            let oid = oid.ok_or_else(|| not_found("ci artifact"))?;
-            if let Some(remote) = r.remote() {
-                let gix = gix_hash::ObjectId::from_hex(oid.as_bytes())
-                    .map_err(|_| not_found("ci artifact"))?;
-                remote.fault_many(std::slice::from_ref(&gix)).await?;
-                // The batched cat-file below must see the faulted object.
-                r.local
-                    .refresh_async()
-                    .await
-                    .map_err(|e| ApiError::Internal(e.to_string()))?;
-            }
-            let blobs = git_cat_file_batch(&r.local, std::slice::from_ref(&oid)).await?;
-            let bytes = blobs.get(&oid).ok_or_else(|| not_found("ci artifact"))?;
-            if bytes.len() as u64 > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
-                return Err(ApiError::PayloadTooLarge);
-            }
-            let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
-            if hex::encode(digest) != sha256 {
+                if let Some(remote) = r.remote() {
+                    let gix = gix_hash::ObjectId::from_hex(oid.as_bytes())
+                        .map_err(|_| not_found("ci artifact"))?;
+                    remote.fault_many(std::slice::from_ref(&gix)).await?;
+                    // The batched cat-file below must see the faulted object.
+                    r.local
+                        .refresh_async()
+                        .await
+                        .map_err(|e| ApiError::Internal(e.to_string()))?;
+                }
+                let blobs = git_cat_file_batch(&r.local, std::slice::from_ref(oid)).await?;
+                let Some(bytes) = blobs.get(oid) else {
+                    continue;
+                };
+                let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
+                if hex::encode(digest) == sha256 {
+                    return Ok(Rendered {
+                        body: bytes::Bytes::from(bytes.clone()),
+                        content_type: "application/octet-stream",
+                        cache_control: IMMUTABLE,
+                        etag: Some(etag_for(&sha256)),
+                    });
+                }
                 // A ref whose payload does not hash to its address is hostile
-                // or corrupt — the content it names does not exist.
-                return Err(not_found("ci artifact (content mismatch)"));
+                // or corrupt; try the next candidate for the same address.
             }
-            Ok(Rendered {
-                body: bytes::Bytes::from(bytes.clone()),
-                content_type: "application/octet-stream",
-                cache_control: IMMUTABLE,
-                etag: Some(etag_for(&sha256)),
-            })
+            if saw_oversize {
+                Err(ApiError::PayloadTooLarge)
+            } else {
+                Err(not_found("ci artifact"))
+            }
         },
     )
     .await

@@ -856,11 +856,13 @@ the runner (the CLI side is `walgit ci log` / `walgit ci artifacts`; the SDK
 side is `repo.ci.artifact(sha256)`). `200` → the exact bytes as
 `application/octet-stream`, `Cache-Control: immutable` + ETag = the quoted
 sha256 (content-addressed: the bytes behind an address never change). The
-server verifies the payload against the address before serving — a ref whose
-blob does not hash to its name answers `404`, as does an unknown address; a
-malformed address (not 64 lowercase hex) is `400`; a blob over the 16 MiB
-convention cap is `413`. Refs-level scan + one batched fault, same shape as
-the collab entry readers.
+server verifies the payload against the address before serving. Candidates are
+restricted to the `ci-artifacts` ref prefix and size-probed before any body
+read, so an earlier same-sha ref cannot shadow the valid publisher and an
+oversized object is refused without materialization. A ref whose blob does not
+hash to its name answers `404`, as does an unknown address; a malformed address
+(not 64 lowercase hex) is `400`; a blob over the 16 MiB convention cap is
+`413`.
 
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
