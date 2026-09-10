@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
+use walgit_git::ObjectFormat;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use walgit_wal::collab::{
@@ -714,7 +715,7 @@ fn git_push_refspecs(
     remote: &str,
     refspecs: &[String],
     atomic: bool,
-    lease: Option<&str>,
+    leases: &[String],
 ) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["-C"]).arg(repo).arg("push");
@@ -723,7 +724,7 @@ fn git_push_refspecs(
     }
     // A `+` refspec prefix would silently short-circuit the lease — a forced
     // update is expressed by the lease (or not at all), never by `+`.
-    if let Some(lease) = lease {
+    for lease in leases {
         cmd.arg(format!("--force-with-lease={lease}"));
     }
     cmd.arg(remote).args(refspecs);
@@ -747,7 +748,7 @@ fn git_push_refspecs(
 /// and filtered here rather than a `refs/collab/inbox/*` pattern: one round
 /// trip either way (every push below re-fetches the same advertisement), and
 /// the pruning must not depend on ls-remote's glob semantics.
-fn git_ls_remote_inbox(repo: &Path, remote: &str) -> Result<std::collections::HashSet<String>> {
+fn git_ls_remote_inbox(repo: &Path, remote: &str) -> Result<HashMap<String, String>> {
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -763,8 +764,8 @@ fn git_ls_remote_inbox(repo: &Path, remote: &str) -> Result<std::collections::Ha
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_once('\t'))
-        .map(|(_, name)| name.trim().to_string())
-        .filter(|name| name.starts_with("refs/collab/inbox/"))
+        .map(|(oid, name)| (name.trim().to_string(), oid.to_string()))
+        .filter(|(name, _)| name.starts_with("refs/collab/inbox/"))
         .collect())
 }
 
@@ -786,11 +787,12 @@ fn keep_fold_record(
     seen: &mut HashMap<String, usize>,
     record: SnapshotRecord,
     entry_actor: &str,
+    format: ObjectFormat,
 ) -> bool {
     if let Some(&index) = seen.get(&record.oid) {
         let current = records.get(index);
         let replace = current.is_some_and(|cur| {
-            cur.entry_ref().is_none()
+            cur.entry_ref(format).is_none()
                 || (cur.principal != entry_actor && record.principal == entry_actor)
         });
         if replace && let Some(slot) = records.get_mut(index) {
@@ -824,6 +826,7 @@ fn keep_fold_record(
 fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Result<()> {
     ref_segment("gc.actor", actor)?;
     let reader = CollabReader::new(repo);
+    let format = reader.object_format()?;
     // The snapshot's own signature is only verifiable against a *registered*
     // key (§4.2) — folding as an unregistered principal would strand every
     // reader with an unverifiable snapshot.
@@ -889,6 +892,7 @@ fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Resu
             &mut seen,
             SnapshotRecord { oid, principal, json },
             &entry.actor,
+            format,
         );
         folded.push(name);
     }
@@ -918,31 +922,43 @@ fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Resu
             // Snapshot first (a CAS from the baseline this gc actually read),
             // then the deletes. A concurrent fold that moved the snapshot in
             // the meantime fails the lease — fetch and retry, never overwrite.
-            if let Some(oid) = &snap_oid {
-                let lease = format!(
-                    "{SNAPSHOT_REF}:{}",
-                    baseline.as_deref().unwrap_or_default()
-                );
-                git_push_refspecs(
-                    repo,
-                    remote,
-                    &[format!("{oid}:{SNAPSHOT_REF}")],
-                    false,
-                    Some(&lease),
-                )
-                .context(
-                    "push the snapshot (the fold baseline moved — a concurrent gc? fetch and retry)",
-                )?;
-            }
+            // A prune-only fold still pushes the baseline snapshot so the
+            // target is proven to hold the history before any inbox deletion;
+            // when it already does this is a harmless no-op.
+            let snapshot_to_push = snap_oid.as_deref().or(baseline.as_deref());
+            let snapshot_to_push = snapshot_to_push.context(
+                "cannot prune a remote without a snapshot: fetch the remote and retry",
+            )?;
+            let lease = format!(
+                "{SNAPSHOT_REF}:{}",
+                baseline.as_deref().unwrap_or_default()
+            );
+            git_push_refspecs(
+                repo,
+                remote,
+                &[format!("{snapshot_to_push}:{SNAPSHOT_REF}")],
+                false,
+                std::slice::from_ref(&lease),
+            )
+            .context(
+                "push the snapshot (the fold baseline moved — a concurrent gc? fetch and retry)",
+            )?;
             // Prune only refs the remote still advertises: a concurrent gc
             // may have pruned some already, and stock git refuses a delete
             // whose ref is not advertised — that refusal is convergence, not
             // an error. Stale local copies are cleaned below either way.
             let live = git_ls_remote_inbox(repo, remote)?;
-            let to_delete: Vec<&String> = folded.iter().filter(|n| live.contains(*n)).collect();
+            let to_delete: Vec<(&String, &String)> = folded
+                .iter()
+                .filter_map(|name| live.get(name).map(|oid| (name, oid)))
+                .collect();
             for chunk in to_delete.chunks(GC_DELETE_CHUNK) {
-                let specs: Vec<String> = chunk.iter().map(|n| format!(":{n}")).collect();
-                git_push_refspecs(repo, remote, &specs, false, None).context(
+                let specs: Vec<String> = chunk.iter().map(|(name, _)| format!(":{name}")).collect();
+                let leases: Vec<String> = chunk
+                    .iter()
+                    .map(|(name, oid)| format!("{name}:{oid}"))
+                    .collect();
+                git_push_refspecs(repo, remote, &specs, false, &leases).context(
                     "delete folded inbox refs; re-run `walgit collab gc` to converge (idempotent)",
                 )?;
             }
@@ -1605,6 +1621,17 @@ impl CollabReader {
             .collect())
     }
 
+    /// The repository's object format; snapshot records carry either 40- or
+    /// 64-hex oids and must be validated in the same hash domain.
+    fn object_format(&self) -> Result<ObjectFormat> {
+        let out = self.git(&["rev-parse", "--show-object-format"])?;
+        match String::from_utf8_lossy(&out).trim() {
+            "sha1" => Ok(ObjectFormat::Sha1),
+            "sha256" => Ok(ObjectFormat::Sha256),
+            other => bail!("unsupported git object format {other:?}"),
+        }
+    }
+
     /// `refs/collab/meta/principals/<principal>` (repo-local) and
     /// `refs/walgit/principals/<principal>` (host registry cached by
     /// `collab principal-fetch`, issue #76) → principal → public key b64.
@@ -1660,11 +1687,12 @@ impl CollabReader {
     /// principals registry.
     pub fn load(&self) -> Result<(Vec<EntryRef>, HashMap<String, String>)> {
         let principals = self.principals()?;
+        let format = self.object_format()?;
         let mut set = EntrySet::new();
         if let Some((_, bytes)) = self.snapshot_blob()? {
             let snap = parse_snapshot(&bytes).map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?;
             for rec in &snap.entries {
-                if let Some(er) = rec.entry_ref() {
+                if let Some(er) = rec.entry_ref(format) {
                     set.insert(er);
                 }
             }
@@ -1677,9 +1705,15 @@ impl CollabReader {
             else {
                 continue;
             };
-            let blob = self.git(&["cat-file", "blob", &oid])?;
-            let entry: Entry = serde_json::from_slice(&blob)
-                .with_context(|| format!("parse entry at {name} ({oid})"))?;
+            // Match the server aggregation: one corrupt inbox entry must
+            // not take the whole report down. Its ref stays in place for gc
+            // to report and skip.
+            let Ok(blob) = self.git(&["cat-file", "blob", &oid]) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<Entry>(&blob) else {
+                continue;
+            };
             set.insert(EntryRef {
                 oid,
                 principal,
@@ -1771,7 +1805,7 @@ mod tests {
     fn fold_records_prefer_the_actor_owned_inbox_copy() {
         let e = entry("t", "issue", "alice", "", "unused", 1, serde_json::json!({}));
         let json = serde_json::to_string(&e.entry).unwrap();
-        let oid = walgit_wal::collab::git_blob_oid(json.as_bytes());
+        let oid = walgit_wal::collab::git_blob_oid(json.as_bytes(), ObjectFormat::Sha1);
         let planted = SnapshotRecord {
             oid: oid.clone(),
             principal: "mallory".to_string(),
@@ -1789,13 +1823,15 @@ mod tests {
             &mut records,
             &mut seen,
             planted.clone(),
-            "alice"
+            "alice",
+            ObjectFormat::Sha1,
         ));
         assert!(keep_fold_record(
             &mut records,
             &mut seen,
             legitimate,
-            "alice"
+            "alice",
+            ObjectFormat::Sha1,
         ));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].principal, "alice");
@@ -1803,7 +1839,8 @@ mod tests {
             &mut records,
             &mut seen,
             planted,
-            "alice"
+            "alice",
+            ObjectFormat::Sha1,
         ));
         assert_eq!(records[0].principal, "alice", "a later planted copy cannot displace it");
     }
@@ -2272,6 +2309,163 @@ mod gc_tests {
             .unwrap();
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout).lines().count()
+    }
+
+    #[test]
+    fn push_prune_only_never_deletes_without_a_snapshot_on_the_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let repo = tmp.path().join("r");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+
+        let (alice_key, alice_pk, alice_sk) = keypair_file(tmp.path(), 7);
+        register(&repo, "alice", &alice_pk);
+        let mut issue = mk_entry("issue", "t1", "alice", "", 1, serde_json::json!({"title": "x"}));
+        issue.sig = sign_entry(&mut issue, &alice_sk);
+        let oid = push_entry(&repo, &issue);
+        let inbox = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["for-each-ref", "--format=%(refname)", "refs/collab/inbox"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        git_push(&repo, "origin", &inbox).unwrap();
+
+        // Local-only fold first: snapshot exists locally, but the remote has
+        // only the inbox and no snapshot.
+        run_gc(&repo, "alice", &alice_key, None).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["fetch", "-q", "origin", "+refs/collab/inbox/*:refs/collab/inbox/*"])
+            .status()
+            .unwrap();
+
+        let pushed = run_gc(&repo, "alice", &alice_key, Some("origin"));
+        let remote_snapshot = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["ls-remote", "origin", SNAPSHOT_REF])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        if pushed.is_ok() {
+            assert!(!remote_snapshot.is_empty(), "a successful prune must publish a snapshot first");
+            let snap_oid = remote_snapshot.split_whitespace().next().unwrap();
+            let snap = std::process::Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["cat-file", "blob", snap_oid])
+                .output()
+                .unwrap();
+            let snap = parse_snapshot(&snap.stdout).unwrap();
+            assert!(snap.entries.iter().any(|record| record.oid == oid));
+        } else {
+            assert_eq!(inbox_ref_count(&repo), 1, "a failed prune leaves the remote inbox intact");
+        }
+    }
+
+    #[test]
+    fn inbox_delete_uses_the_oid_seen_by_ls_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let repo = tmp.path().join("r");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+
+        let name = "refs/collab/inbox/alice/item";
+        let first = git_write_blob(&repo, "first").unwrap();
+        let second = git_write_blob(&repo, "second").unwrap();
+        git_update_ref(&repo, name, Some(&first)).unwrap();
+        git_push(&repo, "origin", name).unwrap();
+        let live = git_ls_remote_inbox(&repo, "origin").unwrap();
+        assert_eq!(live.get(name), Some(&first));
+
+        git_update_ref(&repo, name, Some(&second)).unwrap();
+        let forced = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["push", "-q", "-f", "origin", name])
+            .status()
+            .unwrap();
+        assert!(forced.success());
+
+        let specs = vec![format!(":{name}")];
+        let leases = vec![format!("{name}:{first}")];
+        assert!(
+            git_push_refspecs(&repo, "origin", &specs, false, &leases).is_err(),
+            "a moved inbox ref must fail the delete lease"
+        );
+        let after = git_ls_remote_inbox(&repo, "origin").unwrap();
+        assert_eq!(after.get(name), Some(&second), "the moved entry survives");
+    }
+
+    #[test]
+    fn load_skips_unparseable_inbox_blobs_like_the_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r");
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+
+        let entry = mk_entry("issue", "t1", "alice", "", 1, serde_json::json!({"title": "ok"}));
+        push_entry(&repo, &entry);
+        let garbage = git_write_blob(&repo, "not an entry").unwrap();
+        git_update_ref(&repo, "refs/collab/inbox/alice/garbage0", Some(&garbage)).unwrap();
+
+        let (entries, principals) = CollabReader::new(&repo).load().unwrap();
+        assert_eq!(entries.len(), 1, "the valid entry survives");
+        assert_eq!(entries[0].entry.id, "t1");
+        assert!(principals.is_empty());
     }
 
     #[test]

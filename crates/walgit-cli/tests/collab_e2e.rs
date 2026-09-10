@@ -757,7 +757,10 @@ async fn gc_fold_keeps_aggregation_byte_identical_and_the_tail_stays_live() -> T
     let parsed: Vec<_> = snap
         .entries
         .iter()
-        .map(|r| r.entry_ref().expect("every record pins its bytes to its oid"))
+        .map(|r| {
+            r.entry_ref(walgit_git::ObjectFormat::Sha1)
+                .expect("every record pins its bytes to its oid")
+        })
         .collect();
     let verified_count = parsed.iter().filter(|e| e.is_verified(&principals_c)).count();
     assert_eq!(verified_count, 9, "9 verified, carol + wrong-key unverified");
@@ -1023,6 +1026,94 @@ async fn a_stale_fold_baseline_loses_the_lease_and_the_crash_resume_prunes_dedup
     assert!(
         snap3.entries.iter().any(|r| r.oid == tail),
         "the tail entry's record is in the snapshot"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sha256_repo_fold_preserves_the_thread() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let created = reqwest::Client::new()
+        .put(format!("{base}/o/sha?object_format=sha256"))
+        .send()
+        .await?;
+    assert!(
+        created.status().is_success() || created.status() == reqwest::StatusCode::CONFLICT,
+        "create sha256 repo: {}",
+        created.status()
+    );
+
+    let bin = env!("CARGO_BIN_EXE_walgit");
+    let keydir = tempfile::tempdir()?;
+    let key = keydir.path().join("alice");
+    std::fs::write(&key, "07".repeat(32))?;
+    let key = key.to_str().unwrap();
+    let run = |args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg("/dev/null")
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "walgit {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let git_in = |dir: &Path, args: &[&str]| -> TestResult<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let repo_dir = tempfile::tempdir()?;
+    git_in(repo_dir.path(), &["init", "-q", "--object-format=sha256", "-b", "main"])?;
+    git_in(repo_dir.path(), &["config", "user.email", "t@t"])?;
+    git_in(repo_dir.path(), &["config", "user.name", "T"])?;
+    git_in(
+        repo_dir.path(),
+        &["remote", "add", "origin", &format!("{base}/o/sha.git")],
+    )?;
+    git_in(repo_dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"])?;
+    git_in(repo_dir.path(), &["push", "-q", "origin", "main"])?;
+    let repo = repo_dir.path().to_str().unwrap();
+    run(&[
+        "collab", "principal-register", "--repo", repo, "--principal", "alice", "--key", key,
+        "--push", "origin",
+    ])?;
+    run(&[
+        "collab", "entry", "--repo", repo, "--kind", "issue", "--id", "sha", "--actor", "alice",
+        "--body", r#"{"title":"sha256 survives"}"#, "--key", key, "--push", "origin",
+    ])?;
+
+    let gc = run(&[
+        "collab", "gc", "--repo", repo, "--actor", "alice", "--key", key, "--push", "origin",
+    ])?;
+    assert!(gc.contains("folded 1 inbox ref(s)"), "{gc}");
+    let thread = run(&["collab", "thread", "sha", "--repo", repo])?;
+    assert!(thread.contains("sha256 survives"), "{thread}");
+
+    let snapshot = git_in(
+        repo_dir.path(),
+        &["cat-file", "blob", "refs/collab/meta/snapshot"],
+    )?;
+    let snapshot = walgit_wal::collab::parse_snapshot(snapshot.as_bytes()).expect("snapshot parses");
+    assert_eq!(snapshot.entries.len(), 1);
+    assert!(
+        snapshot.entries[0]
+            .entry_ref(walgit_git::ObjectFormat::Sha256)
+            .is_some(),
+        "sha256 snapshot record must validate in its own object format"
     );
     Ok(())
 }

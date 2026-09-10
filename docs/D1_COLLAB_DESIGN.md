@@ -368,10 +368,11 @@
 现有收件箱尾，**按 oid 去重**（同 oid 即同内容，内容寻址保证无歧义）。聚合是条目
 集合的纯函数（既有测试锁死了"读序无关、字节一致"），所以折叠前后输入集合不变 ⇒
 聚合输出逐字节不变——这是本设计的验收等式。两端共用 `walgit-wal::collab` 的快照
-解析：server `collab_load` 多 fault 一个 blob、多读一个 cat-file 对象（不加 round
-trip）；CLI `CollabReader::load` 同理，`walgit ci` 经同一 loader 自动受益。server 侧
-快照 blob 上限 64 MiB（超限 503，指向 CLI/gc）——预算从"ref 条数"变成"尾部 ref
-条数 + 一个有界 blob"，20k 墙只数未折叠尾部。
+解析，并按仓库 object format（sha1/sha256）重算 record oid：server `collab_load`
+先以 object header 查快照 size、再 fault/读一个 blob；CLI `CollabReader::load` 同理，
+`walgit ci` 经同一 loader 自动受益。server 侧快照 blob 上限 64 MiB（remote 与
+local/mounted 路径都在 body 物化前拒绝，超限 503 指向 CLI/gc）——预算从"ref 条数"
+变成"尾部 ref 条数 + 一个有界 blob"，20k 墙只数未折叠尾部。
 
 **折叠单元（写侧）**：`walgit collab gc --actor <principal> --key <key> [--push <remote>]`，
 CLI 形态而非 maintainer 单元——理由：折叠者必须有 collab principal 与签名密钥
@@ -379,7 +380,8 @@ CLI 形态而非 maintainer 单元——理由：折叠者必须有 collab princ
 receive-pack，manifest CAS 是唯一提交点）；任何客户端都能跑，自动化 = cron/agent
 调 CLI（同 `walgit mirror` 的形态）。步骤：
 
-1. 读现有快照记录（**逐字携带**，不重序列化——oid 是对原始字节的内容寻址）∪ 当前
+1. 读现有快照记录（**逐字携带**，不重序列化——oid 是对原始字节的内容寻址，按仓库
+   object format 校验）∪ 当前
    本地 `refs/collab/inbox/*` 中**可解析**的条目（不可解析的收件箱 blob 不折叠、ref
    留在原地，与读侧"跳过损坏条目"语义一致）。oid 去重。
 2. 构造并签名新快照，`git hash-object -w` 落本地。
@@ -401,11 +403,15 @@ receive-pack，manifest CAS 是唯一提交点）；任何客户端都能跑，�
    ref：并发 gc 可能已经剪掉其中一些，而 stock git 对"通告里没有的 ref"的删除
    请求会报 `unable to delete …: remote ref does not exist`（客户端侧拒绝，退出码
    非零）——直接把这种拒绝当错误会让"重跑收敛"的承诺失效（本地残留 ref 永远删
-   不掉）。这次通告读取不额外付费：后续每个删除 push 本就各自重取一遍通告。
+   不掉）。删除时为每个 ref 携带刚读到的 OID lease，避免通告与删除之间同名 ref
+   被 force-update 后误删新条目。这次通告读取不额外付费：后续每个删除 push 本就
+   各自重取一遍通告。
    残余的本地陈旧副本由第 5 步/本地镜像清理。
    **纯剪枝折叠**：当本次一条新记录都没加（本地收件箱全是快照已携带的重复——
-   崩溃或竞态 gc 的未剪尾巴）时，快照**不重建**也不重推——重建只在 `ts` 字段上
-   不同，是纯 ref churn（还会多发一条 snapshot 事件）；折叠退化为只做剪枝。
+   崩溃或竞态 gc 的未剪尾巴）时，快照**不重建**，但仍以同一 baseline OID 做一次
+   CAS：远端已持有同一快照时是 no-op；远端缺失时先把本地基线快照建立到目标，
+   远端漂移时 lease 失败，任何情况下都不会先删后补。重建只在 `ts` 字段上不同，
+   是纯 ref churn（还会多发一条 snapshot 事件）；折叠退化为“验证/补齐快照 + 剪枝”。
 5. 以服务器为准 reconcile 本地命名空间（删本地已不在远端的收件箱 ref）。
 
 **剪枝语义与可回放性（红线交代）**。删除就是普通 receive-pack ref 删除，经 WAL
