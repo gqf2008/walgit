@@ -20,6 +20,12 @@ pub const CLAIM_TTL_MIN_SECS: u64 = 1;
 pub const CLAIM_TTL_MAX_SECS: u64 = 86_400;
 /// §7.4: attempts are bounded like ci.toml's `max_attempts` (V7).
 pub const ATTEMPT_MAX: u32 = 10;
+/// §11: the read side treats an oversized entry body as **malformed** (visible
+/// red, never a convergence input). The write side's §6.1/§8.2 field limits
+/// keep honest bodies under ~30 KiB (a 4096-byte `log_summary` worst-case
+/// JSON-escaped plus 32 artifacts); this cap is a generous bound above that,
+/// not a second schema.
+pub const CI_BODY_MAX_BYTES: usize = 256 * 1024;
 
 /// §5: `run_id = "ci-" + hex16(fnv1a64(task || 0x1f || ref || 0x1f || commit))`.
 /// Deterministic and computable by any client; the collab thread id of both
@@ -132,6 +138,63 @@ fn body_u32(body: &serde_json::Value, key: &str, min: u32, max: u32) -> Option<u
         .filter(|v| (min..=max).contains(v))
 }
 
+/// §11 read side: is the body's compact JSON serialization within
+/// `CI_BODY_MAX_BYTES`? Computed without building the string, bailing out the
+/// moment the budget is blown — an abusive body costs a bounded walk, not an
+/// allocation of its full size. The byte count matches `serde_json`'s compact
+/// form exactly (its escaping rule: only `"`, `\` and control characters
+/// expand; everything else is raw UTF-8).
+fn body_within_cap(body: &serde_json::Value) -> bool {
+    json_fits(body, CI_BODY_MAX_BYTES)
+}
+
+/// Whether `v`'s compact serialization is at most `budget` bytes.
+fn json_fits(v: &serde_json::Value, budget: usize) -> bool {
+    fn walk(v: &serde_json::Value, remaining: &mut usize) -> Option<()> {
+        use serde_json::Value;
+        let cost = match v {
+            Value::Null => 4,
+            Value::Bool(b) => {
+                if *b {
+                    4 // true
+                } else {
+                    5 // false
+                }
+            }
+            Value::Number(n) => n.to_string().len(),
+            Value::String(s) => {
+                2 + s
+                    .chars()
+                    .map(|c| match c {
+                        '"' | '\\' => 2,
+                        '\u{8}' | '\u{9}' | '\u{a}' | '\u{c}' | '\u{d}' => 2,
+                        c if (c as u32) < 0x20 => 6, // \u00XX
+                        c => c.len_utf8(),
+                    })
+                    .sum::<usize>()
+            }
+            Value::Array(a) => 2 + a.len().saturating_sub(1),
+            Value::Object(o) => 2 + o.len().saturating_sub(1) + o.len(), // braces, commas, colons
+        };
+        *remaining = remaining.checked_sub(cost)?;
+        match v {
+            Value::Array(a) => a.iter().try_for_each(|x| walk(x, remaining))?,
+            Value::Object(o) => {
+                o.values()
+                    .try_for_each(|x| walk(x, remaining))
+                    .and(o.keys().try_for_each(|k| {
+                        // Each key serializes as a JSON string.
+                        walk(&Value::String(k.clone()), remaining)
+                    }))?
+            }
+            _ => {}
+        }
+        Some(())
+    }
+    let mut remaining = budget;
+    walk(v, &mut remaining).is_some()
+}
+
 /// Parse a `ci_claim` body (§6.1). Strict: wrong/missing fields → `None`
 /// (the entry stays visible in the thread but never drives convergence).
 pub fn parse_claim(r: &EntryRef) -> Option<CiClaim> {
@@ -139,6 +202,9 @@ pub fn parse_claim(r: &EntryRef) -> Option<CiClaim> {
         return None;
     }
     let body = &r.entry.body;
+    if !body_within_cap(body) {
+        return None; // §11: oversized body = malformed
+    }
     let ttl_secs = body_u32(
         body,
         "ttl",
@@ -163,6 +229,9 @@ pub fn parse_result(r: &EntryRef) -> Option<CiResult> {
         return None;
     }
     let body = &r.entry.body;
+    if !body_within_cap(body) {
+        return None; // §11: oversized body = malformed
+    }
     let conclusion = Conclusion::parse(body_str(body, "conclusion")?.as_str())?;
     Some(CiResult {
         oid: r.oid.clone(),
@@ -997,6 +1066,87 @@ mod tests {
             "smuggled claim is not a claim"
         );
         assert_eq!(view.unverified, 1);
+    }
+
+    #[test]
+    fn oversized_body_is_malformed_and_never_drives_state() {
+        // §11: the write side's field limits bound honest bodies; the read side
+        // treats anything over CI_BODY_MAX_BYTES as malformed — a visible red
+        // that cannot win a claim or settle a run.
+        let (sk, pk) = keypair(1);
+        let mut principals = HashMap::new();
+        principals.insert("ci-a".to_string(), pk);
+        let id = run_ref("runBig");
+
+        let huge = "x".repeat(CI_BODY_MAX_BYTES);
+        let big_claim = signed_entry(
+            &sk,
+            &id,
+            CI_CLAIM_KIND,
+            "ci-a",
+            "a1",
+            900,
+            serde_json::json!({"task": "t", "ref": "r", "commit": "c", "ttl": 300, "attempt": 1,
+                "runner": huge}),
+        );
+        assert!(
+            parse_claim(&big_claim).is_none(),
+            "an oversized claim body is malformed"
+        );
+        let entries = vec![&big_claim];
+        let view = run_view(&id, &entries, &principals, NOW).expect("view");
+        assert_eq!(
+            view.state,
+            RunState::Pending,
+            "oversized claim is not a claim"
+        );
+        assert_eq!(view.unverified, 1, "…but it stays a visible red");
+        assert_eq!(
+            decide(&view, "ci-a", 1),
+            Decision::Claim { attempt: 1 },
+            "anyone may (re)claim — the blob cannot wedge the run"
+        );
+
+        let big_result = signed_entry(
+            &sk,
+            &id,
+            CI_RESULT_KIND,
+            "ci-a",
+            "r1",
+            950,
+            serde_json::json!({"task": "t", "ref": "r", "commit": "c", "attempt": 1,
+                "claim": "a1", "conclusion": "success",
+                "log_summary": "x".repeat(CI_BODY_MAX_BYTES), "log_sha256": "abc"}),
+        );
+        assert!(parse_result(&big_result).is_none());
+
+        // The boundary: a body just under the cap still parses.
+        let mut ok_body =
+            serde_json::json!({"task": "t", "ref": "r", "commit": "c", "ttl": 300, "attempt": 1});
+        let base_len = serde_json::to_string(&ok_body).unwrap().len();
+        let pad = CI_BODY_MAX_BYTES - base_len - 15; // ,"pad":"…" framing
+        ok_body["pad"] = serde_json::Value::String("y".repeat(pad));
+        assert!(serde_json::to_string(&ok_body).unwrap().len() <= CI_BODY_MAX_BYTES);
+        let ok_entry = signed_entry(&sk, &id, CI_CLAIM_KIND, "ci-a", "a2", 900, ok_body);
+        assert!(
+            parse_claim(&ok_entry).is_some(),
+            "a body within the cap parses"
+        );
+
+        // The estimator agrees with the real serializer on tricky content
+        // (escapes, multibyte, nesting) — the cap cannot be gamed by encoding.
+        for v in [
+            serde_json::json!({"a": "q\"ü\\中\u{1}", "b": [1, true, null, {"c": "d"}]}),
+            serde_json::json!({"k": "x".repeat(1000)}),
+            serde_json::json!(["\u{7f}", "é", 3.5]),
+        ] {
+            let exact = serde_json::to_string(&v).unwrap().len();
+            assert!(json_fits(&v, exact), "at the exact size it fits ({exact})");
+            assert!(
+                !json_fits(&v, exact - 1),
+                "one byte short of the exact size it does not ({exact})"
+            );
+        }
     }
 
     #[test]
