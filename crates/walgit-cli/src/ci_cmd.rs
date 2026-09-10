@@ -457,10 +457,7 @@ async fn remote_artifact_fits_cap(
         .pop_if_empty()
         .extend(segments.split('/'));
     endpoint.query_pairs_mut().append_pair("actor", actor);
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build artifact preflight client")?;
+    let client = artifact_preflight_client(repo, &remote_url)?;
     let mut req = client
         .head(endpoint)
         .header("Accept", "application/octet-stream");
@@ -484,6 +481,57 @@ async fn remote_artifact_fits_cap(
         ),
         status => bail!("HEAD artifact size: unexpected HTTP {status}"),
     }
+}
+
+/// Reuse Git's URL-scoped TLS policy for the out-of-band HEAD request: the
+/// default standalone deployment pins a self-signed CA only in
+/// `http.<url>.sslCAInfo`, which reqwest's system roots cannot see.
+fn artifact_preflight_client(repo: &Path, remote_url: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = git_config_urlmatch(repo, remote_url, "http.sslCAInfo")? {
+        let path = expand_home(std::path::Path::new(&path));
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("read Git sslCAInfo {}", path.display()))?;
+        for cert in reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("parse Git sslCAInfo {}", path.display()))?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if git_config_urlmatch(repo, remote_url, "http.sslVerify")?
+        .is_some_and(|v| v.eq_ignore_ascii_case("false"))
+    {
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    builder.build().context("build artifact preflight client")
+}
+
+fn git_config_urlmatch(repo: &Path, url: &str, key: &str) -> Result<Option<String>> {
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["config", "--get-urlmatch", key, url])
+        .output()
+        .with_context(|| format!("git config --get-urlmatch {key}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+fn expand_home(path: &Path) -> std::path::PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(rest) = raw.strip_prefix("~/") else {
+        return path.to_path_buf();
+    };
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map_or_else(|| path.to_path_buf(), |home| home.join(rest))
 }
 
 /// Ask Git for a credential scoped to this exact remote URL. Never forward a
@@ -2426,6 +2474,37 @@ command = "cargo test"
             .unwrap();
         assert!(!allowed, "413 closes the fetch path");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "only HEAD was issued");
+    }
+
+    #[test]
+    fn git_urlmatch_reads_scoped_tls_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(dir.path())
+            .args([
+                "config",
+                "http.https://example.test/.sslVerify",
+                "false",
+            ])
+            .status()
+            .unwrap();
+        assert_eq!(
+            git_config_urlmatch(
+                dir.path(),
+                "https://example.test/o/r.git",
+                "http.sslVerify"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("false")
+        );
     }
 
     #[cfg(unix)]
