@@ -355,6 +355,11 @@ pub(crate) fn entry_uuid() -> String {
 
 /// Write a blob via `git hash-object -w --stdin`; returns the oid.
 pub(crate) fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<String> {
+    git_write_blob_bytes(repo, content.as_bytes())
+}
+
+/// Binary-safe variant (D1-CI §8.2 artifact/log bytes are not text).
+pub(crate) fn git_write_blob_bytes(repo: &std::path::Path, content: &[u8]) -> Result<String> {
     let mut child = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -367,7 +372,7 @@ pub(crate) fn git_write_blob(repo: &std::path::Path, content: &str) -> Result<St
         .stdin
         .take()
         .context("git hash-object stdin")?
-        .write_all(content.as_bytes())?;
+        .write_all(content)?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
         bail!(
@@ -401,15 +406,27 @@ pub(crate) fn git_update_ref(repo: &std::path::Path, name: &str, oid: Option<&st
 }
 
 pub(crate) fn git_push(repo: &std::path::Path, remote: &str, name: &str) -> Result<()> {
+    git_push_many(repo, remote, &[name])
+}
+
+/// One push for several refs (D1-CI §8.2: a result's artifact batch travels
+/// as a single receive-pack round trip).
+pub(crate) fn git_push_many(repo: &std::path::Path, remote: &str, names: &[&str]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
-        .args(["push", remote, name])
+        .arg("push")
+        .arg(remote)
+        .args(names)
         .output()
         .context("git push")?;
     if !out.status.success() {
         bail!(
-            "git push {remote} {name} failed: {}",
+            "git push {remote} ({} refs) failed: {}",
+            names.len(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -1317,10 +1334,20 @@ fn write_state(path: &Path, map: &std::collections::HashMap<String, String>) -> 
 }
 
 pub(crate) fn git_fetch_collab(repo: &Path, remote: &str) -> Result<()> {
+    // Entries and meta only — deliberately NOT refs/collab/ci-artifacts/*
+    // (D1-CI §8.2): those blobs are up to 16 MiB each and are pulled on
+    // demand (`walgit ci log` / `walgit ci artifacts`), never into every
+    // watcher checkout.
     let out = std::process::Command::new("git")
         .args(["-C"])
         .arg(repo)
-        .args(["fetch", "-q", remote, "+refs/collab/*:refs/collab/*"])
+        .args([
+            "fetch",
+            "-q",
+            remote,
+            "+refs/collab/inbox/*:refs/collab/inbox/*",
+            "+refs/collab/meta/*:refs/collab/meta/*",
+        ])
         .output()
         .context("git fetch collab refs")?;
     if !out.status.success() {
@@ -1330,6 +1357,49 @@ pub(crate) fn git_fetch_collab(repo: &Path, remote: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// On-demand pull of one D1-CI object (§8.2). The result entry names the
+/// publisher and content address, so fetching the whole artifact namespace
+/// would turn one log download into an unbounded transfer.
+pub(crate) fn git_fetch_ci_artifact(
+    repo: &Path,
+    remote: &str,
+    actor: &str,
+    sha256: &str,
+) -> Result<bool> {
+    ref_segment("ci.artifact.actor", actor)?;
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid CI artifact sha256 {sha256:?}");
+    }
+    let name = format!("{}{actor}/{sha256}", walgit_wal::ci::CI_ARTIFACT_REF_PREFIX);
+    let probe = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["ls-remote", "--exit-code", "--refs", remote, &name])
+        .output()
+        .context("git ls-remote ci artifact ref")?;
+    match probe.status.code() {
+        Some(0) => {}
+        Some(2) => return Ok(false), // no such ref: external/not published
+        _ => bail!(
+            "git ls-remote {remote} {name} failed: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        ),
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["fetch", "-q", remote, &format!("+{name}:{name}")])
+        .output()
+        .context("git fetch ci artifact refs")?;
+    if !out.status.success() {
+        bail!(
+            "git fetch {remote} {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(true)
 }
 
 fn refs_map(repo: &Path) -> Result<std::collections::HashMap<String, String>> {

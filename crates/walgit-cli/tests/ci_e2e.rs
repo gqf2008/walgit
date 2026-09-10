@@ -710,3 +710,84 @@ schedule = "* * * * * *"
     assert!(slot >= started, "slot after the baseline: {state}");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn artifacts_and_the_full_log_round_trip_through_git_objects() -> TestResult {
+    let (base, _shutdown) = start_server().await?;
+    let bin = env!("CARGO_BIN_EXE_walgit").to_string();
+    let keydir = tempfile::tempdir()?;
+    let key = write_key(keydir.path(), 0x31)?;
+
+    // §8.2 storage convention: the task declares an artifact, the runner
+    // uploads the bytes as a plain git blob under refs/collab/ci-artifacts/
+    // and the result entry carries the addressing array.
+    let ci_toml = r#"
+version = 1
+[[task]]
+name = "dist"
+command = "mkdir -p out && printf 'artifact-payload-42' > out/app.bin && echo build-log-marker"
+artifacts = ["out/app.bin"]
+"#;
+    let work = work_repo(&base, ci_toml)?;
+    run(&bin, &["ci", "validate", "--repo", path_s(&work)])?;
+    let r1 = clone_repo(&base)?;
+    let r1s = path_s(&r1).to_string();
+    let out = ci_run(&bin, &r1s, "ci-a", &key, &[], &[])?;
+    assert!(
+        out.status.success(),
+        "runner pass failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let st = status_json(&bin, &r1s)?;
+    let run_view = run_of(&st, "dist");
+    assert_eq!(run_view["state"], "done", "{st}");
+    assert_eq!(run_view["conclusion"], "success", "{st}");
+    let eff = run_view["attempts"]
+        .as_array()
+        .unwrap()
+        .last()
+        .map(|a| &a["effective"])
+        .unwrap();
+    let artifacts = eff["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the result carries the artifacts array: {eff}"));
+    assert_eq!(artifacts.len(), 1, "{eff}");
+    assert_eq!(artifacts[0]["name"], "app.bin");
+    assert_eq!(artifacts[0]["path"], "out/app.bin");
+    assert_eq!(artifacts[0]["bytes"], 19);
+    let sha256 = artifacts[0]["sha256"].as_str().unwrap().to_string();
+    assert_eq!(sha256.len(), 64, "content address: {eff}");
+    let log_sha = eff["log_sha256"].as_str().unwrap().to_string();
+    assert_eq!(log_sha.len(), 64, "the log is a content address too: {eff}");
+    let run_id = run_view["id"].as_str().unwrap().to_string();
+
+    // A second clone has neither the collab refs nor the artifact objects:
+    // both pull paths are exercised on demand.
+    let r2 = clone_repo(&base)?;
+    let r2s = path_s(&r2).to_string();
+    let log = run(&bin, &["ci", "log", "--repo", &r2s, &run_id])?;
+    assert!(
+        log.contains("build-log-marker"),
+        "the full captured log, not the summary: {log}"
+    );
+    let outdir = tempfile::tempdir()?;
+    let outdir_s = outdir.path().to_str().unwrap().to_string();
+    run(
+        &bin,
+        &[
+            "ci",
+            "artifacts",
+            "--repo",
+            &r2s,
+            &run_id,
+            "--out",
+            &outdir_s,
+        ],
+    )?;
+    let got = std::fs::read(outdir.path().join("app.bin"))?;
+    assert_eq!(got, b"artifact-payload-42", "byte-identical download");
+
+    Ok(())
+}

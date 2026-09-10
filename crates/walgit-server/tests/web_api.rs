@@ -1576,3 +1576,82 @@ async fn collab_board_projects_threads_under_the_default_definition() -> TestRes
     assert_eq!(other[0]["title"], "hi");
     Ok(())
 }
+
+/// D1 §8.2 storage convention (issue #161): the HTTP read side of
+/// `refs/collab/ci-artifacts/<actor>/<sha256>` — exact bytes, immutable
+/// caching, sha256-verified, 400/404 shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_ci_artifact_serves_verified_bytes() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("f.txt"), "x\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "init"])?;
+
+    let payload = b"artifact-payload-42";
+    let sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload));
+    std::fs::write(dir.join("app.bin"), payload)?;
+    let oid = git_in(&dir, &["hash-object", "-w", "app.bin"])?;
+    let oid = oid.trim();
+    git_in(
+        &dir,
+        &[
+            "update-ref",
+            &format!("refs/collab/ci-artifacts/ci-a/{sha256}"),
+            oid,
+        ],
+    )?;
+    // A hostile ref: its name claims a sha256 the payload does not hash to.
+    let bogus = "00".repeat(32);
+    git_in(
+        &dir,
+        &[
+            "update-ref",
+            &format!("refs/collab/ci-artifacts/ci-a/{bogus}"),
+            oid,
+        ],
+    )?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "r")],
+    )?;
+
+    let (st, body, headers) = get_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{sha256}"),
+        &[],
+    )
+    .await?;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(hdr(&headers, "content-type"), "application/octet-stream");
+    assert!(
+        hdr(&headers, "cache-control").contains("immutable"),
+        "immutable bytes: {}",
+        hdr(&headers, "cache-control")
+    );
+    assert_eq!(hdr(&headers, "etag"), format!("\"{sha256}\""));
+    assert_eq!(body.as_bytes(), payload);
+
+    let missing = "11".repeat(32);
+    let (st, _, _) = get_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{missing}"),
+        &[],
+    )
+    .await?;
+    assert_eq!(st, 404);
+    let (st, _, _) = get_h(&server, "/o/r/api/collab/ci-artifacts/not-hex", &[]).await?;
+    assert_eq!(st, 400, "a malformed address is a bad request");
+    let (st, _, _) = get_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{bogus}"),
+        &[],
+    )
+    .await?;
+    assert_eq!(st, 404, "content mismatch is not the artifact");
+    Ok(())
+}

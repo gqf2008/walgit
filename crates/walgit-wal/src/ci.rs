@@ -27,6 +27,20 @@ pub const ATTEMPT_MAX: u32 = 10;
 /// not a second schema.
 pub const CI_BODY_MAX_BYTES: usize = 256 * 1024;
 
+/// §8.2 storage convention (issue #161): artifact and log bytes are ordinary
+/// git blobs, pushed through the same receive-pack channel as everything
+/// else, content-addressed under this ref namespace:
+/// `refs/collab/ci-artifacts/<actor>/<sha256>`. Any git client fetches them;
+/// the web API serves them by hash.
+pub const CI_ARTIFACT_REF_PREFIX: &str = "refs/collab/ci-artifacts/";
+/// §8.2: at most this many artifacts per result (write-side; the read side
+/// truncates a longer list rather than rejecting the entry).
+pub const CI_ARTIFACTS_PER_RESULT_MAX: usize = 32;
+/// §8.2 storage convention: one artifact/log object's byte cap. Bounded so a
+/// runner pass's upload batch stays small and the read side can refuse to
+/// materialize absurd blobs.
+pub const CI_ARTIFACT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// 64-bit FNV-1a — the §5 run-id digest.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -143,6 +157,20 @@ pub struct CiResult {
     pub duration_ms: Option<u64>,
     pub log_summary: String,
     pub log_sha256: String,
+    /// §8.2: declared output files (bytes in the repo's object store under
+    /// `CI_ARTIFACT_REF_PREFIX`, or at an external `url` the writer set).
+    pub artifacts: Vec<CiArtifact>,
+}
+
+/// §8.2: one declared output file. Integrity is the `sha256`; consumers
+/// verify after fetching, wherever the bytes came from.
+#[derive(Serialize, Clone, Debug)]
+pub struct CiArtifact {
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub url: Option<String>,
 }
 
 fn body_str(body: &serde_json::Value, key: &str) -> Option<String> {
@@ -269,7 +297,51 @@ pub fn parse_result(r: &EntryRef) -> Option<CiResult> {
         duration_ms: body.get("duration_ms").and_then(serde_json::Value::as_u64),
         log_summary: body_str(body, "log_summary").unwrap_or_default(),
         log_sha256: body_str(body, "log_sha256").unwrap_or_default(),
+        artifacts: parse_artifacts(body)?,
     })
+}
+
+/// §8.2: `artifacts` is optional, but present-and-not-an-array makes the whole
+/// entry malformed (a writer claiming the field must mean it). Items are
+/// shape-checked one by one — a bad item drops, it does not condemn the
+/// entry; the list is truncated to the per-result cap.
+fn parse_artifacts(body: &serde_json::Value) -> Option<Vec<CiArtifact>> {
+    let Some(val) = body.get("artifacts") else {
+        return Some(Vec::new()); // absent = no artifacts, not malformed
+    };
+    let arr = val.as_array()?;
+    let mut out = Vec::with_capacity(arr.len().min(CI_ARTIFACTS_PER_RESULT_MAX));
+    for item in arr.iter().take(CI_ARTIFACTS_PER_RESULT_MAX) {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let (Some(name), Some(path), Some(sha256), Some(bytes)) = (
+            obj.get("name").and_then(serde_json::Value::as_str),
+            obj.get("path").and_then(serde_json::Value::as_str),
+            obj.get("sha256").and_then(serde_json::Value::as_str),
+            obj.get("bytes").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        if name.is_empty() || name.len() > 128 || path.is_empty() {
+            continue;
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let url = obj
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        out.push(CiArtifact {
+            name: name.to_string(),
+            path: path.to_string(),
+            sha256: sha256.to_string(),
+            bytes,
+            url,
+        });
+    }
+    Some(out)
 }
 
 // ---- §7 aggregation: one run's view ----------------------------------------------
@@ -1111,6 +1183,64 @@ mod tests {
             scheduled_run_id("test", "refs/heads/main", "abc1", 700_000_000),
             scheduled_run_id("test", "refs/heads/main", "abc", 1_700_000_000)
         );
+    }
+
+    #[test]
+    fn artifacts_parse_shape_checked_and_truncated() {
+        // §8.2: `artifacts` is optional, but present-not-an-array is malformed
+        // (the whole entry); items are shape-checked one by one — conforming
+        // ones survive, the rest drop; the list is truncated to the cap.
+        let (sk, _pk) = keypair(1);
+        let hex64 = "ab".repeat(32);
+
+        // Absent key: parses, empty list.
+        let e = signed_entry(
+            &sk,
+            "run",
+            CI_RESULT_KIND,
+            "ci-a",
+            "r0",
+            900,
+            result_body("t", "r", "c", 1, "a0", "success"),
+        );
+        let r = parse_result(&e).expect("parses");
+        assert!(r.artifacts.is_empty());
+
+        // Present but not an array: the whole entry is malformed.
+        let mut bad = result_body("t", "r", "c", 1, "a0", "success");
+        bad["artifacts"] = serde_json::json!("not-an-array");
+        let e = signed_entry(&sk, "run", CI_RESULT_KIND, "ci-a", "r1", 900, bad);
+        assert!(parse_result(&e).is_none(), "not an array = malformed");
+
+        // Mixed items: conforming ones survive, the rest drop.
+        let mut mixed = result_body("t", "r", "c", 1, "a0", "success");
+        mixed["artifacts"] = serde_json::json!([
+            {"name": "report.html", "path": "target/report.html", "sha256": &hex64, "bytes": 12},
+            {"name": "no-sha", "path": "x", "bytes": 1},
+            {"name": "bad-sha", "path": "x", "sha256": "zz", "bytes": 1},
+            {"name": "x".repeat(129), "path": "x", "sha256": &hex64, "bytes": 1},
+            "junk",
+            {"name": "with-url", "path": "p", "sha256": &hex64, "bytes": 1, "url": "https://x"}
+        ]);
+        let e = signed_entry(&sk, "run", CI_RESULT_KIND, "ci-a", "r2", 900, mixed);
+        let r = parse_result(&e).expect("parses");
+        assert_eq!(r.artifacts.len(), 2, "{:?}", r.artifacts);
+        assert_eq!(r.artifacts[0].name, "report.html");
+        assert_eq!(r.artifacts[0].path, "target/report.html");
+        assert_eq!(r.artifacts[0].bytes, 12);
+        assert_eq!(r.artifacts[0].url, None);
+        assert_eq!(r.artifacts[1].url.as_deref(), Some("https://x"));
+
+        // Over the per-result cap: truncated, still parses.
+        let mut many = result_body("t", "r", "c", 1, "a0", "success");
+        many["artifacts"] = serde_json::json!(
+            (0..40)
+                .map(|i| serde_json::json!({"name": format!("f{i}"), "path": "p", "sha256": &hex64, "bytes": 1}))
+                .collect::<Vec<_>>()
+        );
+        let e = signed_entry(&sk, "run", CI_RESULT_KIND, "ci-a", "r3", 900, many);
+        let r = parse_result(&e).expect("parses");
+        assert_eq!(r.artifacts.len(), CI_ARTIFACTS_PER_RESULT_MAX);
     }
 
     #[test]

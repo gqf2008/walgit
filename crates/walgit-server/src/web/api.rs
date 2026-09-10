@@ -227,6 +227,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/collab/report"), get(collab_report))
             .route(&format!("{base}/collab/board"), get(collab_board))
             .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
+            .route(
+                &format!("{base}/collab/ci-artifacts/{{sha256}}"),
+                get(collab_ci_artifact),
+            )
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
             .route(&format!("{base}/resolve"), get(resolve_root))
@@ -1732,6 +1736,74 @@ async fn collab_thread(
                 SWR,
                 None,
             ))
+        },
+    )
+    .await
+}
+
+/// §8.2 storage convention (issue #161): a CI log/artifact's bytes are a
+/// plain git blob at `refs/collab/ci-artifacts/<actor>/<sha256>`, pushed
+/// through receive-pack like any collab object. This is the HTTP read side
+/// for SDK and browser: refs-level scan of the namespace, the blob faulted
+/// like any collab object, and — the whole point of the content address —
+/// sha256-verified before one byte goes out. Immutable + strong `ETag`: the
+/// bytes behind an address never change (D10).
+async fn collab_ci_artifact(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, sha256)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "ci-artifacts key must be a 64-char hex sha256".into(),
+        ));
+    }
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let suffix = format!("/{sha256}");
+            let mut oid: Option<String> = None;
+            for (name, o) in &r.index.all {
+                if name.starts_with(walgit_wal::ci::CI_ARTIFACT_REF_PREFIX)
+                    && name.ends_with(&suffix)
+                {
+                    oid = Some(o.clone());
+                    break;
+                }
+            }
+            let oid = oid.ok_or_else(|| not_found("ci artifact"))?;
+            if let Some(remote) = r.remote() {
+                let gix = gix_hash::ObjectId::from_hex(oid.as_bytes())
+                    .map_err(|_| not_found("ci artifact"))?;
+                remote.fault_many(std::slice::from_ref(&gix)).await?;
+                // The batched cat-file below must see the faulted object.
+                r.local
+                    .refresh_async()
+                    .await
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+            }
+            let blobs = git_cat_file_batch(&r.local, std::slice::from_ref(&oid)).await?;
+            let bytes = blobs.get(&oid).ok_or_else(|| not_found("ci artifact"))?;
+            if bytes.len() as u64 > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+                return Err(ApiError::PayloadTooLarge);
+            }
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
+            if hex::encode(digest) != sha256 {
+                // A ref whose payload does not hash to its address is hostile
+                // or corrupt — the content it names does not exist.
+                return Err(not_found("ci artifact (content mismatch)"));
+            }
+            Ok(Rendered {
+                body: bytes::Bytes::from(bytes.clone()),
+                content_type: "application/octet-stream",
+                cache_control: IMMUTABLE,
+                etag: Some(etag_for(&sha256)),
+            })
         },
     )
     .await

@@ -16,6 +16,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -95,6 +96,16 @@ pub enum CiAction {
         /// State file (default `<gitdir>/ci-run.json`, §4).
         #[arg(long)]
         state: Option<PathBuf>,
+        /// Hosted mode (§4.2): also serve the events-bridge webhook on this
+        /// address — each verified batch is a hint to evaluate now (the
+        /// trigger truth stays the poll diff).
+        #[arg(long, conflicts_with = "once")]
+        listen: Option<std::net::SocketAddr>,
+        /// Events-bridge webhook secret (HMAC-SHA256, docs/EVENTS.md);
+        /// env `WALGIT_CI_WEBHOOK_SECRET`. Client-side only — it never
+        /// enters a bucket object, a ref, or a result entry (§9 red line).
+        #[arg(long, env = "WALGIT_CI_WEBHOOK_SECRET", requires = "listen")]
+        webhook_secret: Option<String>,
     },
     /// Every run in the checkout's collab log, aggregated (§8.3).
     Status {
@@ -104,6 +115,32 @@ pub enum CiAction {
         /// text | markdown | json
         #[arg(long, default_value = "text")]
         format: String,
+    },
+    /// Print a run's full captured log (§8.2): the blob `log_sha256` names,
+    /// fetched on demand; falls back to the entry's stored summary.
+    Log {
+        /// Repository checkout whose collab refs are read.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote to fetch artifact objects from when missing locally.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Run id (ci-…); default: the newest run in the log.
+        run: Option<String>,
+    },
+    /// Download a run's artifacts into a directory (§8.2), sha256-verified.
+    Artifacts {
+        /// Repository checkout whose collab refs are read.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Remote to fetch artifact objects from when missing locally.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Run id (ci-…); default: the newest run in the log.
+        run: Option<String>,
+        /// Destination directory.
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
     },
 }
 
@@ -147,6 +184,8 @@ pub fn run(action: CiAction) -> Result<()> {
             claim_ttl,
             task,
             state,
+            listen,
+            webhook_secret,
         } => {
             crate::collab_cmd::ref_segment("ci.actor", &actor)?;
             let signing = crate::collab_cmd::read_signing_key(&key)?;
@@ -178,9 +217,38 @@ pub fn run(action: CiAction) -> Result<()> {
                 }
                 return Ok(());
             }
+            // §4.2 hosted mode: the wake endpoint is an events-bridge
+            // consumer; a verified batch only cuts the nap short — the pass
+            // itself still re-reads the remote's tips (trigger = ref facts).
+            let wake = match listen {
+                Some(addr) => {
+                    let (bound, rx) = crate::ci_wake::spawn_wake_listener(
+                        addr,
+                        webhook_secret.map(String::into_bytes),
+                    )?;
+                    println!("ci: wake endpoint on http://{bound} (point events.webhook_url here)");
+                    Some(rx)
+                }
+                None => None,
+            };
             loop {
                 let _ = runner.run_pass(claim_ttl)?;
-                std::thread::sleep(Duration::from_secs(interval.max(1)));
+                let nap = Duration::from_secs(interval.max(1));
+                match &wake {
+                    // A wake hint cuts the nap; a hint while a pass ran (or
+                    // while one was already pending) folds away (coalesce).
+                    Some(rx) => {
+                        match rx.recv_timeout(nap) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            // A dead listener must not turn the poll loop into
+                            // a hot spin; fall back to the normal interval.
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                std::thread::sleep(nap);
+                            }
+                        }
+                    }
+                    None => std::thread::sleep(nap),
+                }
             }
         }
         CiAction::Status { repo, format } => {
@@ -206,7 +274,170 @@ pub fn run(action: CiAction) -> Result<()> {
             }
             Ok(())
         }
+        CiAction::Log { repo, remote, run } => {
+            let (id, result) = latest_effective_result(&repo, &remote, run.as_deref())?;
+            let empty_sha = sha256_hex(b"");
+            if result.log_sha256.is_empty() || result.log_sha256 == empty_sha {
+                // An empty capture was never uploaded; the summary is the log.
+                print!("{}", result.log_summary);
+                return Ok(());
+            }
+            if let Some(bytes) =
+                fetch_ci_object(&repo, &remote, &result.actor, &result.log_sha256)?
+            {
+                std::io::stdout().write_all(&bytes)?;
+            } else {
+                eprintln!(
+                    "ci: run {id}: log object {} not published; the stored summary follows",
+                    result.log_sha256
+                );
+                print!("{}", result.log_summary);
+            }
+            Ok(())
+        }
+        CiAction::Artifacts {
+            repo,
+            remote,
+            run,
+            out,
+        } => {
+            let (id, result) = latest_effective_result(&repo, &remote, run.as_deref())?;
+            if result.artifacts.is_empty() {
+                println!("ci: run {id} declares no artifacts");
+                return Ok(());
+            }
+            std::fs::create_dir_all(&out).with_context(|| format!("create {}", out.display()))?;
+            for a in &result.artifacts {
+                // §8.2 name is a base name; a hostile writer could smuggle a
+                // path — never write outside `--out`.
+                let Some(fname) = Path::new(&a.name)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                else {
+                    eprintln!("ci: {}: unusable name, skipped", a.name);
+                    continue;
+                };
+                let Some(bytes) = fetch_ci_object(&repo, &remote, &result.actor, &a.sha256)? else {
+                    if let Some(url) = &a.url {
+                        println!("ci: {fname}: external artifact, see {url}");
+                    } else {
+                        eprintln!("ci: {fname}: object {} not published, skipped", a.sha256);
+                    }
+                    continue;
+                };
+                let dest = out.join(&fname);
+                std::fs::write(&dest, &bytes)
+                    .with_context(|| format!("write {}", dest.display()))?;
+                println!(
+                    "ci: {fname} ({} bytes, sha256 verified) -> {}",
+                    a.bytes,
+                    dest.display()
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+/// The run selected by `--run` (or the newest) and its latest attempt's
+/// effective result (§7.2) — what `ci log`/`ci artifacts` download from.
+fn latest_effective_result(
+    repo: &Path,
+    remote: &str,
+    run: Option<&str>,
+) -> Result<(String, walgit_wal::ci::CiResult)> {
+    if let Err(e) = crate::collab_cmd::git_fetch_collab(repo, remote) {
+        eprintln!("ci: fetch collab refs failed ({e:#}); reading local state");
+    }
+    let (entries, principals) = crate::collab_cmd::CollabReader::new(repo).load()?;
+    let refs: Vec<&EntryRef> = entries.iter().collect();
+    let ci = walgit_wal::ci::ci_entries(&refs);
+    let now = chrono::Utc::now().timestamp();
+    let runs = walgit_wal::ci::collect_runs(&ci, &principals, now);
+    let view = match run {
+        Some(id) => runs
+            .get(id)
+            .with_context(|| format!("run {id} not found"))?,
+        None => runs
+            .values()
+            .max_by_key(|v| v.last_ts)
+            .context("no runs yet")?,
+    };
+    let result = view
+        .attempts
+        .last()
+        .and_then(|a| a.effective.clone())
+        .with_context(|| format!("run {} has no effective result", view.id))?;
+    Ok((view.id.clone(), result))
+}
+
+/// The bytes of one artifact/log object (§8.2): a git blob under
+/// `refs/collab/ci-artifacts/*/<sha256>`, fetched from the remote on demand
+/// and sha256-verified before it is handed out. `None` = not published.
+fn fetch_ci_object(
+    repo: &Path,
+    remote: &str,
+    actor: &str,
+    sha256: &str,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(bytes) = read_ci_object_local(repo, sha256)? {
+        return Ok(Some(bytes));
+    }
+    if !crate::collab_cmd::git_fetch_ci_artifact(repo, remote, actor, sha256)? {
+        return Ok(None);
+    }
+    read_ci_object_local(repo, sha256)
+}
+
+fn read_ci_object_local(repo: &Path, sha256: &str) -> Result<Option<Vec<u8>>> {
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            walgit_wal::ci::CI_ARTIFACT_REF_PREFIX,
+        ])
+        .output()
+        .context("git for-each-ref ci-artifacts")?;
+    if !out.status.success() {
+        bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let suffix = format!("/{sha256}");
+    let oid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .find(|(name, _)| name.ends_with(&suffix))
+        .map(|(_, oid)| oid.to_string());
+    let Some(oid) = oid else {
+        return Ok(None);
+    };
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["cat-file", "blob", &oid])
+        .output()
+        .context("git cat-file")?;
+    if !out.status.success() {
+        bail!(
+            "git cat-file {oid} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if out.stdout.len() as u64 > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+        bail!(
+            "artifact {sha256} exceeds the {}-byte cap",
+            walgit_wal::ci::CI_ARTIFACT_MAX_BYTES
+        );
+    }
+    let actual = sha256_hex(&out.stdout);
+    if actual != sha256 {
+        bail!("artifact {sha256}: content hashes to {actual} — corrupt object");
+    }
+    Ok(Some(out.stdout))
 }
 
 // ---- .walgit/ci.toml schema (docs/D1_CI_PROTOCOL.md §3) ------------------------
@@ -244,6 +475,11 @@ struct CiTask {
     /// the task fires per slot even while its refs do not move.
     #[serde(default)]
     schedule: Option<String>,
+    /// §8.2: relative paths (inside the task worktree) to upload as artifacts
+    /// after the run — bytes into the repo's object store, references in the
+    /// result entry.
+    #[serde(default)]
+    artifacts: Vec<String>,
 }
 
 /// A validated task with pipeline defaults applied — what the runner executes.
@@ -257,6 +493,8 @@ pub struct CiResolvedTask {
     pub env_allow: Vec<String>,
     /// The validated cron expression (V10), when the task is also periodic.
     pub schedule: Option<String>,
+    /// The validated artifact paths (V11).
+    pub artifacts: Vec<String>,
 }
 
 /// A validated `.walgit/ci.toml`.
@@ -437,6 +675,32 @@ pub fn parse_and_validate(raw: &[u8]) -> Result<CiResolved, String> {
                 ),
             );
         }
+        // V11 (§8.2): artifact declarations are relative paths inside the
+        // task worktree — collectable by the runner, never absolute, never
+        // escaping the worktree, `/`-separated on every platform.
+        check(
+            &mut errors,
+            t.artifacts.len() <= walgit_wal::ci::CI_ARTIFACTS_PER_RESULT_MAX,
+            format!(
+                "V11: task {name:?} artifacts has {} entries, limit {}",
+                t.artifacts.len(),
+                walgit_wal::ci::CI_ARTIFACTS_PER_RESULT_MAX
+            ),
+        );
+        for a in &t.artifacts {
+            check(
+                &mut errors,
+                !a.is_empty()
+                    && a.len() <= 255
+                    && !a.starts_with('/')
+                    && !a.contains('\\')
+                    && !a.contains(':')
+                    && a.split('/').all(|c| !c.is_empty() && c != "." && c != ".."),
+                format!(
+                    "V11: task {name:?} artifacts entry {a:?} must be a relative path (no leading /, no \\ or drive letter, no empty/./.. components)"
+                ),
+            );
+        }
         tasks.push(CiResolvedTask {
             name: name.clone(),
             refs,
@@ -445,6 +709,7 @@ pub fn parse_and_validate(raw: &[u8]) -> Result<CiResolved, String> {
             max_attempts,
             env_allow,
             schedule: t.schedule.clone(),
+            artifacts: t.artifacts.clone(),
         });
     }
     if errors.is_empty() {
@@ -643,6 +908,22 @@ struct ExecOutcome {
     duration_ms: u64,
     /// Merged stdout+stderr tail, at most `LOG_CAPTURE_MAX` bytes.
     log: Vec<u8>,
+    /// §8.2: declared artifacts collected from the worktree before its
+    /// removal — the git blob already written, integrity hash computed.
+    artifacts: Vec<CollectedArtifact>,
+}
+
+/// §8.2: one collected artifact, ready to upload.
+struct CollectedArtifact {
+    /// Base name (§8.2 `name`, ≤ 128 bytes — enforced at collection).
+    name: String,
+    /// The declared worktree-relative path (§8.2 `path`).
+    path: String,
+    /// Integrity hash (§8.2 `sha256`) — also the artifact ref's last segment.
+    sha256: String,
+    bytes: u64,
+    /// The git blob oid already written to the runner's object store.
+    oid: String,
 }
 
 /// Per-task terminal state within one pass (§4: a ref tip is recorded as
@@ -729,11 +1010,7 @@ impl Runner {
         // held elsewhere) is not swept; the trigger path revisits it first.
         let now = chrono::Utc::now().timestamp();
         for (ref_name, tip) in &tips {
-            if !state
-                .processed
-                .get(ref_name)
-                .is_some_and(|seen| seen == tip)
-            {
+            if state.processed.get(ref_name).is_none_or(|seen| seen != tip) {
                 continue;
             }
             match self.cron_sweep_ref(ref_name, tip, &mut state, ttl_override, now, &mut exit) {
@@ -784,11 +1061,10 @@ impl Runner {
         let Some(raw) = self.read_ci_toml(tip)? else {
             return Ok(dirty);
         };
-        let cfg = match parse_and_validate(&raw) {
-            Ok(c) => c,
-            // An invalid declaration was already reported (and the pass
-            // failed) by the trigger path; the sweep has nothing to add.
-            Err(_) => return Ok(dirty),
+        // An invalid declaration was already reported (and the pass failed)
+        // by the trigger path; the sweep has nothing to add.
+        let Ok(cfg) = parse_and_validate(&raw) else {
+            return Ok(dirty);
         };
         let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
         let short: String = tip.chars().take(8).collect();
@@ -940,7 +1216,7 @@ impl Runner {
     ) -> Result<TaskOutcome> {
         let mut error_reclaims = 0u32;
         loop {
-            let decision = match self.run_view(&id)? {
+            let decision = match self.run_view(id)? {
                 Some(view) => walgit_wal::ci::decide(&view, &self.actor, task.max_attempts),
                 None => Decision::Claim { attempt: 1 },
             };
@@ -960,7 +1236,7 @@ impl Runner {
                         task,
                         ref_name,
                         commit,
-                        &id,
+                        id,
                         attempt,
                         &claim_oid,
                         &mut error_reclaims,
@@ -969,11 +1245,10 @@ impl Runner {
                     }
                 }
                 Decision::Claim { attempt } => {
-                    let claim_oid =
-                        self.publish_claim(&id, task, ref_name, commit, ttl, attempt)?;
+                    let claim_oid = self.publish_claim(id, task, ref_name, commit, ttl, attempt)?;
                     // The convergence point (§6.2 step 3): re-read the log;
                     // only the deterministic winner executes.
-                    let recheck = match self.run_view(&id)? {
+                    let recheck = match self.run_view(id)? {
                         Some(v) => walgit_wal::ci::decide(&v, &self.actor, task.max_attempts),
                         None => Decision::Claim { attempt: 1 },
                     };
@@ -986,7 +1261,7 @@ impl Runner {
                                 task,
                                 ref_name,
                                 commit,
-                                &id,
+                                id,
                                 attempt,
                                 &claim_oid,
                                 &mut error_reclaims,
@@ -1024,7 +1299,20 @@ impl Runner {
         error_reclaims: &mut u32,
     ) -> Result<bool> {
         let outcome = self.execute(task, ref_name, commit, id, attempt);
-        self.publish_result(id, task, ref_name, commit, attempt, claim_oid, &outcome)?;
+        // §8.2: the log + artifact bytes travel through the same receive-pack
+        // channel BEFORE the result references them — a published reference
+        // must never dangle. An upload failure degrades to references-only
+        // (the summary still rides in the entry), never blocks the result.
+        let artifacts = match self.upload_run_objects(&outcome) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("ci: run {id}: object upload failed ({e:#}); publishing without them");
+                Vec::new()
+            }
+        };
+        self.publish_result(
+            id, task, ref_name, commit, attempt, claim_oid, &outcome, artifacts,
+        )?;
         if outcome.conclusion != Conclusion::Error {
             return Ok(true);
         }
@@ -1034,6 +1322,46 @@ impl Runner {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// §8.2 storage convention: the captured log and every collected artifact
+    /// become content-addressed git blobs under
+    /// `refs/collab/ci-artifacts/<actor>/<sha256>`, pushed in ONE receive-pack
+    /// round trip. Returns the result entry's `artifacts` array.
+    fn upload_run_objects(&self, outcome: &ExecOutcome) -> Result<Vec<serde_json::Value>> {
+        let prefix = walgit_wal::ci::CI_ARTIFACT_REF_PREFIX;
+        // Ref name → blob oid, deduplicated by content (two identical files
+        // share one sha256, one ref, one blob).
+        let mut refs: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if !outcome.log.is_empty() {
+            let sha = sha256_hex(&outcome.log);
+            let oid = crate::collab_cmd::git_write_blob_bytes(&self.repo, &outcome.log)?;
+            refs.insert(format!("{prefix}{}/{sha}", self.actor), oid);
+        }
+        for a in &outcome.artifacts {
+            refs.insert(
+                format!("{prefix}{}/{}", self.actor, a.sha256),
+                a.oid.clone(),
+            );
+        }
+        for (name, oid) in &refs {
+            crate::collab_cmd::git_update_ref(&self.repo, name, Some(oid))?;
+        }
+        let names: Vec<&str> = refs.keys().map(String::as_str).collect();
+        crate::collab_cmd::git_push_many(&self.repo, &self.remote, &names)?;
+        Ok(outcome
+            .artifacts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "path": a.path,
+                    "sha256": a.sha256,
+                    "bytes": a.bytes,
+                })
+            })
+            .collect())
     }
 
     /// The run's view over freshly fetched collab refs (§6.2 step 1).
@@ -1190,24 +1518,26 @@ impl Runner {
         attempt: u32,
         claim_oid: &str,
         outcome: &ExecOutcome,
+        artifacts: Vec<serde_json::Value>,
     ) -> Result<()> {
-        let oid = self.publish(
-            CI_RESULT_KIND,
-            id,
-            claim_oid,
-            serde_json::json!({
-                "task": task.name,
-                "ref": ref_name,
-                "commit": commit,
-                "attempt": attempt,
-                "claim": claim_oid,
-                "conclusion": outcome.conclusion.as_str(),
-                "exit_code": outcome.exit_code,
-                "duration_ms": outcome.duration_ms,
-                "log_summary": tail_string(&outcome.log, LOG_SUMMARY_MAX),
-                "log_sha256": sha256_hex(&outcome.log),
-            }),
-        )?;
+        let mut body = serde_json::json!({
+            "task": task.name,
+            "ref": ref_name,
+            "commit": commit,
+            "attempt": attempt,
+            "claim": claim_oid,
+            "conclusion": outcome.conclusion.as_str(),
+            "exit_code": outcome.exit_code,
+            "duration_ms": outcome.duration_ms,
+            "log_summary": tail_string(&outcome.log, LOG_SUMMARY_MAX),
+            "log_sha256": sha256_hex(&outcome.log),
+        });
+        if !artifacts.is_empty()
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("artifacts".into(), serde_json::Value::Array(artifacts));
+        }
+        let oid = self.publish(CI_RESULT_KIND, id, claim_oid, body)?;
         println!(
             "ci: run {id} task {} attempt {attempt}: {} (exit {}, {} ms) as {oid}",
             task.name,
@@ -1238,6 +1568,7 @@ impl Runner {
             exit_code: None,
             duration_ms: millis_since(started),
             log: msg.into_bytes(),
+            artifacts: Vec::new(),
         };
         let dir = match tempfile::tempdir() {
             Ok(d) => d,
@@ -1260,7 +1591,12 @@ impl Runner {
                 String::from_utf8_lossy(&added.stderr).trim()
             ));
         }
-        let outcome = self.run_command(dir.path(), task, ref_name, commit, id, attempt);
+        let mut outcome = self.run_command(dir.path(), task, ref_name, commit, id, attempt);
+        // §8.2: collect declared artifacts before the worktree goes away.
+        // Infra-error runs never produced a task state worth collecting from.
+        if outcome.conclusion != Conclusion::Error && !task.artifacts.is_empty() {
+            outcome.artifacts = Self::collect_artifacts(dir.path(), task);
+        }
         // Best-effort cleanup: a failed removal never blocks the result (§8.1).
         let _ = Command::new("git")
             .args(["-C"])
@@ -1274,6 +1610,62 @@ impl Runner {
             .args(["worktree", "prune"])
             .output();
         outcome
+    }
+
+    /// §8.2: hash each declared artifact into the runner's object store (the
+    /// worktree shares it) and compute its integrity sha256, streaming — a
+    /// missing/oversized/non-file entry is skipped with a note, never fatal:
+    /// the result must still publish (§8.1 cleanup discipline).
+    fn collect_artifacts(worktree: &Path, task: &CiResolvedTask) -> Vec<CollectedArtifact> {
+        let mut out = Vec::new();
+        for rel in &task.artifacts {
+            let path = worktree.join(rel);
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                _ => {
+                    eprintln!("ci: artifact {rel:?}: not a regular file, skipped");
+                    continue;
+                }
+            };
+            if meta.len() > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+                eprintln!(
+                    "ci: artifact {rel:?}: {} bytes over the {}-byte cap, skipped",
+                    meta.len(),
+                    walgit_wal::ci::CI_ARTIFACT_MAX_BYTES
+                );
+                continue;
+            }
+            let Some(name) = Path::new(rel)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty() && n.len() <= 128)
+            else {
+                eprintln!("ci: artifact {rel:?}: base name missing or over 128 bytes, skipped");
+                continue;
+            };
+            let oid = match git_hash_object_file(worktree, rel) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("ci: artifact {rel:?}: hash-object failed ({e:#}), skipped");
+                    continue;
+                }
+            };
+            let sha256 = match sha256_file(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ci: artifact {rel:?}: hashing failed ({e:#}), skipped");
+                    continue;
+                }
+            };
+            out.push(CollectedArtifact {
+                name,
+                path: rel.clone(),
+                sha256,
+                bytes: meta.len(),
+                oid,
+            });
+        }
+        out
     }
 
     /// Spawn the command (§8.1): `sh -c` (POSIX) / `cmd /C` (Windows), cwd =
@@ -1296,6 +1688,7 @@ impl Runner {
             exit_code: None,
             duration_ms: millis_since(started),
             log: msg.into_bytes(),
+            artifacts: Vec::new(),
         };
         let (program, prefix): (&str, &[&str]) = if cfg!(windows) {
             ("cmd", &["/C"])
@@ -1350,6 +1743,7 @@ impl Runner {
                     exit_code: None,
                     duration_ms: millis_since(started),
                     log: take_log(&log),
+                    artifacts: Vec::new(),
                 };
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -1369,6 +1763,7 @@ impl Runner {
             exit_code: code.map(i64::from),
             duration_ms: millis_since(started),
             log: take_log(&log),
+            artifacts: Vec::new(),
         }
     }
 }
@@ -1494,6 +1889,35 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = sha2::Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
+}
+
+/// §8.2: streaming sha256 of a file (artifacts are capped at 16 MiB but never
+/// buffered whole).
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    std::io::copy(&mut f, &mut h).with_context(|| format!("read {}", path.display()))?;
+    Ok(hex::encode(h.finalize()))
+}
+
+/// `git hash-object -w -- <rel>` inside the task worktree: the blob lands in
+/// the shared object store of the runner's checkout. Returns the blob oid.
+fn git_hash_object_file(worktree: &Path, rel: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(worktree)
+        .args(["hash-object", "-w", "--"])
+        .arg(rel)
+        .output()
+        .context("git hash-object")?;
+    if !out.status.success() {
+        bail!(
+            "git hash-object -w {rel} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// `<gitdir>/ci-run.json` (§4/§4.3), the runner's local bookkeeping — a cache
@@ -1715,6 +2139,46 @@ secrets = ["x"]
             "0 ".repeat(200)
         );
         assert!(errs(&long).contains("V10"));
+    }
+
+    #[test]
+    fn artifacts_are_validated_and_carried() {
+        // V11 (§8.2): declared artifacts are relative paths inside the task
+        // worktree — collectable, never absolute, never escaping.
+        let r = ok(
+            "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nartifacts=[\"target/report.html\", \"dist/out.bin\"]\n",
+        );
+        assert_eq!(
+            r.tasks[0].artifacts,
+            vec!["target/report.html".to_string(), "dist/out.bin".to_string()]
+        );
+        let r = ok(MINIMAL);
+        assert!(r.tasks[0].artifacts.is_empty(), "default: no artifacts");
+        // TOML literal strings (single quotes) so backslashes stay literal.
+        for bad in [
+            "/abs/path",
+            "C:\\win\\out",
+            "a/../escape",
+            "../up",
+            "./dot",
+            "back\\slash",
+            "drive:D/x",
+            "a//double",
+            "",
+        ] {
+            let e = errs(&format!(
+                "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nartifacts=['{bad}']\n"
+            ));
+            assert!(e.contains("V11"), "{bad:?}: {e}");
+        }
+        let many = (0..33)
+            .map(|i| format!("'f{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let e = errs(&format!(
+            "version = 1\n[[task]]\nname=\"a\"\ncommand=\"true\"\nartifacts=[{many}]\n"
+        ));
+        assert!(e.contains("V11"), "{e}");
     }
 
     #[test]
@@ -1965,6 +2429,7 @@ max_attempts = 2
                 max_attempts: 1,
                 env_allow: env_allow.iter().map(|s| (*s).to_string()).collect(),
                 schedule: None,
+                artifacts: Vec::new(),
             }
         }
 
