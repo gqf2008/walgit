@@ -471,8 +471,12 @@ decision in §4 — or the PR is; never "fix later".
   chain verifiable after pruning; the oid is recomputable from the bytes).
   The fold unit is the CLI (`walgit collab gc`), never the maintainer —
   the folder must hold a collab principal and signing key, and the write
-  goes through receive-pack like any other: snapshot ref lands first
-  (forced blob→blob update, still CAS'd server-side), the pruned inbox
+  goes through receive-pack like any other: snapshot ref lands first as a
+  **CAS from the baseline the gc actually read** (`--force-with-lease=refs/collab/meta/snapshot:<baseline>`;
+  no snapshot means an empty `<baseline>`, i.e. `refs/collab/meta/snapshot:`, not a zero oid —
+  never a `+` refspec, which would silently short-circuit the lease; a
+  concurrent fold that moved the ref fails the push and the gc retries),
+  the pruned inbox
   refs are deleted after, in batches. Readers dedup by oid, so aggregation
   before and after a fold is byte-identical — that equality is the
   acceptance test. Server and CLI parse the snapshot through the same

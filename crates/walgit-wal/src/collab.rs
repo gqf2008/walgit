@@ -254,7 +254,6 @@ pub fn snapshot_canonical(snap: &Snapshot) -> String {
 
 /// Sign a snapshot document; returns `ed25519:<base64>`. Symmetric to
 /// `sign_entry`; used by the fold's write path (`walgit collab gc`).
-#[allow(dead_code)]
 pub fn sign_snapshot(snap: &mut Snapshot, key: &SigningKey) -> String {
     let canonical = snapshot_canonical(snap);
     let sig = key.sign(canonical.as_bytes());

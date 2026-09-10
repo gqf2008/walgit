@@ -1524,6 +1524,18 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
             "collab namespace has more than {COLLAB_MAX_ENTRIES} unfolded refs; fold the inbox with `walgit collab gc` (D1 §11.4) or aggregate offline with the `walgit collab` CLI (this budget guards the remote reader and the per-request object fan-out)"
         )));
     }
+    // D45 size precheck: refuse an oversized snapshot from one header read
+    // before faulting — never download 64 MiB just to reject it.
+    if let (Some(remote), Some(oid)) = (r.remote(), snapshot_oid.as_ref())
+        && let Ok(hex) = gix_hash::ObjectId::from_hex(oid.as_bytes())
+        && let Some((_, size)) = remote.kind_and_size(&hex).await?
+        && usize::try_from(size).map_or(true, |size| size > COLLAB_SNAPSHOT_MAX_BYTES)
+    {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "collab snapshot exceeds {} MiB; aggregate offline with the `walgit collab` CLI",
+            COLLAB_SNAPSHOT_MAX_BYTES / (1024 * 1024)
+        )));
+    }
     if let Some(remote) = r.remote() {
         let mut oids: Vec<gix_hash::ObjectId> = plan
             .iter()
@@ -1553,9 +1565,17 @@ async fn collab_load(st: &AppState, r: &Repo) -> Result<CollabState, ApiError> {
     // deduped by oid — a mid-fold state (snapshot moved, deletes pending)
     // aggregates identically to either side of it.
     let mut set = walgit_wal::collab::EntrySet::new();
-    if let Some(oid) = &snapshot_oid
-        && let Some(bytes) = blobs.get(oid)
-    {
+    if let Some(oid) = &snapshot_oid {
+        // Fail closed when the advertised snapshot cannot be read: skipping it
+        // would silently degrade the aggregation to the inbox tail and drop
+        // every folded entry from history (D45).
+        let Some(bytes) = blobs.get(oid) else {
+            return Err(internal(format!(
+                "{} ({oid}) is advertised by the ref index but its blob is missing locally; \
+                 repair the checkout before aggregating",
+                walgit_wal::collab::SNAPSHOT_REF
+            )));
+        };
         if bytes.len() > COLLAB_SNAPSHOT_MAX_BYTES {
             return Err(ApiError::ServiceUnavailable(format!(
                 "collab snapshot exceeds {} MiB; aggregate offline with the `walgit collab` CLI",

@@ -692,11 +692,22 @@ fn run_principal_revoke(repo: &Path, principal: &str, push: Option<&str>) -> Res
 /// matches or was already done; a rejected batch is converged by re-running.
 const GC_DELETE_CHUNK: usize = 500;
 
-fn git_push_refspecs(repo: &Path, remote: &str, refspecs: &[String], atomic: bool) -> Result<()> {
+fn git_push_refspecs(
+    repo: &Path,
+    remote: &str,
+    refspecs: &[String],
+    atomic: bool,
+    lease: Option<&str>,
+) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["-C"]).arg(repo).arg("push");
     if atomic {
         cmd.arg("--atomic");
+    }
+    // A `+` refspec prefix would silently short-circuit the lease — a forced
+    // update is expressed by the lease (or not at all), never by `+`.
+    if let Some(lease) = lease {
+        cmd.arg(format!("--force-with-lease={lease}"));
     }
     cmd.arg(remote).args(refspecs);
     let out = cmd.output().context("git push")?;
@@ -710,46 +721,140 @@ fn git_push_refspecs(repo: &Path, remote: &str, refspecs: &[String], atomic: boo
     Ok(())
 }
 
+/// The refnames a remote currently advertises under the collab inbox — what
+/// the gc's delete batches are filtered against. A concurrent gc may have
+/// pruned some already, and stock git refuses a delete whose ref is not
+/// advertised (`unable to delete …: remote ref does not exist`): that refusal
+/// would break the fold's "re-run to converge" promise, so the gc never asks
+/// git to delete a ref it has not just seen. The full advertisement is read
+/// and filtered here rather than a `refs/collab/inbox/*` pattern: one round
+/// trip either way (every push below re-fetches the same advertisement), and
+/// the pruning must not depend on ls-remote's glob semantics.
+fn git_ls_remote_inbox(repo: &Path, remote: &str) -> Result<std::collections::HashSet<String>> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["ls-remote", remote])
+        .output()
+        .context("git ls-remote")?;
+    if !out.status.success() {
+        bail!(
+            "git ls-remote {remote} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(_, name)| name.trim().to_string())
+        .filter(|name| name.starts_with("refs/collab/inbox/"))
+        .collect())
+}
+
+/// Whether the seed about to sign a fold is the public key registered for its
+/// actor. A mismatched pair would publish a snapshot whose actor cannot verify
+/// it, stranding every reader with an apparently malicious fold.
+fn signing_key_matches_registered(key: &SigningKey, registered_public_key: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(registered_public_key.trim())
+        .is_ok_and(|bytes| bytes.as_slice() == key.verifying_key().as_bytes())
+}
+
+/// Record one entry in a snapshot fold, preferring the copy whose inbox
+/// principal is the entry's own actor when the same oid appears under multiple
+/// refs. Returns whether `records` changed and therefore needs a new snapshot;
+/// a duplicate that adds no better copy is prune-only.
+fn keep_fold_record(
+    records: &mut Vec<SnapshotRecord>,
+    seen: &mut HashMap<String, usize>,
+    record: SnapshotRecord,
+    entry_actor: &str,
+) -> bool {
+    if let Some(&index) = seen.get(&record.oid) {
+        let current = records.get(index);
+        let replace = current.is_some_and(|cur| {
+            cur.entry_ref().is_none()
+                || (cur.principal != entry_actor && record.principal == entry_actor)
+        });
+        if replace && let Some(slot) = records.get_mut(index) {
+            *slot = record;
+        }
+        return replace;
+    }
+    seen.insert(record.oid.clone(), records.len());
+    records.push(record);
+    true
+}
+
 /// `collab gc`: fold every parseable inbox entry into the signed snapshot at
 /// `refs/collab/meta/snapshot` and prune the folded refs. The new snapshot
 /// composes the existing one (records carried verbatim — an oid addresses the
 /// original bytes, so records are never re-serialized) with the current tail.
 /// Unparseable inbox blobs are left in place (the read side skips them too).
+/// A fold that records nothing new (every local inbox ref is a duplicate the
+/// snapshot already carries — a crashed or raced gc's un-pruned tail) is
+/// prune-only: the snapshot is never rebuilt, because a rebuild would differ
+/// only in `ts` — pure ref churn.
 ///
-/// Push order is the safety boundary: the snapshot lands first (forced
-/// blob→blob update client-side; the server still CASes the advertised old
-/// value, so a concurrent fold loses with stale-info — fetch and retry), then
-/// the folded refs are deleted in batches. A crash or a reader mid-fold sees
-/// duplicates, never a loss; the read side dedups by oid.
+/// Push order is the safety boundary: the snapshot lands first — a CAS from
+/// the baseline this gc actually read (`--force-with-lease=ref:baseline`; a
+/// concurrent fold that already moved the ref fails the lease and the gc
+/// retries, never overwrites) — then the folded refs are deleted in batches,
+/// and only the ones the remote still advertises (stock git refuses a delete
+/// whose ref is missing; another gc may have pruned it mid-flight). A crash
+/// or a reader mid-fold sees duplicates, never a loss; the read side dedups
+/// by oid.
 fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Result<()> {
     ref_segment("gc.actor", actor)?;
     let reader = CollabReader::new(repo);
-    let mut records: Vec<SnapshotRecord> = match reader.snapshot_blob()? {
-        Some(bytes) => parse_snapshot(&bytes)
-            .map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?
-            .entries,
-        None => Vec::new(),
+    // The snapshot's own signature is only verifiable against a *registered*
+    // key (§4.2) — folding as an unregistered principal would strand every
+    // reader with an unverifiable snapshot.
+    let principals = reader.principals()?;
+    let Some(registered_public_key) = principals.get(actor) else {
+        bail!(
+            "gc.actor {actor} has no registered collab key in this repository; \
+             `walgit collab principal-register --principal {actor} --key <keyfile>` first"
+        );
     };
-    let mut seen: std::collections::HashSet<String> =
-        records.iter().map(|r| r.oid.clone()).collect();
+    let key = read_signing_key(key_path)?;
+    if !signing_key_matches_registered(&key, registered_public_key) {
+        bail!(
+            "gc.key does not match the public key registered for gc.actor {actor}; \
+             use the key registered for this principal or rotate it explicitly"
+        );
+    }
+    // The baseline the snapshot push leases against: the snapshot ref's value
+    // as this gc read it (§11.4). `None` is `--force-with-lease=ref:` (an
+    // explicitly empty <expect>), Git's portable "the ref must not exist";
+    // the zero OID is not equivalent on current Git.
+    let (baseline, mut records): (Option<String>, Vec<SnapshotRecord>) =
+        match reader.snapshot_blob()? {
+            Some((oid, bytes)) => (
+                Some(oid),
+                parse_snapshot(&bytes)
+                    .map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?
+                    .entries,
+            ),
+            None => (None, Vec::new()),
+        };
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        seen.entry(record.oid.clone()).or_insert(index);
+    }
     let mut folded: Vec<String> = Vec::new(); // inbox ref names to prune
+    let mut changed = false; // a new or better record ⇒ rebuild the snapshot
     let mut left = 0usize; // unparseable blobs left in place
     for (name, oid) in reader.inbox_refs()? {
-        if seen.contains(&oid) {
-            // Already folded (an earlier gc crashed mid-prune) — prune the
-            // duplicate ref without re-recording the entry.
-            folded.push(name);
-            continue;
-        }
         let blob = reader.git(&["cat-file", "blob", &oid])?;
         let Ok(json) = String::from_utf8(blob) else {
             left += 1;
             continue;
         };
-        if serde_json::from_str::<Entry>(&json).is_err() {
+        let Ok(entry) = serde_json::from_str::<Entry>(&json) else {
             left += 1;
             continue;
-        }
+        };
         let Some(principal) = name
             .strip_prefix("refs/collab/inbox/")
             .and_then(|p| p.rsplit_once('/'))
@@ -758,45 +863,88 @@ fn run_gc(repo: &Path, actor: &str, key_path: &Path, push: Option<&str>) -> Resu
             left += 1;
             continue;
         };
-        seen.insert(oid.clone());
-        records.push(SnapshotRecord { oid, principal, json });
+        // Already folded (an earlier gc crashed mid-prune, or a concurrent gc
+        // raced this checkout's lagging fetch): prune the duplicate without
+        // re-recording it, unless this copy is the actor-owned one and the
+        // existing record names a planted inbox.
+        changed |= keep_fold_record(
+            &mut records,
+            &mut seen,
+            SnapshotRecord { oid, principal, json },
+            &entry.actor,
+        );
         folded.push(name);
     }
     if folded.is_empty() {
         println!("collab gc: nothing to fold ({left} unparseable inbox blob(s) left in place)");
         return Ok(());
     }
-    let key = read_signing_key(key_path)?;
-    let snap = build_snapshot(actor, chrono::Utc::now().timestamp(), records, &key);
-    let snap_oid = git_write_blob(repo, &serde_json::to_string(&snap)?)?;
+    // Nothing new to record ⇒ prune-only fold: the snapshot the baseline
+    // names already carries every entry, so it is never rebuilt (a rebuild
+    // would differ only in `ts` — pure ref churn).
+    let snap_oid = if changed {
+        let snap = build_snapshot(actor, chrono::Utc::now().timestamp(), records, &key);
+        Some(git_write_blob(repo, &serde_json::to_string(&snap)?)?)
+    } else {
+        None
+    };
     match push {
         None => {
-            git_update_ref(repo, SNAPSHOT_REF, Some(&snap_oid))?;
+            if let Some(oid) = &snap_oid {
+                git_update_ref(repo, SNAPSHOT_REF, Some(oid))?;
+            }
             for name in &folded {
                 git_update_ref(repo, name, None)?;
             }
         }
         Some(remote) => {
-            // Snapshot first, then the deletes.
-            git_push_refspecs(repo, remote, &[format!("+{snap_oid}:{SNAPSHOT_REF}")], true)
-                .context("push the snapshot (a concurrent fold? fetch and retry)")?;
-            for chunk in folded.chunks(GC_DELETE_CHUNK) {
+            // Snapshot first (a CAS from the baseline this gc actually read),
+            // then the deletes. A concurrent fold that moved the snapshot in
+            // the meantime fails the lease — fetch and retry, never overwrite.
+            if let Some(oid) = &snap_oid {
+                let lease = format!(
+                    "{SNAPSHOT_REF}:{}",
+                    baseline.as_deref().unwrap_or_default()
+                );
+                git_push_refspecs(
+                    repo,
+                    remote,
+                    &[format!("{oid}:{SNAPSHOT_REF}")],
+                    false,
+                    Some(&lease),
+                )
+                .context(
+                    "push the snapshot (the fold baseline moved — a concurrent gc? fetch and retry)",
+                )?;
+            }
+            // Prune only refs the remote still advertises: a concurrent gc
+            // may have pruned some already, and stock git refuses a delete
+            // whose ref is not advertised — that refusal is convergence, not
+            // an error. Stale local copies are cleaned below either way.
+            let live = git_ls_remote_inbox(repo, remote)?;
+            let to_delete: Vec<&String> = folded.iter().filter(|n| live.contains(*n)).collect();
+            for chunk in to_delete.chunks(GC_DELETE_CHUNK) {
                 let specs: Vec<String> = chunk.iter().map(|n| format!(":{n}")).collect();
-                git_push_refspecs(repo, remote, &specs, false).context(
+                git_push_refspecs(repo, remote, &specs, false, None).context(
                     "delete folded inbox refs; re-run `walgit collab gc` to converge (idempotent)",
                 )?;
             }
             // Mirror the fold locally so this checkout aggregates the folded
             // shape immediately.
-            git_update_ref(repo, SNAPSHOT_REF, Some(&snap_oid))?;
+            if let Some(oid) = &snap_oid {
+                git_update_ref(repo, SNAPSHOT_REF, Some(oid))?;
+            }
             for name in &folded {
                 git_update_ref(repo, name, None)?;
             }
         }
     }
     println!(
-        "collab gc: folded {} inbox ref(s) into {SNAPSHOT_REF} ({snap_oid}); {left} unparseable left in place",
-        folded.len()
+        "collab gc: folded {} inbox ref(s) into {SNAPSHOT_REF} ({}); {left} unparseable left in place",
+        folded.len(),
+        snap_oid
+            .as_deref()
+            .unwrap_or_else(|| baseline.as_deref().unwrap_or("new")),
     );
     Ok(())
 }
@@ -1423,14 +1571,17 @@ impl CollabReader {
     }
 
     /// The raw snapshot blob at `refs/collab/meta/snapshot`, when present
-    /// (D45 fold).
-    fn snapshot_blob(&self) -> Result<Option<Vec<u8>>> {
+    /// (D45 fold), paired with the ref's current oid — the fold baseline the
+    /// snapshot push leases against (§11.4: a gc must CAS the ref from the
+    /// value it actually read, or a concurrent fold's snapshot can be lost).
+    fn snapshot_blob(&self) -> Result<Option<(String, Vec<u8>)>> {
         let out = self.git(&["for-each-ref", "--format=%(objectname)", SNAPSHOT_REF])?;
         let oid = String::from_utf8_lossy(&out).trim().to_string();
         if oid.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.git(&["cat-file", "blob", &oid])?))
+        let blob = self.git(&["cat-file", "blob", &oid])?;
+        Ok(Some((oid, blob)))
     }
 
     /// Load the aggregation input: the folded history at
@@ -1440,7 +1591,7 @@ impl CollabReader {
     pub fn load(&self) -> Result<(Vec<EntryRef>, HashMap<String, String>)> {
         let principals = self.principals()?;
         let mut set = EntrySet::new();
-        if let Some(bytes) = self.snapshot_blob()? {
+        if let Some((_, bytes)) = self.snapshot_blob()? {
             let snap = parse_snapshot(&bytes).map_err(|e| anyhow::anyhow!("{SNAPSHOT_REF}: {e}"))?;
             for rec in &snap.entries {
                 if let Some(er) = rec.entry_ref() {
@@ -1536,6 +1687,55 @@ mod tests {
         assert!(verify_entry(&e.entry, &pk).is_ok());
         e.entry.body = serde_json::json!({"title": "tampered"});
         assert!(verify_entry(&e.entry, &pk).is_err());
+    }
+
+    #[test]
+    fn gc_signing_key_must_match_the_registered_public_key() {
+        let (sk, pk) = keypair();
+        assert!(signing_key_matches_registered(&sk, &pk));
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        assert!(!signing_key_matches_registered(&other, &pk));
+    }
+
+    #[test]
+    fn fold_records_prefer_the_actor_owned_inbox_copy() {
+        let e = entry("t", "issue", "alice", "", "unused", 1, serde_json::json!({}));
+        let json = serde_json::to_string(&e.entry).unwrap();
+        let oid = walgit_wal::collab::git_blob_oid(json.as_bytes());
+        let planted = SnapshotRecord {
+            oid: oid.clone(),
+            principal: "mallory".to_string(),
+            json: json.clone(),
+        };
+        let legitimate = SnapshotRecord {
+            oid,
+            principal: "alice".to_string(),
+            json,
+        };
+
+        let mut records = Vec::new();
+        let mut seen = HashMap::new();
+        assert!(keep_fold_record(
+            &mut records,
+            &mut seen,
+            planted.clone(),
+            "alice"
+        ));
+        assert!(keep_fold_record(
+            &mut records,
+            &mut seen,
+            legitimate,
+            "alice"
+        ));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].principal, "alice");
+        assert!(!keep_fold_record(
+            &mut records,
+            &mut seen,
+            planted,
+            "alice"
+        ));
+        assert_eq!(records[0].principal, "alice", "a later planted copy cannot displace it");
     }
 
     #[test]
