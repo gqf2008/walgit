@@ -206,18 +206,34 @@ timeout = "10m"
 name = "nightly"
 command = "cargo test --release"
 schedule = "0 0 2 * * *"   # 可选：6/7 字段 UTC cron（秒 分 时 日 月 周 [年]）或 @daily
+
+[[task]]
+name = "dist"
+command = "cargo build --release && cp target/release/walgit out.bin"
+artifacts = ["out.bin"]    # 可选：任务结束后收集的产物（相对路径，≤ 32 项，单件 ≤ 16 MiB）
 ```
 运行 runner（任意机器）：
 ```bash
 walgit ci validate --repo <checkout>
 walgit ci run --repo <checkout> --remote origin --actor ci-runner --key <keyfile> --once
+walgit ci run --repo <checkout> --remote origin --actor ci-runner --key <keyfile> \
+  --listen 127.0.0.1:8099          # 常驻模式：events webhook 可立即唤醒一次 pass
 walgit ci status --repo <checkout>
+walgit ci log --repo <checkout> [<run-id>]              # 打印该 run 的完整捕获日志
+walgit ci artifacts --repo <checkout> [<run-id>] --out out/  # 逐个 sha256 校验下载产物
 ```
 - runner 认领任务、执行、把结果签成 `ci_result` 条目回传；
 - 同一 run 的多次尝试收敛到唯一生效结果；秘密只进 runner 环境，不进仓库。
 - `schedule` = 对不动的 ref 周期性评估：runner 每个 pass 顺带做 cron 扫描，错过的
   槽位合并为最新一个（不补跑）；`--once` 配外部调度器（crontab / systemd timer）
   即可当定时 CI 用。定时运行与 ref 触发运行是两个并行线程，各自收敛。
+- `--listen` = events 桥 webhook 唤醒；若服务端配了 `events.webhook_secret`，runner
+  同时设置同名环境变量 `WALGIT_CI_WEBHOOK_SECRET`（或传 `--webhook-secret`）。秘钥只
+  留在 runner 进程，不进入仓库；唤醒只是提示，真正触发仍以 `ls-remote` 的 tip diff 为准。
+- 日志与产物存放在仓库自身的 git 对象里（`refs/collab/ci-artifacts/<actor>/<sha256>`，
+  按内容寻址）：普通 clone/fetch 不会带上它们，`ci log`/`ci artifacts` 按需拉取并
+  先验哈希再交付；浏览器/SDK 走 `GET /{o}/{r}/api/collab/ci-artifacts/<sha256>`
+  （`repo.ci.artifact(sha256)`）。
 
 ---
 

@@ -65,6 +65,7 @@ timeout  = "30m"                           # 覆盖管道级
 max_attempts = 2                           # 覆盖管道级
 env_allow = ["RUSTFLAGS", "CARGO_NET_GIT_FETCH_WITH_CLI"]  # 透传给任务的环境变量名（§9）
 schedule  = "0 0 2 * * *"                  # 可选：6/7 字段 UTC cron 或 @hourly/@daily/@weekly（§4.3）
+artifacts = ["target/dist/app.tar.gz"]     # 可选：任务结束后收集的产物相对路径（§8.2）
 ```
 
 ### 3.1 校验规则（normative，`walgit ci validate` 逐条实现）
@@ -81,6 +82,7 @@ schedule  = "0 0 2 * * *"                  # 可选：6/7 字段 UTC cron 或 @h
 | V8 | `env_allow` 每项匹配 `[A-Za-z_][A-Za-z0-9_]*`，≤ 64 项；**禁止 `WALGIT_CI_*`**（runner 注入保留名，§8.2） | — |
 | V9 | 文件本身 ≤ 64 KiB | — |
 | V10 | `schedule` ≤ 255 字节且可解析：6/7 字段 UTC cron（秒 分 时 日 月 周 [年]）或 `@hourly`/`@daily`/`@weekly` 简写——与 bundle 策略的 `schedule`（D22）同一解析器（`walgit-bundle` 的 `parse_schedule`） | — |
+| V11 | `artifacts` ≤ 32 项；每项 ≤ 255 字节、非空、相对路径：不以 `/` 开头、不含 `\`/`:`、无空/`.`/`..` 分量 | 产物越界进不了结果条目（§8.2） |
 
 ### 3.2 触发匹配语义
 
@@ -104,10 +106,13 @@ schedule  = "0 0 2 * * *"                  # 可选：6/7 字段 UTC cron 或 @h
    （一个往返，无 pack），与本地状态文件对比得"变化过的 ref"。对离线一段时间后回来的
    runner，对比自然**合并（coalesce）**为"处理当前 tip"——中间的多次推送折叠成最后一次。
    这与 events 桥的 backfill 契约同一哲学：正确性不依赖推送，只依赖事实。
-2. **events 桥 webhook（push 形态，扩展点，本批次未实现）**：常驻托管 runner 可挂
-   `events.webhook_url`，按 `docs/EVENTS.md` 验签、按 `X-Walgit-Delivery` 去重、按
-   `(repo, seq, ref_name)` 去重，把每条 ref 事件当作一次触发提示。实现它不改变本协议的
-   任何对象或状态机——它只是把 §5 步骤 1 的输入从轮询换成推送。
+2. **events 桥 webhook（push 唤醒，issue #161 已实现）**：常驻托管 runner 用
+   `walgit ci run --listen <addr>` 挂载唤醒端点，并可通过
+   `WALGIT_CI_WEBHOOK_SECRET`（或 `--webhook-secret`）配置与 `docs/EVENTS.md` 相同的
+   HMAC-SHA256 密钥。端点按 `X-Walgit-Signature` 验签、按 `X-Walgit-Delivery` 去重；
+   只对 `refs/heads/*`、`refs/tags/*` 事件返回唤醒提示。唤醒只缩短本轮轮询间隔，
+   runner 仍用 `ls-remote` 的 tip diff 决定触发——事件丢失/重放/伪造都不会改写运行事实，
+   也不改变本协议的任何对象或状态机。
 
 **状态与去重（runner 侧）**：状态文件 `<gitdir>/ci-run.json` 记录 `{"processed": {ref: oid}}`。
 一次 pass 里：当前 tip ≠ 已处理 oid 的 ref 是**待处理**；对该 ref 的**全部**任务到达终态
@@ -339,11 +344,28 @@ done    : effective 存在                               → Settled(conclusion)
 - `conclusion` ∈ `success | failure | timeout | error`；`exit_code` 为整数，`timeout`/无法
   取得时为 `null`。
 - **日志摘要**：`log_summary` 是完整捕获输出（stdout+stderr 合并）的**末尾** ≤ 4096 字节
-  （写入侧截断，UTF-8 字符边界对齐）；完整日志的完整性由 `log_sha256` 兜底——runner 可
-  把完整日志留本地或作为 artifact 上传，walgit 不存日志正文。
-- **产物（artifacts）**：大产物**不进 git 对象**——只放引用 + 哈希：`name` ≤ 128 字节、
-  `path` 任务工作区内的相对路径、`sha256`（完整性）、`bytes`、可选 `url`（任何取用方自行
-  验哈希；walgit 不解释 url）。每个结果 ≤ 32 个 artifact。
+  （写入侧截断，UTF-8 字符边界对齐）。
+- **日志与产物存放约定（issue #161 已实现）**：完整日志与声明的产物都是**普通 git blob**，
+  与协作条目同一条 receive-pack 通道入仓，ref 形如
+  `refs/collab/ci-artifacts/<actor>/<sha256>`——按内容寻址，一个 runner 一次 run 推一批
+  （同一 sha256 去重）。单个对象 ≤ 16 MiB（`CI_ARTIFACT_MAX_BYTES`，超出则该产物跳过、
+  结果照常发布）；每个结果 ≤ 32 个 artifact（`CI_ARTIFACTS_PER_RESULT_MAX`）。读取方
+  **必须**在交付字节前按 sha256 校验内容——内容寻址的意义就在于名为 X 的 ref 里不是 X
+  的内容视为不存在（hostile/corrupt）。
+  - runner：任务结束（非 `error` 结论）后、发布结果前上传；上传失败降级为只发引用。
+    日志 blob 只在捕获非空时上传，空捕获的 `log_sha256` 为 sha256(空串) 且不推 ref。
+  - 拉取：**按需**，绝不在每个 watcher 的 `git fetch refs/collab/*` 里带上 16 MiB blob——
+    常规 collab fetch 收窄到 `inbox/* + meta/*`，产物命名空间单独 fetch。
+  - CLI：`walgit ci log [--repo .] [--remote origin] [run]` 打印完整捕获（取不到 blob 时
+    退回 `log_summary`）；`walgit ci artifacts [--out <dir>] [run]` 逐个 sha256 校验落盘，
+    `name` 只取基名（永不写出 `--out` 之外）。
+  - HTTP：`GET /{o}/{r}/api/collab/ci-artifacts/<sha256>` → `application/octet-stream` +
+    immutable/ETag，服务端先验哈希再发字节；SDK `repo.ci.artifact(sha256)` → ArrayBuffer。
+  - `url` 字段保留给 runner 自行放外部对象存储的产物（任何取用方自行验哈希；walgit
+    不解释 url）；桶内通道是默认约定，外部 url 是显式 opt-out。
+- `artifacts` 数组项 shape-check：`name` 非空 ≤ 128 字节、`path` 任务工作区内相对路径
+  （V11 禁绝对路径/反斜杠/冒号/`.`/`..` 分量）、`sha256` 64-hex、`bytes` 非负整数；
+  坏项丢弃，不连坐条目；`artifacts` 存在但不是数组 → 整条目 malformed。
 - 其余字段必填、类型严格；malformed 待遇同 §6.1。
 
 ### 8.3 展示（读侧）
@@ -373,7 +395,7 @@ done    : effective 存在                               → Settled(conclusion)
 | 层 | 键 | 规则 |
 |---|---|---|
 | 触发（轮询） | `(ref, tip oid)` | 状态文件 processed；tip 相同不重触发；coalesce 到当前 tip |
-| 触发（webhook，扩展点） | `(repo, seq, ref_name)` / `X-Walgit-Delivery` | 按 docs/EVENTS.md |
+| 触发（webhook 唤醒） | `X-Walgit-Delivery`；实际触发仍由 tip diff 决定 | 按 docs/EVENTS.md |
 | claim | `(id, attempt, actor)` | 同 principal 的重复认领无害：胜者规则全序，min 唯一 |
 | result | `(id, attempt)` | `effective` 全序唯一；重复结果记录但不生效 |
 | 事件重放 | 条目 oid（内容寻址） | 重放/重投递产生同一 oid，聚合幂等 |
@@ -399,6 +421,10 @@ done    : effective 存在                               → Settled(conclusion)
   kill 后 TTL 重认领、秘密边界负向、超时结论）。
 - **issue #161 落地**：§11 读侧 size cap（`CI_BODY_MAX_BYTES`）；§4.3 cron 定时触发
   （ci.toml `schedule` + V10 + run id 定时变体 + 状态文件 cron 簿记 + e2e 用例
-  `a_scheduled_task_fires_on_an_unmoved_ref`）。
-- **开放项**（不影响协议对象与状态机）：events 桥 webhook 传输（§4.2，托管 runner 场景）；
-  完整日志/产物的标准化存放位置（现在是引用 + 哈希，放哪由部署定）。
+  `a_scheduled_task_fires_on_an_unmoved_ref`）；§8.2 日志/产物存放约定
+  （`refs/collab/ci-artifacts/<actor>/<sha256>` 桶内 blob 通道 + V11 + `walgit ci log`/
+  `walgit ci artifacts` + HTTP `GET …/api/collab/ci-artifacts/<sha256>` + SDK
+  `repo.ci.artifact`，e2e 用例 `artifacts_and_the_full_log_round_trip_through_git_objects`，
+  server 集成 `collab_ci_artifact_serves_verified_bytes`）；§4.2 events 桥 webhook 唤醒
+  （`walgit ci run --listen` + HMAC 验签 + delivery 去重）。
+- **开放项**：无（issue #161 范围已全部落地）。

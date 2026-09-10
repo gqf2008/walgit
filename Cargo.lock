@@ -5843,6 +5843,7 @@ dependencies = [
  "futures",
  "gix-hash",
  "hex",
+ "hmac 0.12.1",
  "humantime",
  "libc",
  "mimalloc",

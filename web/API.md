@@ -847,6 +847,21 @@ past it the answer is a `503` pointing at the `walgit collab` CLI, which
 aggregates offline. SWR caching (stale-while-revalidate=60), never
 immutable — collab state changes with every push.
 
+#### `GET /{owner}/{repo}/api/collab/ci-artifacts/{sha256}`
+
+The D1-CI §8.2 storage convention's HTTP read side (issue #161): a CI run's
+full log and its declared artifacts live as plain git blobs at
+`refs/collab/ci-artifacts/<actor>/<sha256>`, pushed through receive-pack by
+the runner (the CLI side is `walgit ci log` / `walgit ci artifacts`; the SDK
+side is `repo.ci.artifact(sha256)`). `200` → the exact bytes as
+`application/octet-stream`, `Cache-Control: immutable` + ETag = the quoted
+sha256 (content-addressed: the bytes behind an address never change). The
+server verifies the payload against the address before serving — a ref whose
+blob does not hash to its name answers `404`, as does an unknown address; a
+malformed address (not 64 lowercase hex) is `400`; a blob over the 16 MiB
+convention cap is `413`. Refs-level scan + one batched fault, same shape as
+the collab entry readers.
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a

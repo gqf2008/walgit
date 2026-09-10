@@ -1094,6 +1094,31 @@ export class RepoClient {
     },
   };
 
+  /** D1 CI lane (docs/D1_CI_PROTOCOL.md): the read side of a run's stored
+      bytes. The runs themselves are read through `collab.report`/the CLI;
+      this is how a browser fetches what a result entry addresses. */
+  readonly ci = {
+    /**
+     * Download one CI log/artifact object by its content address (§8.2
+     * storage convention, issue #161): the bytes the runner pushed to
+     * `refs/collab/ci-artifacts/<actor>/<sha256>`. The server verifies the
+     * payload against the address before serving (a mismatch is a 404), caps
+     * at 16 MiB, immutable + ETag. Mirrors `walgit ci log|artifacts`.
+     */
+    artifact: async (sha256: string, opts?: CallOptions): Promise<ArrayBuffer> => {
+      if (!/^[0-9a-f]{64}$/.test(sha256)) {
+        throw new ReposError(400, `ci.artifact: ${JSON.stringify(sha256)} is not a 64-char lowercase hex sha256`);
+      }
+      const url = this.client.url(`${this.p}/collab/ci-artifacts/${enc(sha256)}`);
+      const r = await this.client.fetch(url, {
+        headers: { Accept: "application/octet-stream", ...opts?.headers },
+        signal: opts?.signal,
+      });
+      if (!r.ok) throw new ReposError(r.status, (await r.text()).trim() || r.statusText, url);
+      return r.arrayBuffer();
+    },
+  };
+
   /** Streaming ref page: `onRef` per match as the server finds it; resolves `{more}`. */
   async refStream(kind: "branches" | "tags" | "all" | "collab", q: RefListQuery, onRef: (r: RefInfo) => void, opts?: CallOptions): Promise<{ more: boolean }> {
     let more = false;
