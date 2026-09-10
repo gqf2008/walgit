@@ -457,13 +457,15 @@ async fn remote_artifact_fits_cap(
         .pop_if_empty()
         .extend(segments.split('/'));
     endpoint.query_pairs_mut().append_pair("actor", actor);
-    let mut req = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build artifact preflight client")?;
+    let mut req = client
         .head(endpoint)
         .header("Accept", "application/octet-stream");
-    if let Ok(token) = std::env::var("WALGIT_TOKEN")
-        && !token.trim().is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {token}"));
+    if let Some(auth) = git_http_authorization(repo, &remote_url)? {
+        req = req.header("Authorization", auth);
     }
     let resp = req.send().await.context("HEAD artifact size")?;
     match resp.status().as_u16() {
@@ -477,11 +479,62 @@ async fn remote_artifact_fits_cap(
             Ok(false)
         }
         401 | 403 => bail!(
-            "HEAD artifact size: HTTP {}; set WALGIT_TOKEN for this remote",
+            "HEAD artifact size: HTTP {}; configure the Git credential helper for this host",
             resp.status()
         ),
         status => bail!("HEAD artifact size: unexpected HTTP {status}"),
     }
+}
+
+/// Ask Git for a credential scoped to this exact remote URL. Never forward a
+/// process-global token: without a host-bound credential the preflight sends
+/// no Authorization header and a 401 is a hard error.
+fn git_http_authorization(repo: &Path, remote_url: &str) -> Result<Option<String>> {
+    let url = reqwest::Url::parse(remote_url)
+        .with_context(|| format!("remote URL {remote_url:?} cannot be parsed"))?;
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    let mut child = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["credential", "fill"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("git credential fill")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        write!(
+            stdin,
+            "protocol={}\nhost={}\npath={}\n\n",
+            url.scheme(),
+            host,
+            url.path()
+        )
+        .context("write git credential query")?;
+    }
+    let out = child.wait_with_output().context("wait git credential fill")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let credential = String::from_utf8_lossy(&out.stdout);
+    let mut username = "";
+    let mut password = "";
+    for line in credential.lines() {
+        if let Some(v) = line.strip_prefix("username=") {
+            username = v;
+        } else if let Some(v) = line.strip_prefix("password=") {
+            password = v;
+        }
+    }
+    if password.is_empty() {
+        return Ok(None);
+    }
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    Ok(Some(format!("Basic {basic}")))
 }
 
 fn read_ci_object_local(repo: &Path, sha256: &str) -> Result<Option<Vec<u8>>> {

@@ -232,7 +232,7 @@ walgit ci artifacts --repo <checkout> [<run-id>] --out out/  # 逐个 sha256 校
   留在 runner 进程，不进入仓库；唤醒只是提示，真正触发仍以 `ls-remote` 的 tip diff 为准。
 - 日志与产物存放在仓库自身的 git 对象里（`refs/collab/ci-artifacts/<actor>/<sha256>`，
   按内容寻址）：普通 clone/fetch 不会带上它们，`ci log`/`ci artifacts` 先通过 HTTP
-  大小预检（需认证时设置 `WALGIT_TOKEN`），再按需拉取并验哈希；无 size 通道的 Git/SSH
+  大小预检（认证沿用 Git 对该 remote 的 credential helper），再按需拉取并验哈希；无 size 通道的 Git/SSH
   远程在下载前拒绝。日志超过 16 MiB 时只保留末尾并置 `log_truncated`。浏览器/SDK 走
   `GET /{o}/{r}/api/collab/ci-artifacts/<sha256>`
   （`repo.ci.artifact(sha256)`）。
