@@ -107,10 +107,11 @@ SERVER_TEST_EXEMPT := "harness e2e sim"
 # The walgit-cli integration suites (issue #141) — the first execution lane
 # these files ever had; until now both CI legs only compiled them. Ubuntu-only,
 # and the platform seam is stated per-file (verified on ab75c81, cited files
-# unchanged through 65fe9a3), because "looks clean" is not the bar for a
-# windows lane (AGENTS.md §5, issue #94 history):
+# unchanged through 65fe9a3; collab_e2e.rs cites refreshed for the D45 gc e2e,
+# #160 — the new spawn is the same /dev/null seam), because "looks clean" is
+# not the bar for a windows lane (AGENTS.md §5, issue #94 history):
 #   - every CLI invocation in both suites passes `--config /dev/null`
-#     (ci_e2e.rs:140,155,415; collab_e2e.rs:89,192,298,467) — D39 makes `NUL`
+#     (ci_e2e.rs:140,155,415; collab_e2e.rs:89,192,298,467,520) — D39 makes `NUL`
 #     the windows form and the tests never branch, so each spawn exits 2;
 #   - ci_e2e's task fixtures are POSIX-shell scripts, executed by the runner
 #     through `cmd /C` on windows (ci_cmd.rs:1147-1150): `sleep 3` (ci_e2e.rs:402),

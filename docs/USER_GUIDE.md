@@ -163,6 +163,15 @@ walgit collab report --repo <checkout> --format markdown   # 全局观测
 walgit collab board --repo <checkout> --format text        # 看板
 ```
 
+### 6.4 收件箱折叠（GC，D45）
+协作条目只增不删，长期会撑大 ref 广播与服务端聚合预算。任一持有身份的主体可定期折叠：
+```bash
+walgit collab gc --repo <checkout> --actor <you> --key <keyfile> --push origin
+```
+它把当前 `refs/collab/inbox/*` 全部条目原样收进签名快照 `refs/collab/meta/snapshot` 并删除已折叠的 ref。
+读侧一律按「快照 ∪ 未折叠尾巴」聚合，折叠前后任何视图（thread/pr/report/board，CLI 与服务端）**字节一致**；
+快照携带每条被删条目的原始签名字节与可重算的 oid，验签链不因删除而断。幂等，可随时重跑；中途崩溃只留重复不留丢失。
+
 > 注意：`status=done` 有 transition 门禁——线程必须先到 `needs-review` 且存在 **verified approve** review。
 
 ---
