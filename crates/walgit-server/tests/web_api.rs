@@ -53,6 +53,17 @@ async fn get_h(
     let text = resp.text().await?;
     Ok((status, text, headers))
 }
+async fn head_h(
+    server: &Server,
+    path: &str,
+) -> anyhow::Result<(reqwest::StatusCode, reqwest::header::HeaderMap)> {
+    let resp = reqwest::Client::new()
+        .head(format!("{}{path}", server.base_url))
+        .send()
+        .await?;
+    Ok((resp.status(), resp.headers().clone()))
+}
+
 fn hdr(h: &reqwest::header::HeaderMap, k: &str) -> String {
     h.get(k)
         .and_then(|v| v.to_str().ok())
@@ -1696,6 +1707,31 @@ async fn collab_ci_artifact_serves_verified_bytes() -> TestResult {
     )
     .await?;
     assert_eq!(st, 413, "oversize objects are refused before body materialization");
+
+    let (st, _) = head_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{sha256}?actor=ci-a"),
+    )
+    .await?;
+    assert_eq!(st, 200, "a fitting exact actor is preflighted");
+    let (st, _) = head_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{sha256}?actor=missing"),
+    )
+    .await?;
+    assert_eq!(st, 404, "the preflight is scoped to the exact actor");
+    let (st, _) = head_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{oversize_sha}?actor=ci-a"),
+    )
+    .await?;
+    assert_eq!(st, 413, "the CLI preflight refuses before fetching the body");
+    let (st, _) = head_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{sha256}?actor=bad%2Factor"),
+    )
+    .await?;
+    assert_eq!(st, 400, "actor is a single ref segment");
     Ok(())
 }
 

@@ -229,7 +229,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/collab/threads/{{id}}"), get(collab_thread))
             .route(
                 &format!("{base}/collab/ci-artifacts/{{sha256}}"),
-                get(collab_ci_artifact),
+                get(collab_ci_artifact).head(collab_ci_artifact_size),
             )
             .route(&format!("{base}/blame/{{*rest}}"), get(blame))
             .route(&format!("{base}/archive/{{*rest}}"), get(archive))
@@ -1774,15 +1774,7 @@ async fn collab_ci_artifact(
     headers: HeaderMap,
     Path((owner, repo_name, sha256)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    if sha256.len() != 64
-        || !sha256
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(ApiError::BadRequest(
-            "ci-artifacts key must be a 64-char lowercase hex sha256".into(),
-        ));
-    }
+    validate_ci_artifact_sha(&sha256)?;
     run(
         &st,
         &headers,
@@ -1791,20 +1783,7 @@ async fn collab_ci_artifact(
         Need::Objects,
         None,
         move |r| async move {
-            let suffix = format!("/{sha256}");
-            let prefix = walgit_wal::ci::CI_ARTIFACT_REF_PREFIX;
-            let start = r
-                .index
-                .all
-                .partition_point(|(name, _)| name.as_str() < prefix);
-            let candidates = r
-                .index
-                .all
-                .get(start..)
-                .unwrap_or_default()
-                .iter()
-                .take_while(|(name, _)| name.starts_with(prefix))
-                .filter(|(name, _)| name.ends_with(&suffix));
+            let candidates = ci_artifact_refs(&r, &sha256, None);
             let mut saw_oversize = false;
             for (_, oid) in candidates {
                 let Some(size) = object_size(&r, oid).await? else {
@@ -1824,7 +1803,9 @@ async fn collab_ci_artifact(
                         .await
                         .map_err(|e| ApiError::Internal(e.to_string()))?;
                 }
-                let blobs = git_cat_file_batch(&r.local, std::slice::from_ref(oid)).await?;
+                let oid_owned = oid.to_string();
+                let blobs =
+                    git_cat_file_batch(&r.local, std::slice::from_ref(&oid_owned)).await?;
                 let Some(bytes) = blobs.get(oid) else {
                     continue;
                 };
@@ -1839,6 +1820,109 @@ async fn collab_ci_artifact(
                 }
                 // A ref whose payload does not hash to its address is hostile
                 // or corrupt; try the next candidate for the same address.
+            }
+            if saw_oversize {
+                Err(ApiError::PayloadTooLarge)
+            } else {
+                Err(not_found("ci artifact"))
+            }
+        },
+    )
+    .await
+}
+
+fn validate_ci_artifact_sha(sha256: &str) -> Result<(), ApiError> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ApiError::BadRequest(
+            "ci-artifacts key must be a 64-char lowercase hex sha256".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refs an artifact address may resolve to. The browser/SDK lookup has no
+/// actor and scans the content-addressed namespace for the first valid bytes
+/// (B3); the CLI preflight names the exact inbox owner it is about to fetch.
+fn ci_artifact_refs<'a>(
+    r: &'a Repo,
+    sha256: &str,
+    actor: Option<&str>,
+) -> Vec<(&'a str, &'a str)> {
+    let prefix = walgit_wal::ci::CI_ARTIFACT_REF_PREFIX;
+    if let Some(actor) = actor {
+        let exact = format!("{prefix}{actor}/{sha256}");
+        return r
+            .index
+            .all
+            .binary_search_by(|(name, _)| name.as_str().cmp(exact.as_str()))
+            .ok()
+            .and_then(|i| r.index.all.get(i))
+            .map(|(name, oid)| vec![(name.as_str(), oid.as_str())])
+            .unwrap_or_default();
+    }
+    let suffix = format!("/{sha256}");
+    let start = r
+        .index
+        .all
+        .partition_point(|(name, _)| name.as_str() < prefix);
+    r.index
+        .all
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|(name, _)| name.starts_with(prefix))
+        .filter(|(name, _)| name.ends_with(&suffix))
+        .map(|(name, oid)| (name.as_str(), oid.as_str()))
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct CiArtifactQuery {
+    actor: Option<String>,
+}
+
+/// HEAD preflight for the CLI: it answers only whether the exact actor's
+/// artifact exists and fits the 16 MiB object cap, before `git fetch` can
+/// materialize an oversized blob. The body route remains the byte endpoint.
+async fn collab_ci_artifact_size(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, sha256)): Path<(String, String, String)>,
+    Query(q): Query<CiArtifactQuery>,
+) -> Result<Response, ApiError> {
+    validate_ci_artifact_sha(&sha256)?;
+    if let Some(actor) = &q.actor
+        && !ref_segment_ok(actor)
+    {
+        return Err(ApiError::BadRequest("invalid ci artifact actor".into()));
+    }
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let mut saw_oversize = false;
+            for (_, oid) in ci_artifact_refs(&r, &sha256, q.actor.as_deref()) {
+                let Some(size) = object_size(&r, oid).await? else {
+                    continue;
+                };
+                if size > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+                    saw_oversize = true;
+                    continue;
+                }
+                return Ok(Rendered {
+                    body: bytes::Bytes::new(),
+                    content_type: "application/octet-stream",
+                    cache_control: IMMUTABLE,
+                    etag: Some(etag_for(&sha256)),
+                });
             }
             if saw_oversize {
                 Err(ApiError::PayloadTooLarge)
