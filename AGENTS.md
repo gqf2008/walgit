@@ -459,6 +459,26 @@ decision in §4 — or the PR is; never "fix later".
   answers `warnings: [...]` instead of a silent "kept". Concurrent PUTs are
   last-writer-wins (admin-only surface, tiny file).
 
+- **D45** **Collab entries fold into a signed snapshot; every aggregation
+  reads snapshot ∪ inbox tail (2026-09-10, #160).** The append-only
+  `refs/collab/inbox/*` namespace hits two walls as it grows: the 20k-ref
+  per-request aggregation budget (`collab_load`) and the clone/fetch ref
+  advertisement size. The fold is the WAL checkpoint's shape applied to the
+  collab namespace (normative: `docs/D1_COLLAB_DESIGN.md` §11.4): one
+  CAS-moved ref `refs/collab/meta/snapshot` points at a signed JSON blob
+  that carries every folded entry verbatim (`oid` + inbox `principal` + raw
+  signed bytes — the digest manifest that keeps the per-entry signature
+  chain verifiable after pruning; the oid is recomputable from the bytes).
+  The fold unit is the CLI (`walgit collab gc`), never the maintainer —
+  the folder must hold a collab principal and signing key, and the write
+  goes through receive-pack like any other: snapshot ref lands first
+  (forced blob→blob update, still CAS'd server-side), the pruned inbox
+  refs are deleted after, in batches. Readers dedup by oid, so aggregation
+  before and after a fold is byte-identical — that equality is the
+  acceptance test. Server and CLI parse the snapshot through the same
+  `walgit-wal::collab` code; the server bounds the snapshot blob at
+  64 MiB and counts only the unfolded tail against the 20k budget.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---

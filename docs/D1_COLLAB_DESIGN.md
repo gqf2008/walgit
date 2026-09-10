@@ -322,9 +322,91 @@
    因此聚合端点（report / threads / board）一律 SWR + ETag、永不 immutable；
    读路径的成本控制来自共享的 `collab_load`（单次 refs 级同步 + 条目一次
    `cat-file --batch` 读完，20k refs 预算），不来自跨请求缓存答案。
-4. 条目 GC/压缩：追加式长期膨胀，可做 checkpoint（聚合状态快照）——借鉴 walgit checkpoint 思路，设计期留 TODO。
+4. 条目 GC/压缩：**已落地（issue #160，walgit D45）**——聚合状态快照（读侧 = 快照 ∪
+   增量尾），设计与语义见 §11.4。
 5. 原型顺序建议：
    ① walgit 侧：通用 refs API + 评审原语端点；
    ② 协作条目协议 + CLI 验证（先于 UI）；
    ③ agent 接入（events 订阅 + 签名条目）；
    ④ dashboard（只读渲染端）。
+
+## 11.4 协作条目折叠：聚合状态快照（snapshot ∪ tail，issue #160 / walgit D45）
+
+**问题**。`refs/collab/inbox/<principal>/<uuid>` 纯追加、只增不减，随使用量撞两堵墙：
+① 聚合读的单请求预算（server `collab_load` 20k refs，超限 503 指向 CLI 离线聚合）；
+② clone/fetch 的 ref 通告体积（每个条目一行通告，即使客户端不取这个命名空间）。
+与 WAL log 只增不减是同一问题，解法是同一个：**借鉴 checkpoint——读侧 = 最新快照 + 其后增量尾**。
+
+**快照 ref 与文档形态**。每仓库至多一个快照 ref：
+
+- `refs/collab/meta/snapshot` → 一个 blob，内容是签名 JSON 文档（`walgit-wal::collab::Snapshot`）：
+
+```json
+{
+  "version": 1,
+  "kind": "collab_snapshot",
+  "actor": "<执行折叠的 principal>",
+  "ts": 1786500000,
+  "entries": [
+    { "oid": "<条目 blob 的 git sha1>", "principal": "<收件箱属主>", "json": "<条目原始字节，逐字>" }
+  ],
+  "sig": "ed25519:<base64，覆盖去掉 sig 后的 canonical 形（§4.2 同一 canonical 契约）>"
+}
+```
+
+- `entries` 按 `oid` 字节序升序——折叠是输入集合的纯函数，同一输入必然产出同一快照。
+- **每条记录自带 oid + principal + 原始签名字节**：这就是剪枝后的 digest 清单。读侧解析
+  记录时重算 `git blob sha1("blob <len>\0" + json)`，与声明的 `oid` 不符的记录**跳过**
+  （与"损坏的收件箱 blob 直接跳过"同一语义——退化可见、绝不静默取信）；`json` 解析
+  不出合法条目的记录同样跳过。快照自身的签名只证明"谁在何时做了折叠"（供审计与
+  watch 通告），**条目信任永不来自快照签名**——每条折叠条目仍按 §4.2 独立验签，
+  收件箱归属校验（`principal == entry.actor`）原样保留。
+- 快照**只折叠 inbox 命名空间**。`meta/principals/*`（每 principal 单例、吊销=删除）与
+  `meta/rules` 不增长、不折叠，读法不变。
+
+**读侧语义（server 与 CLI 同一份代码）**。聚合输入 = `parse_snapshot(快照 blob)` ∪
+现有收件箱尾，**按 oid 去重**（同 oid 即同内容，内容寻址保证无歧义）。聚合是条目
+集合的纯函数（既有测试锁死了"读序无关、字节一致"），所以折叠前后输入集合不变 ⇒
+聚合输出逐字节不变——这是本设计的验收等式。两端共用 `walgit-wal::collab` 的快照
+解析：server `collab_load` 多 fault 一个 blob、多读一个 cat-file 对象（不加 round
+trip）；CLI `CollabReader::load` 同理，`walgit ci` 经同一 loader 自动受益。server 侧
+快照 blob 上限 64 MiB（超限 503，指向 CLI/gc）——预算从"ref 条数"变成"尾部 ref
+条数 + 一个有界 blob"，20k 墙只数未折叠尾部。
+
+**折叠单元（写侧）**：`walgit collab gc --actor <principal> --key <key> [--push <remote>]`，
+CLI 形态而非 maintainer 单元——理由：折叠者必须有 collab principal 与签名密钥
+（maintainer 进程没有协作层身份），且写必须走 receive-pack（§5：写永远走 walgit
+receive-pack，manifest CAS 是唯一提交点）；任何客户端都能跑，自动化 = cron/agent
+调 CLI（同 `walgit mirror` 的形态）。步骤：
+
+1. 读现有快照记录（**逐字携带**，不重序列化——oid 是对原始字节的内容寻址）∪ 当前
+   本地 `refs/collab/inbox/*` 中**可解析**的条目（不可解析的收件箱 blob 不折叠、ref
+   留在原地，与读侧"跳过损坏条目"语义一致）。oid 去重。
+2. 构造并签名新快照，`git hash-object -w` 落本地。
+3. **先落快照**：`git push --atomic origin +<oid>:refs/collab/meta/snapshot`
+   （blob→blob 更新客户端需要 force；服务端仍以通告的 old 值做 CAS——并发折叠者
+   必有一方 stale-info 失败，重取重折）。快照先落地是安全性边界：此后任何被删
+   条目都已在快照中可见。repo policy 视角（§6 / docs/POLICY.md）：这一步是
+   `update` + `force-push`，第 4 步是 `delete`——受保护的仓库里 gc 主体需要
+   相应的允许/绕行（D1 参考策略下即 admin）。
+4. **再删收件箱**：分批 `git push origin :refs/collab/inbox/...`（每批 ≤500 条，
+   规避 ARG_MAX；非原子——收件箱 ref 从不移动，删除天然幂等，部分失败重跑即可）。
+5. 以服务器为准 reconcile 本地命名空间（删本地已不在远端的收件箱 ref）。
+
+**剪枝语义与可回放性（红线交代）**。删除就是普通 receive-pack ref 删除，经 WAL
+发布：**append-only 的审计记录是 WAL log 本身**（每条 create/delete 都入 log，
+`walgit wal materialize --at-seq` 在保留窗口内可回放到折叠前任意点），collab refs
+从来不是审计链的载体。被剪条目的**内容**由快照永久携带（oid + 原始字节 + 逐条
+可验签），即使原条目 blob 日后被 base rebuild 作为不可达对象回收，验证链也不断。
+折叠中途崩溃：快照先落 ⇒ 读者看到的聚合始终等价（残留 ref 与快照重复，读侧
+去重）；重跑 gc 收敛。折叠中途的读者（快照更新后、删除完成前）看到重复输入 ⇒
+去重后同一答案。
+
+**与 20k 预算 / 通告体积的关系**。折叠后 `refs/collab/*` = 1 个快照 ref +
+principals/rules 单例 + 未折叠尾部：info/refs 通告行数与聚合读的 fan-out 都不再随
+历史总量增长；一次 gc 把 N 条 ref 收成 1 条 ref + 1 个有界 blob。events 桥视角：
+一次 gc = 1 条 snapshot 更新事件 + N 条删除事件（`(repo, seq, ref)` 去重、可回放，
+既有契约不变）；`collab watch` 把快照 ref 的变化以 `kind=snapshot` 通告
+（verified = 快照签名对 actor 注册 key 的验证结果）。**获取字节换通告行数**：
+fetch 该命名空间的客户端会拉取快照 blob（≈ 折叠历史的体积），这是设计取向——
+不关心协作层的克隆不取这个命名空间。
