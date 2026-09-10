@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Subcommand;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::io::Write as _;
@@ -282,6 +282,11 @@ pub fn run(action: CiAction) -> Result<()> {
                 print!("{}", result.log_summary);
                 return Ok(());
             }
+            if result.log_truncated {
+                eprintln!(
+                    "ci: run {id}: stored log exceeds the retention cap; showing the retained tail"
+                );
+            }
             if let Some(bytes) =
                 fetch_ci_object(&repo, &remote, &result.actor, &result.log_sha256)?
             {
@@ -307,6 +312,7 @@ pub fn run(action: CiAction) -> Result<()> {
                 return Ok(());
             }
             std::fs::create_dir_all(&out).with_context(|| format!("create {}", out.display()))?;
+            let mut names = HashSet::new();
             for a in &result.artifacts {
                 // §8.2 name is a base name; a hostile writer could smuggle a
                 // path — never write outside `--out`.
@@ -317,6 +323,10 @@ pub fn run(action: CiAction) -> Result<()> {
                     eprintln!("ci: {}: unusable name, skipped", a.name);
                     continue;
                 };
+                if !names.insert(fname.clone()) {
+                    eprintln!("ci: {fname}: duplicate artifact name, skipped");
+                    continue;
+                }
                 let Some(bytes) = fetch_ci_object(&repo, &remote, &result.actor, &a.sha256)? else {
                     if let Some(url) = &a.url {
                         println!("ci: {fname}: external artifact, see {url}");
@@ -326,8 +336,7 @@ pub fn run(action: CiAction) -> Result<()> {
                     continue;
                 };
                 let dest = out.join(&fname);
-                std::fs::write(&dest, &bytes)
-                    .with_context(|| format!("write {}", dest.display()))?;
+                write_artifact_file(&dest, &bytes)?;
                 println!(
                     "ci: {fname} ({} bytes, sha256 verified) -> {}",
                     a.bytes,
@@ -337,6 +346,22 @@ pub fn run(action: CiAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn write_artifact_file(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .with_context(|| {
+            format!(
+                "create {} (refusing to overwrite or follow an existing path)",
+                dest.display()
+            )
+        })?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", dest.display()))?;
+    Ok(())
 }
 
 /// The run selected by `--run` (or the newest) and its latest attempt's
@@ -407,37 +432,54 @@ fn read_ci_object_local(repo: &Path, sha256: &str) -> Result<Option<Vec<u8>>> {
         );
     }
     let suffix = format!("/{sha256}");
-    let oid = String::from_utf8_lossy(&out.stdout)
+    let candidates: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_once(' '))
-        .find(|(name, _)| name.ends_with(&suffix))
-        .map(|(_, oid)| oid.to_string());
-    let Some(oid) = oid else {
-        return Ok(None);
-    };
-    let out = Command::new("git")
-        .args(["-C"])
-        .arg(repo)
-        .args(["cat-file", "blob", &oid])
-        .output()
-        .context("git cat-file")?;
-    if !out.status.success() {
-        bail!(
-            "git cat-file {oid} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        .filter(|(name, _)| name.ends_with(&suffix))
+        .map(|(_, oid)| oid.to_string())
+        .collect();
+    for oid in candidates {
+        let size = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["cat-file", "-s", &oid])
+            .output()
+            .context("git cat-file -s")?;
+        if !size.status.success() {
+            continue;
+        }
+        let size = std::str::from_utf8(&size.stdout)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if size.is_none_or(|size| size > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES) {
+            eprintln!(
+                "ci: artifact {sha256}: object {oid} is missing or exceeds the {}-byte cap; ignored",
+                walgit_wal::ci::CI_ARTIFACT_MAX_BYTES
+            );
+            continue;
+        }
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["cat-file", "blob", &oid])
+            .output()
+            .context("git cat-file")?;
+        if !out.status.success() {
+            continue;
+        }
+        if out.stdout.len() as u64 > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
+            continue;
+        }
+        let actual = sha256_hex(&out.stdout);
+        if actual != sha256 {
+            eprintln!(
+                "ci: artifact {sha256}: object {oid} hashes to {actual}; ignored"
+            );
+            continue;
+        }
+        return Ok(Some(out.stdout));
     }
-    if out.stdout.len() as u64 > walgit_wal::ci::CI_ARTIFACT_MAX_BYTES {
-        bail!(
-            "artifact {sha256} exceeds the {}-byte cap",
-            walgit_wal::ci::CI_ARTIFACT_MAX_BYTES
-        );
-    }
-    let actual = sha256_hex(&out.stdout);
-    if actual != sha256 {
-        bail!("artifact {sha256}: content hashes to {actual} — corrupt object");
-    }
-    Ok(Some(out.stdout))
+    Ok(None)
 }
 
 // ---- .walgit/ci.toml schema (docs/D1_CI_PROTOCOL.md §3) ------------------------
@@ -880,7 +922,9 @@ const BASE_ENV_ALLOW: [&str; 10] = [
     "PATHEXT",
     "USERPROFILE",
 ];
-/// Captured output kept in memory: the tail of the merged stdout+stderr (§8.2).
+/// Captured output kept in memory: the retained tail of merged stdout+stderr.
+/// It matches the artifact object cap, so a published log blob is always
+/// uploadable; larger output sets `log_truncated` and keeps the last cap bytes.
 const LOG_CAPTURE_MAX: usize = 16 * 1024 * 1024;
 /// The `log_summary` bound a result entry carries (§8.2).
 const LOG_SUMMARY_MAX: usize = 4096;
@@ -908,9 +952,17 @@ struct ExecOutcome {
     duration_ms: u64,
     /// Merged stdout+stderr tail, at most `LOG_CAPTURE_MAX` bytes.
     log: Vec<u8>,
+    /// True when earlier output was dropped from `log`.
+    log_truncated: bool,
     /// §8.2: declared artifacts collected from the worktree before its
     /// removal — the git blob already written, integrity hash computed.
     artifacts: Vec<CollectedArtifact>,
+}
+
+#[derive(Default)]
+struct CapturedLog {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 /// §8.2: one collected artifact, ready to upload.
@@ -933,6 +985,50 @@ enum TaskOutcome {
     Settled(Conclusion),
     /// Someone else holds the run, or this pass gave up — revisit later.
     Deferred,
+}
+
+struct RefOutcome {
+    terminal: bool,
+    failed: bool,
+    schedules: Vec<(String, Option<String>)>,
+}
+
+fn schedule_key(ref_name: &str, task: &str) -> String {
+    format!("{ref_name}\u{1f}{task}")
+}
+
+fn schedule_prefix(ref_name: &str) -> String {
+    format!("{ref_name}\u{1f}")
+}
+
+fn apply_schedule_snapshot(
+    state: &mut RunnerState,
+    ref_name: &str,
+    schedules: &[(String, Option<String>)],
+    task_filter: Option<&str>,
+) {
+    if let Some(task_name) = task_filter {
+        let key = schedule_key(ref_name, task_name);
+        state.schedules.remove(&key);
+        state.cron.remove(&key);
+        if let Some((_, Some(expr))) = schedules
+            .iter()
+            .find(|(name, _)| name == task_name)
+        {
+            state.schedules.insert(key, expr.clone());
+        }
+        return;
+    }
+    let prefix = schedule_prefix(ref_name);
+    state.schedules.retain(|key, _| !key.starts_with(&prefix));
+    state.cron.retain(|key, _| !key.starts_with(&prefix));
+    for (task_name, schedule) in schedules {
+        if let Some(expr) = schedule {
+            state
+                .schedules
+                .insert(schedule_key(ref_name, task_name), expr.clone());
+        }
+    }
 }
 
 impl Runner {
@@ -981,6 +1077,25 @@ impl Runner {
         let mut exit = 0i32;
         let mut dirty = false;
         let tips = self.ls_tips()?;
+        let live_refs: std::collections::HashSet<&str> =
+            tips.iter().map(|(name, _)| name.as_str()).collect();
+        let stale: std::collections::HashSet<String> = state
+            .processed
+            .keys()
+            .filter(|name| !live_refs.contains(name.as_str()))
+            .cloned()
+            .chain(state.schedules.keys().filter_map(|key| {
+                let (ref_name, _) = key.split_once('\u{1f}')?;
+                (!live_refs.contains(ref_name)).then(|| ref_name.to_string())
+            }))
+            .collect();
+        for ref_name in stale {
+            state.processed.remove(&ref_name);
+            let prefix = schedule_prefix(&ref_name);
+            state.schedules.retain(|key, _| !key.starts_with(&prefix));
+            state.cron.retain(|key, _| !key.starts_with(&prefix));
+            dirty = true;
+        }
         for (ref_name, tip) in &tips {
             if state
                 .processed
@@ -990,12 +1105,18 @@ impl Runner {
                 continue;
             }
             match self.process_ref(ref_name, ttl_override) {
-                Ok((terminal, failed)) => {
-                    if terminal {
+                Ok(outcome) => {
+                    apply_schedule_snapshot(
+                        &mut state,
+                        ref_name,
+                        &outcome.schedules,
+                        self.task_filter.as_deref(),
+                    );
+                    if outcome.terminal {
                         state.processed.insert(ref_name.clone(), tip.clone());
                         dirty = true;
                     }
-                    if failed {
+                    if outcome.failed {
                         exit = 1;
                     }
                 }
@@ -1009,11 +1130,36 @@ impl Runner {
         // is exactly what a schedule fires on. A deferred ref (a task still
         // held elsewhere) is not swept; the trigger path revisits it first.
         let now = chrono::Utc::now().timestamp();
-        for (ref_name, tip) in &tips {
+        let tip_by_ref: HashMap<&str, &str> =
+            tips.iter().map(|(name, tip)| (name.as_str(), tip.as_str())).collect();
+        let mut scheduled_keys: Vec<String> = state.schedules.keys().cloned().collect();
+        scheduled_keys.sort();
+        for key in scheduled_keys {
+            let Some((ref_name, task_name)) = key.split_once('\u{1f}') else {
+                continue;
+            };
+            if self.task_filter.as_deref().is_some_and(|name| name != task_name) {
+                continue;
+            }
+            let Some(tip) = tip_by_ref.get(ref_name).copied() else {
+                continue;
+            };
             if state.processed.get(ref_name).is_none_or(|seen| seen != tip) {
                 continue;
             }
-            match self.cron_sweep_ref(ref_name, tip, &mut state, ttl_override, now, &mut exit) {
+            let Some(expr) = state.schedules.get(&key).cloned() else {
+                continue;
+            };
+            match self.cron_sweep_one(
+                ref_name,
+                tip,
+                task_name,
+                &expr,
+                &mut state,
+                ttl_override,
+                now,
+                &mut exit,
+            ) {
                 Ok(swept) => dirty |= swept,
                 Err(e) => {
                     eprintln!("ci: {ref_name}: cron sweep: {e:#}");
@@ -1027,99 +1173,99 @@ impl Runner {
         Ok(exit)
     }
 
-    /// §4.3: evaluate every scheduled task of an unmoved ref against the cron
-    /// bookkeeping in the state file. First sight seeds the baseline (a task
-    /// added to an old ref must not burst-run its backlog); a due slot runs
-    /// once as a fresh run identity (`scheduled_run_id`); a backlog deeper
-    /// than the scan bound advances the bookkeeping without running. All
-    /// checks are local until a slot actually fires. Returns whether the
-    /// state changed.
-    fn cron_sweep_ref(
+    /// §4.3: evaluate one persisted scheduled task of an unmoved ref. The
+    /// expression is already validated; git objects are read only when a slot
+    /// actually fires. Returns whether state changed.
+    #[allow(clippy::too_many_arguments)]
+    fn cron_sweep_one(
         &self,
         ref_name: &str,
         tip: &str,
+        task_name: &str,
+        expr: &str,
         state: &mut RunnerState,
         ttl_override: Option<u64>,
         now: i64,
         exit: &mut i32,
     ) -> Result<bool> {
-        let mut dirty = false;
-        // The tip was fetched when the ref was processed; if the objects went
-        // away since (fresh clone over a copied state file), fetch once —
-        // exactly what a changed ref would cost.
-        let have = Command::new("git")
-            .args(["-C"])
-            .arg(&self.repo)
-            .args(["cat-file", "-e", &format!("{tip}^{{commit}}")])
-            .output()
-            .context("git cat-file -e")?
-            .status
-            .success();
-        if !have {
-            self.fetch_commit(ref_name)?;
-        }
-        let Some(raw) = self.read_ci_toml(tip)? else {
-            return Ok(dirty);
+        let Some(&last) = state.cron.get(&schedule_key(ref_name, task_name)) else {
+            state.cron.insert(schedule_key(ref_name, task_name), now);
+            return Ok(true);
         };
-        // An invalid declaration was already reported (and the pass failed)
-        // by the trigger path; the sweep has nothing to add.
-        let Ok(cfg) = parse_and_validate(&raw) else {
-            return Ok(dirty);
+        let Ok(schedule) = walgit_bundle::schedule::parse_schedule(expr) else {
+            let key = schedule_key(ref_name, task_name);
+            state.schedules.remove(&key);
+            state.cron.remove(&key);
+            return Ok(true);
         };
-        let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
-        let short: String = tip.chars().take(8).collect();
-        for t in cfg.matching(ref_name) {
-            let Some(expr) = &t.schedule else {
-                continue;
-            };
-            if self.task_filter.as_deref().is_some_and(|n| n != t.name) {
-                continue;
+        match walgit_bundle::schedule::due_slot(&schedule, last, now) {
+            DueSlot::NotDue => Ok(false),
+            DueSlot::Skip(slot) => {
+                state.cron.insert(schedule_key(ref_name, task_name), slot);
+                Ok(true)
             }
-            let key = format!("{ref_name}\u{1f}{}", t.name);
-            let Some(&last) = state.cron.get(&key) else {
-                state.cron.insert(key, now);
-                dirty = true;
-                continue;
-            };
-            let Ok(schedule) = walgit_bundle::schedule::parse_schedule(expr) else {
-                continue; // V10 already rejected a bad expression; defensive.
-            };
-            match walgit_bundle::schedule::due_slot(&schedule, last, now) {
-                DueSlot::NotDue => {}
-                DueSlot::Skip(slot) => {
-                    state.cron.insert(key, slot);
-                    dirty = true;
+            DueSlot::Run(slot) => {
+                let have = Command::new("git")
+                    .args(["-C"])
+                    .arg(&self.repo)
+                    .args(["cat-file", "-e", &format!("{tip}^{{commit}}")])
+                    .output()
+                    .context("git cat-file -e")?
+                    .status
+                    .success();
+                if !have {
+                    self.fetch_commit(ref_name)?;
                 }
-                DueSlot::Run(slot) => {
-                    let id = scheduled_run_id(&t.name, ref_name, tip, slot);
-                    println!(
-                        "ci: {ref_name} @ {short} task {}: schedule fired (slot {slot}), run {id}",
-                        t.name
-                    );
-                    match self.process_task(t, ref_name, tip, ttl, &id)? {
-                        TaskOutcome::Settled(Conclusion::Success) => {
-                            state.cron.insert(key, slot);
-                            dirty = true;
-                        }
-                        TaskOutcome::Settled(other) => {
-                            println!(
-                                "ci: {ref_name} @ {short} task {}: settled {}",
-                                t.name,
-                                other.as_str()
-                            );
-                            state.cron.insert(key, slot);
-                            dirty = true;
-                            *exit = 1;
-                        }
-                        // Held elsewhere or gave up: leave the slot pending so
-                        // the next pass re-decides the same run (§4, same rule
-                        // as the trigger path's unprocessed tip).
-                        TaskOutcome::Deferred => {}
+                let Some(raw) = self.read_ci_toml(tip)? else {
+                    let key = schedule_key(ref_name, task_name);
+                    state.schedules.remove(&key);
+                    state.cron.remove(&key);
+                    return Ok(true);
+                };
+                let Ok(cfg) = parse_and_validate(&raw) else {
+                    let key = schedule_key(ref_name, task_name);
+                    state.schedules.remove(&key);
+                    state.cron.remove(&key);
+                    return Ok(true);
+                };
+                let Some(task) = cfg
+                    .matching(ref_name)
+                    .into_iter()
+                    .find(|task| task.name == task_name && task.schedule.as_deref() == Some(expr))
+                else {
+                    let key = schedule_key(ref_name, task_name);
+                    state.schedules.remove(&key);
+                    state.cron.remove(&key);
+                    return Ok(true);
+                };
+                let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
+                let key = schedule_key(ref_name, task_name);
+                let short: String = tip.chars().take(8).collect();
+                let id = scheduled_run_id(task_name, ref_name, tip, slot);
+                println!(
+                    "ci: {ref_name} @ {short} task {task_name}: schedule fired (slot {slot}), run {id}"
+                );
+                match self.process_task(task, ref_name, tip, ttl, &id)? {
+                    TaskOutcome::Settled(Conclusion::Success) => {
+                        state.cron.insert(key, slot);
+                        Ok(true)
                     }
+                    TaskOutcome::Settled(other) => {
+                        println!(
+                            "ci: {ref_name} @ {short} task {task_name}: settled {}",
+                            other.as_str()
+                        );
+                        state.cron.insert(key, slot);
+                        *exit = 1;
+                        Ok(true)
+                    }
+                    // Held elsewhere or gave up: leave the slot pending so
+                    // the next pass re-decides the same run (§4, same rule
+                    // as the trigger path's unprocessed tip).
+                    TaskOutcome::Deferred => Ok(false),
                 }
             }
         }
-        Ok(dirty)
     }
 
     /// The trigger surface (§3.2): `refs/heads/*` and `refs/tags/*` of the
@@ -1154,22 +1300,36 @@ impl Runner {
         Ok(tips)
     }
 
-    /// All tasks of one ref tip (§3.2/§4). Returns (all-terminal, any-failed).
-    /// The tip itself is the caller's (`run_pass`) processed-state key.
-    fn process_ref(&self, ref_name: &str, ttl_override: Option<u64>) -> Result<(bool, bool)> {
+    /// All tasks of one ref tip (§3.2/§4). The tip itself is the caller's
+    /// (`run_pass`) processed-state key. The returned schedule snapshot is
+    /// persisted so quiet cron passes do not re-read git objects per ref.
+    fn process_ref(&self, ref_name: &str, ttl_override: Option<u64>) -> Result<RefOutcome> {
         let commit = self.fetch_commit(ref_name)?;
         let short: String = commit.chars().take(8).collect();
         let Some(raw) = self.read_ci_toml(&commit)? else {
             println!("ci: {ref_name} @ {short}: no .walgit/ci.toml");
-            return Ok((true, false));
+            return Ok(RefOutcome {
+                terminal: true,
+                failed: false,
+                schedules: Vec::new(),
+            });
         };
         let cfg = match parse_and_validate(&raw) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("ci: {ref_name} @ {short}: invalid .walgit/ci.toml, skipping: {e}");
-                return Ok((true, true));
+                return Ok(RefOutcome {
+                    terminal: true,
+                    failed: true,
+                    schedules: Vec::new(),
+                });
             }
         };
+        let schedules = cfg
+            .matching(ref_name)
+            .into_iter()
+            .map(|task| (task.name.clone(), task.schedule.clone()))
+            .collect();
         let ttl = ttl_override.unwrap_or(cfg.claim_ttl_secs);
         // §4: the tip is recorded as processed only once **every** task of the
         // tip reached a terminal state — a later task standing down (someone
@@ -1198,7 +1358,11 @@ impl Runner {
                 TaskOutcome::Deferred => all_terminal = false,
             }
         }
-        Ok((all_terminal, any_failed))
+        Ok(RefOutcome {
+            terminal: all_terminal,
+            failed: any_failed,
+            schedules,
+        })
     }
 
     /// One task of one ref tip: decide, claim, execute, publish — repeat until
@@ -1532,10 +1696,13 @@ impl Runner {
             "log_summary": tail_string(&outcome.log, LOG_SUMMARY_MAX),
             "log_sha256": sha256_hex(&outcome.log),
         });
-        if !artifacts.is_empty()
-            && let Some(obj) = body.as_object_mut()
-        {
-            obj.insert("artifacts".into(), serde_json::Value::Array(artifacts));
+        if let Some(obj) = body.as_object_mut() {
+            if !artifacts.is_empty() {
+                obj.insert("artifacts".into(), serde_json::Value::Array(artifacts));
+            }
+            if outcome.log_truncated {
+                obj.insert("log_truncated".into(), serde_json::Value::Bool(true));
+            }
         }
         let oid = self.publish(CI_RESULT_KIND, id, claim_oid, body)?;
         println!(
@@ -1568,6 +1735,7 @@ impl Runner {
             exit_code: None,
             duration_ms: millis_since(started),
             log: msg.into_bytes(),
+            log_truncated: false,
             artifacts: Vec::new(),
         };
         let dir = match tempfile::tempdir() {
@@ -1688,6 +1856,7 @@ impl Runner {
             exit_code: None,
             duration_ms: millis_since(started),
             log: msg.into_bytes(),
+            log_truncated: false,
             artifacts: Vec::new(),
         };
         let (program, prefix): (&str, &[&str]) = if cfg!(windows) {
@@ -1724,7 +1893,7 @@ impl Runner {
             Ok(c) => c,
             Err(e) => return fail(format!("spawn `{}`: {e}", task.command)),
         };
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(CapturedLog::default()));
         let readers = [
             drain(child.stdout.take(), Arc::clone(&log)),
             drain(child.stderr.take(), Arc::clone(&log)),
@@ -1738,11 +1907,13 @@ impl Runner {
                 for r in readers {
                     let _ = r.join();
                 }
+                let captured = take_log(&log);
                 return ExecOutcome {
                     conclusion: Conclusion::Timeout,
                     exit_code: None,
                     duration_ms: millis_since(started),
-                    log: take_log(&log),
+                    log: captured.bytes,
+                    log_truncated: captured.truncated,
                     artifacts: Vec::new(),
                 };
             }
@@ -1758,11 +1929,13 @@ impl Runner {
         } else {
             Conclusion::Failure
         };
+        let captured = take_log(&log);
         ExecOutcome {
             conclusion,
             exit_code: code.map(i64::from),
             duration_ms: millis_since(started),
-            log: take_log(&log),
+            log: captured.bytes,
+            log_truncated: captured.truncated,
             artifacts: Vec::new(),
         }
     }
@@ -1831,17 +2004,37 @@ fn kill_tree(child: &mut Child) {
 
 /// The captured tail out of the shared buffer (poison-tolerant: a panicking
 /// reader thread must not lose the task's output).
-fn take_log(log: &Mutex<Vec<u8>>) -> Vec<u8> {
+fn take_log(log: &Mutex<CapturedLog>) -> CapturedLog {
     let mut guard = log
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::mem::take(&mut *guard)
 }
 
+/// Append one chunk while retaining only the last `limit` bytes.
+fn append_capped(captured: &mut CapturedLog, chunk: &[u8], limit: usize) {
+    if chunk.len() >= limit {
+        captured.bytes.clear();
+        let start = chunk.len().saturating_sub(limit);
+        if let Some(tail) = chunk.get(start..) {
+            captured.bytes.extend_from_slice(tail);
+        }
+        captured.truncated = true;
+        return;
+    }
+    if captured.bytes.len() + chunk.len() > limit {
+        let keep = limit.saturating_sub(chunk.len());
+        let drop = captured.bytes.len().saturating_sub(keep);
+        captured.bytes.drain(..drop);
+        captured.truncated = true;
+    }
+    captured.bytes.extend_from_slice(chunk);
+}
+
 /// Pipe one child stream into the shared, capped log tail (§8.2).
 fn drain<R: Read + Send + 'static>(
     pipe: Option<R>,
-    log: Arc<Mutex<Vec<u8>>>,
+    log: Arc<Mutex<CapturedLog>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let Some(reader) = pipe else {
@@ -1853,15 +2046,11 @@ fn drain<R: Read + Send + 'static>(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let mut tail = log
+                    let mut captured = log
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if tail.len() + n > LOG_CAPTURE_MAX {
-                        let cut = (tail.len() + n - LOG_CAPTURE_MAX).min(tail.len());
-                        tail.drain(..cut);
-                    }
                     if let Some(chunk) = buf.get(..n) {
-                        tail.extend_from_slice(chunk);
+                        append_capped(&mut captured, chunk, LOG_CAPTURE_MAX);
                     }
                 }
             }
@@ -1923,7 +2112,8 @@ fn git_hash_object_file(worktree: &Path, rel: &str) -> Result<String> {
 /// `<gitdir>/ci-run.json` (§4/§4.3), the runner's local bookkeeping — a cache
 /// of what the collab log already says, never a second source of truth:
 /// `{"processed": {"<ref>": "<tip oid>"}, "cron": {"<ref>\u{1f}<task>":
-/// <slot epoch>}}`. Missing file = nothing processed yet.
+/// <slot epoch>}, "schedules": {"<ref>\u{1f}<task>": "<cron>"}}`. Missing file
+/// = nothing processed yet.
 #[derive(Default)]
 struct RunnerState {
     /// Ref tips whose every task reached a terminal state (§4).
@@ -1931,6 +2121,9 @@ struct RunnerState {
     /// The newest slot each scheduled (ref, task) pair has accounted for
     /// (§4.3) — seeded at first sight, advanced past each due slot.
     cron: HashMap<String, i64>,
+    /// Validated cron expressions by `<ref>\u{1f}<task>`. Populated while the
+    /// tip is processed, so a quiet pass never re-reads ci.toml per ref.
+    schedules: HashMap<String, String>,
 }
 
 fn read_state(path: &Path) -> Result<RunnerState> {
@@ -1953,6 +2146,13 @@ fn read_state(path: &Path) -> Result<RunnerState> {
             }
         }
     }
+    if let Some(obj) = v.get("schedules").and_then(serde_json::Value::as_object) {
+        for (k, val) in obj {
+            if let Some(expr) = val.as_str() {
+                state.schedules.insert(k.clone(), expr.to_string());
+            }
+        }
+    }
     Ok(state)
 }
 
@@ -1967,9 +2167,16 @@ fn write_state(path: &Path, state: &RunnerState) -> Result<()> {
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
         .collect();
+    let schedules: serde_json::Map<String, serde_json::Value> = state
+        .schedules
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
     std::fs::write(
         path,
-        serde_json::to_string_pretty(&serde_json::json!({ "processed": processed, "cron": cron }))?,
+        serde_json::to_string_pretty(
+            &serde_json::json!({ "processed": processed, "cron": cron, "schedules": schedules }),
+        )?,
     )
     .with_context(|| format!("write state {}", path.display()))?;
     Ok(())
@@ -1994,6 +2201,63 @@ version = 1
 name = "test"
 command = "cargo test"
 "#;
+
+    #[test]
+    fn captured_log_keeps_full_bytes_until_the_cap_then_marks_truncation() {
+        let mut captured = CapturedLog::default();
+        append_capped(&mut captured, b"123456", 10);
+        append_capped(&mut captured, b"7890", 10);
+        assert_eq!(captured.bytes, b"1234567890");
+        assert!(!captured.truncated);
+
+        append_capped(&mut captured, b"abcdefghijkl", 10);
+        assert_eq!(captured.bytes, b"cdefghijkl");
+        assert!(captured.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_download_refuses_to_follow_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"safe").unwrap();
+        let link = dir.path().join("artifact.bin");
+        symlink(&victim, &link).unwrap();
+
+        let err = write_artifact_file(&link, b"owned").unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:#}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn cron_bookkeeping_persists_only_scheduled_tasks() {
+        let mut state = RunnerState::default();
+        apply_schedule_snapshot(
+            &mut state,
+            "refs/heads/main",
+            &[
+                ("build".into(), Some("0 0 2 * * *".into())),
+                ("test".into(), None),
+            ],
+            None,
+        );
+        assert_eq!(
+            state
+                .schedules
+                .get("refs/heads/main\u{1f}build")
+                .map(String::as_str),
+            Some("0 0 2 * * *")
+        );
+        assert!(!state.schedules.contains_key("refs/heads/main\u{1f}test"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ci-run.json");
+        write_state(&path, &state).unwrap();
+        let loaded = read_state(&path).unwrap();
+        assert_eq!(loaded.schedules, state.schedules);
+    }
 
     #[test]
     fn minimal_valid_with_defaults() {

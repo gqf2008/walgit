@@ -1605,6 +1605,18 @@ async fn collab_ci_artifact_serves_verified_bytes() -> TestResult {
             oid,
         ],
     )?;
+    // A hostile same-address ref sorted before the valid publisher must not
+    // shadow the real bytes.
+    std::fs::write(dir.join("evil.bin"), b"not-the-payload")?;
+    let evil_oid = git_in(&dir, &["hash-object", "-w", "evil.bin"])?;
+    git_in(
+        &dir,
+        &[
+            "update-ref",
+            &format!("refs/collab/ci-artifacts/aaa/{sha256}"),
+            evil_oid.trim(),
+        ],
+    )?;
     // A hostile ref: its name claims a sha256 the payload does not hash to.
     let bogus = "00".repeat(32);
     git_in(
@@ -1648,10 +1660,67 @@ async fn collab_ci_artifact_serves_verified_bytes() -> TestResult {
     assert_eq!(st, 400, "a malformed address is a bad request");
     let (st, _, _) = get_h(
         &server,
+        &format!(
+            "/o/r/api/collab/ci-artifacts/{}",
+            sha256.to_uppercase()
+        ),
+        &[],
+    )
+    .await?;
+    assert_eq!(st, 400, "only lowercase sha256 addresses are canonical");
+    let (st, _, _) = get_h(
+        &server,
         &format!("/o/r/api/collab/ci-artifacts/{bogus}"),
         &[],
     )
     .await?;
     assert_eq!(st, 404, "content mismatch is not the artifact");
+
+    let oversize = vec![0u8; usize::try_from(walgit_wal::ci::CI_ARTIFACT_MAX_BYTES).unwrap() + 1];
+    std::fs::write(dir.join("oversize.bin"), &oversize)?;
+    let oversize_oid = git_in(&dir, &["hash-object", "-w", "oversize.bin"])?;
+    let oversize_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&oversize));
+    let oversize_ref = format!("refs/collab/ci-artifacts/ci-a/{oversize_sha}");
+    git_in(
+        &dir,
+        &["update-ref", &oversize_ref, oversize_oid.trim()],
+    )?;
+    git_in(
+        &dir,
+        &["push", "-q", &server.repo_url("o", "r"), &oversize_ref],
+    )?;
+    let (st, _, _) = get_h(
+        &server,
+        &format!("/o/r/api/collab/ci-artifacts/{oversize_sha}"),
+        &[],
+    )
+    .await?;
+    assert_eq!(st, 413, "oversize objects are refused before body materialization");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collab_snapshot_over_cap_is_rejected_before_body_read() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "big").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "init"])?;
+
+    let size = 64usize * 1024 * 1024 + 1;
+    let oversize = vec![0u8; size];
+    std::fs::write(dir.join("snapshot.bin"), &oversize)?;
+    let oid = git_in(&dir, &["hash-object", "-w", "snapshot.bin"])?;
+    let snapshot_ref = walgit_wal::collab::SNAPSHOT_REF;
+    git_in(&dir, &["update-ref", snapshot_ref, oid.trim()])?;
+    git_in(
+        &dir,
+        &["push", "-q", &server.repo_url("o", "big"), snapshot_ref],
+    )?;
+
+    let (st, _, _) = get_h(&server, "/o/big/api/collab/report", &[]).await?;
+    assert_eq!(st, 503, "oversize snapshot is rejected before body materialization");
     Ok(())
 }
