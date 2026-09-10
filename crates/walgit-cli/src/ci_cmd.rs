@@ -881,7 +881,7 @@ const BASE_ENV_ALLOW: [&str; 10] = [
     "USERPROFILE",
 ];
 /// Captured output kept in memory: the tail of the merged stdout+stderr (§8.2).
-const LOG_CAPTURE_MAX: usize = 64 * 1024;
+const LOG_CAPTURE_MAX: usize = 16 * 1024 * 1024;
 /// The `log_summary` bound a result entry carries (§8.2).
 const LOG_SUMMARY_MAX: usize = 4096;
 /// An `error` conclusion voids its claim (§6.3), so the same attempt is

@@ -725,7 +725,7 @@ async fn artifacts_and_the_full_log_round_trip_through_git_objects() -> TestResu
 version = 1
 [[task]]
 name = "dist"
-command = "mkdir -p out && printf 'artifact-payload-42' > out/app.bin && echo build-log-marker"
+command = "mkdir -p out && printf 'artifact-payload-42' > out/app.bin && echo log-head-marker && i=0; while [ $i -lt 2000 ]; do printf 'log-filler-%04d-xxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; i=$((i+1)); done && echo build-log-marker"
 artifacts = ["out/app.bin"]
 "#;
     let work = work_repo(&base, ci_toml)?;
@@ -771,6 +771,10 @@ artifacts = ["out/app.bin"]
     assert!(
         log.contains("build-log-marker"),
         "the full captured log, not the summary: {log}"
+    );
+    assert!(
+        log.contains("log-head-marker"),
+        "the log must retain content older than the old 64 KiB tail cap"
     );
     let outdir = tempfile::tempdir()?;
     let outdir_s = outdir.path().to_str().unwrap().to_string();
