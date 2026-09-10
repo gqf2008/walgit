@@ -144,7 +144,7 @@ pub enum CiAction {
     },
 }
 
-pub fn run(action: CiAction) -> Result<()> {
+pub async fn run(action: CiAction) -> Result<()> {
     match action {
         CiAction::Validate { repo, file } => {
             let path = file.unwrap_or_else(|| repo.join(".walgit").join("ci.toml"));
@@ -288,7 +288,7 @@ pub fn run(action: CiAction) -> Result<()> {
                 );
             }
             if let Some(bytes) =
-                fetch_ci_object(&repo, &remote, &result.actor, &result.log_sha256)?
+                fetch_ci_object(&repo, &remote, &result.actor, &result.log_sha256).await?
             {
                 std::io::stdout().write_all(&bytes)?;
             } else {
@@ -327,7 +327,9 @@ pub fn run(action: CiAction) -> Result<()> {
                     eprintln!("ci: {fname}: duplicate artifact name, skipped");
                     continue;
                 }
-                let Some(bytes) = fetch_ci_object(&repo, &remote, &result.actor, &a.sha256)? else {
+                let Some(bytes) =
+                    fetch_ci_object(&repo, &remote, &result.actor, &a.sha256).await?
+                else {
                     if let Some(url) = &a.url {
                         println!("ci: {fname}: external artifact, see {url}");
                     } else {
@@ -399,7 +401,7 @@ fn latest_effective_result(
 /// The bytes of one artifact/log object (§8.2): a git blob under
 /// `refs/collab/ci-artifacts/*/<sha256>`, fetched from the remote on demand
 /// and sha256-verified before it is handed out. `None` = not published.
-fn fetch_ci_object(
+async fn fetch_ci_object(
     repo: &Path,
     remote: &str,
     actor: &str,
@@ -408,10 +410,78 @@ fn fetch_ci_object(
     if let Some(bytes) = read_ci_object_local(repo, sha256)? {
         return Ok(Some(bytes));
     }
+    if !remote_artifact_fits_cap(repo, remote, actor, sha256).await? {
+        return Ok(None);
+    }
     if !crate::collab_cmd::git_fetch_ci_artifact(repo, remote, actor, sha256)? {
         return Ok(None);
     }
     read_ci_object_local(repo, sha256)
+}
+
+/// Ask the walgit HTTP endpoint for the exact actor/sha object size before
+/// `git fetch` can materialize it. The endpoint answers 413 for an oversized
+/// payload without reading the blob body; a missing object is a normal
+/// "not published" outcome. Pure Git/SSH remotes have no size metadata
+/// channel, so on-demand artifact reads fail closed instead of downloading
+/// an unbounded object just to reject it.
+async fn remote_artifact_fits_cap(
+    repo: &Path,
+    remote: &str,
+    actor: &str,
+    sha256: &str,
+) -> Result<bool> {
+    let url = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["remote", "get-url", remote])
+        .output()
+        .context("git remote get-url")?;
+    if !url.status.success() {
+        bail!(
+            "git remote get-url {remote} failed: {}",
+            String::from_utf8_lossy(&url.stderr).trim()
+        );
+    }
+    let remote_url = String::from_utf8_lossy(&url.stdout).trim().to_string();
+    let mut endpoint = reqwest::Url::parse(remote_url.trim_end_matches(".git"))
+        .with_context(|| format!("remote URL {remote_url:?} is not HTTP(S)"))?;
+    anyhow::ensure!(
+        matches!(endpoint.scheme(), "http" | "https"),
+        "remote {remote_url:?} has no walgit artifact size endpoint; refused to fetch {sha256} before a size check"
+    );
+    let segments = format!("api/collab/ci-artifacts/{sha256}");
+    endpoint
+        .path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("remote URL {remote_url:?} cannot carry a path"))?
+        .pop_if_empty()
+        .extend(segments.split('/'));
+    endpoint.query_pairs_mut().append_pair("actor", actor);
+    let mut req = reqwest::Client::new()
+        .head(endpoint)
+        .header("Accept", "application/octet-stream");
+    if let Ok(token) = std::env::var("WALGIT_TOKEN")
+        && !token.trim().is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.context("HEAD artifact size")?;
+    match resp.status().as_u16() {
+        200 => Ok(true),
+        404 => Ok(false),
+        413 => {
+            eprintln!(
+                "ci: artifact {sha256}: object exceeds the {}-byte cap; skipped before fetch",
+                walgit_wal::ci::CI_ARTIFACT_MAX_BYTES
+            );
+            Ok(false)
+        }
+        401 | 403 => bail!(
+            "HEAD artifact size: HTTP {}; set WALGIT_TOKEN for this remote",
+            resp.status()
+        ),
+        status => bail!("HEAD artifact size: unexpected HTTP {status}"),
+    }
 }
 
 fn read_ci_object_local(repo: &Path, sha256: &str) -> Result<Option<Vec<u8>>> {
@@ -2213,6 +2283,56 @@ command = "cargo test"
         append_capped(&mut captured, b"abcdefghijkl", 10);
         assert_eq!(captured.bytes, b"cdefghijkl");
         assert!(captured.truncated);
+    }
+
+    #[tokio::test]
+    async fn remote_oversize_is_rejected_before_git_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = hits.clone();
+        let app = axum::Router::new().route(
+            "/o/r/api/collab/ci-artifacts/{sha256}",
+            axum::routing::head(move || {
+                let hits = handler_hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                        "artifact too large",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(dir.path())
+            .args(["remote", "add", "origin"])
+            .arg(format!("http://{addr}/o/r.git"))
+            .status()
+            .unwrap();
+
+        let sha = "ab".repeat(32);
+        let allowed = remote_artifact_fits_cap(dir.path(), "origin", "ci-a", &sha)
+            .await
+            .unwrap();
+        assert!(!allowed, "413 closes the fetch path");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "only HEAD was issued");
     }
 
     #[cfg(unix)]

@@ -761,7 +761,7 @@ async fn dispatch(command: Command, cfg: Config, config_path: std::path::PathBuf
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
         Command::Collab { action } => collab_cmd::run(action).await,
         Command::Principal { action } => principal_cmd::run(action).await,
-        Command::Ci { action } => ci_cmd::run(action),
+        Command::Ci { action } => ci_cmd::run(action).await,
         Command::Mirror {
             from,
             to,

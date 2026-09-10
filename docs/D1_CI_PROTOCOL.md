@@ -368,7 +368,10 @@ done    : effective 存在                               → Settled(conclusion)
   - CLI：`walgit ci log [--repo .] [--remote origin] [run]` 打印所存日志（`log_truncated=true`
     时明确告警；取不到 blob 时退回 `log_summary`）；`walgit ci artifacts [--out <dir>] [run]`
     逐个 sha256 校验并以 `create_new` 落盘（拒绝覆盖、拒绝跟随已有 symlink），重复 basename
-    跳过；`name` 只取基名（永不写出 `--out` 之外）。
+    跳过；`name` 只取基名（永不写出 `--out` 之外）。fresh clone 先对 http(s) walgit remote
+    发带精确 actor 的 `HEAD /…/ci-artifacts/<sha256>?actor=<actor>`；只有 `200` 才执行
+    `git fetch`，`413/404` 直接跳过；没有 HTTP size 元数据通道的 remote 在 fetch 前 fail
+    closed，避免为了拒绝超限对象而先完整下载。需要认证时使用 `WALGIT_TOKEN`。
   - HTTP：`GET /{o}/{r}/api/collab/ci-artifacts/<sha256>` → `application/octet-stream` +
     immutable/ETag；地址必须是 64 位小写 hex，服务端先查 size、再读取并验哈希后发字节。
     同地址可能有恶意遮蔽 ref，服务端只在 `ci-artifacts` 前缀范围内遍历候选直到找到哈希正确的

@@ -864,6 +864,12 @@ hash to its name answers `404`, as does an unknown address; a malformed address
 (not 64 lowercase hex) is `400`; a blob over the 16 MiB convention cap is
 `413`.
 
+`HEAD` on the same route is the CLI's preflight. With `?actor=<principal>` it
+is scoped to the exact publisher ref the CLI will fetch: `200` means the object
+exists and fits the cap, `404` means that actor's object is absent, and `413`
+means it exceeds the cap. The preflight never reads the blob body; remotes
+without this HTTP metadata channel are refused before `git fetch`.
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a
