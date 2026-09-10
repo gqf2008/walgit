@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use walgit_git::ObjectFormat;
 
 // ---- §4.2 entry schema -------------------------------------------------------
 
@@ -186,8 +187,8 @@ impl SnapshotRecord {
     /// hash to the declared oid or do not parse as an entry — skipped exactly
     /// like a corrupt inbox blob: visible degradation (the totals move), never
     /// silent trust.
-    pub fn entry_ref(&self) -> Option<EntryRef> {
-        if git_blob_oid(self.json.as_bytes()) != self.oid {
+    pub fn entry_ref(&self, format: ObjectFormat) -> Option<EntryRef> {
+        if git_blob_oid(self.json.as_bytes(), format) != self.oid {
             return None;
         }
         let entry: Entry = serde_json::from_str(&self.json).ok()?;
@@ -214,14 +215,19 @@ pub struct Snapshot {
     pub sig: String,
 }
 
-/// The git blob id of raw bytes: `sha1("blob <len>\0" + bytes)` — how a
-/// record's declared oid is pinned to its bytes.
-pub fn git_blob_oid(bytes: &[u8]) -> String {
-    use sha1::Digest as _;
-    let mut h = sha1::Sha1::new();
+/// The git blob id of raw bytes: `<hash>("blob <len>\0" + bytes)` in the
+/// repository's object format — how a record's declared oid is pinned to its
+/// bytes. Both SHA-1 and SHA-256 repositories are first-class.
+pub fn git_blob_oid(bytes: &[u8], format: ObjectFormat) -> String {
+    let mut h = gix_hash::hasher(format.kind());
     h.update(format!("blob {}\0", bytes.len()).as_bytes());
     h.update(bytes);
-    hex::encode(h.finalize())
+    #[allow(
+        clippy::expect_used,
+        reason = "the header update above makes try_finalize infallible"
+    )]
+    let oid = h.try_finalize().expect("git object hash finalization");
+    oid.to_string()
 }
 
 /// Parse and validate a snapshot document. Fails closed on a wrong
@@ -1750,7 +1756,7 @@ mod snapshot_tests {
             serde_json::to_string(e).unwrap()
         };
         SnapshotRecord {
-            oid: git_blob_oid(json.as_bytes()),
+            oid: git_blob_oid(json.as_bytes(), ObjectFormat::Sha1),
             principal: principal.to_string(),
             json,
         }
@@ -1889,15 +1895,31 @@ mod snapshot_tests {
     #[test]
     fn git_blob_oid_matches_git_known_answers() {
         // `printf <bytes> | git hash-object --stdin`
-        assert_eq!(git_blob_oid(b"hello"), "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
-        assert_eq!(git_blob_oid(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
-        assert_eq!(git_blob_oid(b"{\"a\":1}"), "daa5053ecf5f9a37b2de733d0751cc1ab53ac010");
+        assert_eq!(
+            git_blob_oid(b"hello", ObjectFormat::Sha1),
+            "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"
+        );
+        assert_eq!(
+            git_blob_oid(b"", ObjectFormat::Sha1),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            git_blob_oid(b"{\"a\":1}", ObjectFormat::Sha1),
+            "daa5053ecf5f9a37b2de733d0751cc1ab53ac010"
+        );
+        assert_eq!(
+            git_blob_oid(b"hello", ObjectFormat::Sha256),
+            "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60"
+        );
     }
 
     #[test]
     fn fold_and_snapshot_plus_tail_are_byte_identical_to_the_unfolded_inbox() {
         let (records, principals) = history();
-        let unfolded: Vec<EntryRef> = records.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let unfolded: Vec<EntryRef> = records
+            .iter()
+            .filter_map(|record| record.entry_ref(ObjectFormat::Sha1))
+            .collect();
         let before: Vec<&EntryRef> = unfolded.iter().collect();
         let fp_before = fingerprint(&before, &principals);
 
@@ -1905,7 +1927,11 @@ mod snapshot_tests {
         // Full fold: every entry into the snapshot, empty tail.
         let snap = build_snapshot("alice", 100, records.clone(), &sk);
         let parsed = parse_snapshot(&serde_json::to_vec(&snap).unwrap()).expect("snapshot parses");
-        let folded: Vec<EntryRef> = parsed.entries.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let folded: Vec<EntryRef> = parsed
+            .entries
+            .iter()
+            .filter_map(|record| record.entry_ref(ObjectFormat::Sha1))
+            .collect();
         let after: Vec<&EntryRef> = folded.iter().collect();
         assert_eq!(
             fp_before,
@@ -1918,7 +1944,11 @@ mod snapshot_tests {
         let cut = records.len() / 2;
         let snap = build_snapshot("alice", 100, records[..cut].to_vec(), &sk);
         let parsed = parse_snapshot(&serde_json::to_vec(&snap).unwrap()).expect("snapshot parses");
-        let mut union: Vec<EntryRef> = parsed.entries.iter().filter_map(SnapshotRecord::entry_ref).collect();
+        let mut union: Vec<EntryRef> = parsed
+            .entries
+            .iter()
+            .filter_map(|record| record.entry_ref(ObjectFormat::Sha1))
+            .collect();
         let mut seen: std::collections::HashSet<String> = union.iter().map(|e| e.oid.clone()).collect();
         for r in &unfolded {
             if seen.insert(r.oid.clone()) {
@@ -1946,13 +1976,19 @@ mod snapshot_tests {
             ..good.clone()
         };
         let garbage = SnapshotRecord {
-            oid: git_blob_oid(b"not json"),
+            oid: git_blob_oid(b"not json", ObjectFormat::Sha1),
             principal: good.principal.clone(),
             json: "not json".to_string(),
         };
-        assert!(good.entry_ref().is_some());
-        assert!(lying.entry_ref().is_none(), "oid must recompute from the bytes");
-        assert!(garbage.entry_ref().is_none(), "unparseable entries skip like corrupt inbox blobs");
+        assert!(good.entry_ref(ObjectFormat::Sha1).is_some());
+        assert!(
+            lying.entry_ref(ObjectFormat::Sha1).is_none(),
+            "oid must recompute from the bytes"
+        );
+        assert!(
+            garbage.entry_ref(ObjectFormat::Sha1).is_none(),
+            "unparseable entries skip like corrupt inbox blobs"
+        );
     }
 
     #[test]
@@ -1998,7 +2034,7 @@ mod snapshot_tests {
         for order in [[legit.clone(), planted.clone()], [planted, legit]] {
             let mut set = EntrySet::new();
             for r in order {
-                set.insert(r.entry_ref().unwrap());
+                set.insert(r.entry_ref(ObjectFormat::Sha1).unwrap());
             }
             let entries = set.into_entries();
             assert_eq!(entries.len(), 1, "same oid = one entry");

@@ -476,12 +476,15 @@ decision in §4 — or the PR is; never "fix later".
   no snapshot means an empty `<baseline>`, i.e. `refs/collab/meta/snapshot:`, not a zero oid —
   never a `+` refspec, which would silently short-circuit the lease; a
   concurrent fold that moved the ref fails the push and the gc retries),
-  the pruned inbox
-  refs are deleted after, in batches. Readers dedup by oid, so aggregation
+  even a prune-only fold revalidates that baseline before deleting, and the
+  pruned inbox refs are deleted after, in batches with per-ref OID leases.
+  Record integrity is checked in the repository's object format (SHA-1 or
+  SHA-256). Readers dedup by oid, so aggregation
   before and after a fold is byte-identical — that equality is the
   acceptance test. Server and CLI parse the snapshot through the same
-  `walgit-wal::collab` code; the server bounds the snapshot blob at
-  64 MiB and counts only the unfolded tail against the 20k budget.
+  `walgit-wal::collab` code; the server rejects a snapshot over 64 MiB before
+  materializing its body on both local and remote paths, and counts only the
+  unfolded tail against the 20k budget.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
