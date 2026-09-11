@@ -106,6 +106,39 @@ func installedAppVersion() -> String {
     return "0.0.0"
 }
 
+/// 菜单里的版本语义:upgrade 行判断的是**托盘 app 版本**(checkForUpdates 用
+/// installedAppVersion),所以显示也用 app 版本;服务进程版本另附,避免
+/// 「已是最新」旁边印着更旧的服务版本(#170)。
+func menuVersionLine(appVersion: String, serviceVersion: String) -> String {
+    let app = stripVersionPrefix(appVersion)
+    let service = stripVersionPrefix(serviceVersion)
+    guard !service.isEmpty else { return "版本 \(app)" }
+    return "版本 \(app) · 服务 \(service)"
+}
+
+func upgradeLine(state: UpdateState, appVersion: String, serviceVersion: String,
+                 release: ReleaseInfo?, sourceSha: String, busyNote: String) -> String {
+    let versionText = menuVersionLine(appVersion: appVersion, serviceVersion: serviceVersion)
+    let app = stripVersionPrefix(appVersion)
+    switch state {
+    case .idle:
+        return "\(versionText) · 检查更新…"
+    case .checking:
+        return "\(versionText) · 正在检查更新…"
+    case .latest:
+        return "\(versionText) · 已是最新 ✓(点击重查)"
+    case .available:
+        if let release {
+            return "⬆️ 下载并升级到 v\(release.version)(当前 \(app))"
+        }
+        return "⬆️ 从源码升级到 \(sourceSha)(当前 \(app))"
+    case .installing:
+        return "升级中…\(busyNote.isEmpty ? "" : " · " + busyNote)"
+    case .failed:
+        return "上次升级失败(点击下载发布页)"
+    }
+}
+
 /// 跨线程传值容器:URLSession 回调与调用方用锁同步,规避并发捕获变量。
 final class Locked<T>: @unchecked Sendable {
     private let lock = NSLock()
@@ -168,22 +201,59 @@ func repoPathValue() -> String {
     UserDefaults.standard.string(forKey: "repoPath") ?? "/Volumes/Workspace/GitHub/walgit"
 }
 
+/// 从 /healthz 的 JSON 里取出 version 字段(与 release-install.sh 的
+/// health_version 同口径)。用 JSON 解析而不是字符串包含:v0.5.1 不能匹配
+/// v0.5.10。解析失败返回空串。
+func healthVersion(_ body: String) -> String {
+    guard let data = body.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let v = obj["version"] as? String
+    else { return "" }
+    return v
+}
+
+/// 手动装 DMG 只换文件,不会重启已在跑的服务进程 —— 进程仍拿着旧二进制,
+/// /healthz 继续报旧版本,菜单看起来"升完级还是旧版"(#170)。只处理「本来
+/// 就在跑」的服务(用户主动停掉的不拉起)。放到后台队列执行,避免拖住主线程。
+private func restartServiceAfterUpgrade(bundledVersion: String, done: @Sendable @escaping () -> Void = {}) {
+    let fm = FileManager.default
+    let ok = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null").0 == 0
+    guard ok else { done(); return }
+    let ensure = "\(deployDir)/walgit-ensure"
+    guard fm.isExecutableFile(atPath: ensure) else { done(); return }
+    _ = sh("WALGIT_DEPLOY_DIR='\(deployDir)' '\(ensure)' >/dev/null 2>&1 || true")
+    let want = "v\(bundledVersion)"
+    for _ in 0..<20 {
+        let (hc, hout) = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null || true")
+        if hc == 0, healthVersion(hout) == want {
+            logLine("bootstrap: 服务已重启到 \(want)")
+            done()
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    logLine("bootstrap: 服务重启后未确认到 \(want),请在托盘里重启服务")
+    done()
+}
+
 /// 首次启动 bootstrap:从 app bundle Resources 落盘 ~/walgit 部署骨架。
 /// 托管文件(walgit 二进制、run-walgit.sh、walgit-ensure)按 bundle 内
 /// skeleton.version 覆盖更新——DMG 覆盖安装即升级;用户文件(walgit.toml)
 /// 永不覆盖(配置与凭证安全)。开发构建(bundle 里没有 walgit 资源)跳过。
-func bootstrapDeploy() {
+func bootstrapDeploy(onServiceRestart: @Sendable @escaping () -> Void = {}) {
     let fm = FileManager.default
     guard let res = Bundle.main.resourceURL?.path,
         fm.fileExists(atPath: "\(res)/walgit")
     else {
         logLine("bootstrap: bundle 无 walgit 资源(开发构建),跳过")
+        onServiceRestart()
         return
     }
     do {
         try fm.createDirectory(atPath: deployDir, withIntermediateDirectories: true)
     } catch {
         logLine("bootstrap: 建 ~/walgit 失败: \(error)")
+        onServiceRestart()
         return
     }
     let bundledVersion = (try? String(contentsOfFile: "\(res)/skeleton.version", encoding: .utf8))
@@ -270,6 +340,7 @@ func bootstrapDeploy() {
         }
     }
     if versionChanged && !managedOK {
+        onServiceRestart()
         return
     }
     // 用户文件:永不覆盖
@@ -289,6 +360,13 @@ func bootstrapDeploy() {
         } catch {
             logLine("bootstrap: 写版本标记失败: \(error)")
         }
+    }
+    if versionChanged && managedOK {
+        DispatchQueue.global(qos: .utility).async {
+            restartServiceAfterUpgrade(bundledVersion: bundledVersion, done: onServiceRestart)
+        }
+    } else {
+        onServiceRestart()
     }
     // CLI 软链:让终端里的 `walgit` 直达部署二进制(/usr/local/bin 归用户所有,
     // 无需管理员)。测试用 WALGIT_CLI_LINK 覆盖——必须与 WALGIT_DEPLOY_DIR
@@ -498,29 +576,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let cur = serviceVersion.isEmpty ? installedAppVersion() : String(serviceVersion.prefix(7))
+        let title = upgradeLine(state: updateState, appVersion: installedAppVersion(),
+                                serviceVersion: serviceVersion, release: releaseInfo,
+                                sourceSha: sourceAvailableSha, busyNote: busyNote)
         let up: NSMenuItem
         switch updateState {
-        case .idle:
-            up = NSMenuItem(title: "版本 \(cur) · 检查更新…", action: #selector(checkUpdateNow), keyEquivalent: "")
-        case .checking:
-            up = NSMenuItem(title: "版本 \(cur) · 正在检查更新…", action: nil, keyEquivalent: "")
+        case .idle, .latest:
+            up = NSMenuItem(title: title, action: #selector(checkUpdateNow), keyEquivalent: "")
+        case .checking, .installing:
+            up = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             up.isEnabled = false
-        case .latest:
-            up = NSMenuItem(title: "版本 \(cur) · 已是最新 ✓(点击重查)", action: #selector(checkUpdateNow), keyEquivalent: "")
         case .available:
-            if let release = releaseInfo {
-                up = NSMenuItem(title: "⬆️ 下载并升级到 v\(release.version)(当前 \(cur))",
-                                action: #selector(doReleaseUpgrade), keyEquivalent: "")
-            } else {
-                up = NSMenuItem(title: "⬆️ 从源码升级到 \(sourceAvailableSha)(当前 \(cur))",
-                                action: #selector(doUpgradeNow), keyEquivalent: "")
-            }
-        case .installing:
-            up = NSMenuItem(title: "升级中…\(busyNote.isEmpty ? "" : " · " + busyNote)", action: nil, keyEquivalent: "")
-            up.isEnabled = false
+            up = NSMenuItem(title: title,
+                            action: releaseInfo == nil ? #selector(doUpgradeNow) : #selector(doReleaseUpgrade),
+                            keyEquivalent: "")
         case .failed:
-            up = NSMenuItem(title: "上次升级失败(点击下载发布页)", action: #selector(openReleases), keyEquivalent: "")
+            up = NSMenuItem(title: title, action: #selector(openReleases), keyEquivalent: "")
         }
         menu.addItem(up)
 
@@ -809,7 +880,40 @@ struct WalgitTrayMain {
     static func main() {
         // 测试钩子:只跑部署骨架 bootstrap 后退出(不启动 NSApplication)。
         if ProcessInfo.processInfo.environment["WALGIT_BOOTSTRAP_ONLY"] == "1" {
-            bootstrapDeploy()
+            let done = DispatchSemaphore(value: 0)
+            bootstrapDeploy(onServiceRestart: { done.signal() })
+            _ = done.wait(timeout: .now() + 20)
+            exit(0)
+        }
+        // 测试钩子:解析一段 /healthz JSON(验证 version 取值的精确性)。
+        if let body = ProcessInfo.processInfo.environment["WALGIT_HEALTH_TEST"] {
+            print(healthVersion(body))
+            exit(0)
+        }
+        // 测试钩子:只打印菜单 upgrade 行(验证版本语义,不启动 NSApplication)。
+        if let appV = ProcessInfo.processInfo.environment["WALGIT_MENU_TEST"] {
+            let svcV = ProcessInfo.processInfo.environment["WALGIT_MENU_SERVICE"] ?? ""
+            let state = ProcessInfo.processInfo.environment["WALGIT_MENU_STATE"] ?? "latest"
+            let releaseV = ProcessInfo.processInfo.environment["WALGIT_MENU_RELEASE"]
+            let release = releaseV.flatMap { v -> ReleaseInfo? in
+                guard let url = URL(string: "https://example.invalid/x.dmg") else { return nil }
+                return ReleaseInfo(tag: "v\(v)", version: v,
+                                   asset: ReleaseAsset(name: "walgit-\(v)-arm64.dmg", url: url,
+                                                       sha256: String(repeating: "a", count: 64)))
+            }
+            let st: UpdateState
+            switch state {
+            case "available": st = .available
+            case "checking": st = .checking
+            case "installing": st = .installing
+            case "failed": st = .failed
+            case "latest": st = .latest
+            default: st = .idle
+            }
+            print(upgradeLine(state: st, appVersion: appV, serviceVersion: svcV,
+                              release: release,
+                              sourceSha: ProcessInfo.processInfo.environment["WALGIT_MENU_SOURCE"] ?? "",
+                              busyNote: ProcessInfo.processInfo.environment["WALGIT_MENU_BUSY"] ?? ""))
             exit(0)
         }
         let app = NSApplication.shared
