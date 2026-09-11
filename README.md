@@ -1,7 +1,7 @@
 # walgit — a git server that is one binary in front of an object store
 
 [![CI](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-blue)](README.md#platforms)
 [![Agent-native](https://img.shields.io/badge/agent--native-work%20units%20%26%20protocol-purple)](AGENTS.md#6-agent-collaboration-protocol)
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
@@ -59,17 +59,35 @@ verbatim in `docs/reference/cursor-git-at-any-scale.md`.
 
 ### 上游基线
 
-分叉点在 `6d8fa54`（2026-08-26）。上游的 git 托管内核（WAL、manifest CAS、
-bundle-uri、远程 reader、`serve`/`maintain`/`events` 角色、Web UI 骨架）保持原样可用，
-本分叉**没有**改这些核心不变式；改动集中在上游刻意不做的那一层及其配套。
+分叉点在 `6d8fa54`（2026-08-26），此后本分叉领先上游 132 个提交
+（`git rev-list --count upstream/main..main`）。
+
+内核的**语义与不变式**不变（桶仍是唯一事实源、manifest CAS 仍是提交点、实例仍是可丢弃缓存），
+但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k，其中约 37.4k 行落在 D1
+之外——包括 Windows 原生支持（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle
+的可靠性修复（#148 重启后 refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储
+健壮性（#129/#130 socket 超时与配置写硬化）以及站点与部署面扩展。
+
+准确的说法是 **D1 是最大的增量，不是唯一增量**；"内核没变"应读作"内核契约没推翻"，
+而不是"内核代码没动过"。
 
 ### 新增功能
 
-**D1 协作层** — 没有协作服务器，协作状态是仓库 `refs/collab/*` 里的**签名、追加式 git 对象**，
-任何人都能克隆、验签、离线重算出同一个视图：
+**D1 协作层** — 没有协作服务器：协作状态是仓库 `refs/collab/*` 里的**签名、追加式 git 对象**，
+权威永远是这些 ref，服务端**不持有**协作状态或聚合结果。协作 ref 不在默认 refspec 里，
+拿到它们需要显式拉取：
+
+```sh
+git clone <repo> && cd <repo>
+git fetch origin '+refs/collab/*:refs/collab/*'
+```
+
+之后即可离线验签、重算出与别人一致的视图。服务端为 Web UI 提供的
+`/api/collab/report`、`/collab/board`、`/collab/threads/{id}` 是**无状态聚合读端点**，
+与 CLI 共用 `walgit-wal::collab` 同一份纯函数，不落库、不作为权威：
 
 - **issue / PR / 评审 / 线程**：`walgit collab` 下的 `thread`、`pr`、`entry`、
-  `board`、`snapshot`、`report`、`gc` 等命令；服务端只托管 ref，不做聚合。
+  `board`、`report`、`gc`（折叠出 `refs/collab/meta/snapshot` 快照）、`watch` 等命令。
 - **看板**：`.walgit/board.toml` 里的声明式列定义，将线程集合折叠成确定性投影
   （见 `docs/BOARD.md`）——板不是状态，是纯函数。
 - **身份**：host 级 principal 注册表（`walgit principal`），一个 token 同时覆盖
@@ -88,7 +106,8 @@ bundle-uri、远程 reader、`serve`/`maintain`/`events` 角色、Web UI 骨架�
 **分发与桌面** — 上游只有二进制与 Containerfile；本分叉补齐了最终用户安装路径：
 
 - **跨平台托盘**：macOS（Swift）、Windows/Linux（Rust）三平台系统托盘，
-  启停服务、版本检测、点击升级（`deploy/tray/`）。
+  启停服务与版本检测（`deploy/tray/`）。**点击升级在 Windows/Linux 依赖本地源码仓库**，
+  经安装器部署、没有源码树的机器只能重跑安装器；Release 感知的自动下载升级目前仅 macOS。
 - **macOS Release 感知升级**：托盘同时比对 GitHub Release 与源码仓库，
   下载 → 严格校验（sha256 / 版本 / 签名 / 公证）→ 原子换装 → 健康检查，失败回滚。
 - **安装包**：macOS 签名+公证 DMG、Linux `.deb`、Windows Inno Setup 安装器，
