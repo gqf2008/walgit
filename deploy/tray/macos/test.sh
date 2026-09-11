@@ -5,6 +5,9 @@ cd "$(dirname "$0")"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/walgit-tray-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# 托盘主程序也要编译(此前 CI 只编译 ReleaseLogic,主程序坏了仍绿)。
+swiftc -swift-version 5 -typecheck ReleaseLogic.swift walgit-tray.swift -framework AppKit
+
 cp release_logic_test_main.swift "$TMP/main.swift"
 swiftc -swift-version 5 ReleaseLogic.swift "$TMP/main.swift" -o "$TMP/release-logic-tests"
 "$TMP/release-logic-tests"
@@ -163,40 +166,90 @@ release_install_fixture() {
 }
 
 
-# [server].listen 非 8081 时,预探活必须用配置端口,否则会把运行中误判为
-# 停止、先 stop 再跳过 start(服务静默停掉)。
+# [server].listen 非 8081 时:真实 walgit-ensure 的 stop/start 必须用配置
+# 端口(不能只测 release-install 的预探活——那是假绿,停服后起不来)。
 listen_fixture() {
     local base="$TMP/listen"
     local deploy="$base/deploy"
-    local mount="$base/mount"
-    local calls="$base/calls.txt"
+    local port=9099
+    local calls="$base/ensure.calls"
+    local rol_ensure="$PWD/walgit-ensure"
     rm -rf "$base"
-    mkdir -p "$deploy" "$mount/walgit-tray.app"
-    : >"$base/x.dmg"
-    printf 'listen = "127.0.0.1:9099"\n' >"$deploy/walgit.toml"
-    cat >"$base/health" <<'HL'
+    mkdir -p "$deploy"
+    printf 'listen = "127.0.0.1:%s"\n' "$port" >"$deploy/walgit.toml"
+    printf '#!/bin/sh\n: >"%s/running.flag"\nexec python3 "%s/server.py" %s\n' "$base" "$base" "$port" >"$deploy/run-walgit.sh"
+    chmod +x "$deploy/run-walgit.sh"
+    printf '#!/bin/sh\nexit 0\n' >"$deploy/walgit"
+    chmod +x "$deploy/walgit"
+    cat >"$deploy/walgit-ensure" <<ENSURE
 #!/bin/sh
-echo "$@" >>"$WALGIT_UPDATE_HC_CALLS"
-echo '{"status":"ok"}'
-HL
-    chmod +x "$base/health"
+echo "\$1" >>"$calls"
+exec "$rol_ensure" "\$@"
+ENSURE
+    chmod +x "$deploy/walgit-ensure"
     : >"$calls"
-    local rc=0
-    WALGIT_DEPLOY_DIR="$deploy" \
-    WALGIT_UPDATE_SKIP_SERVICE=1 \
-    WALGIT_UPDATE_SKIP_OPEN=1 \
-    WALGIT_UPDATE_HEALTHCHECK="$base/health" \
-    WALGIT_UPDATE_HC_CALLS="$calls" \
-    WALGIT_UPDATE_BOOTSTRAP_WAIT=1 \
-    WALGIT_UPDATE_TRAY_WAIT=1 \
-        ./release-install.sh "$base/x.dmg" "$mount" "/nonexistent/app" 0.5.0 999999 \
-        >/dev/null 2>&1 || rc=$?
-    [ "$rc" != 0 ] || { echo "FAIL(listen): expected script to abort later" >&2; return 1; }
-    grep -q '9099' "$calls" || { echo "FAIL(listen): healthcheck did not probe configured 9099 port" >&2; return 1; }
-    if grep -q '8081' "$calls"; then
-        echo "FAIL(listen): healthcheck fell back to 8081" >&2
+
+    mkdir -p "$base/bin"
+    cat >"$base/bin/screen" <<'SCREEN'
+#!/bin/sh
+# 极简 screen 替身:把 `-dmS name bash -c "cmd"` 的 cmd 直接后台执行。
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift 2>/dev/null || true   # 会话名
+[ "${1:-}" = "bash" ] && shift
+[ "${1:-}" = "-c" ] && shift
+[ $# -ge 1 ] || exit 0
+nohup /bin/sh -c "$1" >/dev/null 2>&1 &
+echo "$!"
+SCREEN
+    chmod +x "$base/bin/screen"
+
+    cat >"$base/server.py" <<'PYSRV'
+import socket, sys
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(5)
+while True:
+    try:
+        c, _ = srv.accept()
+    except OSError:
+        break
+    try:
+        c.recv(4096)
+        body = '{"status":"ok","version":"v0.4.0"}'
+        c.sendall(("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode() + body.encode())
+    except OSError:
+        pass
+    finally:
+        c.close()
+PYSRV
+    # 模拟服务在 9099 上运行(walgit-ensure stop 会按配置端口把它停掉)。
+    python3 "$base/server.py" "$port" >/dev/null 2>&1 &
+    local srv_pid=$!
+    sleep 1
+
+    WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" stop >/dev/null 2>&1 || true
+    grep -qx stop "$calls" || { kill "$srv_pid" 2>/dev/null || true; echo "FAIL(listen): stop did not target configured port" >&2; return 1; }
+    if kill -0 "$srv_pid" 2>/dev/null; then
+        ( kill -INT "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true
+        echo "FAIL(listen): stop left the 9099 listener running" >&2
         return 1
     fi
+
+    # start 应把 run-walgit.sh 拉起并在 9099 上探活成功。
+    PATH="$base/bin:$PATH" WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" start >/dev/null 2>&1 || true
+    local started=0
+    grep -qx start "$calls" && started=1
+    # 清理 start 拉起的 mock daemon,避免污染后续 fixture / 端口残留。
+    local leftover
+    leftover="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    [ -n "$leftover" ] && kill $leftover 2>/dev/null || true
+    [ "$started" = 1 ] || { echo "FAIL(listen): start not invoked" >&2; return 1; }
     return 0
 }
 

@@ -106,6 +106,18 @@ func installedAppVersion() -> String {
     return "0.0.0"
 }
 
+/// 跨线程传值容器:URLSession 回调与调用方用锁同步,规避并发捕获变量。
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+    func set(_ newValue: T) {
+        lock.lock(); value = newValue; lock.unlock()
+    }
+    func get() -> T? {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+
 /// GitHub latest release. Tests may point `WALGIT_RELEASE_FIXTURE` at a local JSON
 /// document; production uses the public API and only trusts a sha256 digest.
 func latestRelease() -> ReleaseInfo? {
@@ -120,10 +132,10 @@ func latestRelease() -> ReleaseInfo? {
     request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     request.setValue("walgit-tray", forHTTPHeaderField: "User-Agent")
     let semaphore = DispatchSemaphore(value: 0)
-    var data: Data?
+    let box = Locked<Data>()
     let task = URLSession.shared.dataTask(with: request) { body, response, _ in
-        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-            data = body
+        if let http = response as? HTTPURLResponse, http.statusCode == 200, let body {
+            box.set(body)
         }
         semaphore.signal()
     }
@@ -132,8 +144,8 @@ func latestRelease() -> ReleaseInfo? {
         task.cancel()
         return nil
     }
-    guard let data else { return nil }
-    return try? parseLatestRelease(data)
+    guard let result = box.get() else { return nil }
+    return try? parseLatestRelease(result)
 }
 
 func sourceUpdateSha() -> String? {
@@ -182,14 +194,19 @@ func bootstrapDeploy() {
     // 托管文件:版本不同则整体覆盖(覆盖安装 DMG = 升级路径)。先写
     // 临时名再原子替换,避免运行中的服务二进制被 remove+copy 的半状态
     // 捕获;只有三项全部成功且新二进制版本核验通过才写 marker。
-    let needsUpdate = !bundledVersion.isEmpty && bundledVersion != installedVersion
     let managed = ["walgit", "run-walgit.sh", "walgit-ensure"]
+    // marker 不一致 → 整体换装;marker 一致但某个托管文件被删 → 只补缺失项。
+    let versionChanged = !bundledVersion.isEmpty && bundledVersion != installedVersion
+    let toWrite = managed.filter { f in
+        versionChanged || !fm.fileExists(atPath: "\(deployDir)/\(f)")
+    }
     var managedOK = true
-    // 先全部落成临时文件再统一提升:任何一个复制/核验失败都不动已装文件,
-    // 避免「walgit 新、ensure 旧、marker 未写」的混合骨架(拖入 DMG 升级)。
-    if needsUpdate {
+    // 先把要写的全部落临时文件并核验版本;提升阶段逐项备份旧文件,任一失败
+    // 回滚已替换项。避免「walgit 新、ensure 旧、marker 未写」的混合骨架,
+    // 也避免 marker 一致但文件被删后不再自愈。
+    if !toWrite.isEmpty && !bundledVersion.isEmpty {
         var staged: [String: String] = [:]
-        for f in managed {
+        for f in toWrite {
             let dst = "\(deployDir)/\(f)"
             let tmp = "\(dst).new-\(ProcessInfo.processInfo.processIdentifier)"
             do {
@@ -210,30 +227,48 @@ func bootstrapDeploy() {
                 logLine("bootstrap: walgit 版本核验失败: \(versionOut.trimmingCharacters(in: .whitespacesAndNewlines))")
             }
         }
+        var installed: [(dst: String, backup: String?)] = []
         if managedOK {
-            for f in managed {
+            for f in toWrite {
                 guard let tmp = staged[f] else { managedOK = false; break }
                 let dst = "\(deployDir)/\(f)"
+                let bak = "\(dst).old-\(ProcessInfo.processInfo.processIdentifier)"
                 do {
+                    var backup: String?
                     if fm.fileExists(atPath: dst) {
-                        _ = try fm.replaceItemAt(URL(fileURLWithPath: dst), withItemAt: URL(fileURLWithPath: tmp))
-                    } else {
-                        try fm.moveItem(atPath: tmp, toPath: dst)
+                        try? fm.removeItem(atPath: bak)
+                        try fm.moveItem(atPath: dst, toPath: bak)
+                        backup = bak
                     }
+                    do {
+                        try fm.moveItem(atPath: tmp, toPath: dst)
+                    } catch {
+                        if let backup { try? fm.moveItem(atPath: backup, toPath: dst) }
+                        managedOK = false
+                        logLine("bootstrap: 写入 \(f) 失败: \(error)")
+                        break
+                    }
+                    installed.append((dst, backup))
                     logLine("bootstrap: 写入 \(f)")
                 } catch {
                     managedOK = false
-                    logLine("bootstrap: 写入 \(f) 失败: \(error)")
+                    logLine("bootstrap: 备份 \(f) 失败: \(error)")
                     break
                 }
             }
         }
         if !managedOK {
+            for item in installed.reversed() {
+                try? fm.removeItem(atPath: item.dst)
+                if let backup = item.backup { try? fm.moveItem(atPath: backup, toPath: item.dst) }
+            }
             for (_, tmp) in staged { try? fm.removeItem(atPath: tmp) }
+            logLine("bootstrap: 托管文件更新未完成,已回滚到旧骨架")
+        } else {
+            for item in installed { if let backup = item.backup { try? fm.removeItem(atPath: backup) } }
         }
     }
-    if needsUpdate && !managedOK {
-        logLine("bootstrap: 托管文件更新未完成,保留旧骨架版本")
+    if versionChanged && !managedOK {
         return
     }
     // 用户文件:永不覆盖

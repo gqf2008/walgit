@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
 # walgit-ensure — 确保本机 walgit 服务在跑（幂等）；status / stop 子命令
+# 端口与服务同源:读 $BASE/walgit.toml 的 [server].listen,默认 127.0.0.1:8081。
 set -euo pipefail
 
 BASE="${WALGIT_DEPLOY_DIR:-$HOME/walgit}"
-URL="http://127.0.0.1:8081"
+
+# 输出 [server].listen 的值(只认第一个 listen = "...");找不到回退默认。
+read_listen() {
+  local cfg="${WALGIT_CONFIG:-$BASE/walgit.toml}" l=""
+  if [ -f "$cfg" ]; then
+    l="$(awk -F'"' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$cfg" 2>/dev/null || true)"
+  fi
+  [ -n "$l" ] || l="127.0.0.1:8081"
+  printf '%s' "$l"
+}
+# release-install.sh 显式传入解析结果,保证 stop/start 与健康检查同端口。
+LISTEN="${WALGIT_LISTEN:-$(read_listen)}"
+PORT="${LISTEN##*:}"
+case "$PORT" in
+  ''|*[!0-9]*) PORT=8081 ;;
+esac
+URL="http://$LISTEN"
 HEALTH_URL="$URL/healthz"
 
 is_running() {
@@ -11,7 +28,7 @@ is_running() {
 }
 
 get_pid() {
-  lsof -tiTCP:8081 -sTCP:LISTEN 2>/dev/null | head -1
+  lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
 }
 
 case "${1:-ensure}" in
@@ -30,7 +47,7 @@ case "${1:-ensure}" in
     pid="$(get_pid || true)"
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
     # 等待完全退出（最多 10s）
-    for i in $(seq 1 10); do
+    for ((i = 0; i < 10; i++)); do
       if ! is_running && [ -z "$(get_pid || true)" ]; then
         echo "walgit: stopped"
         exit 0
@@ -53,7 +70,7 @@ case "${1:-ensure}" in
     # screen 保活启动（exec 会话会回收裸后台进程）
     screen -dmS walgit-server bash -c "cd $BASE && ./run-walgit.sh > $BASE/server.log 2>&1; echo EXIT=\$? >> $BASE/server.log"
     # 等待就绪（最多 15s）
-    for i in $(seq 1 15); do
+    for ((i = 0; i < 15; i++)); do
       if is_running; then
         echo "walgit: started (pid $(get_pid)) — $URL"
         exit 0

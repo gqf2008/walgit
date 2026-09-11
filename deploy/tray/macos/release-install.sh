@@ -72,6 +72,9 @@ listen_addr() {
     printf '%s' "$l"
 }
 HEALTH_URL="http://$(listen_addr)/healthz"
+# walgit-ensure 的 stop/start 必须探测同一端口;函数不会随子进程继承,显式传值。
+WALGIT_LISTEN="$(listen_addr)"
+export WALGIT_LISTEN
 
 SERVICE_WAS_RUNNING=0
 healthcheck "$HEALTH_URL" >/dev/null 2>&1 && SERVICE_WAS_RUNNING=1
@@ -135,7 +138,7 @@ rollback() {
         mv "$BACKUP" "$APP_DEST" 2>/dev/null || true
     fi
     restore_deploy_files
-    [ "${WALGIT_UPDATE_SKIP_OPEN:-0}" != "1" ] && open "$APP_DEST" >/dev/null 2>&1 || true
+    [ "${WALGIT_UPDATE_SKIP_OPEN:-0}" != "1" ] && open --env "WALGIT_DEPLOY_DIR=$DEPLOY" "$APP_DEST" >/dev/null 2>&1 || true
     if [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
         "$DEPLOY/walgit-ensure" >/dev/null 2>&1 || true
     fi
@@ -148,7 +151,7 @@ cleanup_mount
 trap - EXIT
 OPEN_FAILED=0
 if [ "${WALGIT_UPDATE_SKIP_OPEN:-0}" != "1" ]; then
-    if ! open "$APP_DEST" >/dev/null 2>&1; then
+    if ! open --env "WALGIT_DEPLOY_DIR=$DEPLOY" "$APP_DEST" >/dev/null 2>&1; then
         OPEN_FAILED=1
     fi
 fi
@@ -175,6 +178,7 @@ if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALG
     for _ in $(seq 1 "$HEALTH_WAIT"); do
         body="$(healthcheck "$HEALTH_URL" --max-time 2 2>/dev/null || true)"
         if [[ "$body" == *"v$VERSION"* ]]; then
+            [ -n "$DEPLOY_BACKUP" ] && rm -rf "$DEPLOY_BACKUP"
             log "SUCCESS: v$VERSION"
             notify "已升级到 v$VERSION"
             exit 0
@@ -184,5 +188,6 @@ if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALG
     rollback "新服务健康检查失败"
 fi
 
+[ -n "$DEPLOY_BACKUP" ] && rm -rf "$DEPLOY_BACKUP"
 log "SUCCESS: v$VERSION"
 notify "已升级到 v$VERSION"
