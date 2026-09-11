@@ -173,8 +173,7 @@ pub(crate) async fn update_reclaiming(
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated);
-                *handle.manifest_version.lock() = Some(meta.version);
+                handle.install_manifest(Arc::new(updated), Some(meta.version));
                 return Ok(());
             }
             Err(StoreError::PreconditionFailed { .. }) => {
@@ -1153,8 +1152,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 if local_ok {
-                    *handle.manifest.write() = Arc::new(committed.clone());
-                    *handle.manifest_version.lock() = Some(version.clone());
+                    handle.install_manifest(Arc::new(committed.clone()), Some(version.clone()));
                     {
                         let mut state = handle.state.lock();
                         state.manifest_version = Some(version.as_str().to_string());
@@ -1494,8 +1492,7 @@ pub(crate) async fn publish_compact_impl(
             },
         };
         if let Some((committed, version)) = committed {
-            *handle.manifest.write() = Arc::new(committed.clone());
-            *handle.manifest_version.lock() = Some(version.clone());
+            handle.install_manifest(Arc::new(committed.clone()), Some(version.clone()));
             note_entry_time(handle, seq, &entry_time);
             // Record *when* each pack left the live set (#175). The manifest only
             // keeps the live set and this COMPACT entry is eventually folded into a
@@ -1657,8 +1654,7 @@ pub(crate) async fn annotate_pack_impl(
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                handle.install_manifest(Arc::new(updated.clone()), Some(meta.version.clone()));
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());
@@ -1821,8 +1817,7 @@ pub(crate) async fn publish_settings_impl(
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                handle.install_manifest(Arc::new(updated.clone()), Some(meta.version.clone()));
                 note_entry_time(handle, seq, &entry_time);
                 {
                     let mut state = handle.state.lock();

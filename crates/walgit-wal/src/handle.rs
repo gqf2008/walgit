@@ -58,6 +58,11 @@ pub struct RepoHandle {
     // Current manifest (last known). Short critical sections, no await.
     pub(crate) manifest: PLRwLock<Arc<Manifest>>,
     pub(crate) manifest_version: PLMutex<Option<Version>>,
+    /// Guards the *pair* above. Writers install `(manifest, version)` under it
+    /// and readers snapshot under it, so the cache can never hold an old
+    /// manifest next to a newer version — which would let a CAS succeed on a
+    /// manifest body that predates the claim it is supposed to see (#175).
+    pub(crate) manifest_pair: PLMutex<()>,
 
     // Persistent local state.
     pub(crate) state: PLMutex<RepoState>,
@@ -211,6 +216,7 @@ impl RepoHandle {
             pack_mutex: TokioMutex::new(()),
             manifest: PLRwLock::new(Arc::new(manifest)),
             manifest_version: PLMutex::new(version),
+            manifest_pair: PLMutex::new(()),
             state: PLMutex::new(state),
             refs_verified: AtomicBool::new(false),
             packs_verified: AtomicBool::new(false),
@@ -444,9 +450,18 @@ impl RepoHandle {
     ///
     /// Every `PutMode::Update(version)` decision must use this (#175).
     pub fn manifest_snapshot(&self) -> (Arc<Manifest>, Option<Version>) {
+        let _pair = self.manifest_pair.lock();
         let version = self.manifest_version.lock().clone();
         let manifest = self.manifest.read().clone();
         (manifest, version)
+    }
+
+    /// Install a new `(manifest, version)` pair atomically. Every writer must
+    /// use this instead of assigning the two fields separately.
+    pub(crate) fn install_manifest(&self, manifest: Arc<Manifest>, version: Option<Version>) {
+        let _pair = self.manifest_pair.lock();
+        *self.manifest.write() = manifest;
+        *self.manifest_version.lock() = version;
     }
 
     /// Last applied log entry sequence (local replay progress).
@@ -1099,8 +1114,7 @@ impl RepoHandle {
                     }
                     // Same content under a version we did not record (a publish that learned the version
                     // by HEAD): adopt the version so the next check is a 304.
-                    *self.manifest.write() = Arc::new(*manifest);
-                    *self.manifest_version.lock() = Some(meta_version);
+                    self.install_manifest(Arc::new(*manifest), Some(meta_version));
                     self.update_freshness();
                     return Ok(());
                 }
@@ -1114,8 +1128,7 @@ impl RepoHandle {
                 )
                 .await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = Arc::new(*manifest);
-                *self.manifest_version.lock() = Some(meta_version);
+                self.install_manifest(Arc::new(*manifest), Some(meta_version));
                 self.mark_refs_verified();
                 self.update_freshness();
             }
@@ -1224,8 +1237,7 @@ impl RepoHandle {
         self.mark_refs_unverified();
         crate::sync::materialize_from_scratch(self, &manifest, &meta.version).await?;
 
-        *self.manifest.write() = Arc::new(manifest);
-        *self.manifest_version.lock() = Some(meta.version);
+        self.install_manifest(Arc::new(manifest), Some(meta.version));
         self.last_freshness.lock().take();
 
         Ok(())

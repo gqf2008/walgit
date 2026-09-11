@@ -266,8 +266,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                handle.install_manifest(Arc::new(updated.clone()), Some(meta.version.clone()));
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());
