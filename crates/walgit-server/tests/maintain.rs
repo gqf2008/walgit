@@ -2188,7 +2188,7 @@ async fn publishing_a_reclaiming_checksum_is_refused() -> anyhow::Result<()> {
 
     step!(
         "list candidate",
-        h.update_reclaiming(std::slice::from_ref(&checksum), &[])
+        h.update_reclaiming(std::slice::from_ref(&checksum), &[], "t")
     )?;
     assert!(
         h.manifest()
@@ -2244,7 +2244,7 @@ async fn pushing_a_reclaiming_checksum_is_refused() -> anyhow::Result<()> {
     let dead = "a".repeat(40);
     step!(
         "list candidate",
-        h.update_reclaiming(std::slice::from_ref(&dead), &[])
+        h.update_reclaiming(std::slice::from_ref(&dead), &[], "t")
     )?;
     assert!(
         h.manifest()
@@ -2328,7 +2328,7 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
     // A live pack must not become a GC candidate, even when asked directly.
     step!(
         "list live",
-        h.update_reclaiming(std::slice::from_ref(&live), &[])
+        h.update_reclaiming(std::slice::from_ref(&live), &[], "t")
     )?;
     assert!(
         h.manifest().reclaiming.is_empty(),
@@ -2340,7 +2340,7 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
     let dead = "f".repeat(40);
     step!(
         "list dead",
-        h.update_reclaiming(std::slice::from_ref(&dead), &[])
+        h.update_reclaiming(std::slice::from_ref(&dead), &[], "t")
     )?;
     assert!(
         h.manifest()
@@ -2351,7 +2351,7 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
     );
     step!(
         "clear dead",
-        h.update_reclaiming(&[], std::slice::from_ref(&dead))
+        h.update_reclaiming(&[], std::slice::from_ref(&dead), "t")
     )?;
     assert!(
         h.manifest().reclaiming.is_empty(),
@@ -2774,6 +2774,8 @@ async fn gc_releases_a_claim_whose_marker_was_already_retired() -> anyhow::Resul
         m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
             checksum: orphan.clone(),
             since: Some(since),
+            owner: "someone-else".into(),
+            token: "their-token".into(),
         });
         m.revision += 1;
         step!(
@@ -2840,7 +2842,7 @@ async fn gc_leaves_a_fresh_claim_to_its_holder() -> anyhow::Result<()> {
     let fresh = "a".repeat(40);
     step!(
         "claim",
-        h.update_reclaiming(std::slice::from_ref(&fresh), &[])
+        h.update_reclaiming(std::slice::from_ref(&fresh), &[], "t")
     )?;
     assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
     step!("gc pass", run_pass(&server.state))?;

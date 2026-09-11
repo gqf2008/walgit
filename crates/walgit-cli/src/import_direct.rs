@@ -1788,6 +1788,8 @@ mod resume_tests {
             vec![walgit_proto::v1::ReclaimingPack {
                 checksum: victim.clone(),
                 since: Some(time::now()),
+                owner: "someone-else".into(),
+                token: "their-token".into(),
             }],
         )
         .await;
@@ -1834,6 +1836,8 @@ mod resume_tests {
             vec![walgit_proto::v1::ReclaimingPack {
                 checksum: ghost.clone(),
                 since: Some(time::now()),
+                owner: "someone-else".into(),
+                token: "their-token".into(),
             }],
         )
         .await;
@@ -1936,6 +1940,8 @@ mod resume_tests {
         m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
             checksum: claimed.clone(),
             since: Some(time::now()),
+            owner: "someone-else".into(),
+            token: "their-token".into(),
         });
         m.revision += 1;
         repo_store

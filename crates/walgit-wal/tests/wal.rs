@@ -3612,7 +3612,7 @@ async fn a_compaction_skips_the_marker_for_a_checksum_gc_has_claimed() {
     // A checksum GC has listed as reclaiming (not live, so the claim holds).
     let claimed = "c".repeat(40);
     handle
-        .update_reclaiming(std::slice::from_ref(&claimed), &[])
+        .update_reclaiming(std::slice::from_ref(&claimed), &[], "t")
         .await
         .unwrap();
     assert!(

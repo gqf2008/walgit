@@ -274,6 +274,55 @@ Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Ok((
         &self.holder
     }
 
+    /// The lease epoch this guard is at now. Every heartbeat advances it, so a
+    /// pass can stamp work with the epoch it owned and later detect that the
+    /// lease (and therefore the right to finish that work) has moved on.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Like [`spawn_heartbeat`], but the caller can stop it *gracefully* (a
+    /// `watch` instead of an `abort`: an abort could cancel a heartbeat whose
+    /// remote CAS already landed, leaving the local version stale and the
+    /// release a no-op) and is told the moment the lease is stolen. A pass
+    /// doing destructive work must check `lost` before each step and stop
+    /// immediately — a lease someone else holds no longer fences it.
+    pub fn spawn_heartbeat_watched(
+        guard: Arc<Mutex<Self>>,
+        every: Duration,
+        ttl: Duration,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        lost: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(every) => {}
+                    _ = stop.changed() => break,
+                }
+                if *stop.borrow() {
+                    break;
+                }
+                let mut g = guard.lock().await;
+                if g.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                match g.heartbeat(ttl).await {
+                    Ok(()) => {}
+                    Err(CoordError::LeaseLost) => {
+                        lost.store(true, Ordering::SeqCst);
+                        tracing::warn!(key = %g.key, "lease lost during heartbeat");
+                        break;
+                    }
+                    Err(e) => {
+                        // Transient store error: keep trying; the store may recover.
+                        tracing::debug!(key = %g.key, error = %e, "heartbeat transient error");
+                    }
+                }
+            }
+        })
+    }
+
     pub fn expires_at(&self) -> SystemTime {
         self.expires_at
     }

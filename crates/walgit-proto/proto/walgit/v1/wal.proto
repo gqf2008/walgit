@@ -65,8 +65,16 @@ message Manifest {
 // One pack bucket GC is in the middle of deleting.
 message ReclaimingPack {
   string checksum = 1;
-  // When GC listed it. Diagnostics / future lease-based timeouts.
+  // When GC listed it. Age fence for crash recovery (and diagnostics).
   google.protobuf.Timestamp since = 2;
+  // Instance id of the GC pass that listed it. A second pass never deletes or
+  // retires a claim another live holder owns — it only recovers one whose
+  // holder is gone (see `token` + the age fence).
+  string owner = 3;
+  // Per-pass fencing token. A pass stamps every claim it lists with its own
+  // token and re-checks it before each destructive step, so a claim released
+  // or taken over by a later pass can no longer authorize deletions (#175).
+  string token = 4;
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a

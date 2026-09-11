@@ -121,6 +121,7 @@ pub(crate) async fn update_reclaiming(
     handle: &RepoHandle,
     add: &[String],
     remove: &[String],
+    token: &str,
 ) -> Result<Arc<Manifest>, WalError> {
     let writer = crate::handle::instance_id();
     let max_retries = handle.cfg.wal.cas_max_retries;
@@ -140,19 +141,25 @@ pub(crate) async fn update_reclaiming(
             if updated.packs.iter().any(|p| &p.checksum == c) {
                 continue;
             }
-            if !updated.reclaiming.iter().any(|r| &r.checksum == c) {
-                updated.reclaiming.push(ReclaimingPack {
+            match updated.reclaiming.iter_mut().find(|r| &r.checksum == c) {
+                // Someone else already holds it: never overwrite *their* fence
+                // — only the holder (or the age-fenced recovery) may release it.
+                Some(r) if r.owner != writer => {}
+                // Ours (re-claimed by this or a later pass of this instance) or
+                // new: stamp the fence this pass will check before each delete.
+                Some(r) => r.token = token.to_string(),
+                None => updated.reclaiming.push(ReclaimingPack {
                     checksum: c.clone(),
                     since: Some(time::now()),
-                });
+                    owner: writer.clone(),
+                    token: token.to_string(),
+                }),
             }
         }
         if updated.reclaiming.len() == current.reclaiming.len()
-            && updated
-                .reclaiming
-                .iter()
-                .zip(current.reclaiming.iter())
-                .all(|(a, b)| a.checksum == b.checksum)
+            && updated.reclaiming.iter().zip(current.reclaiming.iter()).all(
+                |(a, b)| a.checksum == b.checksum && a.owner == b.owner && a.token == b.token,
+            )
         {
             // Nothing to change: the caller still gets the manifest the claim
             // set is defined against, so it can compute per-repo config for
