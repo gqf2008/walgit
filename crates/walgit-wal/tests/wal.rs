@@ -3485,3 +3485,91 @@ async fn test_rebuilt_bucket_replaces_leftover_refs() {
         "leftover ref survived a bucket rebuild"
     );
 }
+
+/// #175: a superseding COMPACT must not commit without its
+/// `wal/_superseded/<checksum>` marker. The marker is what tells bucket GC when
+/// a pack left the live set, so a lost refresh would let GC use an old
+/// timestamp and delete the pack inside the retention window. The markers are
+/// therefore written *before* the manifest CAS, and a terminal write failure
+/// aborts the unit (nothing has committed yet).
+#[tokio::test]
+async fn a_supersession_without_its_marker_does_not_commit() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let faulty = FaultStore::new(store.clone(), "faulty", 7);
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(faulty.clone(), Arc::new(cfg));
+
+    let id = repo_id("test", "markerguard");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    // Two pushed packs so a full repack really supersedes something.
+    let work = WorkRepo::new();
+    let mut prev = String::new();
+    for i in 0..2 {
+        let c = work.commit(&format!("c{i}"), &format!("d{i}"));
+        let pack = if prev.is_empty() {
+            work.create_pack()
+        } else {
+            work.create_incremental_pack(&c, &prev)
+        };
+        let ingested = ingest_pack_data(&handle, pack).await.unwrap();
+        let txn = make_txn(vec![("refs/heads/main", &prev, &c)]);
+        handle
+            .publish_push(Some(ingested), txn, HashMap::new())
+            .await
+            .unwrap();
+        prev = c;
+    }
+    let live = handle.manifest().packs[0].checksum.clone();
+
+    // Fresh refs view before repacking (doing this *after* the repack would
+    // prune the not-yet-published replacement pack).
+    {
+        let _g = handle.sync_full().await.unwrap();
+    }
+
+    // Repack into a single new pack that supersedes the live one.
+    let repack = handle
+        .local()
+        .repack(walgit_git::RepackOptions {
+            mode: walgit_git::RepackMode::Full,
+            write_bitmap: false,
+            write_midx: false,
+            keep: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(
+        !repack.new_packs.is_empty() && !repack.removed.is_empty(),
+        "repack must produce a replacement and remove the live pack"
+    );
+
+    // Every write under the marker prefix now fails for good.
+    faulty.set(
+        FaultPlan {
+            p_err_before: 1.0,
+            ..Default::default()
+        }
+        .with_only(&["_superseded/"]),
+    );
+
+    let result = handle
+        .publish_compact(repack.new_packs[0].clone(), repack.removed.clone(), 2)
+        .await;
+    assert!(
+        result.is_err(),
+        "a supersession that cannot record its marker must not report success"
+    );
+
+    // Nothing committed: the pack the failed unit wanted to supersede is still
+    // live, and no manifest write happened.
+    let _g = handle.sync_full().await.unwrap();
+    let after = handle.manifest();
+    assert!(
+        after.packs.iter().any(|p| p.checksum == live),
+        "the live set must be untouched after the aborted supersession: {after:?}"
+    );
+}

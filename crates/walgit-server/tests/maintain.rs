@@ -2501,3 +2501,225 @@ async fn gc_reclaims_expired_superseded_packs_and_keeps_live_and_young_ones() ->
     );
     Ok(())
 }
+
+/// #175: the unit's bound counts *reclaimable* work, and anything left behind
+/// keeps the unit due. Two ways the old shape was wrong, checked together:
+/// the bound was applied before the live filter, so (a) an older marker on a
+/// superseded-and-re-adopted (live) pack spent quota and starved a dead one, and
+/// (b) a pass that stopped at the bound still reported `complete`, writing
+/// `gc.pb` and sleeping a whole `gc_interval` with eligibility left on the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_bounds_reclaimable_work_and_stays_due_while_eligible_markers_remain() -> anyhow::Result<()>
+{
+    use futures::StreamExt;
+    use prost::Message;
+    use walgit_proto::keys;
+    use walgit_proto::v1::SupersededPack;
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::{ObjectStore, ObjectStoreExt, PutMode};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+            c.compaction.retention_superseded = std::time::Duration::from_hours(7 * 24);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+    let live = h
+        .manifest()
+        .packs
+        .first()
+        .expect("push published a pack")
+        .checksum
+        .clone();
+
+    let mut ts = walgit_proto::time::now();
+    // The live pack's marker is the *oldest*: with the bound applied first it
+    // would take the first slot every pass and never let the dead ones through.
+    ts.seconds -= 10 * 24 * 3600;
+    step!(
+        "live marker",
+        h.store().put_bytes(
+            &keys::superseded_key(&live),
+            SupersededPack {
+                checksum: live.clone(),
+                superseded_at: Some(ts),
+                seq: 1,
+            }
+            .encode_to_vec(),
+            PutMode::Create,
+        )
+    )?;
+    // 33 dead packs, all past the 7d window: one more than the 32/unit bound.
+    let mut deads = Vec::new();
+    for i in 0u32..33 {
+        let checksum = format!("{:040x}", 0xdead_0000u64 + u64::from(i));
+        let mut at = walgit_proto::time::now();
+        at.seconds -= 9 * 24 * 3600 + i64::from(i);
+        step!(
+            "dead marker",
+            h.store().put_bytes(
+                &keys::superseded_key(&checksum),
+                SupersededPack {
+                    checksum: checksum.clone(),
+                    superseded_at: Some(at),
+                    seq: 2 + u64::from(i),
+                }
+                .encode_to_vec(),
+                PutMode::Create,
+            )
+        )?;
+        step!(
+            "dead body",
+            h.store()
+                .put_bytes(&keys::pack_key(&checksum), vec![0u8; 32], PutMode::Create)
+        )?;
+        deads.push(checksum);
+    }
+
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+
+    // Exactly the 32/unit bound of *dead* packs went, not 31 (the live marker
+    // must not have spent a slot).
+    let mut remaining = 0usize;
+    for checksum in &deads {
+        if h.store().head(&keys::pack_key(checksum)).await?.is_some() {
+            remaining += 1;
+        }
+    }
+    assert_eq!(
+        remaining,
+        1,
+        "the live marker must not spend quota: expected 32 dead reclaimed, {remaining} left"
+    );
+    // Work remains, so the pass must NOT record gc.pb and the unit stays due.
+    assert!(
+        h.store().get_bytes(keys::GC).await?.is_none(),
+        "an incomplete pass must not write gc.pb"
+    );
+    assert!(
+        matches!(step!("plan again", next_unit(&server.state, &id))?, Unit::Gc(_)),
+        "the GC unit must stay due while eligible markers remain"
+    );
+
+    // A clean pass (nothing left but the live marker) drains the rest and records.
+    step!("second pass", run_pass(&server.state))?;
+    let mut left = 0usize;
+    let mut stream = h.store().list(keys::SUPERSEDED_DIR, None);
+    while let Some(m) = stream.next().await {
+        let m = m?;
+        if m.key.starts_with(keys::SUPERSEDED_DIR) {
+            left += 1;
+        }
+    }
+    assert_eq!(left, 1, "only the live pack's marker stays (dropping it is irreversible)");
+    assert!(
+        h.store().get_bytes(keys::GC).await?.is_some(),
+        "a drained pass records gc.pb"
+    );
+    Ok(())
+}
+
+/// #175 / D24: `[compaction]` is a per-repo settings section, so GC must honour
+/// the *effective* retention. A repo that asks for a longer provenance window
+/// must not have its packs deleted on the host's shorter one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_honours_the_repo_retention_override() -> anyhow::Result<()> {
+    use prost::Message;
+    use walgit_proto::keys;
+    use walgit_proto::v1::SupersededPack;
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::{ObjectStore, ObjectStoreExt, PutMode};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+            // Host keeps 7d; the repo below overrides it to 30d.
+            c.compaction.retention_superseded = std::time::Duration::from_hours(7 * 24);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+    step!(
+        "repo settings",
+        h.publish_settings(
+            "[compaction]\nretention_superseded = \"30d\"\n",
+            "tester",
+            "longer provenance window",
+        )
+    )?;
+    assert_eq!(
+        h.effective_config().compaction.retention_superseded,
+        std::time::Duration::from_hours(30 * 24),
+        "the repo override must reach the effective config"
+    );
+
+    // A pack dropped 8 days ago: past the host's 7d, inside the repo's 30d.
+    let dead = "d".repeat(40);
+    let mut at = walgit_proto::time::now();
+    at.seconds -= 8 * 24 * 3600;
+    step!(
+        "marker",
+        h.store().put_bytes(
+            &keys::superseded_key(&dead),
+            SupersededPack {
+                checksum: dead.clone(),
+                superseded_at: Some(at),
+                seq: 5,
+            }
+            .encode_to_vec(),
+            PutMode::Create,
+        )
+    )?;
+    step!(
+        "body",
+        h.store()
+            .put_bytes(&keys::pack_key(&dead), vec![0u8; 32], PutMode::Create)
+    )?;
+
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+    assert!(
+        h.store().head(&keys::pack_key(&dead)).await?.is_some(),
+        "the repo's 30d window must win over the host's 7d"
+    );
+    Ok(())
+}
