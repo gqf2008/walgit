@@ -214,7 +214,10 @@ impl RepoHandle {
       -> Result<u64, WalError>;
   /// List/clear packs bucket GC is reclaiming (#175), under the manifest CAS. GC lists a checksum before
   /// deleting any of its objects; a publisher must not re-adopt a listed checksum (→ `WalError::Reclaiming`).
-  pub async fn update_reclaiming(&self, add: &[String], remove: &[String]) -> Result<(), WalError>;
+  /// `token` is this pass's fencing token: claims it lists carry `owner`+`token` and are re-checked before
+  /// every destructive step. Returns the manifest the claim set was committed against (per-repo config/live).
+  pub async fn update_reclaiming(&self, add: &[String], remove: &[String], token: &str)
+      -> Result<Arc<walgit_proto::v1::Manifest>, WalError>;
   /// Write checkpoint at current head (refs snapshot + pack set), then CAS manifest (checkpoint=, min_seq=,
   /// log_segments trimmed). Idempotent.
   pub async fn write_checkpoint(&self) -> Result<CheckpointRef, WalError>;
