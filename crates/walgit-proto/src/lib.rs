@@ -41,6 +41,8 @@ pub mod keys {
     pub const LFS_DIR: &str = "lfs/objects/";
     /// Per-repo connectivity audit result (`FsckReport`). Overwritten, not WAL.
     pub const FSCK: &str = "fsck.pb";
+    /// Per-repo bucket-GC record (`GcReport`). Overwritten, not WAL.
+    pub const GC: &str = "gc.pb";
     pub const CATALOG: &str = "meta/repos.pb";
     /// Per-repo push policy (JSON). Not on the WAL; CAS'd independently.
     pub const POLICY: &str = "policy.json";
@@ -67,6 +69,11 @@ pub mod keys {
     }
     pub fn commit_graph_key(checksum_hex: &str) -> String {
         format!("{WAL_DIR}{checksum_hex}.commit-graph")
+    }
+    /// Marks a pack that a COMPACT entry dropped from the live set, so
+    /// bucket-side GC knows *when* it became garbage (`SupersededPack`).
+    pub fn superseded_key(checksum_hex: &str) -> String {
+        format!("{WAL_DIR}{checksum_hex}.superseded")
     }
     pub fn checkpoint_dir(seq: u64) -> String {
         format!("{CHECKPOINTS_DIR}{seq:016x}/")

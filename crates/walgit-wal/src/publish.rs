@@ -44,7 +44,9 @@ use tracing::Instrument;
 use walgit_git::{IngestedPack, PackInfo};
 use walgit_proto::keys;
 use walgit_proto::v1::PackKind;
-use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef, Manifest, PackRef, RefTransaction};
+use walgit_proto::v1::{
+    EntryKind, LogEntry, LogSegmentRef, Manifest, PackRef, RefTransaction, SupersededPack,
+};
 use walgit_proto::{frame, time};
 use walgit_store::{ObjectStore, Prefixed, PutBody, PutMode, PutOptions, StoreError};
 
@@ -1398,6 +1400,38 @@ pub(crate) async fn publish_compact_impl(
             *handle.manifest.write() = Arc::new(committed.clone());
             *handle.manifest_version.lock() = Some(version.clone());
             note_entry_time(handle, seq, &entry_time);
+            // Record *when* each pack left the live set (#175). The manifest only
+            // keeps the live set and this COMPACT entry is eventually folded into a
+            // checkpoint, so without a marker bucket-side GC cannot tell "superseded
+            // an hour ago" from "superseded last week" and must keep everything.
+            // Written after the CAS (only real supersessions get a marker) and
+            // create-if-absent (write-once per checksum). A crash between the CAS and
+            // this write leaks one pack — the safe direction.
+            for s in &supersedes_hex {
+                let marker = SupersededPack {
+                    checksum: s.clone(),
+                    superseded_at: Some(entry_time),
+                    seq,
+                };
+                let opts = PutOptions {
+                    mode: PutMode::Create,
+                    immutable: true,
+                    ..Default::default()
+                };
+                if let Err(e) = handle
+                    .store
+                    .put(
+                        &keys::superseded_key(s),
+                        PutBody::Bytes(bytes::Bytes::from(marker.encode_to_vec())),
+                        opts,
+                    )
+                    .await
+                {
+                    // Already-present is the normal case (a retry that landed twice);
+                    // anything else is worth a line but must not fail the publish.
+                    tracing::warn!(repo = %handle.id, checksum = %s, "superseded marker write failed: {e}");
+                }
+            }
             {
                 let mut state = handle.state.lock();
                 state.manifest_version = Some(version.as_str().to_string());
