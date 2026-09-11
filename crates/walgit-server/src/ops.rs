@@ -233,15 +233,29 @@ async fn gc_superseded_packs(
     use walgit_proto::v1::SupersededPack;
     use walgit_store::ObjectStore;
 
-    // D24: `[compaction]` is a per-repo settings section, so the retention
-    // window must come from the *effective* config — a repo that asks for a
-    // longer window must not have its packs deleted on the host's shorter one.
-    let retention = handle.effective_config().compaction.retention_superseded;
+    // Fresh refs *first*: the retention window (D24: `[compaction]` is a
+    // per-repo settings section), the live set and the marker ages must all
+    // come from one generation. Reading a stale cached handle would let another
+    // instance's settings change land after we captured the window (#175).
+    let (retention, live) = {
+        let _guard = handle.sync_refs().await.map_err(|e| e.to_string())?;
+        let retention = handle.effective_config().compaction.retention_superseded;
+        let live: std::collections::HashSet<String> = handle
+            .manifest()
+            .packs
+            .iter()
+            .map(|p| p.checksum.clone())
+            .collect();
+        (retention, live)
+    };
     let now = std::time::SystemTime::now();
 
-    // Collect markers that have aged past the retention window. Reading each
-    // marker is one GET; the listing is bounded by the number of packs a repo
-    // ever superseded within the window, not by its object count.
+    // Collect markers that have aged past the retention window *and* whose pack
+    // is not live in that same generation. Reading each marker is one GET; the
+    // listing is bounded by the number of packs a repo ever superseded within
+    // the window, not by its object count. Dropping live checksums before the
+    // bound below is what keeps an old marker on a re-adopted pack from
+    // spending quota and starving real candidates.
     let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
     let mut scanned = 0u64;
     {
@@ -261,6 +275,9 @@ async fn gc_superseded_packs(
                 continue;
             };
             let marker = SupersededPack::decode(raw.as_ref()).map_err(|e| e.to_string())?;
+            if live.contains(&marker.checksum) {
+                continue;
+            }
             let Some(at) = marker
                 .superseded_at
                 .as_ref()
@@ -274,23 +291,6 @@ async fn gc_superseded_packs(
             candidates.push((marker.checksum, at));
         }
     }
-    if candidates.is_empty() {
-        return Ok((0, 0, true));
-    }
-    // A marker outlives its pack's death: a superseded pack a publisher
-    // re-adopted is live again, and its old marker must neither be deleted nor
-    // spend this unit's quota. Sync refs so the live set is current, then drop
-    // live checksums *before* the bound — the bound counts reclaimable work, so
-    // an unbounded pile of stale live markers cannot starve real candidates.
-    let guard = handle.sync_refs().await.map_err(|e| e.to_string())?;
-    let live: std::collections::HashSet<String> = handle
-        .manifest()
-        .packs
-        .iter()
-        .map(|p| p.checksum.clone())
-        .collect();
-    drop(guard);
-    candidates.retain(|(c, _)| !live.contains(c));
     if candidates.is_empty() {
         return Ok((0, 0, true));
     }
@@ -325,12 +325,45 @@ async fn gc_superseded_packs(
     let mut deleted = 0u64;
     let mut freed = 0u64;
     let mut all_complete = !truncated;
-    let mut reclaimed: Vec<String> = Vec::new();
+    // (checksum, marker version) for packs whose objects are all gone.
+    let mut reclaimed: Vec<(String, walgit_store::Version)> = Vec::new();
+    // Claims we hold but must release without deleting (the marker was
+    // refreshed, or the pack turned out live).
+    let mut release: Vec<String> = Vec::new();
     for (checksum, at) in candidates {
         if !owned.contains(&checksum) || live.contains(&checksum) {
             // A publisher re-adopted it before our claim, or another GC pass
             // owns it. Leave the pack and its marker alone.
             log(format!("gc: {checksum} is live again — skipped"));
+            continue;
+        }
+        // Re-read the marker now that we own the claim: the timestamp scanned
+        // above may predate a concurrent supersession that refreshed it after
+        // our read (the writer overwrites the marker before its manifest CAS,
+        // and our claim CAS is what makes any later supersession lose — so this
+        // read is the authoritative age for the generation we are deleting in).
+        let marker_key = keys::superseded_key(&checksum);
+        let Some((meta, raw)) = handle
+            .store()
+            .get_bytes(&marker_key)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            // Marker gone: someone else retired it; drop the claim.
+            release.push(checksum.clone());
+            continue;
+        };
+        let marker = SupersededPack::decode(raw.as_ref()).map_err(|e| e.to_string())?;
+        let fresh_at = marker
+            .superseded_at
+            .as_ref()
+            .map_or(at, walgit_proto::time::to_system);
+        if now.duration_since(fresh_at).unwrap_or_default() <= retention {
+            log(format!(
+                "gc: {checksum} was superseded again inside the window — skipped"
+            ));
+            release.push(checksum.clone());
+            all_complete = false;
             continue;
         }
         let side_files = [
@@ -369,34 +402,48 @@ async fn gc_superseded_packs(
         }
         if !complete {
             // The marker is the only record that this pack is garbage: keep it
-            // until every object is gone.
+            // until every object is gone. The claim stays too, so the pack is
+            // still listed against re-adoption.
             all_complete = false;
             continue;
         }
-        reclaimed.push(checksum.clone());
         log(format!(
             "gc: reclaimed {checksum} (superseded {:.1}h ago)",
-            now.duration_since(at)
+            now.duration_since(fresh_at)
                 .unwrap_or_default()
                 .as_secs_f64()
                 / 3600.0
         ));
+        reclaimed.push((checksum, meta.version));
         deleted += 1;
     }
-    if !reclaimed.is_empty() {
-        // Release the claim, then drop the markers: the marker is the record
-        // that this pack is garbage, so it goes last (and only once every
-        // object is gone).
+    if !reclaimed.is_empty() || !release.is_empty() {
+        // Release claims before dropping markers. A pack whose objects are gone
+        // releases now; a skipped one releases so a later pass re-judges it.
+        let mut release_claims: Vec<String> = release.clone();
+        release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
         handle
-            .update_reclaiming(&[], &reclaimed)
+            .update_reclaiming(&[], &release_claims)
             .await
             .map_err(|e| e.to_string())?;
-        for checksum in &reclaimed {
-            handle
+        for (checksum, version) in &reclaimed {
+            // Conditional: between the release and here a publisher could have
+            // re-adopted the checksum and superseded it again, writing a fresh
+            // marker. Deleting the old one unseen would orphan that new pack.
+            match handle
                 .store()
-                .delete(&keys::superseded_key(checksum), None)
+                .delete(&keys::superseded_key(checksum), Some(version.clone()))
                 .await
-                .map_err(|e| format!("gc: delete marker {checksum}: {e}"))?;
+            {
+                Ok(()) | Err(walgit_store::StoreError::NotFound { .. }) => {}
+                Err(walgit_store::StoreError::PreconditionFailed { .. }) => {
+                    log(format!(
+                        "gc: marker {checksum} was rewritten — keeping the new one"
+                    ));
+                    all_complete = false;
+                }
+                Err(e) => return Err(format!("gc: delete marker {checksum}: {e}")),
+            }
         }
     }
     if scanned > 0 {
@@ -660,7 +707,7 @@ async fn run(
                 &walgit_proto::keys::lease_key("gc"),
                 walgit_store::coord::instance_id(),
                 "gc",
-                state.cfg.compaction.lease_ttl,
+                handle.effective_config().compaction.lease_ttl,
             )
             .await
             .map_err(|e| e.to_string())?;
