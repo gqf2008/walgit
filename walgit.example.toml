@@ -174,7 +174,7 @@ factor = 2                        # geometric repack factor
 trigger_packs = 16                # compact when this many tier-0 packs exist
 trigger_bytes = "1GiB"            # or when tier-0 pack bytes exceed this (either way: at least 2 fresh packs; the base/history
                                   # pack are never folded; a base is rebuilt only by the weekly unit / `walgit compact --base`)
-lease_ttl = "10m"                 # compaction lease TTL
+lease_ttl = "10m"                 # compaction + bucket-GC lease TTL (floored at 30s; the GC pass renews it)
 retention_superseded = "7d"       # keep old packs for provenance / rewind
 engine = "git"                    # "git" (gix cannot delta-compress)
 

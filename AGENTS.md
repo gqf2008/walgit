@@ -151,7 +151,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `wal/<checksum>.pack/.idx/.rev/.bitmap/.commit-graph` | Immutable packs, content-addressed by pack checksum: push packs (tier 0), compaction outputs (tier 1), the base (tier 2, bitmap'd), plus the side-files a reader needs. A pack a COMPACT entry dropped also carries a marker under `wal/_superseded/<checksum>` (when it left the live set; its own prefix so GC's listing never walks pack objects) — the manifest keeps only the live set, and the superseding entry is eventually folded into a checkpoint, so the marker is what lets bucket GC age a pack. |
 | `checkpoints/<seq>/checkpoint.pb`, `refs.pb` | Folded state at `seq`: live pack set + full `RefSnapshot`. Cold start = snapshot + tail, never full replay. |
 | `bundles/list.pb`, `bundles/<strategy>/…` | bundle-uri artefacts + CAS'd list. |
-| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`, `bundle:<strategy>`. The only cross-instance mutex. |
+| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`, `bundle:<strategy>`, `gc` (the GC pass renews it for its whole run; `ReclaimingPack.since` + a `max(3×lease_ttl, 5min)` age fence is what lets a later pass recover claims a dead holder left behind). The only cross-instance mutex. |
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |

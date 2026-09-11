@@ -1911,4 +1911,66 @@ mod resume_tests {
             );
         }
     }
+
+    /// #175: a dropped checksum bucket GC has already claimed is skipped when
+    /// writing the replacement markers. GC retires that marker while it holds
+    /// the claim, so a refresh landing in that window would leave the dead pack
+    /// unrecorded where the backend's conditional delete is HEAD+compare+DELETE
+    /// (S3). The claim itself is GC's and must survive the import.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_import_skips_markers_for_checksums_gc_has_claimed() {
+        let src = source();
+        let cfg = cfg();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let repo = "t/replace-claim";
+        let id = walgit_git::RepoId::new("t", "replace-claim").unwrap();
+        let repo_store = Prefixed::new(store.clone(), id.store_prefix());
+        run_with_store(opts(src.path(), repo), &cfg, store.clone(), false)
+            .await
+            .unwrap();
+
+        // Claim one of the packs the replace will drop.
+        let (meta, bytes) = repo_store.get_bytes(keys::MANIFEST).await.unwrap().unwrap();
+        let mut m = Manifest::decode(bytes.as_ref()).unwrap();
+        let claimed = m.packs[0].checksum.clone();
+        m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
+            checksum: claimed.clone(),
+            since: Some(time::now()),
+        });
+        m.revision += 1;
+        repo_store
+            .put_bytes(
+                keys::MANIFEST,
+                m.encode_to_vec(),
+                PutMode::Update(meta.version),
+            )
+            .await
+            .unwrap();
+
+        // A different source replaces the pack set, dropping `claimed`.
+        let src2 = source();
+        std::fs::write(src2.path().join("extra"), "different bytes\n").unwrap();
+        sh(src2.path(), &["add", "."]);
+        sh(src2.path(), &["commit", "-q", "-m", "extra"]);
+        sh(src2.path(), &["repack", "-adb", "-q"]);
+        sh(src2.path(), &["prune-packed"]);
+        let mut o2 = opts(src2.path(), repo);
+        o2.replace = true;
+        run_with_store(o2, &cfg, store.clone(), false).await.unwrap();
+
+        assert!(
+            repo_store
+                .get_bytes(&keys::superseded_key(&claimed))
+                .await
+                .unwrap()
+                .is_none(),
+            "a claimed checksum must not get a replacement marker"
+        );
+        let (_, bytes) = repo_store.get_bytes(keys::MANIFEST).await.unwrap().unwrap();
+        let after = Manifest::decode(bytes.as_ref()).unwrap();
+        assert!(
+            after.reclaiming.iter().any(|r| r.checksum == claimed),
+            "the import must not clear GC's claim: {after:?}"
+        );
+    }
 }
