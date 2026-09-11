@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,3 +34,6 @@ jobs:
             deploy/tray/tray-rs -> target
       - name: Build (release)
         run: cargo build --release --target-dir target --manifest-path deploy/tray/tray-rs/Cargo.toml
+      - name: macOS tray release/package guards
+        if: runner.os == 'macOS'
+        run: deploy/tray/macos/test.sh
