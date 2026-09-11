@@ -433,6 +433,22 @@ impl RepoHandle {
         self.manifest_version.lock().clone()
     }
 
+    /// The `(manifest, version)` pair a CAS must be based on, read in the only
+    /// order that cannot pair an old manifest with a new version.
+    ///
+    /// Writers publish a new manifest and then its version (separate locks), so
+    /// reading version-first makes `(old manifest, new version)` unobservable:
+    /// if we see the new version, the manifest write that preceded it is already
+    /// visible. The opposite pairing — new manifest, old version — is harmless:
+    /// the CAS simply loses and retries.
+    ///
+    /// Every `PutMode::Update(version)` decision must use this (#175).
+    pub fn manifest_snapshot(&self) -> (Arc<Manifest>, Option<Version>) {
+        let version = self.manifest_version.lock().clone();
+        let manifest = self.manifest.read().clone();
+        (manifest, version)
+    }
+
     /// Last applied log entry sequence (local replay progress).
     pub fn applied_seq(&self) -> u64 {
         self.state.lock().applied_seq

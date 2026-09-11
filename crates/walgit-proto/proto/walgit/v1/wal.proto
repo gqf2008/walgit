@@ -190,7 +190,7 @@ message RefTransaction {
   bool atomic = 3;
 }
 
-// Written under `wal/_superseded/<checksum>` when a
+// One superseded pack: written under `wal/_superseded/<checksum>` when a
 // COMPACT entry drops it from `Manifest.packs`. It records *when* the pack left
 // the live set, which the manifest alone cannot express (it keeps only the live
 // set, and the superseding log entry is eventually folded into a checkpoint).

@@ -232,8 +232,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     // Round 2: CAS manifest: set checkpoint, min_seq = seq+1, trim log_segments
     let mut attempts = 0u32;
     loop {
-        let current_manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (current_manifest, known_version) = handle.manifest_snapshot();
 
         // If checkpoint already at or past head, done
         if let Some(ref cp) = current_manifest.checkpoint

@@ -228,7 +228,7 @@ async fn gc_superseded_packs(
     handle: &RepoHandle,
     max: usize,
     log: Log<'_>,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, bool), String> {
     use futures::StreamExt;
     use walgit_proto::keys;
     use walgit_proto::v1::SupersededPack;
@@ -273,7 +273,7 @@ async fn gc_superseded_packs(
         }
     }
     if candidates.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, true));
     }
     // Oldest first: a partial unit should reclaim the longest-dead packs.
     candidates.sort_by_key(|(_, at)| *at);
@@ -302,6 +302,7 @@ async fn gc_superseded_packs(
 
     let mut deleted = 0u64;
     let mut freed = 0u64;
+    let mut all_complete = true;
     let mut reclaimed: Vec<String> = Vec::new();
     for (checksum, at) in candidates {
         if !owned.contains(&checksum) || live.contains(&checksum) {
@@ -347,11 +348,12 @@ async fn gc_superseded_packs(
         if !complete {
             // The marker is the only record that this pack is garbage: keep it
             // until every object is gone.
+            all_complete = false;
             continue;
         }
         reclaimed.push(checksum.clone());
         log(format!(
-            "gc: reclaimed {checksum} (superseded {:.1}h ago, {freed} bytes total)",
+            "gc: reclaimed {checksum} (superseded {:.1}h ago)",
             now.duration_since(at)
                 .unwrap_or_default()
                 .as_secs_f64()
@@ -380,7 +382,7 @@ async fn gc_superseded_packs(
             "gc: scanned {scanned} marker(s), reclaimed {deleted}, freed {freed} bytes"
         ));
     }
-    Ok((deleted, freed))
+    Ok((deleted, freed, all_complete))
 }
 
 /// Upper bound on packs reclaimed per GC unit: a unit must stay bounded so one
@@ -646,16 +648,29 @@ async fn run(
                     serde_json::json!({"skipped": "lease-held"}),
                 ));
             };
+            // Clamped: the caller may not widen a unit past the bound the
+            // lease/reporting semantics were sized for.
             let max = params
                 .get("max")
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|n| *n > 0)
-                .unwrap_or(GC_MAX_PACKS_PER_UNIT);
+                .unwrap_or(GC_MAX_PACKS_PER_UNIT)
+                .min(GC_MAX_PACKS_PER_UNIT);
             let outcome = gc_superseded_packs(state, &handle, max, log).await;
             if let Err(e) = lease.release().await {
                 log(format!("gc: lease release failed: {e}"));
             }
-            let (packs, bytes) = outcome?;
+            let (packs, bytes, complete) = outcome?;
+            if !complete {
+                // Something could not be deleted: the claims stay (correct — the
+                // pack is still there), so do NOT write gc.pb. The unit stays
+                // due and the next pass retries instead of leaving the checksum
+                // refused for a whole gc_interval.
+                return Ok((
+                    format!("gc: incomplete ({packs} reclaimed); retrying next pass"),
+                    serde_json::json!({"packs": packs, "bytes": bytes, "complete": false}),
+                ));
+            }
             let report = walgit_proto::v1::GcReport {
                 at: Some(walgit_proto::time::now()),
                 packs,

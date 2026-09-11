@@ -2077,6 +2077,61 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
     Ok(())
 }
 
+/// #175: GC runs under the per-repo `gc` lease. A pass that cannot take it must
+/// do nothing and leave the unit due (no `gc.pb`), or a claim it never
+/// established would be reported as a completed pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_skips_while_another_instance_holds_the_lease() -> anyhow::Result<()> {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::ObjectStore;
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // Another instance holds the lease for ten minutes.
+    let lease_store: walgit_store::DynStore = std::sync::Arc::new(h.store().clone());
+    let lease = walgit_store::coord::try_acquire(
+        lease_store,
+        &walgit_proto::keys::lease_key("gc"),
+        "another-host",
+        "gc",
+        std::time::Duration::from_secs(600),
+    )
+    .await?
+    .expect("the test takes the lease");
+
+    step!("pass while held", run_pass(&server.state))?;
+    assert!(
+        h.store().head(walgit_proto::keys::GC).await?.is_none(),
+        "a pass that could not take the lease must not write gc.pb"
+    );
+    let unit = step!("plan still due", next_unit(&server.state, &id))?;
+    assert!(
+        matches!(unit, Unit::Gc(_)),
+        "the unit must stay due, got {unit:?}"
+    );
+
+    lease.release().await?;
+    step!("pass after release", run_pass(&server.state))?;
+    assert!(
+        h.store().head(walgit_proto::keys::GC).await?.is_some(),
+        "with the lease free the pass records gc.pb"
+    );
+    Ok(())
+}
+
 /// #175: a publisher must refuse a checksum bucket GC has listed as reclaiming.
 /// This is the other half of the ordering invariant — without it a publisher
 /// could put a checksum GC is deleting back into `packs`.

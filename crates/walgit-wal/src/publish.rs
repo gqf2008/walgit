@@ -127,8 +127,7 @@ pub(crate) async fn update_reclaiming(
     let mut attempts = 0u32;
     loop {
         handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
-        let current = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (current, known_version) = handle.manifest_snapshot();
         let mut updated: Manifest = (*current).clone();
         updated
             .reclaiming
@@ -665,9 +664,8 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         {
             return finish_all_errors(batch, e);
         }
-        let manifest = handle.manifest.read().clone();
+        let (manifest, known_version) = handle.manifest_snapshot();
         let head_seq = manifest.head_seq;
-        let known_version = handle.manifest_version.lock().clone();
 
         // A checksum bucket GC has listed as reclaiming must not be re-adopted
         // (#175): the CAS that listed it and the CAS that would make it live are
@@ -1394,8 +1392,7 @@ pub(crate) async fn publish_compact_impl(
             handle.sync_impl().await?;
         }
 
-        let manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (manifest, known_version) = handle.manifest_snapshot();
 
         if manifest.reclaiming.iter().any(|r| r.checksum == checksum) {
             return Err(WalError::Reclaiming(checksum.clone()));
@@ -1626,8 +1623,7 @@ pub(crate) async fn annotate_pack_impl(
     }
     let mut attempts = 0u32;
     loop {
-        let current = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (current, known_version) = handle.manifest_snapshot();
         let mut updated: Manifest = (*current).clone();
         let Some(p) = updated.packs.iter_mut().find(|p| p.checksum == checksum) else {
             return Err(WalError::Corrupt(format!(
@@ -1753,8 +1749,7 @@ pub(crate) async fn publish_settings_impl(
     let mut attempts = 0u32;
     loop {
         handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
-        let manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (manifest, known_version) = handle.manifest_snapshot();
         let revision = manifest.settings.as_ref().map_or(0, |s| s.revision) + 1;
         let settings = walgit_proto::v1::RepoSettings {
             toml: toml_text.to_string(),
