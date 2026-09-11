@@ -149,7 +149,8 @@ rollback() {
     fi
     restore_deploy_files
     [ "${WALGIT_UPDATE_SKIP_OPEN:-0}" != "1" ] && open --env "WALGIT_DEPLOY_DIR=$DEPLOY" "$APP_DEST" >/dev/null 2>&1 || true
-    if [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
+    # 只恢复"升级前本来在跑"的服务;用户主动停掉的不要借回滚之名拉起。
+    if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
         "$DEPLOY/walgit-ensure" >/dev/null 2>&1 || true
     fi
     notify "$(printf '%s，已恢复旧版本' "$why")"
