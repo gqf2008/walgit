@@ -4,6 +4,9 @@ target/
 # Windows installer build output (deploy/windows/installer.iss via ISCC)
 deploy/windows/Output/
 
+# macOS tray build output (deploy/tray/macos/build-dmg.sh)
+deploy/tray/macos/dist/
+
 # local secrets / environment — never in the repo
 .env
 .env.*

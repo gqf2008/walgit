@@ -94,6 +94,80 @@ func sh(_ command: String) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+func installedAppVersion() -> String {
+    if let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+       !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return stripVersionPrefix(value)
+    }
+    if let value = try? String(contentsOfFile: "\(deployDir)/.skeleton-version", encoding: .utf8),
+       !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return stripVersionPrefix(value)
+    }
+    return "0.0.0"
+}
+
+/// 跨线程传值容器:URLSession 回调与调用方用锁同步,规避并发捕获变量。
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+    func set(_ newValue: T) {
+        lock.lock(); value = newValue; lock.unlock()
+    }
+    func get() -> T? {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+
+/// GitHub latest release. Tests may point `WALGIT_RELEASE_FIXTURE` at a local JSON
+/// document; production uses the public API and only trusts a sha256 digest.
+func latestRelease() -> ReleaseInfo? {
+    if let fixture = ProcessInfo.processInfo.environment["WALGIT_RELEASE_FIXTURE"], !fixture.isEmpty {
+        return try? fixtureReleaseCheck(path: fixture, currentVersion: installedAppVersion())
+    }
+    let endpoint = ProcessInfo.processInfo.environment["WALGIT_RELEASE_API"]
+        ?? "https://api.github.com/repos/gqf2008/walgit/releases/latest"
+    guard let url = URL(string: endpoint) else { return nil }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 10
+    request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    request.setValue("walgit-tray", forHTTPHeaderField: "User-Agent")
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = Locked<Data>()
+    let task = URLSession.shared.dataTask(with: request) { body, response, _ in
+        if let http = response as? HTTPURLResponse, http.statusCode == 200, let body {
+            box.set(body)
+        }
+        semaphore.signal()
+    }
+    task.resume()
+    guard semaphore.wait(timeout: .now() + 15) == .success else {
+        task.cancel()
+        return nil
+    }
+    guard let result = box.get() else { return nil }
+    return try? parseLatestRelease(result)
+}
+
+func sourceUpdateSha() -> String? {
+    guard hasSourceRepoPath() else { return nil }
+    let repo = repoPathValue()
+    _ = sh("git -C '\(repo)' fetch origin main 2>&1")
+    let (c1, localOut) = sh("git -C '\(repo)' rev-parse HEAD")
+    let (c2, remoteOut) = sh("git -C '\(repo)' rev-parse origin/main")
+    let local = localOut.trimmingCharacters(in: .whitespacesAndNewlines)
+    let remote = remoteOut.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard c1 == 0, c2 == 0, !local.isEmpty, !remote.isEmpty, local != remote else { return nil }
+    return String(remote.prefix(7))
+}
+
+func hasSourceRepoPath() -> Bool {
+    FileManager.default.fileExists(atPath: "\(repoPathValue())/.git")
+}
+
+func repoPathValue() -> String {
+    UserDefaults.standard.string(forKey: "repoPath") ?? "/Volumes/Workspace/GitHub/walgit"
+}
+
 /// 首次启动 bootstrap:从 app bundle Resources 落盘 ~/walgit 部署骨架。
 /// 托管文件(walgit 二进制、run-walgit.sh、walgit-ensure)按 bundle 内
 /// skeleton.version 覆盖更新——DMG 覆盖安装即升级;用户文件(walgit.toml)
@@ -117,23 +191,86 @@ func bootstrapDeploy() {
     let marker = "\(deployDir)/.skeleton-version"
     let installedVersion = (try? String(contentsOfFile: marker, encoding: .utf8))
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
-    // 托管文件:版本不同则整体覆盖(覆盖安装 DMG = 升级路径)
-    let needsUpdate = !bundledVersion.isEmpty && bundledVersion != installedVersion
-    for f in ["walgit", "run-walgit.sh", "walgit-ensure"] {
-        let dst = "\(deployDir)/\(f)"
-        if !needsUpdate && fm.fileExists(atPath: dst) { continue }
-        if fm.fileExists(atPath: dst) { try? fm.removeItem(atPath: dst) }
-        do {
-            try fm.copyItem(atPath: "\(res)/\(f)", toPath: dst)
+    // 托管文件:版本不同则整体覆盖(覆盖安装 DMG = 升级路径)。先写
+    // 临时名再原子替换,避免运行中的服务二进制被 remove+copy 的半状态
+    // 捕获;只有三项全部成功且新二进制版本核验通过才写 marker。
+    let managed = ["walgit", "run-walgit.sh", "walgit-ensure"]
+    // marker 不一致 → 整体换装;marker 一致但某个托管文件被删 → 只补缺失项。
+    let versionChanged = !bundledVersion.isEmpty && bundledVersion != installedVersion
+    let toWrite = managed.filter { f in
+        versionChanged || !fm.fileExists(atPath: "\(deployDir)/\(f)")
+    }
+    var managedOK = true
+    // 先把要写的全部落临时文件并核验版本;提升阶段逐项备份旧文件,任一失败
+    // 回滚已替换项。避免「walgit 新、ensure 旧、marker 未写」的混合骨架,
+    // 也避免 marker 一致但文件被删后不再自愈。
+    if !toWrite.isEmpty && !bundledVersion.isEmpty {
+        var staged: [String: String] = [:]
+        for f in toWrite {
+            let dst = "\(deployDir)/\(f)"
+            let tmp = "\(dst).new-\(ProcessInfo.processInfo.processIdentifier)"
             do {
-                try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: dst)
+                try? fm.removeItem(atPath: tmp)
+                try fm.copyItem(atPath: "\(res)/\(f)", toPath: tmp)
+                try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: tmp)
+                staged[f] = tmp
             } catch {
-                logLine("bootstrap: \(f) chmod 失败: \(error)")
+                managedOK = false
+                logLine("bootstrap: 预置 \(f) 失败: \(error)")
             }
-            logLine("bootstrap: 写入 \(f)")
-        } catch {
-            logLine("bootstrap: \(f) 失败: \(error)")
         }
+        if managedOK, let stagedWalgit = staged["walgit"] {
+            let (vc, versionOut) = sh("'\(stagedWalgit)' --version 2>&1")
+            let token = versionOut.trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: " ").last.map(String.init) ?? ""
+            if vc != 0 || token != "v\(bundledVersion)" {
+                managedOK = false
+                logLine("bootstrap: walgit 版本核验失败: \(versionOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+        var installed: [(dst: String, backup: String?)] = []
+        if managedOK {
+            for f in toWrite {
+                guard let tmp = staged[f] else { managedOK = false; break }
+                let dst = "\(deployDir)/\(f)"
+                let bak = "\(dst).old-\(ProcessInfo.processInfo.processIdentifier)"
+                do {
+                    var backup: String?
+                    if fm.fileExists(atPath: dst) {
+                        try? fm.removeItem(atPath: bak)
+                        try fm.moveItem(atPath: dst, toPath: bak)
+                        backup = bak
+                    }
+                    do {
+                        try fm.moveItem(atPath: tmp, toPath: dst)
+                    } catch {
+                        if let backup { try? fm.moveItem(atPath: backup, toPath: dst) }
+                        managedOK = false
+                        logLine("bootstrap: 写入 \(f) 失败: \(error)")
+                        break
+                    }
+                    installed.append((dst, backup))
+                    logLine("bootstrap: 写入 \(f)")
+                } catch {
+                    managedOK = false
+                    logLine("bootstrap: 备份 \(f) 失败: \(error)")
+                    break
+                }
+            }
+        }
+        if !managedOK {
+            for item in installed.reversed() {
+                try? fm.removeItem(atPath: item.dst)
+                if let backup = item.backup { try? fm.moveItem(atPath: backup, toPath: item.dst) }
+            }
+            for (_, tmp) in staged { try? fm.removeItem(atPath: tmp) }
+            logLine("bootstrap: 托管文件更新未完成,已回滚到旧骨架")
+        } else {
+            for item in installed { if let backup = item.backup { try? fm.removeItem(atPath: backup) } }
+        }
+    }
+    if versionChanged && !managedOK {
+        return
     }
     // 用户文件:永不覆盖
     let userFile = "\(deployDir)/walgit.toml"
@@ -202,7 +339,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 升级菜单状态机(abb 同款):idle 未查 / checking 检查中 / latest 已最新 /
     /// available 有新版本 / installing 安装中 / failed 失败(点击重查)。
     var updateState = UpdateState.idle
-    var availableSha = ""
+    var sourceAvailableSha = ""
+    var releaseInfo: ReleaseInfo?
+    var lastNotifiedKey = ""
     var busyNote = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -359,13 +498,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let cur = serviceVersion.isEmpty ? "…" : String(serviceVersion.prefix(7))
+        let cur = serviceVersion.isEmpty ? installedAppVersion() : String(serviceVersion.prefix(7))
         let up: NSMenuItem
-        if !hasSourceRepo() {
-            // DMG 消费者形态:没有源码仓库,升级 = 下载新 DMG 覆盖安装
-            // (bootstrap 按骨架版本换托管文件)。
-            up = NSMenuItem(title: "下载新版本(打开发布页)", action: #selector(openReleases), keyEquivalent: "")
-        } else {
         switch updateState {
         case .idle:
             up = NSMenuItem(title: "版本 \(cur) · 检查更新…", action: #selector(checkUpdateNow), keyEquivalent: "")
@@ -375,13 +509,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .latest:
             up = NSMenuItem(title: "版本 \(cur) · 已是最新 ✓(点击重查)", action: #selector(checkUpdateNow), keyEquivalent: "")
         case .available:
-            up = NSMenuItem(title: "⬆️ 升级到新版本 \(availableSha)(当前 \(cur))", action: #selector(doUpgradeNow), keyEquivalent: "")
+            if let release = releaseInfo {
+                up = NSMenuItem(title: "⬆️ 下载并升级到 v\(release.version)(当前 \(cur))",
+                                action: #selector(doReleaseUpgrade), keyEquivalent: "")
+            } else {
+                up = NSMenuItem(title: "⬆️ 从源码升级到 \(sourceAvailableSha)(当前 \(cur))",
+                                action: #selector(doUpgradeNow), keyEquivalent: "")
+            }
         case .installing:
             up = NSMenuItem(title: "升级中…\(busyNote.isEmpty ? "" : " · " + busyNote)", action: nil, keyEquivalent: "")
             up.isEnabled = false
         case .failed:
-            up = NSMenuItem(title: "上次升级失败(点击重查)", action: #selector(checkUpdateNow), keyEquivalent: "")
-        }
+            up = NSMenuItem(title: "上次升级失败(点击下载发布页)", action: #selector(openReleases), keyEquivalent: "")
         }
         menu.addItem(up)
 
@@ -420,67 +559,165 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openWeb() { NSWorkspace.shared.open(webURL) }
 
-    func hasSourceRepo() -> Bool {
-        FileManager.default.fileExists(atPath: "\(repoPath())/.git")
-    }
+    func hasSourceRepo() -> Bool { return hasSourceRepoPath() }
 
     @objc func openReleases() {
         NSWorkspace.shared.open(URL(string: "https://github.com/gqf2008/walgit/releases")!)
     }
 
     @objc func checkUpdateNow() {
-        guard hasSourceRepo() else { openReleases(); return }
-        updateState = .checking; refreshButton()
+        updateState = .checking
+        refreshButton()
+        checkForUpdates(notifyWhenNew: false)
+    }
+
+    @objc func doUpgradeNow() {
+        guard !sourceAvailableSha.isEmpty else { openReleases(); return }
+        updateState = .installing; busyNote = ""; refreshButton()
+        DispatchQueue.global().async { self.upgradePipeline() }
+    }
+
+    @objc func doReleaseUpgrade() {
+        guard let release = releaseInfo else { openReleases(); return }
+        updateState = .installing
+        busyNote = "下载中…"
+        refreshButton()
+        notify("walgit 正在升级", "下载 v\(release.version) 安装包")
         DispatchQueue.global().async {
-            let repo = self.repoPath()
-            _ = sh("git -C '\(repo)' fetch origin main 2>&1")
-            let (c1, lOut) = sh("cd '\(repo)' && git rev-parse HEAD")
-            let (c2, rOut) = sh("cd '\(repo)' && git rev-parse origin/main")
-            let l = lOut.trimmingCharacters(in: .whitespacesAndNewlines)
-            let r = rOut.trimmingCharacters(in: .whitespacesAndNewlines)
-            DispatchQueue.main.async {
-                guard c1 == 0, c2 == 0, !l.isEmpty, !r.isEmpty else {
-                    self.updateState = .failed; self.refreshButton(); return
+            do {
+                try self.releaseUpgrade(release)
+            } catch {
+                DispatchQueue.main.async {
+                    self.updateState = .failed
+                    self.busyNote = ""
+                    self.refreshButton()
                 }
-                if l != r {
+                self.notify("walgit 升级失败", "\(error)")
+                logLine("release: upgrade failed: \(error)")
+            }
+        }
+    }
+
+    func autoCheck() {
+        guard updateState != .installing, updateState != .checking, !transitioning else { return }
+        guard updateState == .idle || updateState == .latest || updateState == .failed else { return }
+        checkForUpdates(notifyWhenNew: true)
+    }
+
+    private func checkForUpdates(notifyWhenNew: Bool) {
+        DispatchQueue.global().async {
+            let current = installedAppVersion()
+            let release = latestRelease()
+            let releaseNewer = release.map { isVersionNewer($0.version, than: current) } ?? false
+            let sourceSha = sourceUpdateSha()
+            DispatchQueue.main.async {
+                self.releaseInfo = releaseNewer ? release : nil
+                self.sourceAvailableSha = self.releaseInfo == nil ? (sourceSha ?? "") : ""
+                if let release = self.releaseInfo {
                     self.updateState = .available
-                    self.availableSha = String(r.prefix(7))
+                    let key = "release:\(release.version)"
+                    if notifyWhenNew && self.lastNotifiedKey != key {
+                        self.lastNotifiedKey = key
+                        self.notify("walgit 发现新版本", "v\(release.version) — 点托盘菜单下载升级")
+                    }
+                } else if let sourceSha = sourceSha {
+                    self.updateState = .available
+                    let key = "source:\(sourceSha)"
+                    if notifyWhenNew && self.lastNotifiedKey != key {
+                        self.lastNotifiedKey = key
+                        self.notify("walgit 发现新源码", "\(sourceSha) — 点托盘菜单升级")
+                    }
                 } else {
                     self.updateState = .latest
                 }
                 self.refreshButton()
             }
+            logLine("detect: installed=\(current) release=\(release.map { "v\($0.version)" } ?? "none") source=\(sourceSha ?? "none")")
         }
     }
 
-    @objc func doUpgradeNow() {
-        updateState = .installing; busyNote = ""; refreshButton()
-        DispatchQueue.global().async { self.upgradePipeline() }
+    private func releaseUpgrade(_ release: ReleaseInfo) throws {
+        let cache = NSHomeDirectory() + "/Library/Caches/walgit"
+        try FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        let dmg = "\(cache)/\(release.asset.name)"
+        try? FileManager.default.removeItem(atPath: dmg)
+        try download(release.asset.url, to: URL(fileURLWithPath: dmg))
+        let (hashCode, hashOut) = sh("shasum -a 256 '\(dmg)'")
+        let gotHash = hashOut.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+            .map { String($0).lowercased() } ?? ""
+        guard hashCode == 0, gotHash == release.asset.sha256.lowercased() else {
+            throw NSError(domain: "walgit-release", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "SHA-256 校验失败"])
+        }
+        let mount = "\(cache)/mount-\(release.version)-$PID"
+        try? FileManager.default.removeItem(atPath: mount)
+        try FileManager.default.createDirectory(atPath: mount, withIntermediateDirectories: true)
+        let (attachCode, attachOut) = sh("hdiutil attach -nobrowse -readonly -mountpoint '\(mount)' '\(dmg)'")
+        guard attachCode == 0 else { throw NSError(domain: "walgit-release", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "挂载 DMG 失败: \(attachOut.suffix(200))"]) }
+        do {
+            let staged = "\(mount)/walgit-tray.app"
+            let (plistCode, plistOut) = sh("/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '\(staged)/Contents/Info.plist'")
+            guard plistCode == 0, plistOut.trimmingCharacters(in: .whitespacesAndNewlines) == release.version else {
+                throw NSError(domain: "walgit-release", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "DMG 内 app 版本不匹配"])
+            }
+            let (signCode, signOut) = sh("codesign --verify --deep --strict '\(staged)' && spctl --assess --type execute '\(staged)'")
+            guard signCode == 0 else { throw NSError(domain: "walgit-release", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "DMG 内 app 签名校验失败: \(signOut.suffix(200))"]) }
+            let script = Bundle.main.resourceURL!.appendingPathComponent("release-install.sh").path
+            guard FileManager.default.fileExists(atPath: script) else {
+                throw NSError(domain: "walgit-release", code: 5,
+                              userInfo: [NSLocalizedDescriptionKey: "缺少 release-install.sh"])
+            }
+            let log = FileHandle(forWritingAtPath: logPath) ?? {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+                return FileHandle(forWritingAtPath: logPath)!
+            }()
+            log.seekToEndOfFile()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+            proc.arguments = [script, dmg, mount, Bundle.main.bundlePath, release.version, String(ProcessInfo.processInfo.processIdentifier)]
+            var env = ProcessInfo.processInfo.environment
+            env["WALGIT_DEPLOY_DIR"] = deployDir
+            proc.environment = env
+            proc.standardOutput = log
+            proc.standardError = log
+            proc.standardInput = FileHandle.nullDevice
+            try proc.run()
+            logLine("release: updater spawned for v\(release.version)")
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        } catch {
+            _ = sh("hdiutil detach '\(mount)' >/dev/null 2>&1 || true")
+            throw error
+        }
     }
 
-    func autoCheck() {
-        guard hasSourceRepo() else { return } // DMG 消费者:升级走下载新版本
-        guard updateState != .installing, updateState != .checking, !transitioning else { return }
-        guard updateState == .idle || updateState == .latest || updateState == .failed else { return }
-        DispatchQueue.global().async {
-            let repo = self.repoPath()
-            _ = sh("git -C '\(repo)' fetch origin main 2>&1")
-            let (c1, lOut) = sh("cd '\(repo)' && git rev-parse HEAD")
-            let (c2, rOut) = sh("cd '\(repo)' && git rev-parse origin/main")
-            let l = lOut.trimmingCharacters(in: .whitespacesAndNewlines)
-            let r = rOut.trimmingCharacters(in: .whitespacesAndNewlines)
-            DispatchQueue.main.async {
-                guard c1 == 0, c2 == 0, !l.isEmpty, !r.isEmpty else { return } // 静默:失败不打扰
-                if l != r {
-                    self.updateState = .available
-                    self.availableSha = String(r.prefix(7))
-                    self.notify("walgit 发现新版本", self.availableSha + " — 点托盘菜单升级")
-                } else if self.updateState == .idle {
-                    self.updateState = .latest
-                }
-                self.refreshButton()
-            }
-            logLine("detect: \(l != r ? "update available \(r.prefix(7))" : "up to date (\(l.prefix(7)))")")
+    private func download(_ url: URL, to destination: URL) throws {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 120
+        // 全部落在 completion 内(无跨线程共享变量):成功搬到 destination,
+        // 失败/超时由文件是否存在判定,超时同时取消任务。
+        try? FileManager.default.removeItem(at: destination)
+        let semaphore = DispatchSemaphore(value: 0)
+        let task = URLSession.shared.downloadTask(with: request) { temp, response, error in
+            defer { semaphore.signal() }
+            guard error == nil,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let temp
+            else { return }
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.moveItem(at: temp, to: destination)
+        }
+        task.resume()
+        guard semaphore.wait(timeout: .now() + 180) == .success else {
+            task.cancel()
+            throw NSError(domain: "walgit-release", code: 8,
+                          userInfo: [NSLocalizedDescriptionKey: "下载超时"])
+        }
+        guard FileManager.default.fileExists(atPath: destination.path) else {
+            throw NSError(domain: "walgit-release", code: 7,
+                          userInfo: [NSLocalizedDescriptionKey: "下载失败"])
         }
     }
 
@@ -567,7 +804,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+@main
+struct WalgitTrayMain {
+    static func main() {
+        // 测试钩子:只跑部署骨架 bootstrap 后退出(不启动 NSApplication)。
+        if ProcessInfo.processInfo.environment["WALGIT_BOOTSTRAP_ONLY"] == "1" {
+            bootstrapDeploy()
+            exit(0)
+        }
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}
