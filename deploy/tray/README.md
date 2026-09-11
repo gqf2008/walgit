@@ -84,11 +84,23 @@ ad-hoc 整体签名,独立 `codesign --verify --deep --strict` 可过。`build-d
 `walgit.icns` 放在同目录再跑 build.sh(可选,缺省用通用图标)。开机自启:
 系统设置 → 通用 → 登录项 → 添加 walgit-tray.app。
 
+菜单上的版本语义:upgrade 行显示**托盘 app 版本**(`版本 X`),正在跑的服务
+版本另附为 `· 服务 Y`——两者不同步时不再把服务版本当成"当前/已最新"
+(#170)。
+
 `test.sh` 覆盖 Release JSON 解析(含 stale asset/缺 digest 负例)、
-语义版本比较(含 build metadata)、AppleDouble/损坏 zip 守卫,并用
-fixture 跑 `release-install.sh` 的成功换装、故障回滚(partial bootstrap
-后四项托管文件一起还原)与非 8081 listen 探活回归;全部在临时部署目录
-内完成,不碰真实 `~/walgit` 与 launchd/服务。
+语义版本比较(含 build metadata)、AppleDouble/损坏 zip 守卫,并用 fixture 覆盖:
+
+- `release-install.sh` 成功换装、故障回滚(partial bootstrap 后四项托管文件
+  一起还原)、非 8081 listen 探活;
+- **升级前服务在跑** → 重启并确认 `/healthz` 到 `v<new>`;**升级前停着** →
+  不拉起(尊重"停止服务"的显式意图);
+- **手动装 DMG**(`bootstrapDeploy`)换完托管文件后,同样把在跑的服务重启到
+  新版本;
+- 菜单 upgrade 行在 idle/checking/latest/available(Release + 源码)/installing/
+  failed 各状态的文案。
+
+全部在临时部署目录内完成,不碰真实 `~/walgit` 与 launchd/服务。
 
 ### Linux(.deb)
 

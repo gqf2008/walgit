@@ -61,6 +61,14 @@ healthcheck() { # healthcheck <url> [extra args...]
     fi
 }
 
+# 服务健康检查返回的是 {"status":"ok","version":"v0.5.1"} —— 取出版本号,
+# 用于判断升级后跑的是不是新二进制(#170:旧进程不会自己退出)。
+health_version() {
+    local body
+    body="$(healthcheck "$HEALTH_URL" --max-time 2 2>/dev/null || true)"
+    printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
 # 与部署配置同源:自定义 [server].listen 时,预探活/重启后健康检查都要用
 # 实际端口,否则会把「运行中」误判成停止后跳过启动(服务静默停掉)。
 listen_addr() {
@@ -76,6 +84,8 @@ HEALTH_URL="http://$(listen_addr)/healthz"
 WALGIT_LISTEN="$(listen_addr)"
 export WALGIT_LISTEN
 
+# 记录升级前服务是否在跑:只有它本来在跑,升级后才该把它带起来。
+# 用户主动停掉的服务不拉起(托盘里"停止服务"是明确意图)。
 SERVICE_WAS_RUNNING=0
 healthcheck "$HEALTH_URL" >/dev/null 2>&1 && SERVICE_WAS_RUNNING=1
 if [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
@@ -176,8 +186,7 @@ done
 if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
     "$DEPLOY/walgit-ensure" >/dev/null 2>&1 || rollback "服务启动失败"
     for _ in $(seq 1 "$HEALTH_WAIT"); do
-        body="$(healthcheck "$HEALTH_URL" --max-time 2 2>/dev/null || true)"
-        if [[ "$body" == *"v$VERSION"* ]]; then
+        if [ "$(health_version)" = "v$VERSION" ]; then
             [ -n "$DEPLOY_BACKUP" ] && rm -rf "$DEPLOY_BACKUP"
             log "SUCCESS: v$VERSION"
             notify "已升级到 v$VERSION"
@@ -185,7 +194,7 @@ if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALG
         fi
         sleep 0.5
     done
-    rollback "新服务健康检查失败"
+    rollback "新服务健康检查未到 v$VERSION(仍跑旧版本?)"
 fi
 
 [ -n "$DEPLOY_BACKUP" ] && rm -rf "$DEPLOY_BACKUP"
