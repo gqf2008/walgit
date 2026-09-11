@@ -625,12 +625,37 @@ async fn run(
             ))
         }
         "gc" => {
+            // Per-repo lease: two GC passes must not interleave. Each would see
+            // the other's claim as its own (the claim is not owner-tagged), and
+            // a pass that released first would let a publisher re-adopt the
+            // checksum while the slower pass still deletes from its snapshot.
+            // D7: leases are the only cross-instance mutex.
+            let lease_store: walgit_store::DynStore = Arc::new(handle.store().clone());
+            let lease = walgit_store::coord::try_acquire(
+                lease_store,
+                &walgit_proto::keys::lease_key("gc"),
+                walgit_store::coord::instance_id(),
+                "gc",
+                state.cfg.compaction.lease_ttl,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let Some(lease) = lease else {
+                return Ok((
+                    "gc: lease held by another instance".to_string(),
+                    serde_json::json!({"skipped": "lease-held"}),
+                ));
+            };
             let max = params
                 .get("max")
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(GC_MAX_PACKS_PER_UNIT);
-            let (packs, bytes) = gc_superseded_packs(state, &handle, max, log).await?;
+            let outcome = gc_superseded_packs(state, &handle, max, log).await;
+            if let Err(e) = lease.release().await {
+                log(format!("gc: lease release failed: {e}"));
+            }
+            let (packs, bytes) = outcome?;
             let report = walgit_proto::v1::GcReport {
                 at: Some(walgit_proto::time::now()),
                 packs,

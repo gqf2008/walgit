@@ -2077,6 +2077,81 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
     Ok(())
 }
 
+/// #175: a publisher must refuse a checksum bucket GC has listed as reclaiming.
+/// This is the other half of the ordering invariant — without it a publisher
+/// could put a checksum GC is deleting back into `packs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publishing_a_reclaiming_checksum_is_refused() -> anyhow::Result<()> {
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::ZERO;
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // A pack that is not live yet (so the claim CAS accepts it).
+    let dir = tempfile::tempdir()?;
+    let tree = git_in(src.path(), &["rev-parse", "HEAD^{tree}"])?
+        .trim()
+        .to_string();
+    let out = std::process::Command::new("git")
+        .current_dir(src.path())
+        .args(["pack-objects", &format!("{}/pack", dir.path().display())])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin
+                .take()
+                .unwrap()
+                .write_all(format!("{tree}\n").as_bytes())?;
+            c.wait_with_output()
+        })?;
+    let checksum = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let pack = dir.path().join(format!("pack-{checksum}.pack"));
+    let idx = dir.path().join(format!("pack-{checksum}.idx"));
+
+    step!(
+        "list candidate",
+        h.update_reclaiming(std::slice::from_ref(&checksum), &[])
+    )?;
+    assert!(
+        h.manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == checksum),
+        "the checksum must be listed before the publish is attempted"
+    );
+
+    let err = step!("add pack", h.add_pack(&pack, &idx, 0, None))
+        .expect_err("a reclaiming checksum must not be publishable");
+    assert!(
+        matches!(err, walgit_wal::WalError::Reclaiming(ref c) if *c == checksum),
+        "expected Reclaiming, got {err:?}"
+    );
+    Ok(())
+}
+
 /// #175: the manifest CAS is what orders reclamation against adoption. A pack
 /// that is live must never be listed as reclaiming (GC would then be free to
 /// delete a pack the manifest points at), and a non-live checksum lists and
@@ -2117,7 +2192,10 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
         .clone();
 
     // A live pack must not become a GC candidate, even when asked directly.
-    step!("list live", h.update_reclaiming(&[live.clone()], &[]))?;
+    step!(
+        "list live",
+        h.update_reclaiming(std::slice::from_ref(&live), &[])
+    )?;
     assert!(
         h.manifest().reclaiming.is_empty(),
         "a live checksum was listed as reclaiming: {:?}",
@@ -2126,7 +2204,10 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
 
     // A non-live checksum lists, then clears, through the same CAS.
     let dead = "f".repeat(40);
-    step!("list dead", h.update_reclaiming(&[dead.clone()], &[]))?;
+    step!(
+        "list dead",
+        h.update_reclaiming(std::slice::from_ref(&dead), &[])
+    )?;
     assert!(
         h.manifest()
             .reclaiming
@@ -2134,7 +2215,10 @@ async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
             .any(|r| r.checksum == dead),
         "a non-live checksum must list"
     );
-    step!("clear dead", h.update_reclaiming(&[], &[dead.clone()]))?;
+    step!(
+        "clear dead",
+        h.update_reclaiming(&[], std::slice::from_ref(&dead))
+    )?;
     assert!(
         h.manifest().reclaiming.is_empty(),
         "clearing must empty the list: {:?}",

@@ -855,20 +855,18 @@ pub async fn run_with_store(
         )
         .await?;
 
-    // Bucket GC (#175) may be reclaiming one of these checksums: it lists the
-    // pack in `Manifest.reclaiming` before deleting any object, and a pack that
-    // is being deleted must not be adopted by an import. Refuse instead of
-    // publishing a manifest that points at bytes someone is removing.
-    for p in &pack_refs {
-        if repo_store
-            .head(&walgit_proto::keys::superseded_key(&p.checksum))
-            .await?
-            .is_some()
-        {
-            return Err(anyhow::anyhow!(
-                "pack {} is being reclaimed by bucket GC; retry the import",
-                p.checksum
-            ));
+    // Bucket GC (#175) lists a pack in `Manifest.reclaiming` before deleting any
+    // of its objects. Adopting a listed checksum would publish a manifest that
+    // points at bytes someone is removing, so refuse (the claim lives for the
+    // duration of one GC pass — seconds — not for the retention window).
+    if let Some(base) = &base_manifest {
+        for p in &pack_refs {
+            if base.reclaiming.iter().any(|r| r.checksum == p.checksum) {
+                return Err(anyhow::anyhow!(
+                    "pack {} is being reclaimed by bucket GC; retry the import",
+                    p.checksum
+                ));
+            }
         }
     }
 
@@ -890,7 +888,12 @@ pub async fn run_with_store(
         }),
         log_segments: vec![],
         packs: pack_refs,
-        reclaiming: vec![],
+        // Never drop a claim GC listed and does not own: this CAS would erase
+        // it while GC is still deleting from its own snapshot (#175).
+        reclaiming: base_manifest
+            .as_ref()
+            .map(|m| m.reclaiming.clone())
+            .unwrap_or_default(),
         updated_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
         revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,

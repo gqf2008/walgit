@@ -1515,9 +1515,12 @@ pub(crate) async fn publish_compact_impl(
                     seq,
                 };
                 // Not `immutable`: GC deletes this object, so it must not carry
-                // a year-long immutable cache header.
+                // a year-long immutable cache header. Overwrite (not Create):
+                // a pack that was superseded, re-adopted and superseded again
+                // must get a *fresh* timestamp, or GC would treat the old one
+                // as its supersession time and skip the new retention window.
                 let opts = PutOptions {
-                    mode: PutMode::Create,
+                    mode: PutMode::Overwrite,
                     ..Default::default()
                 };
                 marker_puts.push(async move {
