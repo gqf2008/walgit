@@ -1,54 +1,164 @@
 #!/bin/bash
-# build-dmg.sh — 构建发布用 macOS DMG:walgit-tray.app + /Applications 拖放安装。
-# 全程:app 签名+公证+装订 → hdiutil 出 DMG → DMG 签名+公证+装订。
-# 依赖:build.sh(swiftc + target/release/walgit)、~/scripts/notarize.sh(app 公证)、
-#       keychain 凭据(Developer ID 身份 + notarytool profile,默认 voicecall-notary)。
-# 用法:./build-dmg.sh [版本]
-# 产物:dist/walgit-<版本>-<arch>.dmg(arch = uname -m)
+# build-dmg.sh — 构建并公证 macOS 发布 DMG。
+#
+# 用法：./build-dmg.sh [版本]
+# 环境：
+#   NOTARY_PROFILE        notarytool profile，默认 voicecall-notary
+#   NOTARY_KEYCHAIN       可选：profile 所在 keychain
+#   NOTARY_S3_ACCELERATION=0  关闭 S3 acceleration（代理环境下更稳）
+#   WALGIT_IDENTITY       可选：Developer ID 身份
+#
+# 产物：dist/walgit-<版本>-<架构>.dmg
 set -euo pipefail
-cd "$(dirname "$0")"
 
-VERSION="${1:-$(git -C "$(cd ../../.. && pwd)" describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+cd "$SCRIPT_DIR"
+
+usage() {
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+check_tree() {
+    local path="$1"
+    local bad
+    bad="$(find "$path" \( -name '._*' -o -name '.DS_Store' \) -print -quit)"
+    if [ -n "$bad" ]; then
+        echo "❌ AppleDouble/DS_Store metadata in $path: $bad" >&2
+        return 1
+    fi
+}
+
+check_zip() {
+    local zip="$1"
+    local bad
+    bad="$(unzip -Z1 "$zip" | grep -E '(^|/)(\._|\.DS_Store)' || true)"
+    if [ -n "$bad" ]; then
+        echo "❌ AppleDouble/DS_Store entries in $zip: $bad" >&2
+        return 1
+    fi
+}
+
+check_version() {
+    local binary="$1"
+    local version="${2#v}"
+    local got
+    got="$("$binary" --version 2>&1 || true)"
+    case "$got" in
+        *"v$version"*) return 0 ;;
+        *)
+            echo "❌ binary reports '$got', expected v$version: $binary" >&2
+            return 1 ;;
+    esac
+}
+
+notary_submit() {
+    local file="$1"
+    local profile="${NOTARY_PROFILE:-voicecall-notary}"
+    local args=(submit "$file" --keychain-profile "$profile" --wait)
+    if [ -n "${NOTARY_KEYCHAIN:-}" ]; then
+        args+=(--keychain "$NOTARY_KEYCHAIN")
+    fi
+    if [ "${NOTARY_S3_ACCELERATION:-1}" = "0" ]; then
+        args+=(--no-s3-acceleration)
+    fi
+    local attempt
+    for attempt in 1 2 3; do
+        if xcrun notarytool "${args[@]}"; then
+            return 0
+        fi
+        echo "notary submission failed (attempt $attempt/3); retrying" >&2
+        sleep 5
+    done
+    return 1
+}
+
+case "${1:-}" in
+    --check-version)
+        check_version "${2:?binary}" "${3:?version}"
+        exit 0 ;;
+    --check-tree)
+        check_tree "${2:?path}"
+        exit 0 ;;
+    --check-zip)
+        check_zip "${2:?zip}"
+        exit 0 ;;
+    -h|--help)
+        usage
+        exit 0 ;;
+esac
+
+VERSION="${1:-$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)}"
 VERSION="${VERSION#v}"
+case "$VERSION" in
+    ''|*[!0-9A-Za-z.+-]*) echo "invalid version: $VERSION" >&2; exit 1 ;;
+esac
+
+for tool in cargo swiftc dot_clean ditto hdiutil plutil codesign security xcrun; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "missing tool: $tool" >&2; exit 1; }
+done
 PROFILE="${NOTARY_PROFILE:-voicecall-notary}"
-DIST=dist
-mkdir -p "$DIST"
-
-# 1. app(含部署骨架资源);SPA 先构建——release 二进制的 web UI 是编译期
-# 嵌入资产,web/dist 缺失时 build.rs 只写占位页,消费者的 /setup 向导会白屏。
-ROOT="$(cd ../../.. && pwd)"
-( cd "$ROOT" && just web-build ) >/dev/null
-TRAY_APP_DIR="${TRAY_APP_DIR:-$HOME/Applications}" ./build.sh "$VERSION"
-APP="${TRAY_APP_DIR:-$HOME/Applications}/walgit-tray.app"
-
-# 1b. 内嵌 walgit 二进制用 Developer ID 重签:公证要求包内所有代码签名
-# 一致(build.sh 的 ad-hoc 只是垫底)。
-IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+IDENTITY="${WALGIT_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"
 [ -n "$IDENTITY" ] || { echo "❌ Keychain 里没有 Developer ID Application 身份" >&2; exit 1; }
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/walgit-dmg.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "== [1/8] build release binary =="
+( cd "$ROOT" && just web-build >/dev/null )
+WALGIT_BUILD_SHA="v$VERSION" cargo build --release --bin walgit --manifest-path "$ROOT/Cargo.toml"
+check_version "$ROOT/target/release/walgit" "$VERSION"
+
+echo "== [2/8] assemble app =="
+APP_ROOT="$WORK/app"
+mkdir -p "$APP_ROOT"
+WALGIT_BIN="$ROOT/target/release/walgit" TRAY_APP_DIR="$APP_ROOT" "$SCRIPT_DIR/build.sh" "$VERSION"
+APP="$APP_ROOT/walgit-tray.app"
+dot_clean -m "$APP" >/dev/null 2>&1 || true
+check_tree "$APP"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" | grep -Fx "$VERSION" >/dev/null
+check_version "$APP/Contents/Resources/walgit" "$VERSION"
+
+echo "== [3/8] sign app =="
 codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/Resources/walgit"
+codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
-# 2. app 签名 + 公证 + 装订(通用脚本;已签已公证则幂等重做)
-~/scripts/notarize.sh "$APP" --profile "$PROFILE"
+echo "== [4/8] notarize app =="
+APP_ZIP="$WORK/walgit-tray.zip"
+ditto -c -k --keepParent --norsrc --noextattr "$APP" "$APP_ZIP"
+check_zip "$APP_ZIP"
+notary_submit "$APP_ZIP"
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+spctl --assess --type execute --verbose=2 "$APP" 2>&1 | tail -1
 
-# 3. 组装 DMG 暂存目录:app + /Applications 软链(拖放安装)
-STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"
-
+echo "== [5/8] assemble DMG =="
 ARCH="$(uname -m)"
 [ "$ARCH" = "arm64" ] || [ "$ARCH" = "x86_64" ] || ARCH="unknown"
-DMG="$DIST/walgit-${VERSION}-${ARCH}.dmg"
-rm -f "$DMG"
-hdiutil create -volname "walgit" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+STAGE="$WORK/dmg"
+mkdir -p "$STAGE"
+ditto --norsrc --noextattr "$APP" "$STAGE/walgit-tray.app"
+ln -s /Applications "$STAGE/Applications"
+check_tree "$STAGE"
+TMP_DMG="$WORK/walgit-${VERSION}-${ARCH}.dmg"
+hdiutil create -volname walgit -srcfolder "$STAGE" -ov -format UDZO "$TMP_DMG" >/dev/null
 
-# 4. DMG 签名 + 公证 + 装订(IDENTITY 已在 1b 解析)
-codesign --force --sign "$IDENTITY" --timestamp "$DMG"
-xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
-xcrun stapler staple "$DMG"
-spctl --assess --type open --context context:primary-signature -v "$DMG" 2>&1 | tail -2
+echo "== [6/8] sign DMG =="
+codesign --force --sign "$IDENTITY" --timestamp "$TMP_DMG"
 
-echo ""
-echo "✅ $DMG(签名 + 公证 + 装订)"
-echo "上传:gh release upload <tag> $DMG --repo gqf2008/walgit"
+echo "== [7/8] notarize + staple DMG =="
+notary_submit "$TMP_DMG"
+xcrun stapler staple "$TMP_DMG"
+xcrun stapler validate "$TMP_DMG"
+spctl --assess --type open --context context:primary-signature -v "$TMP_DMG" 2>&1 | tail -1
+
+echo "== [8/8] publish local artifact =="
+mkdir -p "$SCRIPT_DIR/dist"
+DMG="$SCRIPT_DIR/dist/walgit-${VERSION}-${ARCH}.dmg"
+TMP_OUT="$DMG.tmp.$$"
+ditto --norsrc --noextattr "$TMP_DMG" "$TMP_OUT"
+mv -f "$TMP_OUT" "$DMG"
+echo "✅ $DMG"
+shasum -a 256 "$DMG"
