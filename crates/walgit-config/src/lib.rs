@@ -444,6 +444,11 @@ pub struct MaintenanceConfig {
     /// whether that host is alive. Default: the instance id.
     #[serde(default)]
     pub host: Option<String>,
+    /// Bucket-GC cadence (#175): reclaim superseded packs older than
+    /// `compaction.retention_superseded`. Result at `repos/<o>/<r>/gc.pb`.
+    /// 0 = off.
+    #[serde(with = "humantime_serde")]
+    pub gc_interval: Duration,
     /// Connectivity audit cadence: `git fsck --connectivity-only` over a complete
     /// local copy, result at `repos/<o>/<r>/fsck.pb` (missing objects →
     /// `walgit_repo_missing_objects{repo}` and the `repair` unit). Lowest
@@ -491,6 +496,7 @@ impl Default for MaintenanceConfig {
             disk: MaintainerDisk::Tmpfs,
             host: None,
             fsck_interval: Duration::from_hours(168),
+            gc_interval: Duration::from_hours(24),
             follow_interval: Duration::from_secs(30),
         }
     }

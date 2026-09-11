@@ -152,6 +152,7 @@ checkpoints = true                # unit 1: checkpoint repos whose wal.* trigger
 max_pack_bytes = "0B"             # declared capacity for units needing a local copy (0 = cache.max_bytes); above it: plan state "wrong-host"
 disk = "tmpfs"                    # "tmpfs" (memory-backed disk) | "ssd" (a real disk: may rebuild bases)
 # host = "maintainer-1"           # heartbeat object maintain/<host>.pb (default: instance id) — the plan shows who maintains a repo
+gc_interval = "24h"                # bucket GC: drop superseded packs older than compaction.retention_superseded → repos/<o>/<r>/gc.pb; 0 = off
 fsck_interval = "7d"              # lowest-priority unit: git fsck --connectivity-only over a complete local copy → repos/<o>/<r>/fsck.pb
                                   # (missing objects → walgit_repo_missing_objects{repo} + the `repair` unit from upstream.git); 0 = off
 follow_interval = "30s"           # upstream-follow loop (its own loop next to the priority loop): fetch each assigned repo's

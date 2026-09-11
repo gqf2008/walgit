@@ -59,6 +59,16 @@ pub const OPS: &[OpSpec] = &[
         mutating: false,
     },
     OpSpec {
+        id: "gc",
+        label: "Bucket GC",
+        description: "Reclaim superseded packs: delete the packs a COMPACT entry dropped once their \
+                      `wal/<checksum>.superseded` marker is older than compaction.retention_superseded \
+                      (the provenance window). At most `max` packs per call (default 32). Ref-level: \
+                      reads the manifest and marker objects, never pack data.",
+        params: &["max"],
+        mutating: false,
+    },
+    OpSpec {
         id: "repair",
         label: "Repair",
         description: "Fetch the objects the last fsck found missing from upstream.git and publish them \
@@ -194,6 +204,156 @@ pub async fn read_fsck(
     use walgit_store::ObjectStoreExt;
     match handle.store().get_bytes(walgit_proto::keys::FSCK).await {
         Ok(Some((_, bytes))) => walgit_proto::v1::FsckReport::decode(bytes.as_ref())
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+
+/// One bounded bucket-GC unit: delete superseded packs that have aged past
+/// `compaction.retention_superseded` (#175).
+///
+/// `Manifest.packs` is the live set. A pack a COMPACT entry dropped is found by
+/// its `wal/<checksum>.superseded` marker, written when that entry committed
+/// (`publish_compact_impl`) — the manifest alone cannot express *when* a pack
+/// left the live set, and the superseding log entry is eventually folded into a
+/// checkpoint. Only marked packs are candidates, which is also what protects a
+/// pack a concurrent publisher uploaded but has not CAS'd yet: no marker, no
+/// candidate.
+///
+/// Bounded by `max` (D22: one unit of the most important missing work).
+async fn gc_superseded_packs(
+    state: &Arc<AppState>,
+    handle: &RepoHandle,
+    max: usize,
+    log: Log<'_>,
+) -> Result<(u64, u64), String> {
+    use futures::StreamExt;
+    use walgit_proto::keys;
+    use walgit_proto::v1::SupersededPack;
+    use walgit_store::ObjectStore;
+
+    let retention = state.cfg.compaction.retention_superseded;
+    let now = std::time::SystemTime::now();
+
+    // Collect markers that have aged past the retention window. Reading each
+    // marker is one GET; the listing is bounded by the number of packs a repo
+    // ever superseded within the window, not by its object count.
+    let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    let mut scanned = 0u64;
+    {
+        let mut stream = handle.store().list(keys::WAL_DIR, None);
+        while let Some(m) = stream.next().await {
+            let m = m.map_err(|e| e.to_string())?;
+            let Some(_) = m.key.strip_suffix(".superseded") else {
+                continue;
+            };
+            scanned += 1;
+            let Some((_, raw)) = handle
+                .store()
+                .get_bytes(&m.key)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            let marker = SupersededPack::decode(raw.as_ref()).map_err(|e| e.to_string())?;
+            let Some(at) = marker
+                .superseded_at
+                .as_ref()
+                .map(walgit_proto::time::to_system)
+            else {
+                continue;
+            };
+            if now.duration_since(at).unwrap_or_default() <= retention {
+                continue;
+            }
+            candidates.push((marker.checksum, at));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok((0, 0));
+    }
+    // Oldest first: a partial unit should reclaim the longest-dead packs.
+    candidates.sort_by_key(|(_, at)| *at);
+    candidates.truncate(max);
+
+    // Re-read the manifest: the candidate list came from a listing that took
+    // time, and a pack that is live *now* must never be deleted.
+    handle.sync_refs().await.map_err(|e| e.to_string())?;
+    let live: std::collections::HashSet<String> = handle
+        .manifest()
+        .packs
+        .iter()
+        .map(|p| p.checksum.clone())
+        .collect();
+
+    let mut deleted = 0u64;
+    let mut freed = 0u64;
+    for (checksum, at) in candidates {
+        if live.contains(&checksum) {
+            // Superseded then re-adopted (or a marker written by a CAS that did
+            // not land): drop the marker, keep the pack.
+            let _ = handle
+                .store()
+                .delete(&keys::superseded_key(&checksum), None)
+                .await;
+            log(format!("gc: {checksum} is live again — marker dropped"));
+            continue;
+        }
+        let side_files = [
+            keys::pack_key(&checksum),
+            keys::idx_key(&checksum),
+            keys::rev_key(&checksum),
+            keys::bitmap_key(&checksum),
+            keys::commit_graph_key(&checksum),
+        ];
+        for key in &side_files {
+            if let Ok(Some(meta)) = handle.store().head(key).await {
+                freed += meta.size;
+                handle
+                    .store()
+                    .delete(key, Some(meta.version))
+                    .await
+                    .map_err(|e| format!("gc: delete {key}: {e}"))?;
+            }
+        }
+        handle
+            .store()
+            .delete(&keys::superseded_key(&checksum), None)
+            .await
+            .map_err(|e| format!("gc: delete marker {checksum}: {e}"))?;
+        log(format!(
+            "gc: reclaimed {checksum} (superseded {:.1}h ago, {freed} bytes total)",
+            now.duration_since(at)
+                .unwrap_or_default()
+                .as_secs_f64()
+                / 3600.0
+        ));
+        deleted += 1;
+    }
+    if scanned > 0 {
+        log(format!(
+            "gc: scanned {scanned} marker(s), reclaimed {deleted}, freed {freed} bytes"
+        ));
+    }
+    Ok((deleted, freed))
+}
+
+/// Upper bound on packs reclaimed per GC unit: a unit must stay bounded so one
+/// pass cannot monopolise a maintainer (D22).
+const GC_MAX_PACKS_PER_UNIT: usize = 32;
+
+
+/// The last bucket-GC pass of `handle`'s repository, if any (#175).
+pub async fn read_gc(
+    handle: &RepoHandle,
+) -> Result<Option<walgit_proto::v1::GcReport>, String> {
+    use walgit_store::ObjectStoreExt;
+    match handle.store().get_bytes(walgit_proto::keys::GC).await {
+        Ok(Some((_, bytes))) => walgit_proto::v1::GcReport::decode(bytes.as_ref())
             .map(Some)
             .map_err(|e| e.to_string()),
         Ok(None) => Ok(None),
@@ -423,6 +583,36 @@ async fn run(
                 serde_json::json!({"pack": checksum, "bytes": bytes}),
             ))
         }
+        "gc" => {
+            let max = params
+                .get("max")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(GC_MAX_PACKS_PER_UNIT);
+            let (packs, bytes) = gc_superseded_packs(state, &handle, max, log).await?;
+            let report = walgit_proto::v1::GcReport {
+                at: Some(walgit_proto::time::now()),
+                packs,
+                bytes,
+                host: crate::maintain::host_name(state),
+            };
+            handle
+                .store()
+                .put_bytes(
+                    walgit_proto::keys::GC,
+                    report.encode_to_vec(),
+                    walgit_store::PutMode::Overwrite,
+                )
+                .await
+                .map_err(|e| format!("writing gc.pb: {e}"))?;
+            let summary = if packs == 0 {
+                "gc: nothing superseded past retention".to_string()
+            } else {
+                format!("gc: {packs} superseded pack(s), {bytes} bytes freed")
+            };
+            tracing::info!(repo = %id, packs, bytes, "bucket gc");
+            Ok((summary, serde_json::json!({"packs": packs, "bytes": bytes})))
+        }
+
         "compact" => {
             let force = flag(params, "force");
             let base = flag(params, "base");
