@@ -98,7 +98,7 @@ ad-hoc 整体签名,独立 `codesign --verify --deep --strict` 可过。`build-d
 - **手动装 DMG**(`bootstrapDeploy`)换完托管文件后,同样把在跑的服务重启到
   新版本;
 - 菜单 upgrade 行在 idle/checking/latest/available(Release + 源码)/installing/
-  failed 各状态的文案。
+  failed 各状态的文案,以及 /healthz 版本字段的精确解析(v0.5.1 不匹配 v0.5.10)。
 
 全部在临时部署目录内完成,不碰真实 `~/walgit` 与 launchd/服务。
 

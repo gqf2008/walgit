@@ -317,6 +317,22 @@ menu_fixture() {
     swiftc -swift-version 5 -framework AppKit walgit-tray.swift ReleaseLogic.swift \
         -o "$tray_bin" || { echo "FAIL(menu): compile tray" >&2; return 1; }
     local out
+    # healthz 版本解析:必须精确,不能把 v0.5.10 当 v0.5.1;容忍键值间空格。
+    case "$(WALGIT_HEALTH_TEST='{"status":"ok","version":"v0.5.10"}' "$tray_bin")" in
+        v0.5.10) ;;
+        *) echo "FAIL(menu): healthz version parse wrong" >&2; return 1 ;;
+    esac
+    # 正控目标:下面这条在把 healthVersion 改回子串匹配时必须红
+    case "$(WALGIT_HEALTH_TEST='{ "status": "ok", "version": "v0.5.1" }' "$tray_bin")" in
+        v0.5.1) ;;
+        *) echo "FAIL(menu): spaced healthz JSON not parsed" >&2; return 1 ;;
+    esac
+    # idle:检查前的版本行
+    out="$(WALGIT_MENU_TEST=0.5.1 WALGIT_MENU_SERVICE=v0.5.0 WALGIT_MENU_STATE=idle "$tray_bin")"
+    case "$out" in
+        *"版本 0.5.1"*"服务 0.5.0"*"检查更新…"*) ;;
+        *) echo "FAIL(menu): idle line wrong: $out" >&2; return 1 ;;
+    esac
     out="$(WALGIT_MENU_TEST=0.5.1 WALGIT_MENU_SERVICE=v0.5.0 WALGIT_MENU_STATE=latest "$tray_bin")"
     case "$out" in
         *"版本 0.5.1"*"已是最新"*) ;;

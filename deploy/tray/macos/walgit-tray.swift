@@ -201,10 +201,21 @@ func repoPathValue() -> String {
     UserDefaults.standard.string(forKey: "repoPath") ?? "/Volumes/Workspace/GitHub/walgit"
 }
 
+/// 从 /healthz 的 JSON 里取出 version 字段(与 release-install.sh 的
+/// health_version 同口径)。用 JSON 解析而不是字符串包含:v0.5.1 不能匹配
+/// v0.5.10。解析失败返回空串。
+func healthVersion(_ body: String) -> String {
+    guard let data = body.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let v = obj["version"] as? String
+    else { return "" }
+    return v
+}
+
 /// 手动装 DMG 只换文件,不会重启已在跑的服务进程 —— 进程仍拿着旧二进制,
 /// /healthz 继续报旧版本,菜单看起来"升完级还是旧版"(#170)。只处理「本来
 /// 就在跑」的服务(用户主动停掉的不拉起)。放到后台队列执行,避免拖住主线程。
-private func restartServiceAfterUpgrade(bundledVersion: String, done: @escaping () -> Void = {}) {
+private func restartServiceAfterUpgrade(bundledVersion: String, done: @Sendable @escaping () -> Void = {}) {
     let fm = FileManager.default
     let ok = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null").0 == 0
     guard ok else { done(); return }
@@ -214,9 +225,7 @@ private func restartServiceAfterUpgrade(bundledVersion: String, done: @escaping 
     let want = "v\(bundledVersion)"
     for _ in 0..<20 {
         let (hc, hout) = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null || true")
-        let token = hout.trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: " ").last.map(String.init) ?? hout
-        if hc == 0, token.contains(want) {
+        if hc == 0, healthVersion(hout) == want {
             logLine("bootstrap: 服务已重启到 \(want)")
             done()
             return
@@ -231,18 +240,20 @@ private func restartServiceAfterUpgrade(bundledVersion: String, done: @escaping 
 /// 托管文件(walgit 二进制、run-walgit.sh、walgit-ensure)按 bundle 内
 /// skeleton.version 覆盖更新——DMG 覆盖安装即升级;用户文件(walgit.toml)
 /// 永不覆盖(配置与凭证安全)。开发构建(bundle 里没有 walgit 资源)跳过。
-func bootstrapDeploy(onServiceRestart: @escaping () -> Void = {}) {
+func bootstrapDeploy(onServiceRestart: @Sendable @escaping () -> Void = {}) {
     let fm = FileManager.default
     guard let res = Bundle.main.resourceURL?.path,
         fm.fileExists(atPath: "\(res)/walgit")
     else {
         logLine("bootstrap: bundle 无 walgit 资源(开发构建),跳过")
+        onServiceRestart()
         return
     }
     do {
         try fm.createDirectory(atPath: deployDir, withIntermediateDirectories: true)
     } catch {
         logLine("bootstrap: 建 ~/walgit 失败: \(error)")
+        onServiceRestart()
         return
     }
     let bundledVersion = (try? String(contentsOfFile: "\(res)/skeleton.version", encoding: .utf8))
@@ -329,6 +340,7 @@ func bootstrapDeploy(onServiceRestart: @escaping () -> Void = {}) {
         }
     }
     if versionChanged && !managedOK {
+        onServiceRestart()
         return
     }
     // 用户文件:永不覆盖
@@ -871,6 +883,11 @@ struct WalgitTrayMain {
             let done = DispatchSemaphore(value: 0)
             bootstrapDeploy(onServiceRestart: { done.signal() })
             _ = done.wait(timeout: .now() + 20)
+            exit(0)
+        }
+        // 测试钩子:解析一段 /healthz JSON(验证 version 取值的精确性)。
+        if let body = ProcessInfo.processInfo.environment["WALGIT_HEALTH_TEST"] {
+            print(healthVersion(body))
             exit(0)
         }
         // 测试钩子:只打印菜单 upgrade 行(验证版本语义,不启动 NSApplication)。
