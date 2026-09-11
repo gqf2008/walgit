@@ -1335,6 +1335,73 @@ fn note_entry_time(handle: &RepoHandle, seq: u64, at: &prost_types::Timestamp) {
     }
 }
 
+/// Write the `wal/_superseded/<checksum>` markers for a superseding COMPACT
+/// entry, before its manifest CAS (#175).
+///
+/// The marker records the supersession time; GC deletes the pack + side-files
+/// once it ages past `compaction.retention_superseded`. Because a pack that was
+/// superseded, re-adopted and superseded again must get a *fresh* timestamp,
+/// the write is `Overwrite` (never `Create`, never `immutable`) and is retried:
+/// a lost refresh would let GC treat the old timestamp as the current one and
+/// delete early. A terminal failure aborts the supersession — nothing has
+/// committed yet, so the caller retries instead of publishing without a record.
+pub async fn write_superseded_markers(
+    store: &Prefixed,
+    supersedes_hex: &[String],
+    seq: u64,
+    at: prost_types::Timestamp,
+) -> Result<(), WalError> {
+    if supersedes_hex.is_empty() {
+        return Ok(());
+    }
+    let opts = PutOptions {
+        mode: PutMode::Overwrite,
+        ..Default::default()
+    };
+    // (key, body) per checksum; retries only re-send what failed.
+    let mut pending: Vec<(String, bytes::Bytes)> = supersedes_hex
+        .iter()
+        .map(|s| {
+            let marker = SupersededPack {
+                checksum: s.clone(),
+                superseded_at: Some(at),
+                seq,
+            };
+            (
+                keys::superseded_key(s),
+                bytes::Bytes::from(marker.encode_to_vec()),
+            )
+        })
+        .collect();
+    let mut last: Option<StoreError> = None;
+    for attempt in 0..3u32 {
+        // Concurrent: a 500-pack supersede must not add 500 serial PUTs to the
+        // compaction critical path.
+        let results = futures::future::join_all(pending.iter().map(|(key, body)| {
+            store.put(key, PutBody::Bytes(body.clone()), opts.clone())
+        }))
+        .await;
+        let mut failed: Vec<(String, bytes::Bytes)> = Vec::new();
+        for ((key, body), result) in pending.drain(..).zip(results) {
+            if let Err(e) = result {
+                last = Some(e);
+                failed.push((key, body));
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        pending = failed;
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+        }
+    }
+    match last {
+        Some(e) => Err(WalError::Store(e)),
+        None => Err(WalError::Retry { attempts: 3 }),
+    }
+}
+
 pub(crate) async fn publish_compact_impl(
     handle: &RepoHandle,
     new_pack: PackInfo,
@@ -1465,6 +1532,14 @@ pub(crate) async fn publish_compact_impl(
             None => PutMode::Create,
         };
 
+        // Record *when* each pack leaves the live set (#175) *before* the CAS.
+        // The marker is what tells GC a pack's supersession time, so a marker
+        // that lagged its supersession (write lost, write swallowed) would let
+        // GC delete a freshly superseded pack inside the retention window. A
+        // failure here aborts the supersession (nothing has committed yet); a
+        // stray marker on a still-live pack is harmless — GC skips live packs.
+        write_superseded_markers(&handle.store, &supersedes_hex, seq, entry_time).await?;
+
         let cas = handle
             .store
             .put(
@@ -1495,50 +1570,6 @@ pub(crate) async fn publish_compact_impl(
         if let Some((committed, version)) = committed {
             handle.install_manifest(Arc::new(committed.clone()), Some(version.clone()));
             note_entry_time(handle, seq, &entry_time);
-            // Record *when* each pack left the live set (#175). The manifest only
-            // keeps the live set and this COMPACT entry is eventually folded into a
-            // checkpoint, so without a marker bucket-side GC cannot tell "superseded
-            // an hour ago" from "superseded last week" and must keep everything.
-            // Written after the CAS (only real supersessions get a marker) and
-            // create-if-absent (write-once per checksum). A crash between the CAS and
-            // this write leaks one pack — the safe direction.
-            let mut marker_puts = Vec::with_capacity(supersedes_hex.len());
-            for s in &supersedes_hex {
-                let marker = SupersededPack {
-                    checksum: s.clone(),
-                    superseded_at: Some(entry_time),
-                    seq,
-                };
-                // Not `immutable`: GC deletes this object, so it must not carry
-                // a year-long immutable cache header. Overwrite (not Create):
-                // a pack that was superseded, re-adopted and superseded again
-                // must get a *fresh* timestamp, or GC would treat the old one
-                // as its supersession time and skip the new retention window.
-                let opts = PutOptions {
-                    mode: PutMode::Overwrite,
-                    ..Default::default()
-                };
-                marker_puts.push(async move {
-                    // Already-present is the normal case (a retry that landed twice);
-                    // anything else is worth a line but must not fail the publish.
-                    if let Err(e) = handle
-                        .store
-                        .put(
-                            &keys::superseded_key(&marker.checksum),
-                            PutBody::Bytes(bytes::Bytes::from(
-                                marker.clone().encode_to_vec(),
-                            )),
-                            opts,
-                        )
-                        .await
-                    {
-                        tracing::warn!(repo = %handle.id, checksum = %marker.checksum, "superseded marker write failed: {e}");
-                    }
-                });
-            }
-            // One round trip each, but concurrent: a 500-pack supersede must not
-            // add 500 serial PUTs to the compaction critical path.
-            futures::future::join_all(marker_puts).await;
             {
                 let mut state = handle.state.lock();
                 state.manifest_version = Some(version.as_str().to_string());

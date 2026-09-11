@@ -224,7 +224,6 @@ pub async fn read_fsck(
 ///
 /// Bounded by `max` (D22: one unit of the most important missing work).
 async fn gc_superseded_packs(
-    state: &Arc<AppState>,
     handle: &RepoHandle,
     max: usize,
     log: Log<'_>,
@@ -234,7 +233,10 @@ async fn gc_superseded_packs(
     use walgit_proto::v1::SupersededPack;
     use walgit_store::ObjectStore;
 
-    let retention = state.cfg.compaction.retention_superseded;
+    // D24: `[compaction]` is a per-repo settings section, so the retention
+    // window must come from the *effective* config — a repo that asks for a
+    // longer window must not have its packs deleted on the host's shorter one.
+    let retention = handle.effective_config().compaction.retention_superseded;
     let now = std::time::SystemTime::now();
 
     // Collect markers that have aged past the retention window. Reading each
@@ -275,8 +277,28 @@ async fn gc_superseded_packs(
     if candidates.is_empty() {
         return Ok((0, 0, true));
     }
+    // A marker outlives its pack's death: a superseded pack a publisher
+    // re-adopted is live again, and its old marker must neither be deleted nor
+    // spend this unit's quota. Sync refs so the live set is current, then drop
+    // live checksums *before* the bound — the bound counts reclaimable work, so
+    // an unbounded pile of stale live markers cannot starve real candidates.
+    let guard = handle.sync_refs().await.map_err(|e| e.to_string())?;
+    let live: std::collections::HashSet<String> = handle
+        .manifest()
+        .packs
+        .iter()
+        .map(|p| p.checksum.clone())
+        .collect();
+    drop(guard);
+    candidates.retain(|(c, _)| !live.contains(c));
+    if candidates.is_empty() {
+        return Ok((0, 0, true));
+    }
     // Oldest first: a partial unit should reclaim the longest-dead packs.
     candidates.sort_by_key(|(_, at)| *at);
+    // Anything past the bound is real work this pass did not do: the unit must
+    // stay due, not wait a whole `gc_interval`.
+    let truncated = candidates.len() > max;
     candidates.truncate(max);
     let checksums: Vec<String> = candidates.iter().map(|(c, _)| c.clone()).collect();
 
@@ -302,7 +324,7 @@ async fn gc_superseded_packs(
 
     let mut deleted = 0u64;
     let mut freed = 0u64;
-    let mut all_complete = true;
+    let mut all_complete = !truncated;
     let mut reclaimed: Vec<String> = Vec::new();
     for (checksum, at) in candidates {
         if !owned.contains(&checksum) || live.contains(&checksum) {
@@ -656,7 +678,7 @@ async fn run(
                 .filter(|n| *n > 0)
                 .unwrap_or(GC_MAX_PACKS_PER_UNIT)
                 .min(GC_MAX_PACKS_PER_UNIT);
-            let outcome = gc_superseded_packs(state, &handle, max, log).await;
+            let outcome = gc_superseded_packs(&handle, max, log).await;
             if let Err(e) = lease.release().await {
                 log(format!("gc: lease release failed: {e}"));
             }
