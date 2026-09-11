@@ -125,7 +125,7 @@ func latestRelease() -> ReleaseInfo? {
         return try? fixtureReleaseCheck(path: fixture, currentVersion: installedAppVersion())
     }
     let endpoint = ProcessInfo.processInfo.environment["WALGIT_RELEASE_API"]
-        ?? "https://api.github.com/repos/gqf2008/walgit/releases/latest"
+        ?? "https://api.github.com/repos/gqf2008/walgit-d1/releases/latest"
     guard let url = URL(string: endpoint) else { return nil }
     var request = URLRequest(url: url)
     request.timeoutInterval = 10
@@ -562,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func hasSourceRepo() -> Bool { return hasSourceRepoPath() }
 
     @objc func openReleases() {
-        NSWorkspace.shared.open(URL(string: "https://github.com/gqf2008/walgit/releases")!)
+        NSWorkspace.shared.open(URL(string: "https://github.com/gqf2008/walgit-d1/releases")!)
     }
 
     @objc func checkUpdateNow() {

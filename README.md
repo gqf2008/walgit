@@ -1,7 +1,7 @@
 # walgit — a git server that is one binary in front of an object store
 
-[![CI](https://github.com/gqf2008/walgit/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit/actions/workflows/ci.yml)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
+[![CI](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-blue)](README.md#platforms)
 [![Agent-native](https://img.shields.io/badge/agent--native-work%20units%20%26%20protocol-purple)](AGENTS.md#6-agent-collaboration-protocol)
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
@@ -43,6 +43,100 @@ It is a Rust implementation of the architecture Cursor described in
 [*Git at any scale*](https://cursor.com/blog/git-at-any-scale) (the system they call Continuity), with the changes
 needed to run it on machines that are smaller than the repository. The post is worth reading first; it is kept
 verbatim in `docs/reference/cursor-git-at-any-scale.md`.
+
+---
+
+## 关于这个仓库 — walgit-d1（分叉说明）
+
+**这是 `tobi/walgit` 的一个独立分叉**（仓库名 `gqf2008/walgit-d1`，命令与二进制仍叫 `walgit`）。
+
+上游 walgit 的目标是**把服务端做小**：git 托管、bundle-uri、LFS、Web UI，仅此而已；
+代码评审 / CI / issue 按上游 `GOAL.md §4` 明确**不在范围内**（principle X “keep walgit small”）。
+
+本分叉在上游那套对象存储 Git 之上，加了**去中心化协作层（代号 D1）**——它不引入独立的
+协作状态或聚合服务，只在 walgit 现有服务上增加一层薄 API，并把整套东西做成了可分发的桌面产品。
+
+因此它与上游在定位上已经分道扬镳，**不打算向上游回并**；取名 `walgit-d1` 就是为了和上游区分开。
+
+### 上游基线
+
+分叉点在 `6d8fa54`（2026-08-26），此后本分叉领先上游 132 个提交
+（`git rev-list --count upstream/main..main`）。
+
+内核的**语义与不变式**不变（桶仍是唯一事实源、manifest CAS 仍是提交点、实例仍是可丢弃缓存），
+但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k；即便只粗扣
+`collab.rs`/`ci.rs`/`collab_cmd.rs`/`ci_cmd.rs` 四个核心文件，剩余仍有约 37k 行
+（其中还含协作层的 Web/SDK/测试），包括 Windows 原生支持
+（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle 的可靠性修复（#148 重启后
+refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储健壮性（#129/#130 socket
+超时与配置写硬化）以及站点与部署面扩展。
+
+准确的说法是 **D1 是最大的增量，不是唯一增量**；"内核没变"应读作"内核契约没推翻"，
+而不是"内核代码没动过"。
+
+### 新增功能
+
+**D1 协作层** — 没有协作服务器：协作状态是仓库 `refs/collab/*` 里的**签名、追加式 git 对象**，
+权威永远是这些 ref，服务端**不持有**协作状态或聚合结果。协作 ref 不在默认 refspec 里，
+拿到它们需要显式拉取：
+
+```sh
+git clone <repo> && cd <repo>
+git fetch origin '+refs/collab/*:refs/collab/*'
+```
+
+之后即可离线验签、重算出与别人一致的视图。若公钥只注册在 host 级 registry
+（`refs/walgit/principals/*`，不在上面的 refspec 里），验签前先跑一次
+`walgit collab principal-fetch` 把它拉到本地。
+
+服务端为 Web UI 提供的 `/{owner}/{repo}/api/collab/report`、`.../collab/board`、
+`.../collab/threads/{id}` 是**无状态聚合读端点**，与 CLI 共用 `walgit-wal::collab`
+同一份纯函数，不落库、不作为权威：
+
+- **issue / PR / 评审 / 线程**：`walgit collab` 下的 `thread`、`pr`、`entry`、
+  `board`、`report`、`gc`（折叠出 `refs/collab/meta/snapshot` 快照）、`watch` 等命令。
+- **看板**：`.walgit/board.toml` 里的声明式列定义，将线程集合折叠成确定性投影
+  （见 `docs/BOARD.md`）——板不是状态，是纯函数。
+- **身份**：host 级 principal 注册表（`walgit principal`），一个 token 同时覆盖
+  git 读写与协作读写；支持签名公钥注册/吊销。
+- **D1-CI（去中心化 CI）**：**服务端零 CI 逻辑**。认领与结果都是 `refs/collab/inbox/*`
+  里的签名条目，由客户端 runner（`walgit ci`）认领、执行被测提交里的 `.walgit/ci.toml`、
+  签名回传；收敛靠对条目日志的确定性规则，不靠互斥。规范见 `docs/D1_CI_PROTOCOL.md`。
+- **Web UI**：协作页、线程/PR 页、看板页、以及面向人类的「了解 D1 协作」讲解页
+  （`/{owner}/{repo}/collab/guide`）。
+- **事件**：ref 事件桥（`events` 角色 + webhook 接收器），至少一次、可回放，
+  有持久游标（`docs/EVENTS.md`）。
+
+**首次运行的部署向导** — `walgit-server` 的 setup wizard：新部署不再要求手写完整
+`walgit.toml` 才能起服务，走 `/setup` 向导配置 store 与认证。
+
+**分发与桌面** — 上游有二进制、Containerfile 与 Nix，但没有最终用户安装器；本分叉补齐了这条路：
+
+- **跨平台托盘**：macOS（Swift）、Windows/Linux（Rust）三平台系统托盘，
+  启停服务与版本检测（`deploy/tray/`）。**点击升级在 Windows/Linux 依赖本地源码仓库**，
+  经安装器部署、没有源码树的机器只能重跑安装器；Release 感知的自动下载升级目前仅 macOS。
+- **macOS Release 感知升级**：托盘同时比对 GitHub Release 与源码仓库，
+  下载 → 严格校验（sha256 / 版本 / 签名 / 公证）→ 原子换装 → 健康检查，失败回滚。
+- **安装包**：Linux `.deb` 与 Windows Inno Setup 安装器由 `release.yml` 在打 tag 时构建；
+  macOS 签名+公证 DMG 由 `deploy/tray/macos/build-dmg.sh` 在 CI 之外构建后上传 Release。
+
+**工程与治理** — 上游没有这些；本分叉按 agent 协作的方式补上：
+issue/PR 模板与批次化流程、`AGENTS.md` 协作协议、CI 分级（fast tier / e2e /
+windows fast tier）、CodeQL、Dependabot、`code review` 与发布规范、Windows 开发
+runbook（`docs/WINDOWS.md`）等。
+
+### 文档
+
+- `docs/USER_GUIDE.md` — 面向人类的完整使用手册（协作层怎么用）。
+- `docs/D1_COLLAB_DESIGN.md`、`docs/D1_CI_PROTOCOL.md` — D1 协作层与 CI 的规范。
+- `docs/BOARD.md`、`docs/EVENTS.md`、`docs/POLICY.md` — 看板 / 事件 / 推送策略。
+- `AGENTS.md` — 架构、所有设计决策、以及 agent 协作协议。
+- `GOAL.md` — 上游的验收目标（本分叉保持其内核语义不变）。
+
+### 与上游的关系
+
+`upstream` remote 指向 `tobi/walgit`，仅用于查阅与偶尔同步内核修复；
+**不接受也不发起回并**。若你想用上游那份“只有 git 托管”的版本，请直接用上游仓库。
 
 ---
 
@@ -133,6 +227,9 @@ open https://walgit.localhost:8080/
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
+* `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
+  **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
+  object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
 
 ## Platforms
 
@@ -143,9 +240,13 @@ suite run on CI's windows leg. Symlink-dependent store-mount tests need an NTFS 
 Developer Mode or run elevated — exFAT drives silently cannot host links). Pass
 `--config NUL` where docs say `/dev/null`. The developer `just dev-store` rig assumes
 podman on POSIX; on Windows see `docs/WINDOWS.md` for the rustfs equivalent.
-* `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
-  **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
-  object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
+
+macOS: this fork's local one-box shape runs the full server **on macOS** — the tray bundles a
+Mach-O `walgit` and starts it with `walgit serve` (`deploy/tray/macos/run-walgit.sh`), and the
+Swift tray plus the signed/notarized DMG are built here (`deploy/tray/macos/`, `build-dmg.sh`).
+The macOS CI leg runs the tray Release/package guards. What is Linux-targeted is **production /
+multi-instance deployment** (containers, the Nix OCI image, tmpfs hosts, object-store-backed
+fleets), not the binary's ability to run on a Mac.
 
 Roles (`server.roles`): `serve` (git, API, UI, bundles, LFS), `maintain` (checkpoints, bundles, compaction,
 fsck/repair), `events` (the webhook bridge). Empty = all. Any number of `serve` hosts may point at one bucket; give
