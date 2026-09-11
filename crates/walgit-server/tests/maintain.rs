@@ -2207,6 +2207,85 @@ async fn publishing_a_reclaiming_checksum_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #175: the receive-pack path (`process_batch`) is the *other* CAS gate. A push
+/// that regenerates a byte-identical pack must be refused while bucket GC has
+/// the checksum listed — this is the path a client actually triggers, and
+/// disabling the check in `publish.rs` lets the push adopt bytes GC is deleting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pushing_a_reclaiming_checksum_is_refused() -> anyhow::Result<()> {
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::ZERO;
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // A checksum that is not live yet (so the claim CAS accepts it): the push
+    // below "regenerates" exactly these bytes, as git deterministically does.
+    let dead = "a".repeat(40);
+    step!(
+        "list candidate",
+        h.update_reclaiming(std::slice::from_ref(&dead), &[])
+    )?;
+    assert!(
+        h.manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == dead),
+        "the checksum must be listed before the push is attempted"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let ingested = walgit_git::IngestedPack {
+        checksum: gix_hash::ObjectId::from_hex(dead.as_bytes())?,
+        pack_path: dir.path().join(format!("pack-{dead}.pack")),
+        idx_path: dir.path().join(format!("pack-{dead}.idx")),
+        pack_size: 1,
+        idx_size: 1,
+        object_count: 1,
+    };
+    let txn = walgit_proto::v1::RefTransaction {
+        updates: vec![walgit_proto::v1::RefUpdate {
+            name: "refs/heads/main".into(),
+            old_oid: String::new(),
+            new_oid: "0".repeat(40),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let Err(err) = step!(
+        "push",
+        h.publish_push(Some(ingested), txn, std::collections::HashMap::default())
+    ) else {
+        panic!("a reclaiming checksum must not be pushed");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&dead) && msg.contains("reclaim"),
+        "expected the push to be refused as reclaiming, got: {msg}"
+    );
+    Ok(())
+}
+
 /// #175: the manifest CAS is what orders reclamation against adoption. A pack
 /// that is live must never be listed as reclaiming (GC would then be free to
 /// delete a pack the manifest points at), and a non-live checksum lists and

@@ -1697,3 +1697,112 @@ impl RepoHandle {
         tx
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use walgit_proto::prost::Message;
+    use walgit_store::memory::MemoryStore;
+    use walgit_store::{PutBody, PutMode, PutOptions};
+
+    /// #175: the `(manifest, version)` pair a CAS is built on must be installed
+    /// and observed *atomically*. Two writers that install their two fields
+    /// separately can interleave so the cache ends up holding an older manifest
+    /// next to a newer version; a CAS then succeeds against a body that predates
+    /// the manifest it is updating and silently erases a `reclaiming` claim
+    /// bucket GC just listed — the manifest ends up pointing at deleted bytes.
+    ///
+    /// Here every writer installs a matched pair, so a concurrent snapshot must
+    /// never observe them mismatched. Reverting `install_manifest` to two
+    /// separate field writes (no `manifest_pair`) makes this fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn manifest_snapshot_never_pairs_a_stale_manifest_with_a_new_version() {
+        use std::sync::atomic::AtomicUsize;
+
+        let store = MemoryStore::shared();
+        let mut cfg = walgit_config::Config::default();
+        cfg.store.backend = walgit_config::StoreBackend::Memory;
+        cfg.store.memory_backend_intentional = true;
+        cfg.cache.dir = tempfile::tempdir().unwrap().keep();
+        let registry = crate::registry::Registry::new(store, Arc::new(cfg));
+
+        let id = RepoId::new("o", "pair").unwrap();
+        let seed = Manifest {
+            repo: id.to_string(),
+            revision: 0,
+            ..Default::default()
+        };
+        let prefixed = Prefixed::new(registry.store().clone(), id.store_prefix());
+        prefixed
+            .put(
+                keys::MANIFEST,
+                PutBody::Bytes(seed.encode_to_vec().into()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+        let handle = registry.open(&id).await.unwrap();
+        // Normalise the opening pair (a store-generated version) to the same
+        // `v<revision>` scheme the writers use, so every snapshot can be checked
+        // without special-casing the seed.
+        handle.install_manifest(handle.manifest(), Some(Version::new("v0")));
+
+        let writers: u64 = 3;
+        let iters = 50_000u64;
+        let bad = Arc::new(AtomicBool::new(false));
+        let writers_done = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(usize::try_from(writers).unwrap() + 3));
+
+        std::thread::scope(|scope| {
+            for w in 0..writers {
+                let h = handle.clone();
+                let start = start.clone();
+                let writers_done = writers_done.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..iters {
+                        let rev = (w + 1) * 1_000_000 + i;
+                        let mut m = (*h.manifest()).clone();
+                        m.revision = rev;
+                        h.install_manifest(Arc::new(m), Some(Version::new(format!("v{rev}"))));
+                    }
+                    writers_done.fetch_add(1, Ordering::Release);
+                });
+            }
+            for _ in 0..3 {
+                let h = handle.clone();
+                let bad = bad.clone();
+                let start = start.clone();
+                let writers_done = writers_done.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    // Sample until every writer has stopped, then once more so a
+                    // tear written last is still caught.
+                    loop {
+                        let (m, v) = h.manifest_snapshot();
+                        if let Some(v) = v
+                            && v.as_str() != format!("v{}", m.revision)
+                        {
+                            bad.store(true, Ordering::Relaxed);
+                        }
+                        if writers_done.load(Ordering::Acquire) == usize::try_from(writers).unwrap() {
+                            let (m, v) = h.manifest_snapshot();
+                            if let Some(v) = v
+                                && v.as_str() != format!("v{}", m.revision)
+                            {
+                                bad.store(true, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        assert!(
+            !bad.load(Ordering::Relaxed),
+            "manifest_snapshot observed a torn (manifest, version) pair"
+        );
+    }
+}

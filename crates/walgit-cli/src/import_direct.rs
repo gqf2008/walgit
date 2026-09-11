@@ -1705,4 +1705,126 @@ mod resume_tests {
             "{r:?}"
         );
     }
+
+    /// A store whose manifest carries `reclaiming` but holds no packs yet — the
+    /// shape GC leaves right before it deletes, and the one an import must respect.
+    async fn seed_manifest_with_claim(
+        repo_store: &Prefixed,
+        object_format: &str,
+        reclaiming: Vec<walgit_proto::v1::ReclaimingPack>,
+    ) {
+        let m = Manifest {
+            format_version: WAL_FORMAT_VERSION,
+            repo: "t/seed".into(),
+            object_format: object_format.into(),
+            reclaiming,
+            ..Default::default()
+        };
+        repo_store
+            .put(
+                keys::MANIFEST,
+                PutBody::Bytes(m.encode_to_vec().into()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// #175: bucket GC lists a pack in `Manifest.reclaiming` before deleting any
+    /// of its objects. An import that would adopt a listed checksum must refuse
+    /// before its CAS — disabling the gate lets it publish a manifest pointing
+    /// at bytes GC is removing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_refuses_a_checksum_bucket_gc_is_reclaiming() {
+        let src = source();
+        let cfg = cfg();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let repo = "t/gc-refuse";
+        let id = walgit_git::RepoId::new("t", "gc-refuse").unwrap();
+        let repo_store = Prefixed::new(store.clone(), id.store_prefix());
+        let pack_dir = crate::import::resolve_git_dir(src.path())
+            .unwrap()
+            .join("objects")
+            .join("pack");
+        let victim = scan_packs(&pack_dir)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.history_of.is_none())
+            .expect("source has an object pack")
+            .checksum;
+        // GC listed the source's own pack: re-importing it would re-adopt bytes
+        // GC is deleting, so the import must refuse.
+        seed_manifest_with_claim(
+            &repo_store,
+            "sha1",
+            vec![walgit_proto::v1::ReclaimingPack {
+                checksum: victim.clone(),
+                since: Some(time::now()),
+            }],
+        )
+        .await;
+        let err = run_with_store(opts(src.path(), repo), &cfg, store.clone(), false)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("reclaim"), "refused: {err}");
+        // The claim survived: refusing did not erase it.
+        let m2 = Manifest::decode(
+            repo_store
+                .get_bytes(keys::MANIFEST)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(
+            m2.reclaiming.iter().any(|r| r.checksum == victim),
+            "the claim must survive the refused import: {m2:?}"
+        );
+    }
+
+    /// #175: an import rewrites the whole manifest, so it must carry forward any
+    /// `reclaiming` claim it did not touch — dropping the list would let a pack
+    /// GC is still deleting be adopted by the very next publisher.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_preserves_a_reclaiming_claim_it_does_not_touch() {
+        let src = source();
+        let cfg = cfg();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let repo = "t/gc-keep";
+        let id = walgit_git::RepoId::new("t", "gc-keep").unwrap();
+        let repo_store = Prefixed::new(store.clone(), id.store_prefix());
+        // A checksum that is not part of the incoming pack set (a pack another
+        // writer superseded): the import does not touch it, so it must survive.
+        let ghost = "e".repeat(40);
+        seed_manifest_with_claim(
+            &repo_store,
+            "sha1",
+            vec![walgit_proto::v1::ReclaimingPack {
+                checksum: ghost.clone(),
+                since: Some(time::now()),
+            }],
+        )
+        .await;
+        run_with_store(opts(src.path(), repo), &cfg, store.clone(), false)
+            .await
+            .unwrap();
+        let m2 = Manifest::decode(
+            repo_store
+                .get_bytes(keys::MANIFEST)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(
+            m2.reclaiming.iter().any(|r| r.checksum == ghost),
+            "the import erased a claim it did not own: {m2:?}"
+        );
+    }
 }
