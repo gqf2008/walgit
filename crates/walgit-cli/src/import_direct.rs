@@ -899,6 +899,28 @@ pub async fn run_with_store(
         revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,
         settings: None,
     };
+    // #175: packs this import drops from the live set still need a
+    // `wal/_superseded/<checksum>` marker, or bucket GC can never reclaim them —
+    // the marker is its only candidate source. Written *before* the CAS (with the
+    // same retrying helper the compaction path uses) so a lost refresh cannot
+    // let GC treat an old timestamp as the current one; a marker left on a pack
+    // that stays live is harmless because GC skips live packs.
+    let new_live: std::collections::HashSet<&str> =
+        manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
+    let dropped: Vec<String> = base_manifest
+        .as_ref()
+        .map(|m| {
+            m.packs
+                .iter()
+                .filter(|p| !new_live.contains(p.checksum.as_str()))
+                .map(|p| p.checksum.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    walgit_wal::write_superseded_markers(&repo_store, &dropped, seq, time::now())
+        .await
+        .context("writing superseded markers for replaced packs")?;
+
     let mode = match base_version {
         Some(v) => PutMode::Update(v),
         None => PutMode::Create,
@@ -1826,5 +1848,61 @@ mod resume_tests {
             m2.reclaiming.iter().any(|r| r.checksum == ghost),
             "the import erased a claim it did not own: {m2:?}"
         );
+    }
+
+    /// #175: `import --replace` drops the previous pack set from the live
+    /// manifest, so it must leave a `wal/_superseded/<checksum>` marker for every
+    /// pack it replaces — the marker is bucket GC's only candidate source, so a
+    /// replace without markers silently manufactures unreclaimable orphans.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_import_marks_the_packs_it_drops() {
+        let src = source();
+        let cfg = cfg();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let repo = "t/replace";
+        let id = walgit_git::RepoId::new("t", "replace").unwrap();
+        let repo_store = Prefixed::new(store.clone(), id.store_prefix());
+        run_with_store(opts(src.path(), repo), &cfg, store.clone(), false)
+            .await
+            .unwrap();
+        let (_, bytes) = repo_store.get_bytes(keys::MANIFEST).await.unwrap().unwrap();
+        let old = Manifest::decode(bytes.as_ref()).unwrap();
+        let old_packs: Vec<String> = old.packs.iter().map(|p| p.checksum.clone()).collect();
+        assert!(!old_packs.is_empty(), "the first import published packs");
+
+        // A different source: its pack set differs, so the replace drops the old
+        // one (the object pack *and* its derived history pack).
+        let src2 = source();
+        std::fs::write(src2.path().join("extra"), "different bytes\n").unwrap();
+        sh(src2.path(), &["add", "."]);
+        sh(src2.path(), &["commit", "-q", "-m", "extra"]);
+        sh(src2.path(), &["repack", "-adb", "-q"]);
+        sh(src2.path(), &["prune-packed"]);
+        let mut o2 = opts(src2.path(), repo);
+        o2.replace = true;
+        run_with_store(o2, &cfg, store.clone(), false).await.unwrap();
+
+        let (_, bytes) = repo_store.get_bytes(keys::MANIFEST).await.unwrap().unwrap();
+        let new = Manifest::decode(bytes.as_ref()).unwrap();
+        let new_live: std::collections::HashSet<&str> =
+            new.packs.iter().map(|p| p.checksum.as_str()).collect();
+        let dropped: Vec<&String> = old_packs
+            .iter()
+            .filter(|c| !new_live.contains(c.as_str()))
+            .collect();
+        assert!(
+            !dropped.is_empty(),
+            "the replace must have dropped a pack: old={old_packs:?} new={new:?}"
+        );
+        for checksum in dropped {
+            assert!(
+                repo_store
+                    .get_bytes(&keys::superseded_key(checksum))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "pack {checksum} was dropped without a superseded marker"
+            );
+        }
     }
 }
