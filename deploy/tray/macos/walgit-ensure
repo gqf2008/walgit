@@ -43,7 +43,7 @@ case "${1:-ensure}" in
     exit 0
     ;;
   stop)
-    screen -S walgit-server -X quit 2>/dev/null || true
+    screen -S "${WALGIT_SCREEN_SESSION:-walgit-server}" -X quit 2>/dev/null || true
     pid="$(get_pid || true)"
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
     # 等待完全退出（最多 10s）
@@ -68,7 +68,7 @@ case "${1:-ensure}" in
       exit 1
     fi
     # screen 保活启动（exec 会话会回收裸后台进程）
-    screen -dmS walgit-server bash -c "cd $BASE && ./run-walgit.sh > $BASE/server.log 2>&1; echo EXIT=\$? >> $BASE/server.log"
+    screen -dmS "${WALGIT_SCREEN_SESSION:-walgit-server}" bash -c "cd $BASE && ./run-walgit.sh > $BASE/server.log 2>&1; echo EXIT=\$? >> $BASE/server.log"
     # 等待就绪（最多 15s）
     for ((i = 0; i < 15; i++)); do
       if is_running; then

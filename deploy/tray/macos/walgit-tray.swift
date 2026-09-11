@@ -221,7 +221,8 @@ func bootstrapDeploy() {
         }
         if managedOK, let stagedWalgit = staged["walgit"] {
             let (vc, versionOut) = sh("'\(stagedWalgit)' --version 2>&1")
-            let token = versionOut.split(separator: " ").last.map(String.init) ?? ""
+            let token = versionOut.trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: " ").last.map(String.init) ?? ""
             if vc != 0 || token != "v\(bundledVersion)" {
                 managedOK = false
                 logLine("bootstrap: walgit 版本核验失败: \(versionOut.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -806,6 +807,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 @main
 struct WalgitTrayMain {
     static func main() {
+        // 测试钩子:只跑部署骨架 bootstrap 后退出(不启动 NSApplication)。
+        if ProcessInfo.processInfo.environment["WALGIT_BOOTSTRAP_ONLY"] == "1" {
+            bootstrapDeploy()
+            exit(0)
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

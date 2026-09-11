@@ -167,17 +167,22 @@ release_install_fixture() {
 
 
 # [server].listen 非 8081 时:真实 walgit-ensure 的 stop/start 必须用配置
-# 端口(不能只测 release-install 的预探活——那是假绿,停服后起不来)。
+# 端口。用动态空闲端口 + 唯一 screen 会话名,避免误伤开发机上的真实服务。
 listen_fixture() {
     local base="$TMP/listen"
     local deploy="$base/deploy"
-    local port=9099
+    local port
+    port="$(python3 - <<'PYPORT'
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()
+PYPORT
+)"
     local calls="$base/ensure.calls"
     local rol_ensure="$PWD/walgit-ensure"
     rm -rf "$base"
     mkdir -p "$deploy"
     printf 'listen = "127.0.0.1:%s"\n' "$port" >"$deploy/walgit.toml"
-    printf '#!/bin/sh\n: >"%s/running.flag"\nexec python3 "%s/server.py" %s\n' "$base" "$base" "$port" >"$deploy/run-walgit.sh"
+    printf '#!/bin/sh\nexec python3 "%s/server.py" %s\n' "$base" "$port" >"$deploy/run-walgit.sh"
     chmod +x "$deploy/run-walgit.sh"
     printf '#!/bin/sh\nexit 0\n' >"$deploy/walgit"
     chmod +x "$deploy/walgit"
@@ -192,14 +197,13 @@ ENSURE
     mkdir -p "$base/bin"
     cat >"$base/bin/screen" <<'SCREEN'
 #!/bin/sh
-# 极简 screen 替身:把 `-dmS name bash -c "cmd"` 的 cmd 直接后台执行。
 while [ $# -gt 0 ]; do
     case "$1" in
         -*) shift ;;
         *) break ;;
     esac
 done
-shift 2>/dev/null || true   # 会话名
+shift 2>/dev/null || true
 [ "${1:-}" = "bash" ] && shift
 [ "${1:-}" = "-c" ] && shift
 [ $# -ge 1 ] || exit 0
@@ -228,33 +232,83 @@ while True:
     finally:
         c.close()
 PYSRV
-    # 模拟服务在 9099 上运行(walgit-ensure stop 会按配置端口把它停掉)。
     python3 "$base/server.py" "$port" >/dev/null 2>&1 &
     local srv_pid=$!
     sleep 1
 
-    WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" stop >/dev/null 2>&1 || true
-    grep -qx stop "$calls" || { kill "$srv_pid" 2>/dev/null || true; echo "FAIL(listen): stop did not target configured port" >&2; return 1; }
+    WALGIT_SCREEN_SESSION="walgit-test-$$" WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" stop >/dev/null 2>&1 || true
+    grep -qx stop "$calls" || { ( kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true; echo "FAIL(listen): stop not called" >&2; return 1; }
     if kill -0 "$srv_pid" 2>/dev/null; then
-        ( kill -INT "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true
-        echo "FAIL(listen): stop left the 9099 listener running" >&2
+        ( kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true
+        echo "FAIL(listen): stop did not stop the listener on $port" >&2
         return 1
     fi
 
-    # start 应把 run-walgit.sh 拉起并在 9099 上探活成功。
-    PATH="$base/bin:$PATH" WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" start >/dev/null 2>&1 || true
+    # start 必须在同一端口真正探活成功(rc=0),而不只是“被调用过”。
+    local start_rc=0
+    PATH="$base/bin:$PATH" WALGIT_SCREEN_SESSION="walgit-test-$$" WALGIT_DEPLOY_DIR="$deploy" \
+        "$deploy/walgit-ensure" start >/dev/null 2>&1 || start_rc=$?
     local started=0
     grep -qx start "$calls" && started=1
-    # 清理 start 拉起的 mock daemon,避免污染后续 fixture / 端口残留。
     local leftover
     leftover="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-    [ -n "$leftover" ] && kill $leftover 2>/dev/null || true
+    if [ -n "$leftover" ]; then
+        ( kill $leftover 2>/dev/null; wait 2>/dev/null ) || true
+    fi
+    [ "$start_rc" = 0 ] || { echo "FAIL(listen): start rc=$start_rc (did not listen on $port)" >&2; return 1; }
     [ "$started" = 1 ] || { echo "FAIL(listen): start not invoked" >&2; return 1; }
+    return 0
+}
+
+bootstrap_fixture() {
+    local base="$TMP/bootstrap"
+    local app="$base/walgit-tray.app"
+    local res="$app/Contents/Resources"
+    local deploy="$base/deploy"
+    rm -rf "$base"
+    mkdir -p "$app/Contents/MacOS" "$res" "$deploy"
+    swiftc -swift-version 5 -framework AppKit walgit-tray.swift ReleaseLogic.swift \
+        -o "$app/Contents/MacOS/walgit-tray" || { echo "FAIL(bootstrap): compile tray" >&2; return 1; }
+    cat >"$res/walgit" <<'STUB'
+#!/bin/sh
+[ "${1:-}" = "--version" ] && echo "walgit v0.5.0"
+STUB
+    printf '#!/bin/sh\nexit 0\n' >"$res/run-walgit.sh"
+    printf '#!/bin/sh\nexit 0\n' >"$res/walgit-ensure"
+    chmod +x "$res/walgit" "$res/run-walgit.sh" "$res/walgit-ensure"
+    printf '0.5.0\n' >"$res/skeleton.version"
+    printf '[server]\nlisten = "127.0.0.1:8081"\n' >"$res/walgit.toml"
+
+    # 旧部署骨架
+    printf '#!/bin/sh\necho "walgit v0.4.0"\n' >"$deploy/walgit"
+    printf 'old\n' >"$deploy/run-walgit.sh"
+    printf 'old\n' >"$deploy/walgit-ensure"
+    chmod +x "$deploy/walgit" "$deploy/run-walgit.sh" "$deploy/walgit-ensure"
+    printf '0.4.0\n' >"$deploy/.skeleton-version"
+
+    WALGIT_BOOTSTRAP_ONLY=1 WALGIT_DEPLOY_DIR="$deploy" WALGIT_CLI_LINK="$base/bin/walgit" \
+        "$app/Contents/MacOS/walgit-tray" >/dev/null 2>&1 \
+        || { echo "FAIL(bootstrap): tray exited nonzero" >&2; return 1; }
+    grep -qx "0.5.0" "$deploy/.skeleton-version" \
+        || { echo "FAIL(bootstrap): marker not upgraded" >&2; return 1; }
+    "$deploy/walgit" --version | grep -qx "walgit v0.5.0" \
+        || { echo "FAIL(bootstrap): walgit binary not upgraded" >&2; return 1; }
+    grep -qx "#!/bin/sh" "$deploy/walgit-ensure" \
+        || { echo "FAIL(bootstrap): walgit-ensure not upgraded" >&2; return 1; }
+
+    # 自愈：删掉一个托管文件，marker 仍是同一版本，下一次 bootstrap 应补回。
+    rm "$deploy/walgit-ensure"
+    WALGIT_BOOTSTRAP_ONLY=1 WALGIT_DEPLOY_DIR="$deploy" WALGIT_CLI_LINK="$base/bin/walgit" \
+        "$app/Contents/MacOS/walgit-tray" >/dev/null 2>&1 \
+        || { echo "FAIL(bootstrap): self-heal exited nonzero" >&2; return 1; }
+    [ -f "$deploy/walgit-ensure" ] \
+        || { echo "FAIL(bootstrap): missing walgit-ensure not self-healed" >&2; return 1; }
     return 0
 }
 
 release_install_fixture success 0.4.0 0.5.0 success
 release_install_fixture rollback 0.4.0 0.6.0 rollback
+bootstrap_fixture
 listen_fixture
 
 bash -n release-install.sh
