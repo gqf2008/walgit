@@ -250,6 +250,36 @@ async fn gc_superseded_packs(
     };
     let now = std::time::SystemTime::now();
 
+    // Crash recovery: a pass that retired a marker but died before releasing its
+    // claim leaves the checksum listed in `Manifest.reclaiming` forever — with
+    // no marker it can never become a candidate again, and a publisher that
+    // regenerates those bytes would be refused permanently. We hold the lease,
+    // so any such claim is ours to finish: a claim whose marker is already gone
+    // and whose pack is not live is a completed reclaim that never released.
+    let mut orphan_claims: Vec<String> = Vec::new();
+    for claim in handle.manifest().reclaiming.clone() {
+        if live.contains(&claim.checksum) {
+            continue;
+        }
+        if let Ok(None) = handle
+            .store()
+            .get_bytes(&keys::superseded_key(&claim.checksum))
+            .await
+        {
+            orphan_claims.push(claim.checksum);
+        }
+    }
+    if !orphan_claims.is_empty() {
+        handle
+            .update_reclaiming(&[], &orphan_claims)
+            .await
+            .map_err(|e| e.to_string())?;
+        log(format!(
+            "gc: released {} claim(s) whose marker was already retired",
+            orphan_claims.len()
+        ));
+    }
+
     // Collect markers that have aged past the retention window *and* whose pack
     // is not live in that same generation. Reading each marker is one GET; the
     // listing is bounded by the number of packs a repo ever superseded within

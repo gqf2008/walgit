@@ -2723,3 +2723,59 @@ async fn gc_honours_the_repo_retention_override() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #175: a GC pass that retired a marker but died before releasing its claim
+/// leaves the checksum listed in `Manifest.reclaiming` forever — with no marker
+/// it can never become a candidate again, and a publisher regenerating those
+/// bytes is refused permanently. The next pass (it holds the lease) releases
+/// such claims: marker gone + pack not live = a completed reclaim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_releases_a_claim_whose_marker_was_already_retired() -> anyhow::Result<()> {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // The crash left: claimed, marker already retired, objects already gone.
+    let orphan = "b".repeat(40);
+    step!(
+        "claim",
+        h.update_reclaiming(std::slice::from_ref(&orphan), &[])
+    )?;
+    assert!(
+        h.manifest().reclaiming.iter().any(|r| r.checksum == orphan),
+        "the checksum must be claimed before the pass"
+    );
+
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+    assert!(
+        !h.manifest().reclaiming.iter().any(|r| r.checksum == orphan),
+        "a claim whose marker is already gone must be released: {:?}",
+        h.manifest().reclaiming
+    );
+    Ok(())
+}
