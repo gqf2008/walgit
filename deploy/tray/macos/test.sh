@@ -369,7 +369,8 @@ menu_fixture() {
 #  (b) 升级前停着 → 不得拉起(托盘里"停止服务"是明确意图)。
 update_service_fixture() {
     local mode="$1"           # running | stopped
-    local base="$TMP/update-$mode"
+    local force_rollback="${2:-0}"
+    local base="$TMP/update-$mode-$force_rollback"
     local deploy="$base/deploy"
     local dest="$base/Applications/walgit-tray.app"
     local mount="$base/mount"
@@ -385,7 +386,12 @@ PYPORT
     : >"$base/x.dmg"
     printf 'listen = "127.0.0.1:%s"\n' "$port" >"$deploy/walgit.toml"
     pkginfo "$dest" "0.5.0"
-    pkginfo "$mount/walgit-tray.app" "0.5.1"
+    # force_rollback:挂载点里的 app 版本与请求升级的版本不符 → 必然回滚
+    if [ "$force_rollback" = 1 ]; then
+        pkginfo "$mount/walgit-tray.app" "0.9.9"
+    else
+        pkginfo "$mount/walgit-tray.app" "0.5.1"
+    fi
     printf '0.5.1\n' >"$deploy/.skeleton-version"
     stub_walgit "$deploy" "0.5.1"
     stub_managed "$deploy" "0.5.1"
@@ -444,6 +450,13 @@ ENSURE
     [ -n "$leftover" ] && ( kill $leftover 2>/dev/null ) || true
 
     if [ "$mode" = running ]; then
+        if [ "$force_rollback" = 1 ]; then
+            # 在跑 + 强制回滚:必须先 stop(再恢复旧版),不得把服务落在停止状态。
+            [ "$rc" != 0 ] || { echo "FAIL(rollback-running): expected failure" >&2; return 1; }
+            grep -qx stop "$calls" || { echo "FAIL(rollback-running): not stopped" >&2; return 1; }
+            grep -qx '' "$calls" || { echo "FAIL(rollback-running): running service not restored" >&2; return 1; }
+            return 0
+        fi
         [ "$rc" = 0 ] || { echo "FAIL(update-running): rc=$rc" >&2; cat "$deploy/tray.log" >&2; return 1; }
         grep -qx stop "$calls" || { echo "FAIL(update-running): not stopped" >&2; return 1; }
         # 重启调用是无参 ensure;日志里是空行
@@ -454,137 +467,21 @@ ENSURE
         esac
     else
         # 先查"有没有被拉起"再查 rc:无条件重启会连带 rollback,rc 非 0 会
-        # 掩盖真正的违规(用户停着的服务被偷偷启动)。
+        # 掩盖真正的违规(用户停着的服务被偷偷启动)。force_rollback=1 时
+        # 升级必然失败,同样不得借"恢复旧版本"之名把服务拉起来。
         if grep -qx '' "$calls"; then
             echo "FAIL(update-stopped): started a service the user had stopped" >&2
             return 1
         fi
-        [ "$rc" = 0 ] || { echo "FAIL(update-stopped): rc=$rc" >&2; return 1; }
+        if [ "$force_rollback" = 1 ]; then
+            [ "$rc" != 0 ] || { echo "FAIL(update-stopped-rollback): expected failure" >&2; return 1; }
+        else
+            [ "$rc" = 0 ] || { echo "FAIL(update-stopped): rc=$rc" >&2; return 1; }
+        fi
     fi
     return 0
 }
 
-# #170 菜单版本语义:upgrade 行显示托盘版本,服务版本单独标注。
-# 修复前它把服务版本当 "版本/当前" 打印,于是「已是最新」旁边会印旧的服务版本。
-menu_fixture() {
-    local app="$TMP/menu/walgit-tray.app"
-    local tray_bin="$app/Contents/MacOS/walgit-tray"
-    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-    swiftc -swift-version 5 -framework AppKit walgit-tray.swift ReleaseLogic.swift \
-        -o "$tray_bin" || { echo "FAIL(menu): compile tray" >&2; return 1; }
-    local out
-    out="$(WALGIT_MENU_TEST=0.5.1 WALGIT_MENU_SERVICE=v0.5.0 WALGIT_MENU_STATE=latest "$tray_bin")"
-    case "$out" in
-        *"版本 0.5.1"*"已是最新"*) ;;
-        *) echo "FAIL(menu): upgrade line wrong: $out" >&2; return 1 ;;
-    esac
-    case "$out" in
-        *"版本 0.5.0"*) echo "FAIL(menu): still prints service version as current: $out" >&2; return 1 ;;
-    esac
-    case "$out" in
-        *"服务 0.5.0"*) ;;
-        *) echo "FAIL(menu): service version not shown separately: $out" >&2; return 1 ;;
-    esac
-    out="$(WALGIT_MENU_TEST=0.5.0 WALGIT_MENU_SERVICE=v0.5.0 WALGIT_MENU_STATE=available WALGIT_MENU_RELEASE=0.5.1 "$tray_bin")"
-    case "$out" in
-        *"下载并升级到 v0.5.1"*"当前 0.5.0"*) ;;
-        *) echo "FAIL(menu): available line wrong: $out" >&2; return 1 ;;
-    esac
-    return 0
-}
-
-# #170 升级后服务必须真的换成新版本:helper 换装前 stop 过,结尾要无条件
-# 重启并确认 /healthz 报 v<new>,否则回滚(修复前只会「确认没有重启」)。
-update_restart_fixture() {
-    local base="$TMP/update"
-    local deploy="$base/deploy"
-    local dest="$base/Applications/walgit-tray.app"
-    local mount="$base/mount"
-    local calls="$base/ensure.calls"
-    local port
-    port="$(python3 - <<'PYPORT'
-import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()
-PYPORT
-)"
-    rm -rf "$base"
-    mkdir -p "$deploy" "$mount/walgit-tray.app/Contents/Resources" "$dest/Contents/Resources" "$base/bin"
-    : >"$base/x.dmg"
-    printf 'listen = "127.0.0.1:%s"\n' "$port" >"$deploy/walgit.toml"
-    pkginfo "$dest" "0.5.0"
-    pkginfo "$mount/walgit-tray.app" "0.5.1"
-    printf '0.5.1\n' >"$deploy/.skeleton-version"
-    stub_walgit "$deploy" "0.5.1"
-    stub_managed "$deploy" "0.5.1"
-    printf '#!/bin/sh\nexit 0\n' >"$deploy/run-walgit.sh"; chmod +x "$deploy/run-walgit.sh"
-
-    # 假的当前服务:9099 风格的真实监听,由 stop 杀掉 —— 模拟「升级前在跑」
-    cat >"$base/server.py" <<'PYS'
-import socket, sys
-port = int(sys.argv[1])
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", port)); srv.listen(5)
-while True:
-    try: c, _ = srv.accept()
-    except OSError: break
-    try:
-        c.recv(4096)
-        body = '{"status":"ok","version":"v0.5.1"}'
-        c.sendall(("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode() + body.encode())
-    except OSError: pass
-    finally: c.close()
-PYS
-    python3 "$base/server.py" "$port" >/dev/null 2>&1 &
-    local srv_pid=$!
-    sleep 0.6
-    printf '#!/bin/sh\nexec python3 "%s/server.py" %s\n' "$base" "$port" >"$deploy/run-walgit.sh"
-    chmod +x "$deploy/run-walgit.sh"
-    mkdir -p "$base/bin"
-    cat >"$base/bin/screen" <<'SCREEN'
-#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
-shift 2>/dev/null || true
-[ "${1:-}" = "bash" ] && shift
-[ "${1:-}" = "-c" ] && shift
-[ $# -ge 1 ] || exit 0
-nohup /bin/sh -c "$1" >/dev/null 2>&1 &
-echo "$!"
-SCREEN
-    chmod +x "$base/bin/screen"
-    cat >"$deploy/walgit-ensure" <<ENSURE
-#!/bin/sh
-echo "\$1" >>"$calls"
-exec "$PWD/walgit-ensure" "\$@"
-ENSURE
-    chmod +x "$deploy/walgit-ensure"
-    : >"$calls"
-
-    local rc=0
-    PATH="$base/bin:$PATH" WALGIT_SCREEN_SESSION="walgit-test-$$" WALGIT_DEPLOY_DIR="$deploy" \
-    WALGIT_UPDATE_SKIP_OPEN=1 WALGIT_UPDATE_BOOTSTRAP_WAIT=4 WALGIT_UPDATE_TRAY_WAIT=2 \
-    WALGIT_UPDATE_HEALTH_WAIT=20 \
-        ./release-install.sh "$base/x.dmg" "$mount" "$dest" 0.5.1 999999 >/dev/null 2>&1 || rc=$?
-
-    local got=""
-    local body
-    body="$(curl -sf --max-time 2 "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
-    got="$(printf '%s' "$body" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-    local leftover
-    leftover="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-    [ -n "$leftover" ] && ( kill $leftover 2>/dev/null ) || true
-    ( kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true
-
-    [ "$rc" = 0 ] || { echo "FAIL(update): helper rc=$rc" >&2; cat "$deploy/tray.log" >&2; return 1; }
-    grep -qx stop "$calls" || { echo "FAIL(update): service not stopped" >&2; return 1; }
-    # 重启调用是无参的 walgit-ensure(默认 ensure),日志里就是一条空行。
-    grep -qx '' "$calls" || { echo "FAIL(update): service not restarted" >&2; return 1; }
-    [ "$got" = "v0.5.1" ] || { echo "FAIL(update): healthz still $got" >&2; return 1; }
-    return 0
-}
-
-# #170 手动装 DMG 路径:bootstrapDeploy 换完托管文件后,若服务本来在跑,
-# 必须把它重启到新版本;服务本来停着则不要拉起(尊重用户的停止意图)。
 bootstrap_restart_fixture() {
     local base="$TMP/bootrestart"
     local app="$base/walgit-tray.app"
@@ -664,6 +561,9 @@ menu_fixture
 bootstrap_fixture
 update_service_fixture running
 update_service_fixture stopped
+# 回滚:在跑的必须恢复;停着的不许被拉起
+update_service_fixture running 1
+update_service_fixture stopped 1
 listen_fixture
 
 bash -n release-install.sh

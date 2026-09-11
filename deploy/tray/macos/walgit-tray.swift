@@ -201,11 +201,37 @@ func repoPathValue() -> String {
     UserDefaults.standard.string(forKey: "repoPath") ?? "/Volumes/Workspace/GitHub/walgit"
 }
 
+/// 手动装 DMG 只换文件,不会重启已在跑的服务进程 —— 进程仍拿着旧二进制,
+/// /healthz 继续报旧版本,菜单看起来"升完级还是旧版"(#170)。只处理「本来
+/// 就在跑」的服务(用户主动停掉的不拉起)。放到后台队列执行,避免拖住主线程。
+private func restartServiceAfterUpgrade(bundledVersion: String, done: @escaping () -> Void = {}) {
+    let fm = FileManager.default
+    let ok = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null").0 == 0
+    guard ok else { done(); return }
+    let ensure = "\(deployDir)/walgit-ensure"
+    guard fm.isExecutableFile(atPath: ensure) else { done(); return }
+    _ = sh("WALGIT_DEPLOY_DIR='\(deployDir)' '\(ensure)' >/dev/null 2>&1 || true")
+    let want = "v\(bundledVersion)"
+    for _ in 0..<20 {
+        let (hc, hout) = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null || true")
+        let token = hout.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ").last.map(String.init) ?? hout
+        if hc == 0, token.contains(want) {
+            logLine("bootstrap: 服务已重启到 \(want)")
+            done()
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    logLine("bootstrap: 服务重启后未确认到 \(want),请在托盘里重启服务")
+    done()
+}
+
 /// 首次启动 bootstrap:从 app bundle Resources 落盘 ~/walgit 部署骨架。
 /// 托管文件(walgit 二进制、run-walgit.sh、walgit-ensure)按 bundle 内
 /// skeleton.version 覆盖更新——DMG 覆盖安装即升级;用户文件(walgit.toml)
 /// 永不覆盖(配置与凭证安全)。开发构建(bundle 里没有 walgit 资源)跳过。
-func bootstrapDeploy() {
+func bootstrapDeploy(onServiceRestart: @escaping () -> Void = {}) {
     let fm = FileManager.default
     guard let res = Bundle.main.resourceURL?.path,
         fm.fileExists(atPath: "\(res)/walgit")
@@ -323,25 +349,12 @@ func bootstrapDeploy() {
             logLine("bootstrap: 写版本标记失败: \(error)")
         }
     }
-    // 手动装 DMG 这条路径只换文件,不会重启已在跑的服务进程 —— 进程仍拿着
-    // 旧二进制, /healthz 继续报旧版本,菜单看起来"升完级还是旧版"(#170)。
-    // 只处理「本来就在跑」的服务:用户主动停掉的不拉起。
     if versionChanged && managedOK {
-        let wasRunning = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null").0 == 0
-        if wasRunning {
-            let ensure = "\(deployDir)/walgit-ensure"
-            if fm.isExecutableFile(atPath: ensure) {
-                _ = sh("WALGIT_DEPLOY_DIR='\(deployDir)' '\(ensure)' >/dev/null 2>&1 || true")
-                var healthy = false
-                for _ in 0..<20 {
-                    let (hc, hout) = sh("curl -sf --max-time 2 '\(healthURL)' 2>/dev/null || true")
-                    if hc == 0, hout.contains("v\(bundledVersion)") { healthy = true; break }
-                    Thread.sleep(forTimeInterval: 0.5)
-                }
-                logLine(healthy ? "bootstrap: 服务已重启到 v\(bundledVersion)"
-                                : "bootstrap: 服务重启后未确认到 v\(bundledVersion),请在托盘里重启服务")
-            }
+        DispatchQueue.global(qos: .utility).async {
+            restartServiceAfterUpgrade(bundledVersion: bundledVersion, done: onServiceRestart)
         }
+    } else {
+        onServiceRestart()
     }
     // CLI 软链:让终端里的 `walgit` 直达部署二进制(/usr/local/bin 归用户所有,
     // 无需管理员)。测试用 WALGIT_CLI_LINK 覆盖——必须与 WALGIT_DEPLOY_DIR
@@ -855,7 +868,9 @@ struct WalgitTrayMain {
     static func main() {
         // 测试钩子:只跑部署骨架 bootstrap 后退出(不启动 NSApplication)。
         if ProcessInfo.processInfo.environment["WALGIT_BOOTSTRAP_ONLY"] == "1" {
-            bootstrapDeploy()
+            let done = DispatchSemaphore(value: 0)
+            bootstrapDeploy(onServiceRestart: { done.signal() })
+            _ = done.wait(timeout: .now() + 20)
             exit(0)
         }
         // 测试钩子:只打印菜单 upgrade 行(验证版本语义,不启动 NSApplication)。
