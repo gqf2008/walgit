@@ -2133,7 +2133,13 @@ async fn gc_reclaims_expired_superseded_packs_and_keeps_live_and_young_ones() ->
     let young = "e".repeat(40);
     let young_ts = walgit_proto::time::now();
 
-    for (checksum, at, seq) in [(&dead, old_ts, 7u64), (&young, young_ts, 9u64)] {
+    // A marker on a *live* pack: "superseded then re-adopted" (or a marker
+    // written by a CAS that never landed). GC must leave the pack alone.
+    for (checksum, at, seq) in [
+        (&dead, old_ts, 7u64),
+        (&young, young_ts, 9u64),
+        (&live, old_ts, 11u64),
+    ] {
         let marker = SupersededPack {
             checksum: checksum.clone(),
             superseded_at: Some(at),
@@ -2147,6 +2153,10 @@ async fn gc_reclaims_expired_superseded_packs_and_keeps_live_and_young_ones() ->
                 PutMode::Create,
             )
         )?;
+    }
+    // The live pack already has its objects (the push published it); only the
+    // two synthetic ones need bodies.
+    for checksum in [&dead, &young] {
         step!(
             "pack body",
             h.store()
@@ -2187,7 +2197,14 @@ async fn gc_reclaims_expired_superseded_packs_and_keeps_live_and_young_ones() ->
         );
         assert!(
             h.store().head(&keys::pack_key(&live)).await?.is_some(),
-            "a live pack must never be reclaimed"
+            "a live pack must never be reclaimed, even with an old marker"
+        );
+        assert!(
+            h.store()
+                .head(&keys::superseded_key(&live))
+                .await?
+                .is_some(),
+            "the live pack's marker is kept (dropping it is irreversible)"
         );
         Ok::<(), anyhow::Error>(())
     })?;

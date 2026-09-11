@@ -1413,9 +1413,10 @@ pub(crate) async fn publish_compact_impl(
                     superseded_at: Some(entry_time),
                     seq,
                 };
+                // Not `immutable`: GC deletes this object, so it must not carry
+                // a year-long immutable cache header.
                 let opts = PutOptions {
                     mode: PutMode::Create,
-                    immutable: true,
                     ..Default::default()
                 };
                 if let Err(e) = handle

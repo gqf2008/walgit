@@ -295,12 +295,9 @@ async fn gc_superseded_packs(
     for (checksum, at) in candidates {
         if live.contains(&checksum) {
             // Superseded then re-adopted (or a marker written by a CAS that did
-            // not land): drop the marker, keep the pack.
-            let _ = handle
-                .store()
-                .delete(&keys::superseded_key(&checksum), None)
-                .await;
-            log(format!("gc: {checksum} is live again — marker dropped"));
+            // not land). Keep both the pack and the marker: dropping a marker is
+            // irreversible, and a fresh marker costs one small object.
+            log(format!("gc: {checksum} is live again — skipped"));
             continue;
         }
         let side_files = [
@@ -310,15 +307,37 @@ async fn gc_superseded_packs(
             keys::bitmap_key(&checksum),
             keys::commit_graph_key(&checksum),
         ];
+        let mut complete = true;
         for key in &side_files {
-            if let Ok(Some(meta)) = handle.store().head(key).await {
-                freed += meta.size;
-                handle
-                    .store()
-                    .delete(key, Some(meta.version))
-                    .await
-                    .map_err(|e| format!("gc: delete {key}: {e}"))?;
+            match handle.store().head(key).await {
+                Ok(Some(meta)) => {
+                    freed += meta.size;
+                    // Conditional delete: if a concurrent publisher re-created the
+                    // object the version moved and this misses rather than
+                    // deleting bytes someone is about to reference.
+                    match handle.store().delete(key, Some(meta.version)).await {
+                        Ok(()) => {}
+                        Err(walgit_store::StoreError::NotFound { .. }) => {}
+                        Err(walgit_store::StoreError::PreconditionFailed { .. }) => {
+                            log(format!("gc: {key} changed under us — leaving it"));
+                            complete = false;
+                        }
+                        Err(e) => return Err(format!("gc: delete {key}: {e}")),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // A transient HEAD error must not silently strand the pack:
+                    // leave the marker so the next pass retries.
+                    log(format!("gc: head {key} failed ({e}) — leaving the marker"));
+                    complete = false;
+                }
             }
+        }
+        if !complete {
+            // The marker is the only record that this pack is garbage: keep it
+            // until every object is gone.
+            continue;
         }
         handle
             .store()
@@ -587,6 +606,7 @@ async fn run(
             let max = params
                 .get("max")
                 .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
                 .unwrap_or(GC_MAX_PACKS_PER_UNIT);
             let (packs, bytes) = gc_superseded_packs(state, &handle, max, log).await?;
             let report = walgit_proto::v1::GcReport {
