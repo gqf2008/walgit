@@ -341,7 +341,7 @@ menu_fixture() {
         *) echo "FAIL(menu): source line wrong: $out" >&2; return 1 ;;
     esac
     # 服务停着时不印空"服务"
-    out="$(WALGIT_MENU_TEST=0.5.1 WALGIT_MENU_SERVICE= WALGIT_MENU_STATE=latest "$tray_bin")"
+    out="$(WALGIT_MENU_TEST=0.5.1 WALGIT_MENU_SERVICE="" WALGIT_MENU_STATE=latest "$tray_bin")"
     case "$out" in
         *"服务 "*) echo "FAIL(menu): empty service label: $out" >&2; return 1 ;;
     esac
