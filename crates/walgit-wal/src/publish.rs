@@ -243,28 +243,6 @@ pub(crate) async fn put_immutable_create(
             // hiccup) must not leave a referenced object missing. Rare path,
             // one HEAD; on a miss, write it unconditionally (content-addressed:
             // whoever wins wrote the same bytes).
-            //
-            // Bucket GC (#175) deletes a superseded pack's objects and removes
-            // its `wal/<checksum>.superseded` marker **last**, and only marked
-            // packs are candidates. So when this is the `.pack` of a checksum
-            // that still carries a marker, a GC pass may be mid-delete: refuse
-            // to adopt it (the caller retries; the retry uploads fresh once the
-            // pack is gone). Once the marker is gone, no GC pass can target this
-            // checksum, so re-checking the object below is enough — a CAS that
-            // lands after that cannot point at deleted bytes.
-            if key.ends_with(".pack") {
-                let checksum = key
-                    .strip_prefix(keys::WAL_DIR)
-                    .and_then(|k| k.strip_suffix(".pack"))
-                    .unwrap_or("");
-                if store
-                    .head(&keys::superseded_key(checksum))
-                    .await?
-                    .is_some()
-                {
-                    return Err(WalError::Reclaiming(checksum.to_string()));
-                }
-            }
             if store.head(&key).await?.is_some() {
                 Ok(())
             } else {
@@ -1529,6 +1507,7 @@ pub(crate) async fn publish_compact_impl(
             // Written after the CAS (only real supersessions get a marker) and
             // create-if-absent (write-once per checksum). A crash between the CAS and
             // this write leaks one pack — the safe direction.
+            let mut marker_puts = Vec::with_capacity(supersedes_hex.len());
             for s in &supersedes_hex {
                 let marker = SupersededPack {
                     checksum: s.clone(),
@@ -1541,20 +1520,27 @@ pub(crate) async fn publish_compact_impl(
                     mode: PutMode::Create,
                     ..Default::default()
                 };
-                if let Err(e) = handle
-                    .store
-                    .put(
-                        &keys::superseded_key(s),
-                        PutBody::Bytes(bytes::Bytes::from(marker.encode_to_vec())),
-                        opts,
-                    )
-                    .await
-                {
+                marker_puts.push(async move {
                     // Already-present is the normal case (a retry that landed twice);
                     // anything else is worth a line but must not fail the publish.
-                    tracing::warn!(repo = %handle.id, checksum = %s, "superseded marker write failed: {e}");
-                }
+                    if let Err(e) = handle
+                        .store
+                        .put(
+                            &keys::superseded_key(&marker.checksum),
+                            PutBody::Bytes(bytes::Bytes::from(
+                                marker.clone().encode_to_vec(),
+                            )),
+                            opts,
+                        )
+                        .await
+                    {
+                        tracing::warn!(repo = %handle.id, checksum = %marker.checksum, "superseded marker write failed: {e}");
+                    }
+                });
             }
+            // One round trip each, but concurrent: a 500-pack supersede must not
+            // add 500 serial PUTs to the compaction critical path.
+            futures::future::join_all(marker_puts).await;
             {
                 let mut state = handle.state.lock();
                 state.manifest_version = Some(version.as_str().to_string());
@@ -1866,9 +1852,6 @@ pub(crate) async fn publish_settings_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use walgit_store::ObjectStoreExt;
-
     /// The transient names `add_pack_impl`'s cross-volume fallback stages
     /// under (`walgit_git::transient_sibling`, `pack-<checksum>.pack.tmp` /
     /// `.idx.tmp`) must stay inside the skip convention of
@@ -1876,56 +1859,6 @@ mod tests {
     /// not importable from walgit-wal, so pin the literal convention here:
     /// if either side drifts, the base rebuild's scratch copy inherits
     /// in-flight packs again and issue #144's protection silently lapses.
-    /// #175: a publisher that finds an already-present pack must not adopt it
-    /// while bucket GC still holds its `.superseded` marker. GC deletes the
-    /// marker *last*, so a present marker means a delete may be in flight; once
-    /// it is gone no GC pass can target the checksum again (candidates come
-    /// from markers), and the object re-check below makes the CAS safe.
-    #[tokio::test]
-    async fn adopting_a_checksum_with_a_superseded_marker_is_refused() {
-        use walgit_store::{ObjectStore, Prefixed, PutMode};
-
-        let store = Prefixed::new(
-            std::sync::Arc::new(walgit_store::memory::MemoryStore::new()),
-            "repos/o/r/",
-        );
-        let checksum = "a".repeat(40);
-        let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join(format!("pack-{checksum}.pack"));
-        std::fs::write(&pack, b"PACK").unwrap();
-
-        let key = keys::pack_key(&checksum);
-        store
-            .put_bytes(&key, b"PACK".to_vec(), PutMode::Create)
-            .await
-            .unwrap();
-        store
-            .put_bytes(
-                &keys::superseded_key(&checksum),
-                b"marker".to_vec(),
-                PutMode::Create,
-            )
-            .await
-            .unwrap();
-
-        let err = put_immutable_create(&store, key.clone(), pack.clone())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, WalError::Reclaiming(ref c) if *c == checksum),
-            "expected a Reclaiming refusal, got {err:?}"
-        );
-
-        // GC finished (it removes the marker last): the same publish now
-        // re-creates the objects and succeeds.
-        store.delete(&key, None).await.unwrap();
-        store
-            .delete(&keys::superseded_key(&checksum), None)
-            .await
-            .unwrap();
-        put_immutable_create(&store, key, pack).await.unwrap();
-    }
-
     #[test]
     fn fallback_tmp_names_match_the_rebuild_skip_convention() {
         for committed in ["pack-0123abcd.pack", "pack-0123abcd.idx"] {

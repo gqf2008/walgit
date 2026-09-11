@@ -34,6 +34,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | LIST | slow, paged, eventually-ish | never on a hot path (rule in AGENTS §5) |
 | CAS overwrite of one object | serialized, ~1 write/s | a CAS'd object is a throughput cap; 412 is the normal contention signal |
 | Range read of a big object | ~100 MB/s per connection | stripe for more; bulk bytes on their own pool |
+| `gc` op (#175) | 1 LIST of `wal/_superseded/` + per object 1 HEAD + 1 conditional DELETE + 2 manifest CAS | refs-level (never reads pack data); ≤ `GC_MAX_PACKS_PER_UNIT`=32 packs per unit, so a pass is bounded. Markers live in their own prefix: the LIST walks markers, not every pack/idx/side-file |
 | Compose | 1 request, no data transfer | ≤ 32 sources |
 
 ## 2. Budgets to defend (happy path, sequential depth → total requests)

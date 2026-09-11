@@ -62,11 +62,10 @@ pub const OPS: &[OpSpec] = &[
         id: "gc",
         label: "Bucket GC",
         description: "Reclaim superseded packs: delete the packs a COMPACT entry dropped once their \
-                      `wal/<checksum>.superseded` marker is older than compaction.retention_superseded \
-                      (the provenance window). At most `max` packs per call (default 32). Ref-level: \
+                      marker is older than compaction.retention_superseded (the provenance window). At most `max` packs per call (default 32). Ref-level: \
                       reads the manifest and marker objects, never pack data.",
         params: &["max"],
-        mutating: false,
+        mutating: true,
     },
     OpSpec {
         id: "repair",
@@ -244,12 +243,12 @@ async fn gc_superseded_packs(
     let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
     let mut scanned = 0u64;
     {
-        let mut stream = handle.store().list(keys::WAL_DIR, None);
+        let mut stream = handle.store().list(keys::SUPERSEDED_DIR, None);
         while let Some(m) = stream.next().await {
             let m = m.map_err(|e| e.to_string())?;
-            let Some(_) = m.key.strip_suffix(".superseded") else {
+            if !m.key.starts_with(keys::SUPERSEDED_DIR) {
                 continue;
-            };
+            }
             scanned += 1;
             let Some((_, raw)) = handle
                 .store()
@@ -327,8 +326,8 @@ async fn gc_superseded_packs(
                     // object the version moved and this misses rather than
                     // deleting bytes someone is about to reference.
                     match handle.store().delete(key, Some(meta.version)).await {
-                        Ok(()) => {}
-                        Err(walgit_store::StoreError::NotFound { .. }) => {}
+                        Ok(())
+                        | Err(walgit_store::StoreError::NotFound { .. }) => {}
                         Err(walgit_store::StoreError::PreconditionFailed { .. }) => {
                             log(format!("gc: {key} changed under us — leaving it"));
                             complete = false;

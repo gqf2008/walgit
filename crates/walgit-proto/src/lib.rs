@@ -72,8 +72,13 @@ pub mod keys {
     }
     /// Marks a pack that a COMPACT entry dropped from the live set, so
     /// bucket-side GC knows *when* it became garbage (`SupersededPack`).
+    ///
+    /// A directory of its own (not `wal/<checksum>.superseded` next to the pack
+    /// objects) so GC's listing walks only the markers — never every pack,
+    /// index and side-file in the repository.
+    pub const SUPERSEDED_DIR: &str = "wal/_superseded/";
     pub fn superseded_key(checksum_hex: &str) -> String {
-        format!("{WAL_DIR}{checksum_hex}.superseded")
+        format!("{SUPERSEDED_DIR}{checksum_hex}")
     }
     pub fn checkpoint_dir(seq: u64) -> String {
         format!("{CHECKPOINTS_DIR}{seq:016x}/")

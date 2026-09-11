@@ -1130,10 +1130,10 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
         let live: std::collections::HashSet<&str> =
             manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
         let mut markers = 0usize;
-        let mut stream = h.store().list(walgit_proto::keys::WAL_DIR, None);
+        let mut stream = h.store().list(walgit_proto::keys::SUPERSEDED_DIR, None);
         while let Some(m) = stream.next().await {
             let m = m?;
-            let Some(checksum) = m.key.strip_suffix(".superseded") else {
+            let Some(checksum) = m.key.strip_prefix(walgit_proto::keys::SUPERSEDED_DIR) else {
                 continue;
             };
             markers += 1;
@@ -2074,6 +2074,72 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
     let _ = step!("pass 2", walgit_server::maintain::run_pass(&server.state))?;
     let again = walgit_bundle::ops::read_list(&store).await?.unwrap();
     assert_eq!(again.bundles.len(), 5);
+    Ok(())
+}
+
+/// #175: the manifest CAS is what orders reclamation against adoption. A pack
+/// that is live must never be listed as reclaiming (GC would then be free to
+/// delete a pack the manifest points at), and a non-live checksum lists and
+/// clears through the same CAS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaiming_list_never_contains_a_live_pack() -> anyhow::Result<()> {
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::ZERO;
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+    let live = h
+        .manifest()
+        .packs
+        .first()
+        .expect("push published a pack")
+        .checksum
+        .clone();
+
+    // A live pack must not become a GC candidate, even when asked directly.
+    step!("list live", h.update_reclaiming(&[live.clone()], &[]))?;
+    assert!(
+        h.manifest().reclaiming.is_empty(),
+        "a live checksum was listed as reclaiming: {:?}",
+        h.manifest().reclaiming
+    );
+
+    // A non-live checksum lists, then clears, through the same CAS.
+    let dead = "f".repeat(40);
+    step!("list dead", h.update_reclaiming(&[dead.clone()], &[]))?;
+    assert!(
+        h.manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == dead),
+        "a non-live checksum must list"
+    );
+    step!("clear dead", h.update_reclaiming(&[], &[dead.clone()]))?;
+    assert!(
+        h.manifest().reclaiming.is_empty(),
+        "clearing must empty the list: {:?}",
+        h.manifest().reclaiming
+    );
     Ok(())
 }
 

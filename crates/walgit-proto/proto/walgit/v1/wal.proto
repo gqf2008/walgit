@@ -190,8 +190,7 @@ message RefTransaction {
   bool atomic = 3;
 }
 
-// checkpoints/<seq>/checkpoint.pb
-// Written next to a superseded pack as `wal/<checksum>.superseded` when a
+// Written under `wal/_superseded/<checksum>` when a
 // COMPACT entry drops it from `Manifest.packs`. It records *when* the pack left
 // the live set, which the manifest alone cannot express (it keeps only the live
 // set, and the superseding log entry is eventually folded into a checkpoint).
@@ -216,6 +215,7 @@ message SupersededPack {
   uint64 seq = 3;
 }
 
+// checkpoints/<seq>/checkpoint.pb
 message Checkpoint {
   uint64 seq = 1;
   string object_format = 2;
