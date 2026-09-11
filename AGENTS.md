@@ -225,7 +225,7 @@ runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to p
 - **A fold never touches the base or a history pack** (`--keep-pack`), **a base is rebuilt only by the weekly
   unit / `compact --base`**, and **a rebuild supersedes every other live pack** by the manifest, not by what git
   happened to delete.
-- Superseded packs are retained `compaction.retention_superseded` (provenance window) then GC'd by the maintainer's `gc` unit: it lists the markers and deletes a pack + its side-files + the marker once the marker is older than the window and the pack is not live (re-checked against a fresh manifest). Only marked packs are candidates, so a pack a concurrent publisher uploaded but has not CAS'd yet is never touched. Bounded per pass (`GC_MAX_PACKS_PER_UNIT`, default 32).
+- Superseded packs are retained `compaction.retention_superseded` (provenance window) then GC'd by the maintainer's `gc` unit: it lists the markers and deletes a pack + its side-files + the marker once the marker is older than the window and the pack is not live (re-checked against a fresh manifest). Only marked packs are candidates, and a publisher refuses to adopt a checksum whose marker is still present (`WalError::Reclaiming`) — the marker is deleted last, so its absence proves the GC pass for that checksum finished. That closes the window where a publisher re-adopting a byte-identical pack could CAS it live between GC's live-check and GC's delete. Bounded per pass (`GC_MAX_PACKS_PER_UNIT`, default 32).
 
 ### 2.5b Self-healing by construction (D22)
 Everything the maintainer produces — checkpoints, bundles per slot, compactions, retention — is a **pure function

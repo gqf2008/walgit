@@ -161,6 +161,28 @@ pub(crate) async fn put_immutable_create(
             // hiccup) must not leave a referenced object missing. Rare path,
             // one HEAD; on a miss, write it unconditionally (content-addressed:
             // whoever wins wrote the same bytes).
+            //
+            // Bucket GC (#175) deletes a superseded pack's objects and removes
+            // its `wal/<checksum>.superseded` marker **last**, and only marked
+            // packs are candidates. So when this is the `.pack` of a checksum
+            // that still carries a marker, a GC pass may be mid-delete: refuse
+            // to adopt it (the caller retries; the retry uploads fresh once the
+            // pack is gone). Once the marker is gone, no GC pass can target this
+            // checksum, so re-checking the object below is enough — a CAS that
+            // lands after that cannot point at deleted bytes.
+            if key.ends_with(".pack") {
+                let checksum = key
+                    .strip_prefix(keys::WAL_DIR)
+                    .and_then(|k| k.strip_suffix(".pack"))
+                    .unwrap_or("");
+                if store
+                    .head(&keys::superseded_key(checksum))
+                    .await?
+                    .is_some()
+                {
+                    return Err(WalError::Reclaiming(checksum.to_string()));
+                }
+            }
             if store.head(&key).await?.is_some() {
                 Ok(())
             } else {
@@ -1744,6 +1766,9 @@ pub(crate) async fn publish_settings_impl(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use walgit_store::ObjectStoreExt;
+
     /// The transient names `add_pack_impl`'s cross-volume fallback stages
     /// under (`walgit_git::transient_sibling`, `pack-<checksum>.pack.tmp` /
     /// `.idx.tmp`) must stay inside the skip convention of
@@ -1751,6 +1776,56 @@ mod tests {
     /// not importable from walgit-wal, so pin the literal convention here:
     /// if either side drifts, the base rebuild's scratch copy inherits
     /// in-flight packs again and issue #144's protection silently lapses.
+    /// #175: a publisher that finds an already-present pack must not adopt it
+    /// while bucket GC still holds its `.superseded` marker. GC deletes the
+    /// marker *last*, so a present marker means a delete may be in flight; once
+    /// it is gone no GC pass can target the checksum again (candidates come
+    /// from markers), and the object re-check below makes the CAS safe.
+    #[tokio::test]
+    async fn adopting_a_checksum_with_a_superseded_marker_is_refused() {
+        use walgit_store::{ObjectStore, Prefixed, PutMode};
+
+        let store = Prefixed::new(
+            std::sync::Arc::new(walgit_store::memory::MemoryStore::new()),
+            "repos/o/r/",
+        );
+        let checksum = "a".repeat(40);
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join(format!("pack-{checksum}.pack"));
+        std::fs::write(&pack, b"PACK").unwrap();
+
+        let key = keys::pack_key(&checksum);
+        store
+            .put_bytes(&key, b"PACK".to_vec(), PutMode::Create)
+            .await
+            .unwrap();
+        store
+            .put_bytes(
+                &keys::superseded_key(&checksum),
+                b"marker".to_vec(),
+                PutMode::Create,
+            )
+            .await
+            .unwrap();
+
+        let err = put_immutable_create(&store, key.clone(), pack.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WalError::Reclaiming(ref c) if *c == checksum),
+            "expected a Reclaiming refusal, got {err:?}"
+        );
+
+        // GC finished (it removes the marker last): the same publish now
+        // re-creates the objects and succeeds.
+        store.delete(&key, None).await.unwrap();
+        store
+            .delete(&keys::superseded_key(&checksum), None)
+            .await
+            .unwrap();
+        put_immutable_create(&store, key, pack).await.unwrap();
+    }
+
     #[test]
     fn fallback_tmp_names_match_the_rebuild_skip_convention() {
         for committed in ["pack-0123abcd.pack", "pack-0123abcd.idx"] {
