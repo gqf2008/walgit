@@ -53,9 +53,10 @@ verbatim in `docs/reference/cursor-git-at-any-scale.md`.
 上游 walgit 的目标是**把服务端做小**：git 托管、bundle-uri、LFS、Web UI，仅此而已；
 代码评审 / CI / issue 按上游 `GOAL.md §4` 明确**不在范围内**（principle X “keep walgit small”）。
 
-本分叉在上游那套对象存储 Git 之上，加了**一层不侵入服务端的去中心化协作层（代号 D1）**，
-并把它做成了可分发的桌面产品。因此它与上游在定位上已经分道扬镳，**不打算向上游回并**；
-取名 `walgit-d1` 就是为了和上游区分开。
+本分叉在上游那套对象存储 Git 之上，加了**去中心化协作层（代号 D1）**——它不引入独立的
+协作状态或聚合服务，只在 walgit 现有服务上增加一层薄 API，并把整套东西做成了可分发的桌面产品。
+
+因此它与上游在定位上已经分道扬镳，**不打算向上游回并**；取名 `walgit-d1` 就是为了和上游区分开。
 
 ### 上游基线
 
@@ -63,10 +64,11 @@ verbatim in `docs/reference/cursor-git-at-any-scale.md`.
 （`git rev-list --count upstream/main..main`）。
 
 内核的**语义与不变式**不变（桶仍是唯一事实源、manifest CAS 仍是提交点、实例仍是可丢弃缓存），
-但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k，其中约 37.4k 行落在 D1
-之外——包括 Windows 原生支持（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle
-的可靠性修复（#148 重启后 refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储
-健壮性（#129/#130 socket 超时与配置写硬化）以及站点与部署面扩展。
+但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k——即便只粗扣
+`collab.rs`/`ci.rs`/`collab_cmd.rs`/`ci_cmd.rs` 四个核心文件，剩下的 D1 之外改动仍有约 37k 行，
+包括 Windows 原生支持（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle 的可靠性修复
+（#148 重启后 refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储健壮性
+（#129/#130 socket 超时与配置写硬化）以及站点与部署面扩展。
 
 准确的说法是 **D1 是最大的增量，不是唯一增量**；"内核没变"应读作"内核契约没推翻"，
 而不是"内核代码没动过"。
@@ -82,9 +84,13 @@ git clone <repo> && cd <repo>
 git fetch origin '+refs/collab/*:refs/collab/*'
 ```
 
-之后即可离线验签、重算出与别人一致的视图。服务端为 Web UI 提供的
-`/api/collab/report`、`/collab/board`、`/collab/threads/{id}` 是**无状态聚合读端点**，
-与 CLI 共用 `walgit-wal::collab` 同一份纯函数，不落库、不作为权威：
+之后即可离线验签、重算出与别人一致的视图。若公钥只注册在 host 级 registry
+（`refs/walgit/principals/*`，不在上面的 refspec 里），验签前先跑一次
+`walgit collab principal-fetch` 把它拉到本地。
+
+服务端为 Web UI 提供的 `/{owner}/{repo}/api/collab/report`、`.../collab/board`、
+`.../collab/threads/{id}` 是**无状态聚合读端点**，与 CLI 共用 `walgit-wal::collab`
+同一份纯函数，不落库、不作为权威：
 
 - **issue / PR / 评审 / 线程**：`walgit collab` 下的 `thread`、`pr`、`entry`、
   `board`、`report`、`gc`（折叠出 `refs/collab/meta/snapshot` 快照）、`watch` 等命令。
@@ -103,15 +109,15 @@ git fetch origin '+refs/collab/*:refs/collab/*'
 **首次运行的部署向导** — `walgit-server` 的 setup wizard：新部署不再要求手写完整
 `walgit.toml` 才能起服务，走 `/setup` 向导配置 store 与认证。
 
-**分发与桌面** — 上游只有二进制与 Containerfile；本分叉补齐了最终用户安装路径：
+**分发与桌面** — 上游有二进制、Containerfile 与 Nix，但没有最终用户安装器；本分叉补齐了这条路：
 
 - **跨平台托盘**：macOS（Swift）、Windows/Linux（Rust）三平台系统托盘，
   启停服务与版本检测（`deploy/tray/`）。**点击升级在 Windows/Linux 依赖本地源码仓库**，
   经安装器部署、没有源码树的机器只能重跑安装器；Release 感知的自动下载升级目前仅 macOS。
 - **macOS Release 感知升级**：托盘同时比对 GitHub Release 与源码仓库，
   下载 → 严格校验（sha256 / 版本 / 签名 / 公证）→ 原子换装 → 健康检查，失败回滚。
-- **安装包**：macOS 签名+公证 DMG、Linux `.deb`、Windows Inno Setup 安装器，
-  全部由 `release.yml` / `build-dmg.sh` 产出。
+- **安装包**：Linux `.deb` 与 Windows Inno Setup 安装器由 `release.yml` 在打 tag 时构建；
+  macOS 签名+公证 DMG 由 `deploy/tray/macos/build-dmg.sh` 在 CI 之外构建后上传 Release。
 
 **工程与治理** — 上游没有这些；本分叉按 agent 协作的方式补上：
 issue/PR 模板与批次化流程、`AGENTS.md` 协作协议、CI 分级（fast tier / e2e /
@@ -230,6 +236,11 @@ suite run on CI's windows leg. Symlink-dependent store-mount tests need an NTFS 
 Developer Mode or run elevated — exFAT drives silently cannot host links). Pass
 `--config NUL` where docs say `/dev/null`. The developer `just dev-store` rig assumes
 podman on POSIX; on Windows see `docs/WINDOWS.md` for the rustfs equivalent.
+
+macOS is a first-class **client** platform: the Swift tray and the signed/notarized DMG
+are built and released from this fork (`deploy/tray/macos/`, `build-dmg.sh`), and the
+macOS CI leg runs the tray Release/package guards. The server itself is not built or
+supported on macOS — run it on Linux.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
