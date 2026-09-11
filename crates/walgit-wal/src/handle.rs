@@ -1393,6 +1393,25 @@ impl RepoHandle {
     /// settings, cached per settings revision. Settings that no longer parse
     /// against this build fall back to the host config with a warning
     /// (never a failure on a read path).
+    /// Effective config for a *specific* manifest generation (not "whatever is
+    /// current"): D24 settings are inline, so a caller that linearizes on a
+    /// manifest must derive its config from that same manifest (#175).
+    pub fn effective_config_for(&self, manifest: &Manifest) -> Arc<walgit_config::Config> {
+        let Some(settings) = manifest.settings.as_ref() else {
+            return self.cfg.clone();
+        };
+        if settings.revision == 0 {
+            return self.cfg.clone();
+        }
+        match self.cfg.with_settings(settings.toml.as_str()) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(repo = %self.id, revision = settings.revision, error = %e, "repo settings do not apply to this build; using the host config");
+                self.cfg.clone()
+            }
+        }
+    }
+
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
         let settings = self.settings();
         let rev = settings.as_ref().map_or(0, |s| s.revision);
@@ -1452,11 +1471,14 @@ impl RepoHandle {
     /// List/clear packs bucket GC is reclaiming (#175). GC lists a pack before
     /// deleting any of its objects; a publisher must not re-adopt a listed
     /// checksum. Both sides go through the manifest CAS.
+    /// Returns the manifest the claim set was read/committed against, so the
+    /// caller can derive per-repo config (D24 settings are inline) for exactly
+    /// that generation (#175).
     pub async fn update_reclaiming(
         &self,
         add: &[String],
         remove: &[String],
-    ) -> Result<(), WalError> {
+    ) -> Result<Arc<Manifest>, WalError> {
         crate::publish::update_reclaiming(self, add, remove).await
     }
 

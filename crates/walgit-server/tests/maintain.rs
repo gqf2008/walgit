@@ -2759,12 +2759,33 @@ async fn gc_releases_a_claim_whose_marker_was_already_retired() -> anyhow::Resul
     let h = step!("open", server.state.registry.open(&id))?;
     step!("sync", h.sync())?;
 
-    // The crash left: claimed, marker already retired, objects already gone.
+    // The crash left: claimed, marker already retired, objects already gone —
+    // and old enough (past the age fence) that no live holder can own it.
     let orphan = "b".repeat(40);
-    step!(
-        "claim",
-        h.update_reclaiming(std::slice::from_ref(&orphan), &[])
-    )?;
+    {
+        use prost::Message;
+        use walgit_proto::keys;
+        use walgit_store::{ObjectStoreExt, PutMode};
+        let (meta, bytes) = step!("manifest", h.store().get_bytes(keys::MANIFEST))?
+            .expect("repo has a manifest");
+        let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref())?;
+        let mut since = walgit_proto::time::now();
+        since.seconds -= 3600;
+        m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
+            checksum: orphan.clone(),
+            since: Some(since),
+        });
+        m.revision += 1;
+        step!(
+            "claim",
+            h.store().put_bytes(
+                keys::MANIFEST,
+                m.encode_to_vec(),
+                PutMode::Update(meta.version),
+            )
+        )?;
+    }
+    step!("resync", h.sync())?;
     assert!(
         h.manifest().reclaiming.iter().any(|r| r.checksum == orphan),
         "the checksum must be claimed before the pass"
@@ -2775,6 +2796,57 @@ async fn gc_releases_a_claim_whose_marker_was_already_retired() -> anyhow::Resul
     assert!(
         !h.manifest().reclaiming.iter().any(|r| r.checksum == orphan),
         "a claim whose marker is already gone must be released: {:?}",
+        h.manifest().reclaiming
+    );
+    Ok(())
+}
+
+/// #175: the crash-recovery release is fenced by claim *age* — a claim younger
+/// than a few lease TTLs may still belong to a live pass whose lease we cannot
+/// see, so the next pass must leave it alone rather than free the checksum for
+/// re-adoption while that pass is still deleting from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_leaves_a_fresh_claim_to_its_holder() -> anyhow::Result<()> {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // A fresh claim with no marker: looks exactly like the crash-recovery
+    // candidate, but it is too young to be a crashed pass's leftover.
+    let fresh = "a".repeat(40);
+    step!(
+        "claim",
+        h.update_reclaiming(std::slice::from_ref(&fresh), &[])
+    )?;
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+    assert!(
+        h.manifest().reclaiming.iter().any(|r| r.checksum == fresh),
+        "a fresh claim must be left to its holder: {:?}",
         h.manifest().reclaiming
     );
     Ok(())

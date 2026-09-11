@@ -226,6 +226,7 @@ pub async fn read_fsck(
 async fn gc_superseded_packs(
     handle: &RepoHandle,
     max: usize,
+    lease_ttl: std::time::Duration,
     log: Log<'_>,
 ) -> Result<(u64, u64, bool), String> {
     use futures::StreamExt;
@@ -256,9 +257,21 @@ async fn gc_superseded_packs(
     // regenerates those bytes would be refused permanently. We hold the lease,
     // so any such claim is ours to finish: a claim whose marker is already gone
     // and whose pack is not live is a completed reclaim that never released.
+    // Claim age is the fence: a claim younger than a few lease TTLs may still
+    // belong to a live pass whose lease we simply cannot see, so it is left
+    // alone. Older than that and no lease holder can still be working on it.
+    let grace = (lease_ttl.saturating_mul(3)).max(std::time::Duration::from_secs(300));
     let mut orphan_claims: Vec<String> = Vec::new();
     for claim in handle.manifest().reclaiming.clone() {
         if live.contains(&claim.checksum) {
+            continue;
+        }
+        let old_enough = claim
+            .since
+            .as_ref()
+            .map(walgit_proto::time::to_system)
+            .is_none_or(|t| now.duration_since(t).unwrap_or_default() >= grace);
+        if !old_enough {
             continue;
         }
         if let Ok(None) = handle
@@ -336,25 +349,29 @@ async fn gc_superseded_packs(
     // object: that CAS is what orders reclamation against adoption. A publisher
     // that would put one of these checksums back into `packs` refuses while it
     // is listed (both sides go through the manifest CAS, so exactly one wins).
-    handle
+    let claim_manifest = handle
         .update_reclaiming(&checksums, &[])
         .await
         .map_err(|e| e.to_string())?;
     // Only the packs the CAS actually listed are ours to delete; the helper
     // skips any that turned out live in the manifest it committed against.
-    let manifest = handle.manifest();
-    let owned: std::collections::HashSet<String> = manifest
+    let owned: std::collections::HashSet<String> = claim_manifest
         .reclaiming
         .iter()
         .map(|r| r.checksum.clone())
         .collect();
-    let live: std::collections::HashSet<String> =
-        manifest.packs.iter().map(|p| p.checksum.clone()).collect();
-    drop(manifest);
+    let live: std::collections::HashSet<String> = claim_manifest
+        .packs
+        .iter()
+        .map(|p| p.checksum.clone())
+        .collect();
     // The claim CAS is the generation every deletion below linearizes in, so
     // the retention window must be the one from *that* manifest — another
-    // instance may have changed it between our first sync and the claim.
-    let retention = handle.effective_config().compaction.retention_superseded;
+    // instance may have published new settings since our first sync.
+    let retention = handle
+        .effective_config_for(&claim_manifest)
+        .compaction
+        .retention_superseded;
 
     let mut deleted = 0u64;
     let mut freed = 0u64;
@@ -742,18 +759,22 @@ async fn run(
             {
                 let _g = handle.sync_refs().await.map_err(|e| e.to_string())?;
             }
-            // Per-repo lease: two GC passes must not interleave. Each would see
-            // the other's claim as its own (the claim is not owner-tagged), and
-            // a pass that released first would let a publisher re-adopt the
-            // checksum while the slower pass still deletes from its snapshot.
-            // D7: leases are the only cross-instance mutex.
+            // Per-repo lease: two GC passes must not interleave. The claims are
+            // not owner-tagged, so exclusivity rests entirely on this lease
+            // (D7). It is *renewed* for the whole pass: a lease that quietly
+            // expired mid-delete would let a second pass run beside us, and the
+            // crash-recovery path could then release a claim we still hold.
+            let lease_ttl = handle.effective_config().compaction.lease_ttl;
+            // Guard against a mis-set (e.g. zero) TTL: a lease nobody can renew
+            // in time is worse than no GC at all.
+            let lease_ttl = lease_ttl.max(std::time::Duration::from_secs(30));
             let lease_store: walgit_store::DynStore = Arc::new(handle.store().clone());
             let lease = walgit_store::coord::try_acquire(
                 lease_store,
                 &walgit_proto::keys::lease_key("gc"),
                 walgit_store::coord::instance_id(),
                 "gc",
-                handle.effective_config().compaction.lease_ttl,
+                lease_ttl,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -763,6 +784,12 @@ async fn run(
                     serde_json::json!({"skipped": "lease-held"}),
                 ));
             };
+            let lease = Arc::new(tokio::sync::Mutex::new(lease));
+            let heartbeat = walgit_store::coord::LeaseGuard::spawn_heartbeat(
+                lease.clone(),
+                lease_ttl / 3,
+                lease_ttl,
+            );
             // Clamped: the caller may not widen a unit past the bound the
             // lease/reporting semantics were sized for.
             let max = params
@@ -771,8 +798,13 @@ async fn run(
                 .filter(|n| *n > 0)
                 .unwrap_or(GC_MAX_PACKS_PER_UNIT)
                 .min(GC_MAX_PACKS_PER_UNIT);
-            let outcome = gc_superseded_packs(&handle, max, log).await;
-            if let Err(e) = lease.release().await {
+            let outcome = gc_superseded_packs(&handle, max, lease_ttl, log).await;
+            // Stop renewing, then release explicitly through the guard.
+            heartbeat.abort();
+            let _ = heartbeat.await;
+            if let Ok(mutex) = Arc::try_unwrap(lease)
+                && let Err(e) = mutex.into_inner().release().await
+            {
                 log(format!("gc: lease release failed: {e}"));
             }
             let (packs, bytes, complete) = outcome?;

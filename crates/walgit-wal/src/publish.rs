@@ -121,7 +121,7 @@ pub(crate) async fn update_reclaiming(
     handle: &RepoHandle,
     add: &[String],
     remove: &[String],
-) -> Result<(), WalError> {
+) -> Result<Arc<Manifest>, WalError> {
     let writer = crate::handle::instance_id();
     let max_retries = handle.cfg.wal.cas_max_retries;
     let mut attempts = 0u32;
@@ -154,7 +154,10 @@ pub(crate) async fn update_reclaiming(
                 .zip(current.reclaiming.iter())
                 .all(|(a, b)| a.checksum == b.checksum)
         {
-            return Ok(());
+            // Nothing to change: the caller still gets the manifest the claim
+            // set is defined against, so it can compute per-repo config for
+            // *that* generation (#175).
+            return Ok(current);
         }
         updated.revision += 1;
         updated.updated_at = Some(time::now());
@@ -173,9 +176,10 @@ pub(crate) async fn update_reclaiming(
             .await
         {
             Ok(meta) => {
-                handle.install_manifest(Arc::new(updated), Some(meta.version.clone()));
+                let committed = Arc::new(updated);
+                handle.install_manifest(committed.clone(), Some(meta.version.clone()));
                 handle.state.lock().manifest_version = Some(meta.version.as_str().to_string());
-                return Ok(());
+                return Ok(committed);
             }
             Err(StoreError::PreconditionFailed { .. }) => {
                 attempts += 1;
