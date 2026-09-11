@@ -3573,3 +3573,101 @@ async fn a_supersession_without_its_marker_does_not_commit() {
         "the live set must be untouched after the aborted supersession: {after:?}"
     );
 }
+
+/// #175: a checksum bucket GC has *claimed* must not have its superseded marker
+/// (re)written by a compaction. GC retires that marker while it holds the
+/// claim; a refresh landing in that window would leave a dead pack with no
+/// record at all on a backend whose conditional delete is HEAD+compare+DELETE
+/// (S3), i.e. a permanent orphan. The live pack being folded still gets its
+/// marker — only the claimed checksum is skipped.
+#[tokio::test]
+async fn a_compaction_skips_the_marker_for_a_checksum_gc_has_claimed() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "claimed");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    // Two live packs so a full repack really folds something.
+    let work = WorkRepo::new();
+    let mut prev = String::new();
+    for i in 0..2 {
+        let c = work.commit(&format!("c{i}"), &format!("d{i}"));
+        let pack = if prev.is_empty() {
+            work.create_pack()
+        } else {
+            work.create_incremental_pack(&c, &prev)
+        };
+        let ingested = ingest_pack_data(&handle, pack).await.unwrap();
+        let txn = make_txn(vec![("refs/heads/main", &prev, &c)]);
+        handle
+            .publish_push(Some(ingested), txn, HashMap::new())
+            .await
+            .unwrap();
+        prev = c;
+    }
+    let live = handle.manifest().packs[0].checksum.clone();
+
+    // A checksum GC has listed as reclaiming (not live, so the claim holds).
+    let claimed = "c".repeat(40);
+    handle
+        .update_reclaiming(std::slice::from_ref(&claimed), &[])
+        .await
+        .unwrap();
+    assert!(
+        handle
+            .manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == claimed),
+        "the checksum must be claimed before the compaction"
+    );
+
+    // Repack, then supersede both the live pack and the claimed checksum.
+    let repack = handle
+        .local()
+        .repack(walgit_git::RepackOptions {
+            mode: walgit_git::RepackMode::Full,
+            write_bitmap: false,
+            write_midx: false,
+            keep: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(!repack.removed.is_empty(), "repack removes the live pack");
+    let mut supersedes = repack.removed.clone();
+    supersedes.push(gix_hash::ObjectId::from_hex(claimed.as_bytes()).unwrap());
+    handle
+        .publish_compact(repack.new_packs[0].clone(), supersedes, 2)
+        .await
+        .unwrap();
+
+    assert!(
+        handle
+            .store()
+            .get_bytes(&walgit_proto::keys::superseded_key(&claimed))
+            .await
+            .unwrap()
+            .is_none(),
+        "a claimed checksum must not get a marker written under the claim"
+    );
+    let marker = handle
+        .store()
+        .get_bytes(&walgit_proto::keys::superseded_key(&live))
+        .await
+        .unwrap();
+    assert!(
+        marker.is_some(),
+        "the folded live pack still records its supersession"
+    );
+    // The claim is untouched by the compaction (GC still owns it).
+    assert!(
+        handle
+            .manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == claimed),
+        "the compaction must not clear GC's claim"
+    );
+}

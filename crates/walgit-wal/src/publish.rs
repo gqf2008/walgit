@@ -1538,8 +1538,19 @@ pub(crate) async fn publish_compact_impl(
         // that lagged its supersession (write lost, write swallowed) would let
         // GC delete a freshly superseded pack inside the retention window. A
         // failure here aborts the supersession (nothing has committed yet); a
-        // stray marker on a still-live pack is harmless — GC skips live packs.
-        write_superseded_markers(&handle.store, &supersedes_hex, seq, entry_time).await?;
+        // stray marker left on a still-live pack is filtered out by GC, which
+        // only ever dies a pack through a supersession that refreshes it.
+        //
+        // A checksum bucket GC has claimed is skipped: GC retires the marker
+        // while it holds the claim, and a writer refreshing it in that window
+        // would leave a dead pack with no marker at all (S3's conditional
+        // delete is HEAD+compare+DELETE, not atomic) (#175).
+        let marker_targets: Vec<String> = supersedes_hex
+            .iter()
+            .filter(|s| !manifest.reclaiming.iter().any(|r| &r.checksum == *s))
+            .cloned()
+            .collect();
+        write_superseded_markers(&handle.store, &marker_targets, seq, entry_time).await?;
 
         let cas = handle
             .store

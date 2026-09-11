@@ -321,6 +321,10 @@ async fn gc_superseded_packs(
     let live: std::collections::HashSet<String> =
         manifest.packs.iter().map(|p| p.checksum.clone()).collect();
     drop(manifest);
+    // The claim CAS is the generation every deletion below linearizes in, so
+    // the retention window must be the one from *that* manifest — another
+    // instance may have changed it between our first sync and the claim.
+    let retention = handle.effective_config().compaction.retention_superseded;
 
     let mut deleted = 0u64;
     let mut freed = 0u64;
@@ -339,9 +343,9 @@ async fn gc_superseded_packs(
         }
         // Re-read the marker now that we own the claim: the timestamp scanned
         // above may predate a concurrent supersession that refreshed it after
-        // our read (the writer overwrites the marker before its manifest CAS,
-        // and our claim CAS is what makes any later supersession lose — so this
-        // read is the authoritative age for the generation we are deleting in).
+        // our read. Claiming X only stops X re-entering `packs`; a compaction
+        // that already lists X in `supersedes` may still refresh its marker, so
+        // the fresh read — not the scanned one — decides the age.
         let marker_key = keys::superseded_key(&checksum);
         let Some((meta, raw)) = handle
             .store()
@@ -418,18 +422,13 @@ async fn gc_superseded_packs(
         deleted += 1;
     }
     if !reclaimed.is_empty() || !release.is_empty() {
-        // Release claims before dropping markers. A pack whose objects are gone
-        // releases now; a skipped one releases so a later pass re-judges it.
-        let mut release_claims: Vec<String> = release.clone();
-        release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
-        handle
-            .update_reclaiming(&[], &release_claims)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Retire the markers *while the claim is still held*. The claim stops
+        // the checksum re-entering `packs`, and `publish_compact_impl` skips
+        // marker writes for claimed checksums — so no fresh marker can appear
+        // under us. That is what makes the retire safe even on a backend whose
+        // conditional delete is HEAD+compare+DELETE (S3), where a release-then-
+        // delete order could drop a marker written in the gap.
         for (checksum, version) in &reclaimed {
-            // Conditional: between the release and here a publisher could have
-            // re-adopted the checksum and superseded it again, writing a fresh
-            // marker. Deleting the old one unseen would orphan that new pack.
             match handle
                 .store()
                 .delete(&keys::superseded_key(checksum), Some(version.clone()))
@@ -437,14 +436,24 @@ async fn gc_superseded_packs(
             {
                 Ok(()) | Err(walgit_store::StoreError::NotFound { .. }) => {}
                 Err(walgit_store::StoreError::PreconditionFailed { .. }) => {
+                    // A marker that outlived our claim generation (e.g. written
+                    // by an older pass): leave it for the next unit.
                     log(format!(
-                        "gc: marker {checksum} was rewritten — keeping the new one"
+                        "gc: marker {checksum} changed — leaving it for the next pass"
                     ));
                     all_complete = false;
                 }
                 Err(e) => return Err(format!("gc: delete marker {checksum}: {e}")),
             }
         }
+        // Release last: a released claim with the marker gone would let a
+        // publisher re-adopt the checksum with no record of what happened.
+        let mut release_claims: Vec<String> = release.clone();
+        release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
+        handle
+            .update_reclaiming(&[], &release_claims)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     if scanned > 0 {
         log(format!(
@@ -696,6 +705,13 @@ async fn run(
             ))
         }
         "gc" => {
+            // Fresh refs before anything: the lease TTL and the retention window
+            // are per-repo settings (D24), and a direct `POST /ops/gc` bypasses
+            // the maintainer's own sync — a cached handle must not hand out a
+            // lease (or a window) sized by a superseded settings revision.
+            {
+                let _g = handle.sync_refs().await.map_err(|e| e.to_string())?;
+            }
             // Per-repo lease: two GC passes must not interleave. Each would see
             // the other's claim as its own (the claim is not owner-tagged), and
             // a pass that released first would let a publisher re-adopt the
