@@ -288,6 +288,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
             c.compaction.enabled = false;
             c.bundles.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::from_secs(3600);
+            c.maintenance.gc_interval = std::time::Duration::ZERO;
         })
     )?;
     step!("put repo", server.put_repo("o", "r"))?;
@@ -1118,6 +1119,35 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
             .collect::<Vec<_>>()
     );
 
+    // #175: every superseded pack gets a `wal/<checksum>.superseded` marker
+    // recording *when* it left the live set. The manifest keeps only the live
+    // set and this COMPACT entry is eventually folded into a checkpoint, so the
+    // marker is the only thing bucket GC can age a pack by.
+    {
+        use futures::StreamExt;
+        use walgit_store::ObjectStore;
+        let manifest = h.manifest();
+        let live: std::collections::HashSet<&str> =
+            manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
+        let mut markers = 0usize;
+        let mut stream = h.store().list(walgit_proto::keys::WAL_DIR, None);
+        while let Some(m) = stream.next().await {
+            let m = m?;
+            let Some(checksum) = m.key.strip_suffix(".superseded") else {
+                continue;
+            };
+            markers += 1;
+            assert!(
+                !live.contains(checksum),
+                "a live pack must not carry a superseded marker: {checksum}"
+            );
+        }
+        assert!(
+            markers > 0,
+            "the rebuild must have marked the packs it superseded"
+        );
+    }
+
     // A push lands between the rebuild and the compose (the rig's churn, 2026-08-22: the compose
     // refused for as long as refs kept moving — "no ref snapshot at the base's seq"). The header
     // must carry the refs AT THE BASE'S SEQ (replayed from the WAL), not the new tip.
@@ -1256,6 +1286,9 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
             c.compaction.enabled = false;
             c.bundles.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            // The rev-index assertions below are about a specific unit: keep the
+            // (lower-priority) GC unit out of this rig's plan.
+            c.maintenance.gc_interval = std::time::Duration::ZERO;
         })
     )?;
     step!("put repo", server.put_repo("o", "r"))?;
@@ -2041,5 +2074,129 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
     let _ = step!("pass 2", walgit_server::maintain::run_pass(&server.state))?;
     let again = walgit_bundle::ops::read_list(&store).await?.unwrap();
     assert_eq!(again.bundles.len(), 5);
+    Ok(())
+}
+
+/// #175: bucket GC reclaims packs that a COMPACT entry superseded, but only
+/// once the `.superseded` marker has aged past
+/// `compaction.retention_superseded` — and never a pack that is still live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_reclaims_expired_superseded_packs_and_keeps_live_and_young_ones() -> anyhow::Result<()> {
+    use prost::Message;
+    use walgit_proto::keys;
+    use walgit_proto::v1::SupersededPack;
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::{ObjectStore, ObjectStoreExt, PutMode};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            // Non-zero so the planner schedules the unit; the marker ages below
+            // decide what is actually reclaimed.
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+            c.compaction.retention_superseded = std::time::Duration::from_hours(7 * 24);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+    let live = h
+        .manifest()
+        .packs
+        .first()
+        .expect("push published a pack")
+        .checksum
+        .clone();
+
+    // A pack that a COMPACT entry dropped eight days ago: past the 7d window.
+    let dead = "d".repeat(40);
+    let mut old_ts = walgit_proto::time::now();
+    old_ts.seconds -= 8 * 24 * 3600;
+    // …and one dropped an hour ago: inside the window, must be kept.
+    let young = "e".repeat(40);
+    let young_ts = walgit_proto::time::now();
+
+    for (checksum, at, seq) in [(&dead, old_ts, 7u64), (&young, young_ts, 9u64)] {
+        let marker = SupersededPack {
+            checksum: checksum.clone(),
+            superseded_at: Some(at),
+            seq,
+        };
+        step!(
+            "marker",
+            h.store().put_bytes(
+                &keys::superseded_key(checksum),
+                marker.encode_to_vec(),
+                PutMode::Create,
+            )
+        )?;
+        step!(
+            "pack body",
+            h.store()
+                .put_bytes(&keys::pack_key(checksum), vec![0u8; 32], PutMode::Create)
+        )?;
+        step!(
+            "idx",
+            h.store()
+                .put_bytes(&keys::idx_key(checksum), vec![0u8; 8], PutMode::Create)
+        )?;
+    }
+
+    assert!(
+        matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)),
+        "GC should be the due unit"
+    );
+    step!("gc pass", run_pass(&server.state))?;
+
+    step!("check dead pack", async {
+        assert!(
+            h.store().head(&keys::pack_key(&dead)).await?.is_none(),
+            "superseded pack past retention must be reclaimed"
+        );
+        assert!(
+            h.store().head(&keys::idx_key(&dead)).await?.is_none(),
+            "side files go with the pack"
+        );
+        assert!(
+            h.store()
+                .head(&keys::superseded_key(&dead))
+                .await?
+                .is_none(),
+            "the marker goes too"
+        );
+        assert!(
+            h.store().head(&keys::pack_key(&young)).await?.is_some(),
+            "a pack inside the retention window must survive"
+        );
+        assert!(
+            h.store().head(&keys::pack_key(&live)).await?.is_some(),
+            "a live pack must never be reclaimed"
+        );
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    // The pass leaves the record the planner reads next time.
+    assert!(
+        step!("gc.pb", h.store().get_bytes(keys::GC))?
+            .is_some(),
+        "the GC pass records gc.pb"
+    );
     Ok(())
 }
