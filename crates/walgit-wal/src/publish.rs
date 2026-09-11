@@ -45,7 +45,8 @@ use walgit_git::{IngestedPack, PackInfo};
 use walgit_proto::keys;
 use walgit_proto::v1::PackKind;
 use walgit_proto::v1::{
-    EntryKind, LogEntry, LogSegmentRef, Manifest, PackRef, RefTransaction, SupersededPack,
+    EntryKind, LogEntry, LogSegmentRef, Manifest, PackRef, ReclaimingPack, RefTransaction,
+    SupersededPack,
 };
 use walgit_proto::{frame, time};
 use walgit_store::{ObjectStore, Prefixed, PutBody, PutMode, PutOptions, StoreError};
@@ -104,6 +105,87 @@ pub(crate) fn pack_ref_from_info(p: &PackInfo, seq: u64, tier: u32) -> PackRef {
             PackKind::Objects as i32
         },
         derived_from: p.history_of.clone().unwrap_or_default(),
+    }
+}
+
+/// Add/remove `Manifest.reclaiming` entries under the manifest CAS (#175).
+///
+/// This is what orders bucket GC against adoption. GC lists a pack it is about
+/// to delete *before* touching any object; a publisher that would put that
+/// checksum back into `packs` refuses while it is listed. Both sides go through
+/// the manifest CAS, so exactly one of "GC reclaims it" and "a publisher
+/// re-adopts it" can win — the other re-reads and backs off. Without this, a
+/// publisher that regenerates a byte-identical pack can CAS it live in the
+/// window between GC's live-check and GC's delete.
+pub(crate) async fn update_reclaiming(
+    handle: &RepoHandle,
+    add: &[String],
+    remove: &[String],
+) -> Result<(), WalError> {
+    let writer = crate::handle::instance_id();
+    let max_retries = handle.cfg.wal.cas_max_retries;
+    let mut attempts = 0u32;
+    loop {
+        handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
+        let current = handle.manifest.read().clone();
+        let known_version = handle.manifest_version.lock().clone();
+        let mut updated: Manifest = (*current).clone();
+        updated
+            .reclaiming
+            .retain(|r| !remove.iter().any(|c| c == &r.checksum));
+        for c in add {
+            // Only list packs that are not live *in this manifest*. The CAS
+            // below is what makes that check authoritative: if a publisher
+            // re-adopted the checksum first, we see it here and skip; if we win,
+            // the publisher's own CAS refuses while it is listed.
+            if updated.packs.iter().any(|p| &p.checksum == c) {
+                continue;
+            }
+            if !updated.reclaiming.iter().any(|r| &r.checksum == c) {
+                updated.reclaiming.push(ReclaimingPack {
+                    checksum: c.clone(),
+                    since: Some(time::now()),
+                });
+            }
+        }
+        if updated.reclaiming.len() == current.reclaiming.len()
+            && updated
+                .reclaiming
+                .iter()
+                .zip(current.reclaiming.iter())
+                .all(|(a, b)| a.checksum == b.checksum)
+        {
+            return Ok(());
+        }
+        updated.revision += 1;
+        updated.updated_at = Some(time::now());
+        updated.writer = writer.clone();
+        let mode = match &known_version {
+            Some(v) => PutMode::Update(v.clone()),
+            None => PutMode::Create,
+        };
+        match handle
+            .store
+            .put(
+                keys::MANIFEST,
+                PutBody::Bytes(bytes::Bytes::from(updated.encode_to_vec())),
+                mode.into(),
+            )
+            .await
+        {
+            Ok(meta) => {
+                *handle.manifest.write() = Arc::new(updated);
+                *handle.manifest_version.lock() = Some(meta.version);
+                return Ok(());
+            }
+            Err(StoreError::PreconditionFailed { .. }) => {
+                attempts += 1;
+                if attempts >= max_retries {
+                    return Err(WalError::Retry { attempts });
+                }
+            }
+            Err(e) => return Err(WalError::Store(e)),
+        }
     }
 }
 
@@ -608,6 +690,20 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let manifest = handle.manifest.read().clone();
         let head_seq = manifest.head_seq;
         let known_version = handle.manifest_version.lock().clone();
+
+        // A checksum bucket GC has listed as reclaiming must not be re-adopted
+        // (#175): the CAS that listed it and the CAS that would make it live are
+        // ordered, so refusing here is what keeps a re-adopted pack from
+        // pointing at bytes GC already deleted. The retry uploads fresh once GC
+        // has finished with it.
+        for req in &batch {
+            if let Some(pack) = &req.pack {
+                let checksum = pack.checksum.to_string();
+                if manifest.reclaiming.iter().any(|r| r.checksum == checksum) {
+                    return finish_all_errors(batch, WalError::Reclaiming(checksum));
+                }
+            }
+        }
 
         // O(log refs) lookups over the cached snapshot + an overlay of what this
         // batch applied; never an O(refs) map per push.
@@ -1322,6 +1418,10 @@ pub(crate) async fn publish_compact_impl(
 
         let manifest = handle.manifest.read().clone();
         let known_version = handle.manifest_version.lock().clone();
+
+        if manifest.reclaiming.iter().any(|r| r.checksum == checksum) {
+            return Err(WalError::Reclaiming(checksum.clone()));
+        }
 
         let entry_time = time::now();
         let make_entry = |seq: u64| LogEntry {

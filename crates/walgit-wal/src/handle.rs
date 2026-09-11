@@ -1421,6 +1421,17 @@ impl RepoHandle {
         crate::publish::annotate_pack_impl(self, checksum, rev, bitmap, commit_graph).await
     }
 
+    /// List/clear packs bucket GC is reclaiming (#175). GC lists a pack before
+    /// deleting any of its objects; a publisher must not re-adopt a listed
+    /// checksum. Both sides go through the manifest CAS.
+    pub async fn update_reclaiming(
+        &self,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<(), WalError> {
+        crate::publish::update_reclaiming(self, add, remove).await
+    }
+
     /// Publish an already built pack (`pack-<checksum>.pack` + `.idx`) as a
     /// tier-`tier` COMPACT entry superseding nothing; `history_of = Some(base)`
     /// marks it a history pack of that base (D18).

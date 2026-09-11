@@ -54,6 +54,19 @@ message Manifest {
   // refs-level sync must see the effective config without another GET; the
   // document is small (validated <= 16 KiB). History = SETTINGS log entries.
   RepoSettings settings = 12;
+  // Packs bucket GC is reclaiming (#175). Listed here under the manifest CAS so
+  // reclamation is ordered against adoption: GC CASes an entry in *before* it
+  // deletes any object, and a publisher that would put a checksum back into
+  // `packs` must refuse while that checksum is listed. Drained by GC as each
+  // pack is deleted (≤ GC_MAX_PACKS_PER_UNIT per pass, so this stays small).
+  repeated ReclaimingPack reclaiming = 13;
+}
+
+// One pack bucket GC is in the middle of deleting.
+message ReclaimingPack {
+  string checksum = 1;
+  // When GC listed it. Diagnostics / future lease-based timeouts.
+  google.protobuf.Timestamp since = 2;
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a

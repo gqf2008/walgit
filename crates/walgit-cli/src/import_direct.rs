@@ -855,6 +855,23 @@ pub async fn run_with_store(
         )
         .await?;
 
+    // Bucket GC (#175) may be reclaiming one of these checksums: it lists the
+    // pack in `Manifest.reclaiming` before deleting any object, and a pack that
+    // is being deleted must not be adopted by an import. Refuse instead of
+    // publishing a manifest that points at bytes someone is removing.
+    for p in &pack_refs {
+        if repo_store
+            .head(&walgit_proto::keys::superseded_key(&p.checksum))
+            .await?
+            .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "pack {} is being reclaimed by bucket GC; retry the import",
+                p.checksum
+            ));
+        }
+    }
+
     // ---- manifest CAS (the linearization point) --------------------------------------
     let manifest = Manifest {
         format_version: WAL_FORMAT_VERSION,
@@ -873,6 +890,7 @@ pub async fn run_with_store(
         }),
         log_segments: vec![],
         packs: pack_refs,
+        reclaiming: vec![],
         updated_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
         revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,

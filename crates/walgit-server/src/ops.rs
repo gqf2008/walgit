@@ -279,24 +279,35 @@ async fn gc_superseded_packs(
     // Oldest first: a partial unit should reclaim the longest-dead packs.
     candidates.sort_by_key(|(_, at)| *at);
     candidates.truncate(max);
+    let checksums: Vec<String> = candidates.iter().map(|(c, _)| c.clone()).collect();
 
-    // Re-read the manifest: the candidate list came from a listing that took
-    // time, and a pack that is live *now* must never be deleted.
-    handle.sync_refs().await.map_err(|e| e.to_string())?;
-    let live: std::collections::HashSet<String> = handle
-        .manifest()
-        .packs
+    // List the candidates in `Manifest.reclaiming` *before* touching any
+    // object: that CAS is what orders reclamation against adoption. A publisher
+    // that would put one of these checksums back into `packs` refuses while it
+    // is listed (both sides go through the manifest CAS, so exactly one wins).
+    handle
+        .update_reclaiming(&checksums, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    // Only the packs the CAS actually listed are ours to delete; the helper
+    // skips any that turned out live in the manifest it committed against.
+    let manifest = handle.manifest();
+    let owned: std::collections::HashSet<String> = manifest
+        .reclaiming
         .iter()
-        .map(|p| p.checksum.clone())
+        .map(|r| r.checksum.clone())
         .collect();
+    let live: std::collections::HashSet<String> =
+        manifest.packs.iter().map(|p| p.checksum.clone()).collect();
+    drop(manifest);
 
     let mut deleted = 0u64;
     let mut freed = 0u64;
+    let mut reclaimed: Vec<String> = Vec::new();
     for (checksum, at) in candidates {
-        if live.contains(&checksum) {
-            // Superseded then re-adopted (or a marker written by a CAS that did
-            // not land). Keep both the pack and the marker: dropping a marker is
-            // irreversible, and a fresh marker costs one small object.
+        if !owned.contains(&checksum) || live.contains(&checksum) {
+            // A publisher re-adopted it before our claim, or another GC pass
+            // owns it. Leave the pack and its marker alone.
             log(format!("gc: {checksum} is live again — skipped"));
             continue;
         }
@@ -339,11 +350,7 @@ async fn gc_superseded_packs(
             // until every object is gone.
             continue;
         }
-        handle
-            .store()
-            .delete(&keys::superseded_key(&checksum), None)
-            .await
-            .map_err(|e| format!("gc: delete marker {checksum}: {e}"))?;
+        reclaimed.push(checksum.clone());
         log(format!(
             "gc: reclaimed {checksum} (superseded {:.1}h ago, {freed} bytes total)",
             now.duration_since(at)
@@ -352,6 +359,22 @@ async fn gc_superseded_packs(
                 / 3600.0
         ));
         deleted += 1;
+    }
+    if !reclaimed.is_empty() {
+        // Release the claim, then drop the markers: the marker is the record
+        // that this pack is garbage, so it goes last (and only once every
+        // object is gone).
+        handle
+            .update_reclaiming(&[], &reclaimed)
+            .await
+            .map_err(|e| e.to_string())?;
+        for checksum in &reclaimed {
+            handle
+                .store()
+                .delete(&keys::superseded_key(checksum), None)
+                .await
+                .map_err(|e| format!("gc: delete marker {checksum}: {e}"))?;
+        }
     }
     if scanned > 0 {
         log(format!(
