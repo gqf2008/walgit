@@ -173,7 +173,8 @@ pub(crate) async fn update_reclaiming(
             .await
         {
             Ok(meta) => {
-                handle.install_manifest(Arc::new(updated), Some(meta.version));
+                handle.install_manifest(Arc::new(updated), Some(meta.version.clone()));
+                handle.state.lock().manifest_version = Some(meta.version.as_str().to_string());
                 return Ok(());
             }
             Err(StoreError::PreconditionFailed { .. }) => {
