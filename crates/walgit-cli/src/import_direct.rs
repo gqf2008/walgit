@@ -907,12 +907,18 @@ pub async fn run_with_store(
     // that stays live is harmless because GC skips live packs.
     let new_live: std::collections::HashSet<&str> =
         manifest.packs.iter().map(|p| p.checksum.as_str()).collect();
+    // A checksum GC has claimed is skipped: GC retires that marker while it
+    // holds the claim, and a refresh landing in that window would leave the
+    // dead pack with no record at all where the backend's conditional delete is
+    // HEAD+compare+DELETE (S3). Claimed checksums are already dead with GC
+    // owning their objects, so there is nothing for the import to record.
     let dropped: Vec<String> = base_manifest
         .as_ref()
         .map(|m| {
             m.packs
                 .iter()
                 .filter(|p| !new_live.contains(p.checksum.as_str()))
+                .filter(|p| !m.reclaiming.iter().any(|r| r.checksum == p.checksum))
                 .map(|p| p.checksum.clone())
                 .collect()
         })
