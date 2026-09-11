@@ -13,10 +13,10 @@ esac
 WALGIT_BIN="${WALGIT_BIN:-$ROOT/target/release/walgit}"
 [ -x "$WALGIT_BIN" ] || { echo "missing walgit binary: $WALGIT_BIN (WALGIT_BIN 可覆盖)" >&2; exit 1; }
 GOT_VERSION="$("$WALGIT_BIN" --version 2>&1 || true)"
-case "$GOT_VERSION" in
-    *"v$VERSION"*) ;;
-    *) echo "walgit binary reports '$GOT_VERSION', expected v$VERSION" >&2; exit 1 ;;
-esac
+# 精确取完整版本 token:不接受 v0.5.0-beta 之类的同前缀版本。
+GOT_TOKEN="${GOT_VERSION##* }"
+[ "$GOT_TOKEN" = "v$VERSION" ] \
+    || { echo "walgit binary reports '$GOT_VERSION', expected v$VERSION" >&2; exit 1; }
 
 APP="${TRAY_APP_DIR:-$HOME/Applications}/walgit-tray.app"
 BIN_DIR="$APP/Contents/MacOS"

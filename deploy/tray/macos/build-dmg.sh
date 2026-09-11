@@ -31,6 +31,12 @@ check_tree() {
 
 check_zip() {
     local zip="$1"
+    # 先确认 zip 本身可读:否则 unzip 失败的 stderr 会被 grep 的 `|| true`
+    # 吞掉,损坏包反而“通过” AppleDouble 守卫(假绿)。
+    if ! unzip -t "$zip" >/dev/null 2>&1; then
+        echo "❌ not a readable zip: $zip" >&2
+        return 1
+    fi
     local bad
     bad="$(unzip -Z1 "$zip" | grep -E '(^|/)(\._|\.DS_Store)' || true)"
     if [ -n "$bad" ]; then
@@ -44,12 +50,13 @@ check_version() {
     local version="${2#v}"
     local got
     got="$("$binary" --version 2>&1 || true)"
-    case "$got" in
-        *"v$version"*) return 0 ;;
-        *)
-            echo "❌ binary reports '$got', expected v$version: $binary" >&2
-            return 1 ;;
-    esac
+    # 精确取完整版本 token:不接受 v0.5.0-beta 之类的同前缀版本。
+    local token="${got##* }"
+    if [ "$token" = "v$version" ]; then
+        return 0
+    fi
+    echo "❌ binary reports '$got', expected v$version: $binary" >&2
+    return 1
 }
 
 notary_submit() {
@@ -97,7 +104,6 @@ esac
 for tool in cargo swiftc dot_clean ditto hdiutil plutil codesign security xcrun; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing tool: $tool" >&2; exit 1; }
 done
-PROFILE="${NOTARY_PROFILE:-voicecall-notary}"
 IDENTITY="${WALGIT_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
     | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"
 [ -n "$IDENTITY" ] || { echo "❌ Keychain 里没有 Developer ID Application 身份" >&2; exit 1; }

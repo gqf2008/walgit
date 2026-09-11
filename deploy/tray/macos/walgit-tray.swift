@@ -121,13 +121,17 @@ func latestRelease() -> ReleaseInfo? {
     request.setValue("walgit-tray", forHTTPHeaderField: "User-Agent")
     let semaphore = DispatchSemaphore(value: 0)
     var data: Data?
-    URLSession.shared.dataTask(with: request) { body, response, _ in
+    let task = URLSession.shared.dataTask(with: request) { body, response, _ in
         if let http = response as? HTTPURLResponse, http.statusCode == 200 {
             data = body
         }
         semaphore.signal()
-    }.resume()
-    _ = semaphore.wait(timeout: .now() + 15)
+    }
+    task.resume()
+    guard semaphore.wait(timeout: .now() + 15) == .success else {
+        task.cancel()
+        return nil
+    }
     guard let data else { return nil }
     return try? parseLatestRelease(data)
 }
@@ -179,31 +183,53 @@ func bootstrapDeploy() {
     // 临时名再原子替换,避免运行中的服务二进制被 remove+copy 的半状态
     // 捕获;只有三项全部成功且新二进制版本核验通过才写 marker。
     let needsUpdate = !bundledVersion.isEmpty && bundledVersion != installedVersion
+    let managed = ["walgit", "run-walgit.sh", "walgit-ensure"]
     var managedOK = true
-    for f in ["walgit", "run-walgit.sh", "walgit-ensure"] {
-        let dst = "\(deployDir)/\(f)"
-        if !needsUpdate && fm.fileExists(atPath: dst) { continue }
-        do {
+    // 先全部落成临时文件再统一提升:任何一个复制/核验失败都不动已装文件,
+    // 避免「walgit 新、ensure 旧、marker 未写」的混合骨架(拖入 DMG 升级)。
+    if needsUpdate {
+        var staged: [String: String] = [:]
+        for f in managed {
+            let dst = "\(deployDir)/\(f)"
             let tmp = "\(dst).new-\(ProcessInfo.processInfo.processIdentifier)"
-            try? fm.removeItem(atPath: tmp)
-            try fm.copyItem(atPath: "\(res)/\(f)", toPath: tmp)
-            try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: tmp)
-            if fm.fileExists(atPath: dst) {
-                _ = try fm.replaceItemAt(URL(fileURLWithPath: dst), withItemAt: URL(fileURLWithPath: tmp))
-            } else {
-                try fm.moveItem(atPath: tmp, toPath: dst)
+            do {
+                try? fm.removeItem(atPath: tmp)
+                try fm.copyItem(atPath: "\(res)/\(f)", toPath: tmp)
+                try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: tmp)
+                staged[f] = tmp
+            } catch {
+                managedOK = false
+                logLine("bootstrap: 预置 \(f) 失败: \(error)")
             }
-            logLine("bootstrap: 写入 \(f)")
-        } catch {
-            managedOK = false
-            logLine("bootstrap: \(f) 失败: \(error)")
         }
-    }
-    if needsUpdate && managedOK {
-        let (vc, versionOut) = sh("'\(deployDir)/walgit' --version 2>&1")
-        if vc != 0 || !versionOut.contains("v\(bundledVersion)") {
-            managedOK = false
-            logLine("bootstrap: walgit 版本核验失败: \(versionOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+        if managedOK, let stagedWalgit = staged["walgit"] {
+            let (vc, versionOut) = sh("'\(stagedWalgit)' --version 2>&1")
+            let token = versionOut.split(separator: " ").last.map(String.init) ?? ""
+            if vc != 0 || token != "v\(bundledVersion)" {
+                managedOK = false
+                logLine("bootstrap: walgit 版本核验失败: \(versionOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+        if managedOK {
+            for f in managed {
+                guard let tmp = staged[f] else { managedOK = false; break }
+                let dst = "\(deployDir)/\(f)"
+                do {
+                    if fm.fileExists(atPath: dst) {
+                        _ = try fm.replaceItemAt(URL(fileURLWithPath: dst), withItemAt: URL(fileURLWithPath: tmp))
+                    } else {
+                        try fm.moveItem(atPath: tmp, toPath: dst)
+                    }
+                    logLine("bootstrap: 写入 \(f)")
+                } catch {
+                    managedOK = false
+                    logLine("bootstrap: 写入 \(f) 失败: \(error)")
+                    break
+                }
+            }
+        }
+        if !managedOK {
+            for (_, tmp) in staged { try? fm.removeItem(atPath: tmp) }
         }
     }
     if needsUpdate && !managedOK {
@@ -581,7 +607,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? FileManager.default.removeItem(atPath: dmg)
         try download(release.asset.url, to: URL(fileURLWithPath: dmg))
         let (hashCode, hashOut) = sh("shasum -a 256 '\(dmg)'")
-        guard hashCode == 0, hashOut.lowercased().contains(release.asset.sha256.lowercased()) else {
+        let gotHash = hashOut.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+            .map { String($0).lowercased() } ?? ""
+        guard hashCode == 0, gotHash == release.asset.sha256.lowercased() else {
             throw NSError(domain: "walgit-release", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "SHA-256 校验失败"])
         }
@@ -614,6 +642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
             proc.arguments = [script, dmg, mount, Bundle.main.bundlePath, release.version, String(ProcessInfo.processInfo.processIdentifier)]
+            var env = ProcessInfo.processInfo.environment
+            env["WALGIT_DEPLOY_DIR"] = deployDir
+            proc.environment = env
             proc.standardOutput = log
             proc.standardError = log
             proc.standardInput = FileHandle.nullDevice
@@ -629,29 +660,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func download(_ url: URL, to destination: URL) throws {
         var request = URLRequest(url: url)
         request.timeoutInterval = 120
+        // 全部落在 completion 内(无跨线程共享变量):成功搬到 destination,
+        // 失败/超时由文件是否存在判定,超时同时取消任务。
+        try? FileManager.default.removeItem(at: destination)
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<Void, Error> = .failure(NSError(domain: "walgit-release", code: 6))
-        URLSession.shared.downloadTask(with: request) { temp, response, error in
+        let task = URLSession.shared.downloadTask(with: request) { temp, response, error in
             defer { semaphore.signal() }
-            if let error {
-                result = .failure(error)
-                return
-            }
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200, let temp else {
-                result = .failure(NSError(domain: "walgit-release", code: 7,
-                    userInfo: [NSLocalizedDescriptionKey: "下载失败: HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)"]))
-                return
-            }
-            do {
-                try? FileManager.default.removeItem(at: destination)
-                try FileManager.default.moveItem(at: temp, to: destination)
-                result = .success(())
-            } catch {
-                result = .failure(error)
-            }
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + 180)
-        try result.get()
+            guard error == nil,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let temp
+            else { return }
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.moveItem(at: temp, to: destination)
+        }
+        task.resume()
+        guard semaphore.wait(timeout: .now() + 180) == .success else {
+            task.cancel()
+            throw NSError(domain: "walgit-release", code: 8,
+                          userInfo: [NSLocalizedDescriptionKey: "下载超时"])
+        }
+        guard FileManager.default.fileExists(atPath: destination.path) else {
+            throw NSError(domain: "walgit-release", code: 7,
+                          userInfo: [NSLocalizedDescriptionKey: "下载失败"])
+        }
     }
 
     func repoPath() -> String {

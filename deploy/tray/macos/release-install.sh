@@ -61,8 +61,20 @@ healthcheck() { # healthcheck <url> [extra args...]
     fi
 }
 
+# 与部署配置同源:自定义 [server].listen 时,预探活/重启后健康检查都要用
+# 实际端口,否则会把「运行中」误判成停止后跳过启动(服务静默停掉)。
+listen_addr() {
+    local l=""
+    if [ -f "$DEPLOY/walgit.toml" ]; then
+        l="$(awk -F'"' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$DEPLOY/walgit.toml" 2>/dev/null || true)"
+    fi
+    [ -n "$l" ] || l="127.0.0.1:8081"
+    printf '%s' "$l"
+}
+HEALTH_URL="http://$(listen_addr)/healthz"
+
 SERVICE_WAS_RUNNING=0
-healthcheck "http://127.0.0.1:8081/healthz" >/dev/null 2>&1 && SERVICE_WAS_RUNNING=1
+healthcheck "$HEALTH_URL" >/dev/null 2>&1 && SERVICE_WAS_RUNNING=1
 if [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
     "$DEPLOY/walgit-ensure" stop >/dev/null 2>&1 || true
 fi
@@ -94,9 +106,27 @@ restore_deploy_files() {
     done
 }
 
+# 新 app 由 `open` 启动后,其 bootstrap 可能已经跑起来;回滚前必须先终止
+# 它,否则会把正在运行的新 bundle 移走,留下「新进程 + 旧 bundle」。
+new_tray_pid() {
+    pgrep -f "$APP_DEST/Contents/MacOS/walgit-tray" 2>/dev/null | head -1 || true
+}
+kill_new_tray() {
+    local pid
+    pid="$(new_tray_pid)"
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+}
+
 rollback() {
     local why="$1"
     log "rollback: $why"
+    kill_new_tray
     [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ] && "$DEPLOY/walgit-ensure" stop >/dev/null 2>&1 || true
     if [ -e "$APP_DEST" ]; then
         mv "$APP_DEST" "$APP_DEST.failed-$VERSION-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -130,7 +160,8 @@ for _ in $(seq 1 "$BOOTSTRAP_WAIT"); do
     app_v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DEST/Contents/Info.plist" 2>/dev/null || true)"
     marker="$(cat "$DEPLOY/.skeleton-version" 2>/dev/null || true)"
     bin_v="$("$DEPLOY/walgit" --version 2>/dev/null || true)"
-    if [ "$app_v" = "$VERSION" ] && [ "$marker" = "$VERSION" ] && [[ "$bin_v" == *"v$VERSION"* ]]; then
+    bin_token="${bin_v##* }"
+    if [ "$app_v" = "$VERSION" ] && [ "$marker" = "$VERSION" ] && [ "$bin_token" = "v$VERSION" ]; then
         ok=1
         break
     fi
@@ -141,11 +172,8 @@ done
 
 if [ "$SERVICE_WAS_RUNNING" = 1 ] && [ -x "$DEPLOY/walgit-ensure" ] && [ "${WALGIT_UPDATE_SKIP_SERVICE:-0}" != "1" ]; then
     "$DEPLOY/walgit-ensure" >/dev/null 2>&1 || rollback "服务启动失败"
-    health="http://127.0.0.1:8081/healthz"
-    listen="$(awk -F'"' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$DEPLOY/walgit.toml" 2>/dev/null || true)"
-    [ -n "$listen" ] && health="http://$listen/healthz"
     for _ in $(seq 1 "$HEALTH_WAIT"); do
-        body="$(healthcheck "$health" --max-time 2 2>/dev/null || true)"
+        body="$(healthcheck "$HEALTH_URL" --max-time 2 2>/dev/null || true)"
         if [[ "$body" == *"v$VERSION"* ]]; then
             log "SUCCESS: v$VERSION"
             notify "已升级到 v$VERSION"

@@ -29,9 +29,11 @@ GitHub Release 与源码仓库；Rust 托盘保留源码仓库检测与安装器
 发现更新 → 菜单行变「⬆️ 下载并升级」或「⬆️ 从源码升级」+ 系统通知；
 **升级必须由用户点击**。
 
-Release 升级管线:下载 DMG → 校验 GitHub `sha256` → 校验签名/公证/版本 →
-停服务 → 备份旧 app → 替换 app → 新 tray bootstrap 原子更新
-`~/walgit` 托管文件 → 启动服务 → 健康验证,失败恢复旧 app/服务。
+Release 升级管线:下载 DMG → 校验 GitHub `sha256`(精确等值)→ 校验
+签名/公证/版本(精确 token)→ 停服务 → 备份旧 app 与 `~/walgit` 托管文件
+→ 替换 app → 新 tray bootstrap 原子更新托管文件 → 启动服务 → 健康验证,
+失败恢复旧 app/托管文件并终止已启动的新托盘(不留「新进程 + 旧 bundle」)。
+健康检查与 `[server].listen` 同源,自定义端口不会被误判成服务已停止。
 
 源码升级管线:ff-merge main → `cargo build --release -p walgit-cli` →
 备份(`walgit.bak-tray`)→ 停 → 热换 → 起 → 15s 健康验证,失败自动回滚。
@@ -82,10 +84,11 @@ ad-hoc 整体签名,独立 `codesign --verify --deep --strict` 可过。`build-d
 `walgit.icns` 放在同目录再跑 build.sh(可选,缺省用通用图标)。开机自启:
 系统设置 → 通用 → 登录项 → 添加 walgit-tray.app。
 
-`test.sh` 覆盖 Release JSON 解析/版本比较/AppleDouble 守卫,并用
-fixture 跑 `release-install.sh` 的成功换装与故障回滚(回滚用
-`WALGIT_UPDATE_*` 轮询/健康检查覆盖在临时部署目录内完成,不碰真实
-`~/walgit` 与 launchd/服务)。
+`test.sh` 覆盖 Release JSON 解析(含 stale asset/缺 digest 负例)、
+语义版本比较(含 build metadata)、AppleDouble/损坏 zip 守卫,并用
+fixture 跑 `release-install.sh` 的成功换装、故障回滚(partial bootstrap
+后四项托管文件一起还原)与非 8081 listen 探活回归;全部在临时部署目录
+内完成,不碰真实 `~/walgit` 与 launchd/服务。
 
 ### Linux(.deb)
 

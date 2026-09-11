@@ -36,6 +36,9 @@ do {
     expect(!isVersionNewer("0.5.0", than: "0.5"), "trailing zero equal reversed")
     expect(isVersionNewer("V0.6.0", than: "v0.5.0"), "uppercase v prefix")
     expect(!isVersionNewer("", than: "0.5.0"), "empty version is not newer")
+    expect(!isVersionNewer("1.0.0+build.2", than: "1.0.0+build.1"), "build metadata not precedence")
+    expect(!isVersionNewer("1.0.0+build.2", than: "1.0.0"), "build metadata equal to release")
+    expect(isVersionNewer("1.0.1+build.2", than: "1.0.0"), "past build metadata still ordered")
 } catch {
     fputs("FAIL: \(error)\n", stderr)
     exit(1)
@@ -67,5 +70,10 @@ let noArchAsset = #"""
 {"tag_name":"v0.5.0","assets":[{"name":"walgit-0.5.0-x86_64.dmg","browser_download_url":"https://example.invalid/x.dmg","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}
 """#
 expectReleaseError(noArchAsset, arch: "arm64", "missing arm64 asset")
+
+let staleAsset = #"""
+{"tag_name":"v0.6.0","assets":[{"name":"walgit-0.5.0-arm64.dmg","browser_download_url":"https://example.invalid/old.dmg","digest":"sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}
+"""#
+expectReleaseError(staleAsset, arch: "arm64", "stale asset must not fall back by suffix")
 
 print("release logic tests: ok")

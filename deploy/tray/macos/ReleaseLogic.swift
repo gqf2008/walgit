@@ -58,19 +58,12 @@ func parseLatestRelease(_ data: Data, arch: String = releaseArch()) throws -> Re
     guard let assets = object["assets"] as? [[String: Any]] else {
         throw ReleaseLogicError.malformed("missing assets array")
     }
+    // 只接受与本 release 版本严格同名、目标架构的 DMG:按后缀回退会
+    // 把旧版本 asset 挂到新 tag 上(菜单误报升级、下载后才失败)。
     let expected = "walgit-\(version)-\(arch).dmg"
-    var fallback: [String: Any]?
-    for asset in assets {
-        guard let name = asset["name"] as? String, name.hasSuffix(".dmg") else { continue }
-        if name == expected {
-            fallback = asset
-            break
-        }
-        if name.hasSuffix("-\(arch).dmg") {
-            fallback = asset
-        }
-    }
-    guard let asset = fallback,
+    guard let asset = assets.first(where: {
+        ($0["name"] as? String) == expected
+    }),
           let name = asset["name"] as? String,
           let urlString = asset["browser_download_url"] as? String,
           let url = URL(string: urlString)
@@ -88,7 +81,11 @@ func parseLatestRelease(_ data: Data, arch: String = releaseArch()) throws -> Re
 }
 
 private func versionParts(_ value: String) -> ([Int], [String]) {
-    let normalized = stripVersionPrefix(value)
+    // SemVer build metadata(`+…`)不参与优先级:相同 core+prerelease 视为相等,
+    // 否则 tag 带 `+build.N` 时会反复提示同版本更新。
+    let normalized = stripVersionPrefix(value).split(separator: "+", maxSplits: 1,
+                                                    omittingEmptySubsequences: false).first
+        .map(String.init) ?? stripVersionPrefix(value)
     let pieces = normalized.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
     let numeric = pieces.first.map(String.init) ?? normalized
     let prerelease = pieces.count > 1 ? String(pieces[1]) : ""
