@@ -64,11 +64,12 @@ verbatim in `docs/reference/cursor-git-at-any-scale.md`.
 （`git rev-list --count upstream/main..main`）。
 
 内核的**语义与不变式**不变（桶仍是唯一事实源、manifest CAS 仍是提交点、实例仍是可丢弃缓存），
-但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k——即便只粗扣
-`collab.rs`/`ci.rs`/`collab_cmd.rs`/`ci_cmd.rs` 四个核心文件，剩下的 D1 之外改动仍有约 37k 行，
-包括 Windows 原生支持（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle 的可靠性修复
-（#148 重启后 refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储健壮性
-（#129/#130 socket 超时与配置写硬化）以及站点与部署面扩展。
+但**改动并不止于新增一层**：相对分叉点共 239 个文件、+46.7k/−4.7k；即便只粗扣
+`collab.rs`/`ci.rs`/`collab_cmd.rs`/`ci_cmd.rs` 四个核心文件，剩余仍有约 37k 行
+（其中还含协作层的 Web/SDK/测试），包括 Windows 原生支持
+（`crates/walgit-wal/src/platform.rs`）、publish/sync/handle 的可靠性修复（#148 重启后
+refs 回退、#36 幻影 refs、#144 跨卷原子 rename）、对象存储健壮性（#129/#130 socket
+超时与配置写硬化）以及站点与部署面扩展。
 
 准确的说法是 **D1 是最大的增量，不是唯一增量**；"内核没变"应读作"内核契约没推翻"，
 而不是"内核代码没动过"。
@@ -226,6 +227,9 @@ open https://walgit.localhost:8080/
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
+* `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
+  **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
+  object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
 
 ## Platforms
 
@@ -237,14 +241,12 @@ Developer Mode or run elevated — exFAT drives silently cannot host links). Pas
 `--config NUL` where docs say `/dev/null`. The developer `just dev-store` rig assumes
 podman on POSIX; on Windows see `docs/WINDOWS.md` for the rustfs equivalent.
 
-macOS is a first-class **client** platform: the Swift tray and the signed/notarized DMG
-are built and released from this fork (`deploy/tray/macos/`, `build-dmg.sh`), and the
-macOS CI leg runs the tray Release/package guards. The server itself is not built or
-supported on macOS — run it on Linux.
-* `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
-  **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
-  object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
-
+macOS: this fork's local one-box shape runs the full server **on macOS** — the tray bundles a
+Mach-O `walgit` and starts it with `walgit serve` (`deploy/tray/macos/run-walgit.sh`), and the
+Swift tray plus the signed/notarized DMG are built here (`deploy/tray/macos/`, `build-dmg.sh`).
+The macOS CI leg runs the tray Release/package guards. What is Linux-targeted is **production /
+multi-instance deployment** (containers, Nix, tmpfs hosts, object-store-backed fleets), not the
+binary's ability to run on a Mac.
 Roles (`server.roles`): `serve` (git, API, UI, bundles, LFS), `maintain` (checkpoints, bundles, compaction,
 fsck/repair), `events` (the webhook bridge). Empty = all. Any number of `serve` hosts may point at one bucket; give
 each repository one maintainer (placement globs) and you are done.
