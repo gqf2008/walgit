@@ -1172,8 +1172,9 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     }
                 } else {
                     // Forget the known version so the next sync performs an unconditional GET and
-                    // replays from the last applied seq.
-                    handle.manifest_version.lock().take();
+                    // replays from the last applied seq. Go through `install_manifest` so the
+                    // `(manifest, version)` pair stays atomic w.r.t. `manifest_snapshot` (#175).
+                    handle.install_manifest(handle.manifest(), None);
                 }
             }
             sweep_burned(&handle.store, &slot)
