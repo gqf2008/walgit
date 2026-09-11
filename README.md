@@ -245,8 +245,9 @@ macOS: this fork's local one-box shape runs the full server **on macOS** — the
 Mach-O `walgit` and starts it with `walgit serve` (`deploy/tray/macos/run-walgit.sh`), and the
 Swift tray plus the signed/notarized DMG are built here (`deploy/tray/macos/`, `build-dmg.sh`).
 The macOS CI leg runs the tray Release/package guards. What is Linux-targeted is **production /
-multi-instance deployment** (containers, Nix, tmpfs hosts, object-store-backed fleets), not the
-binary's ability to run on a Mac.
+multi-instance deployment** (containers, the Nix OCI image, tmpfs hosts, object-store-backed
+fleets), not the binary's ability to run on a Mac.
+
 Roles (`server.roles`): `serve` (git, API, UI, bundles, LFS), `maintain` (checkpoints, bundles, compaction,
 fsck/repair), `events` (the webhook bridge). Empty = all. Any number of `serve` hosts may point at one bucket; give
 each repository one maintainer (placement globs) and you are done.
