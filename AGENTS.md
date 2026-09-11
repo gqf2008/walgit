@@ -601,7 +601,7 @@ Kind: `batch` (checklist-driven), `bug`, `enhancement` (task). Batches own the
 4. **Blocked**: add `blocked` + a comment saying what is missing.
 5. **Done**: the PR merge closes the issue (auto-merge enabled); remove `needs-review`.
 
-`gh` templates (copy-paste, `--repo gqf2008/walgit` implicit):
+`gh` templates (copy-paste, `--repo gqf2008/walgit-d1` implicit):
 
 ```bash
 # claim
@@ -610,8 +610,8 @@ gh issue comment <n> --body "🔄 [处理中][wt-<name>] <plan>"
 # move to review
 gh issue edit <n> --add-label needs-review --remove-label in-progress
 # check CI for a PR (conclusion per job + failing steps)
-gh pr checks <pr> --repo gqf2008/walgit
-gh run view <run> --repo gqf2008/walgit --json jobs --jq '.jobs[]|{n:.name,c:.conclusion,f:[.steps[]|select(.conclusion=="failure")|.name]}'
+gh pr checks <pr> --repo gqf2008/walgit-d1
+gh run view <run> --repo gqf2008/walgit-d1 --json jobs --jq '.jobs[]|{n:.name,c:.conclusion,f:[.steps[]|select(.conclusion=="failure")|.name]}'
 # release (see 6.4)
 gh release create v0.1.0 --generate-notes
 ```

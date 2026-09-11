@@ -70,7 +70,7 @@ Priority: optional
 Architecture: amd64
 Depends: libgtk-3-0, libayatana-appindicator3-1, libxdo3
 Maintainer: qingfeng gao <gao.qingfeng@gmail.com>
-Homepage: https://github.com/gqf2008/walgit
+Homepage: https://github.com/gqf2008/walgit-d1
 Description: Git at any scale, on object storage
  walgit serves git (smart HTTP v0/v2, receive-pack, upload-pack, bundle-uri,
  LFS) and a browsing web UI from an object-store bucket. This package installs

@@ -1,6 +1,6 @@
 # walgit — a git server that is one binary in front of an object store
 
-[![CI](https://github.com/gqf2008/walgit/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit/actions/workflows/ci.yml)
+[![CI](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml/badge.svg)](https://github.com/gqf2008/walgit-d1/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue)](README.md#platforms)
 [![Agent-native](https://img.shields.io/badge/agent--native-work%20units%20%26%20protocol-purple)](AGENTS.md#6-agent-collaboration-protocol)
 
@@ -43,6 +43,74 @@ It is a Rust implementation of the architecture Cursor described in
 [*Git at any scale*](https://cursor.com/blog/git-at-any-scale) (the system they call Continuity), with the changes
 needed to run it on machines that are smaller than the repository. The post is worth reading first; it is kept
 verbatim in `docs/reference/cursor-git-at-any-scale.md`.
+
+---
+
+## 关于这个仓库 — walgit-d1（分叉说明）
+
+**这是 `tobi/walgit` 的一个独立分叉**（仓库名 `gqf2008/walgit-d1`，命令与二进制仍叫 `walgit`）。
+
+上游 walgit 的目标是**把服务端做小**：git 托管、bundle-uri、LFS、Web UI，仅此而已；
+代码评审 / CI / issue 按上游 `GOAL.md §4` 明确**不在范围内**（principle X “keep walgit small”）。
+
+本分叉在上游那套对象存储 Git 之上，加了**一层不侵入服务端的去中心化协作层（代号 D1）**，
+并把它做成了可分发的桌面产品。因此它与上游在定位上已经分道扬镳，**不打算向上游回并**；
+取名 `walgit-d1` 就是为了和上游区分开。
+
+### 上游基线
+
+分叉点在 `6d8fa54`（2026-08-26）。上游的 git 托管内核（WAL、manifest CAS、
+bundle-uri、远程 reader、`serve`/`maintain`/`events` 角色、Web UI 骨架）保持原样可用，
+本分叉**没有**改这些核心不变式；改动集中在上游刻意不做的那一层及其配套。
+
+### 新增功能
+
+**D1 协作层** — 没有协作服务器，协作状态是仓库 `refs/collab/*` 里的**签名、追加式 git 对象**，
+任何人都能克隆、验签、离线重算出同一个视图：
+
+- **issue / PR / 评审 / 线程**：`walgit collab` 下的 `thread`、`pr`、`entry`、
+  `board`、`snapshot`、`report`、`gc` 等命令；服务端只托管 ref，不做聚合。
+- **看板**：`.walgit/board.toml` 里的声明式列定义，将线程集合折叠成确定性投影
+  （见 `docs/BOARD.md`）——板不是状态，是纯函数。
+- **身份**：host 级 principal 注册表（`walgit principal`），一个 token 同时覆盖
+  git 读写与协作读写；支持签名公钥注册/吊销。
+- **D1-CI（去中心化 CI）**：**服务端零 CI 逻辑**。认领与结果都是 `refs/collab/inbox/*`
+  里的签名条目，由客户端 runner（`walgit ci`）认领、执行被测提交里的 `.walgit/ci.toml`、
+  签名回传；收敛靠对条目日志的确定性规则，不靠互斥。规范见 `docs/D1_CI_PROTOCOL.md`。
+- **Web UI**：协作页、线程/PR 页、看板页、以及面向人类的「了解 D1 协作」讲解页
+  （`/{owner}/{repo}/collab/guide`）。
+- **事件**：ref 事件桥（`events` 角色 + webhook 接收器），至少一次、可回放，
+  有持久游标（`docs/EVENTS.md`）。
+
+**首次运行的部署向导** — `walgit-server` 的 setup wizard：新部署不再要求手写完整
+`walgit.toml` 才能起服务，走 `/setup` 向导配置 store 与认证。
+
+**分发与桌面** — 上游只有二进制与 Containerfile；本分叉补齐了最终用户安装路径：
+
+- **跨平台托盘**：macOS（Swift）、Windows/Linux（Rust）三平台系统托盘，
+  启停服务、版本检测、点击升级（`deploy/tray/`）。
+- **macOS Release 感知升级**：托盘同时比对 GitHub Release 与源码仓库，
+  下载 → 严格校验（sha256 / 版本 / 签名 / 公证）→ 原子换装 → 健康检查，失败回滚。
+- **安装包**：macOS 签名+公证 DMG、Linux `.deb`、Windows Inno Setup 安装器，
+  全部由 `release.yml` / `build-dmg.sh` 产出。
+
+**工程与治理** — 上游没有这些；本分叉按 agent 协作的方式补上：
+issue/PR 模板与批次化流程、`AGENTS.md` 协作协议、CI 分级（fast tier / e2e /
+windows fast tier）、CodeQL、Dependabot、`code review` 与发布规范、Windows 开发
+runbook（`docs/WINDOWS.md`）等。
+
+### 文档
+
+- `docs/USER_GUIDE.md` — 面向人类的完整使用手册（协作层怎么用）。
+- `docs/D1_COLLAB_DESIGN.md`、`docs/D1_CI_PROTOCOL.md` — D1 协作层与 CI 的规范。
+- `docs/BOARD.md`、`docs/EVENTS.md`、`docs/POLICY.md` — 看板 / 事件 / 推送策略。
+- `AGENTS.md` — 架构、所有设计决策、以及 agent 协作协议。
+- `GOAL.md` — 上游的验收目标（本分叉保持其内核语义不变）。
+
+### 与上游的关系
+
+`upstream` remote 指向 `tobi/walgit`，仅用于查阅与偶尔同步内核修复；
+**不接受也不发起回并**。若你想用上游那份“只有 git 托管”的版本，请直接用上游仓库。
 
 ---
 
