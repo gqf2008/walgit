@@ -1152,11 +1152,12 @@ impl Default for S3Config {
 /// enough to stall the server, which is why it is home-relative, not a
 /// workspace/mounted path.
 pub fn deploy_home() -> std::path::PathBuf {
-    home_dir()
-        .map(|h| h.join(".walgit"))
+    match home_dir() {
+        Some(h) => h.join(".walgit"),
         // No HOME at all (a container without a passwd entry): fall back to the
         // temp dir, which is where D39 put everything before.
-        .unwrap_or_else(|| std::env::temp_dir().join("walgit"))
+        None => std::env::temp_dir().join("walgit"),
+    }
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
