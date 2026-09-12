@@ -31,11 +31,27 @@ get_pid() {
   lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1
 }
 
+# 端口占用也是"在跑":服务可能正卡在一次慢 I/O 上而错过 2s 健康检查。
+# 这种情况下再起一个实例只会 "Address already in use",而且它的 `>` 重定向
+# 会把正在写的 server.log 截断成稀疏大文件——这就是"服务间歇性重启"的假象。
+port_bound() {
+  [ -n "$(get_pid)" ]
+}
+
+# 启动前的就绪等待:健康检查通过,或端口已被占住(说明进程起来了但还没应答)。
+ready() {
+  is_running || port_bound
+}
+
 case "${1:-ensure}" in
   status)
     if is_running; then
       pid="$(get_pid)"
       echo "walgit: running (pid ${pid:-?}) — $URL"
+    elif port_bound; then
+      pid="$(get_pid)"
+      echo "walgit: running but unresponsive (pid ${pid:-?}) — $URL" >&2
+      exit 1
     else
       echo "walgit: not running — $URL"
       exit 1
@@ -58,7 +74,7 @@ case "${1:-ensure}" in
     exit 1
     ;;
   ensure|start|"")
-    if is_running; then
+    if ready; then
       echo "walgit: already running (pid $(get_pid)) — $URL"
       exit 0
     fi
@@ -67,11 +83,16 @@ case "${1:-ensure}" in
       echo "walgit: 部署不完整（缺 $BASE 下的 walgit / walgit.toml / run-walgit.sh）" >&2
       exit 1
     fi
-    # screen 保活启动（exec 会话会回收裸后台进程）
-    screen -dmS "${WALGIT_SCREEN_SESSION:-walgit-server}" bash -c "cd $BASE && ./run-walgit.sh > $BASE/server.log 2>&1; echo EXIT=\$? >> $BASE/server.log"
+    # screen 保活启动（exec 会话会回收裸后台进程）。追加而不是截断:截断会把
+    # 正在跑的服务日志清零（`>` + 旧进程的写偏移 = 稀疏大文件），排查时看不到
+    # 现场;超过 32 MiB 先轮转一份 .1 再续写。
+    if [ -f "$BASE/server.log" ] && [ "$(wc -c <"$BASE/server.log" 2>/dev/null || echo 0)" -gt 33554432 ]; then
+      mv -f "$BASE/server.log" "$BASE/server.log.1" 2>/dev/null || true
+    fi
+    screen -dmS "${WALGIT_SCREEN_SESSION:-walgit-server}" bash -c "cd $BASE && ./run-walgit.sh >> $BASE/server.log 2>&1; echo EXIT=\$? >> $BASE/server.log"
     # 等待就绪（最多 15s）
     for ((i = 0; i < 15; i++)); do
-      if is_running; then
+      if ready; then
         echo "walgit: started (pid $(get_pid)) — $URL"
         exit 0
       fi
