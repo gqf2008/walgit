@@ -341,16 +341,21 @@ PYS
         sleep 0.8
     fi
 
-    # 真实 ensure 的替身:记录调用;start 时把版本推进到 v0.5.1(模拟重启新二进制)
-    cat >"$deploy/walgit-ensure" <<ENSURE
+    # 服务生命周期现在是 `walgit service <verb>`:stub 记录 service 子命令的
+    # 动词;start/restart 时把版本推进到 v0.5.1(模拟重启到新二进制)。
+    cat >"$deploy/walgit" <<STUB
 #!/bin/sh
-echo "\$1" >>"$calls"
-case "\${1:-ensure}" in
-  ensure|start|"") printf 'v0.5.1\n' >"$base/version" ;;
-esac
+if [ "\${1:-}" = "--version" ]; then echo "walgit v0.5.1"; exit 0; fi
+if [ "\${1:-}" = "service" ]; then
+  echo "\${2:-}" >>"$calls"
+  case "\${2:-start}" in
+    start|restart) printf 'v0.5.1\n' >"$base/version" ;;
+  esac
+fi
 exit 0
-ENSURE
-    chmod +x "$deploy/walgit-ensure"
+STUB
+    chmod +x "$deploy/walgit"
+    printf '#!/bin/sh\nexit 0\n' >"$deploy/walgit-ensure"; chmod +x "$deploy/walgit-ensure"
     : >"$calls"
 
     local rc=0
@@ -372,13 +377,12 @@ ENSURE
             # 在跑 + 强制回滚:必须先 stop(再恢复旧版),不得把服务落在停止状态。
             [ "$rc" != 0 ] || { echo "FAIL(rollback-running): expected failure" >&2; return 1; }
             grep -qx stop "$calls" || { echo "FAIL(rollback-running): not stopped" >&2; return 1; }
-            grep -qx '' "$calls" || { echo "FAIL(rollback-running): running service not restored" >&2; return 1; }
+            grep -qx start "$calls" || { echo "FAIL(rollback-running): running service not restored" >&2; return 1; }
             return 0
         fi
         [ "$rc" = 0 ] || { echo "FAIL(update-running): rc=$rc" >&2; cat "$deploy/tray.log" >&2; return 1; }
         grep -qx stop "$calls" || { echo "FAIL(update-running): not stopped" >&2; return 1; }
-        # 重启调用是无参 ensure;日志里是空行
-        grep -qx '' "$calls" || { echo "FAIL(update-running): not restarted" >&2; return 1; }
+        grep -qx start "$calls" || { echo "FAIL(update-running): not restarted" >&2; return 1; }
         case "$got" in
             *'"version":"v0.5.1"'*) ;;
             *) echo "FAIL(update-running): healthz still $got" >&2; return 1 ;;
@@ -387,7 +391,7 @@ ENSURE
         # 先查"有没有被拉起"再查 rc:无条件重启会连带 rollback,rc 非 0 会
         # 掩盖真正的违规(用户停着的服务被偷偷启动)。force_rollback=1 时
         # 升级必然失败,同样不得借"恢复旧版本"之名把服务拉起来。
-        if grep -qx '' "$calls"; then
+        if grep -qx start "$calls"; then
             echo "FAIL(update-stopped): started a service the user had stopped" >&2
             return 1
         fi
@@ -417,7 +421,16 @@ PYPORT
         -o "$app/Contents/MacOS/walgit-tray" || { echo "FAIL(bootrestart): compile" >&2; return 1; }
 
     # bundle 里是 v0.5.1
-    printf '#!/bin/sh\necho "walgit v0.5.1"\n' >"$res/walgit"; chmod +x "$res/walgit"
+    # 服务重启现在是 `walgit service restart`（脚本不再是负责人）：stub 必须
+    # 既回答 --version，也实现 restart 的副作用（把假服务切到新版本）。
+    cat >"$res/walgit" <<STUB
+#!/bin/sh
+case "\${1:-}" in
+  --version) echo "walgit v0.5.1" ;;
+  service) printf 'v0.5.1\n' >"$base/version" ;;
+esac
+STUB
+    chmod +x "$res/walgit"
     printf '#!/bin/sh\nexit 0\n' >"$res/run-walgit.sh"; chmod +x "$res/run-walgit.sh"
     # bundle 自带的 walgit-ensure 就是"重启"语义:写新版本号,让假服务随之更新。
     printf '#!/bin/sh\nprintf "v0.5.1\\n" >"%s/version"\n' "$base" >"$res/walgit-ensure"
@@ -426,7 +439,14 @@ PYPORT
     printf '[server]\nlisten = "127.0.0.1:%s"\n' "$port" >"$res/walgit.toml"
 
     # 部署里是 v0.5.0 + marker 0.5.0
-    printf '#!/bin/sh\necho "walgit v0.5.0"\n' >"$deploy/walgit"; chmod +x "$deploy/walgit"
+    cat >"$deploy/walgit" <<STUB
+#!/bin/sh
+case "\${1:-}" in
+  --version) echo "walgit v0.5.0" ;;
+  service) printf 'v0.5.1\n' >"$base/version" ;;
+esac
+STUB
+    chmod +x "$deploy/walgit"
     printf 'old\n' >"$deploy/run-walgit.sh"; chmod +x "$deploy/run-walgit.sh"
     printf 'old\n' >"$deploy/walgit-ensure"
     printf '0.5.0\n' >"$deploy/.skeleton-version"
