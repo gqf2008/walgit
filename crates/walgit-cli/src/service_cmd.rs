@@ -113,7 +113,7 @@ async fn start(config: &Path, listen: &str, pidfile: &Path, log: &Path) -> Resul
         }
         return Ok(());
     }
-    rotate_log(log)?;
+    rotate_log(log);
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -158,13 +158,12 @@ async fn start(config: &Path, listen: &str, pidfile: &Path, log: &Path) -> Resul
 
 /// Append-only log that rotates rather than truncating: `>` used to zero a
 /// running server's log out from under it (a sparse 100 MB+ file).
-fn rotate_log(log: &Path) -> Result<()> {
+fn rotate_log(log: &Path) {
     if let Ok(meta) = std::fs::metadata(log)
         && meta.len() > LOG_ROTATE_BYTES
     {
         let _ = std::fs::rename(log, log.with_extension("log.1"));
     }
-    Ok(())
 }
 
 fn tail(path: &Path, lines: usize) -> Option<String> {

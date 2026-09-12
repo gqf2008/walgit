@@ -293,10 +293,10 @@ async fn gc_superseded_packs(
         {
             Ok(None) => orphan_claims.push((claim.checksum, claim.owner, claim.token)),
             Ok(Some(_)) => takeovers.push((claim.checksum, claim.owner, claim.token)),
-            Err(e) => {
-                log(format!("gc: reading marker for {} failed ({e})", claim.checksum));
-                continue;
-            }
+            Err(e) => log(format!(
+                "gc: reading marker for {} failed ({e})",
+                claim.checksum
+            )),
         }
     }
     if !orphan_claims.is_empty() || !takeovers.is_empty() {
