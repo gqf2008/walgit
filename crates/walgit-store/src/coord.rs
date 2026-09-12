@@ -274,12 +274,6 @@ Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Ok((
         &self.holder
     }
 
-    /// The lease epoch this guard is at now. Every heartbeat advances it, so a
-    /// pass can stamp work with the epoch it owned and later detect that the
-    /// lease (and therefore the right to finish that work) has moved on.
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
 
     /// Like [`spawn_heartbeat`], but the caller can stop it *gracefully* (a
     /// `watch` instead of an `abort`: an abort could cancel a heartbeat whose

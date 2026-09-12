@@ -263,7 +263,10 @@ async fn gc_superseded_packs(
     // and only once it is older than a few lease TTLs: a younger claim may still
     // belong to a live pass whose lease we simply cannot see.
     let grace = (lease_ttl.saturating_mul(3)).max(std::time::Duration::from_secs(300));
-    let mut orphan_claims: Vec<String> = Vec::new();
+    // (checksum, owner, token) of a stale claim we vetted: the release is a
+    // compare-and-remove, so a claim another pass has since taken over is left
+    // exactly as it is.
+    let mut orphan_claims: Vec<(String, String, String)> = Vec::new();
     for claim in handle.manifest().reclaiming.clone() {
         if claim.owner == owner || live.contains(&claim.checksum) {
             continue;
@@ -282,12 +285,12 @@ async fn gc_superseded_packs(
             .get_bytes(&keys::superseded_key(&claim.checksum))
             .await
         {
-            orphan_claims.push(claim.checksum);
+            orphan_claims.push((claim.checksum, claim.owner, claim.token));
         }
     }
     if !orphan_claims.is_empty() {
         handle
-            .update_reclaiming(&[], &orphan_claims, token)
+            .update_reclaiming(&[], &[], &orphan_claims, token)
             .await
             .map_err(|e| e.to_string())?;
         log(format!(
@@ -366,7 +369,7 @@ async fn gc_superseded_packs(
         .collect();
     drop(before_claim);
     let claim_manifest = handle
-        .update_reclaiming(&claimable, &[], token)
+        .update_reclaiming(&claimable, &[], &[], token)
         .await
         .map_err(|e| e.to_string())?;
     // Only claims carrying *this* pass's fence are ours to delete; the helper
@@ -513,6 +516,14 @@ async fn gc_superseded_packs(
             if lost.load(Ordering::SeqCst) {
                 break;
             }
+            // The retire is destructive too: re-verify the fence immediately
+            // before it, so a claim a newer pass took over cannot be retired by
+            // this stale one.
+            if !claim_still_ours(handle, checksum, owner, token).await? {
+                log(format!("gc: claim for {checksum} moved on — leaving its marker"));
+                all_complete = false;
+                continue;
+            }
             match handle
                 .store()
                 .delete(&keys::superseded_key(checksum), Some(version.clone()))
@@ -531,13 +542,19 @@ async fn gc_superseded_packs(
             }
         }
         // Release last: a released claim with the marker gone would let a
-        // publisher re-adopt the checksum with no record of what happened.
-        let mut release_claims: Vec<String> = release.clone();
-        release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
-        handle
-            .update_reclaiming(&[], &release_claims, token)
-            .await
-            .map_err(|e| e.to_string())?;
+        // publisher re-adopt the checksum with no record of what happened. A
+        // pass that lost its lease releases nothing — the claim is left for the
+        // age-fenced recovery of whichever pass holds the lease next.
+        if !lost.load(Ordering::SeqCst) {
+            let mut release_claims: Vec<String> = release.clone();
+            release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
+            handle
+                .update_reclaiming(&[], &release_claims, &[], token)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            all_complete = false;
+        }
     }
     if scanned > 0 {
         log(format!(
@@ -822,11 +839,10 @@ async fn run(
             {
                 let _g = handle.sync_refs().await.map_err(|e| e.to_string())?;
             }
-            // Per-repo lease: two GC passes must not interleave. The claims are
-            // not owner-tagged, so exclusivity rests entirely on this lease
-            // (D7). It is *renewed* for the whole pass: a lease that quietly
-            // expired mid-delete would let a second pass run beside us, and the
-            // crash-recovery path could then release a claim we still hold.
+            // Per-repo lease: two GC passes must not interleave. Claims carry
+            // an owner+token fence, so a later pass cannot touch ours while we
+            // still hold it — but the lease is still what keeps two passes from
+            // doing the same work, so it is *renewed* for the whole run.
             let lease_ttl = handle.effective_config().compaction.lease_ttl;
             // Guard against a mis-set (e.g. zero) TTL: a lease nobody can renew
             // in time is worse than no GC at all.

@@ -3612,7 +3612,7 @@ async fn a_compaction_skips_the_marker_for_a_checksum_gc_has_claimed() {
     // A checksum GC has listed as reclaiming (not live, so the claim holds).
     let claimed = "c".repeat(40);
     handle
-        .update_reclaiming(std::slice::from_ref(&claimed), &[], "t")
+        .update_reclaiming(std::slice::from_ref(&claimed), &[], &[], "t")
         .await
         .unwrap();
     assert!(
@@ -3669,5 +3669,85 @@ async fn a_compaction_skips_the_marker_for_a_checksum_gc_has_claimed() {
             .iter()
             .any(|r| r.checksum == claimed),
         "the compaction must not clear GC's claim"
+    );
+}
+
+/// #175: releasing a claim is fenced by `owner`+`token`. A stale pass (an older
+/// token, or a different instance) must neither take over another holder's
+/// claim nor release it — otherwise a pass that already deleted a pack's bytes
+/// could unlock the checksum for re-adoption while a newer pass is deleting it.
+#[tokio::test]
+async fn a_claim_release_is_fenced_by_owner_and_token() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = make_config(cache.path(), 0);
+    let registry = Registry::new(store.clone(), Arc::new(cfg));
+    let id = repo_id("test", "fence");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let c = "c".repeat(40);
+
+    // Pass 1 claims C.
+    handle
+        .update_reclaiming(std::slice::from_ref(&c), &[], &[], "T1")
+        .await
+        .unwrap();
+    let owner = handle
+        .manifest()
+        .reclaiming
+        .iter()
+        .find(|r| r.checksum == c)
+        .expect("claimed")
+        .owner
+        .clone();
+
+    // A second pass of the same instance cannot take it over.
+    handle
+        .update_reclaiming(std::slice::from_ref(&c), &[], &[], "T2")
+        .await
+        .unwrap();
+    assert!(
+        handle
+            .manifest()
+            .reclaiming
+            .iter()
+            .any(|r| r.checksum == c && r.token == "T1"),
+        "a different token must not take over the claim: {:?}",
+        handle.manifest().reclaiming
+    );
+
+    // …and its release with the wrong token is a no-op.
+    handle
+        .update_reclaiming(&[], std::slice::from_ref(&c), &[], "T2")
+        .await
+        .unwrap();
+    assert!(
+        handle.manifest().reclaiming.iter().any(|r| r.checksum == c),
+        "a stale release must not remove the current holder's claim: {:?}",
+        handle.manifest().reclaiming
+    );
+
+    // An exact compare-and-remove of a claim we observed does work (the
+    // recovery path), but not with a mismatched token.
+    handle
+        .update_reclaiming(
+            &[],
+            &[],
+            &[(c.clone(), owner.clone(), "not-the-token".into())],
+            "T9",
+        )
+        .await
+        .unwrap();
+    assert!(
+        handle.manifest().reclaiming.iter().any(|r| r.checksum == c),
+        "a compare-and-remove with the wrong token must not fire"
+    );
+    handle
+        .update_reclaiming(&[], &[], &[(c.clone(), owner, "T1".into())], "T9")
+        .await
+        .unwrap();
+    assert!(
+        handle.manifest().reclaiming.is_empty(),
+        "an exact compare-and-remove clears the claim: {:?}",
+        handle.manifest().reclaiming
     );
 }

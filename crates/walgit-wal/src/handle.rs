@@ -1477,10 +1477,11 @@ impl RepoHandle {
     pub async fn update_reclaiming(
         &self,
         add: &[String],
-        remove: &[String],
+        remove_own: &[String],
+        recover: &[(String, String, String)],
         token: &str,
     ) -> Result<Arc<Manifest>, WalError> {
-        crate::publish::update_reclaiming(self, add, remove, token).await
+        crate::publish::update_reclaiming(self, add, remove_own, recover, token).await
     }
 
     /// Publish an already built pack (`pack-<checksum>.pack` + `.idx`) as a

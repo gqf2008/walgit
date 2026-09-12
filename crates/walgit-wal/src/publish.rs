@@ -120,7 +120,8 @@ pub(crate) fn pack_ref_from_info(p: &PackInfo, seq: u64, tier: u32) -> PackRef {
 pub(crate) async fn update_reclaiming(
     handle: &RepoHandle,
     add: &[String],
-    remove: &[String],
+    remove_own: &[String],
+    recover: &[(String, String, String)],
     token: &str,
 ) -> Result<Arc<Manifest>, WalError> {
     let writer = crate::handle::instance_id();
@@ -130,9 +131,19 @@ pub(crate) async fn update_reclaiming(
         handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
         let (current, known_version) = handle.manifest_snapshot();
         let mut updated: Manifest = (*current).clone();
-        updated
-            .reclaiming
-            .retain(|r| !remove.iter().any(|c| c == &r.checksum));
+        // A release is fenced: a claim is removed only when the caller still
+        // holds it (`owner`+`token` match this pass), or when it is an exact
+        // compare-and-remove of a stale claim recovery already vetted. A stale
+        // pass can therefore never unlock a claim a newer pass has taken over.
+        updated.reclaiming.retain(|r| {
+            let own = r.owner == writer
+                && r.token == token
+                && remove_own.iter().any(|c| c == &r.checksum);
+            let recovered = recover
+                .iter()
+                .any(|(c, o, t)| c == &r.checksum && o == &r.owner && t == &r.token);
+            !(own || recovered)
+        });
         for c in add {
             // Only list packs that are not live *in this manifest*. The CAS
             // below is what makes that check authoritative: if a publisher
@@ -141,19 +152,16 @@ pub(crate) async fn update_reclaiming(
             if updated.packs.iter().any(|p| &p.checksum == c) {
                 continue;
             }
-            match updated.reclaiming.iter_mut().find(|r| &r.checksum == c) {
-                // Someone else already holds it: never overwrite *their* fence
-                // — only the holder (or the age-fenced recovery) may release it.
-                Some(r) if r.owner != writer => {}
-                // Ours (re-claimed by this or a later pass of this instance) or
-                // new: stamp the fence this pass will check before each delete.
-                Some(r) => r.token = token.to_string(),
-                None => updated.reclaiming.push(ReclaimingPack {
+            // An existing claim is never overwritten, even by another pass of
+            // *this* instance: a different `token` is a different holder, and
+            // only holding it (or an age-fenced recovery release) may change it.
+            if !updated.reclaiming.iter().any(|r| &r.checksum == c) {
+                updated.reclaiming.push(ReclaimingPack {
                     checksum: c.clone(),
                     since: Some(time::now()),
                     owner: writer.clone(),
                     token: token.to_string(),
-                }),
+                });
             }
         }
         if updated.reclaiming.len() == current.reclaiming.len()
