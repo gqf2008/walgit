@@ -272,6 +272,11 @@ async fn gc_superseded_packs(
     // Marker still there ⇒ adopt it: the same CAS compare-removes the stale
     // tuple and adds ours, so the pass can then finish the reclamation.
     let mut takeovers: Vec<(String, String, String)> = Vec::new();
+    // Checksums this pass adopted above; if the scan then finds nothing to do
+    // (the marker vanished between our GET and the take-over CAS) they carry no
+    // work and must be released, or the publisher is refused until the next
+    // `gc_interval`.
+    let mut adopted: Vec<String> = Vec::new();
     for claim in handle.manifest().reclaiming.clone() {
         let ours = claim.owner == owner && claim.token == token;
         if ours || live.contains(&claim.checksum) {
@@ -311,6 +316,7 @@ async fn gc_superseded_packs(
             .update_reclaiming(&adopt, &[], &recover, token)
             .await
             .map_err(|e| e.to_string())?;
+        adopted.extend(adopt);
         if !orphan_claims.is_empty() {
             log(format!(
                 "gc: released {} claim(s) whose marker was already retired",
@@ -367,6 +373,12 @@ async fn gc_superseded_packs(
         }
     }
     if candidates.is_empty() {
+        if !adopted.is_empty() {
+            handle
+                .update_reclaiming(&[], &adopted, &[], token)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         return Ok((0, 0, true));
     }
     // Oldest first: a partial unit should reclaim the longest-dead packs.
@@ -494,10 +506,23 @@ async fn gc_superseded_packs(
             }
             match handle.store().head(key).await {
                 Ok(Some(meta)) => {
+                    // Re-verify the fence per object: a pass that was suspended
+                    // long enough for its lease to lapse cannot see `lost`
+                    // update while it is stopped, and by the time it resumes
+                    // another pass may have adopted the claim, finished the
+                    // reclamation and let a publisher re-adopt the checksum.
+                    // Re-checking here (plus the version taken above) closes
+                    // both orders: an earlier re-upload fails this check, a
+                    // later one fails the version-conditioned delete.
+                    if !claim_still_ours(handle, &checksum, owner, token).await? {
+                        log(format!(
+                            "gc: claim for {checksum} moved on — leaving {key}"
+                        ));
+                        complete = false;
+                        all_complete = false;
+                        break;
+                    }
                     freed += meta.size;
-                    // Conditional delete on the version we just read: while the
-                    // claim is ours no publisher can re-adopt the checksum, so
-                    // nothing can recreate these bytes under us.
                     match handle.store().delete(key, Some(meta.version)).await {
                         Ok(())
                         | Err(walgit_store::StoreError::NotFound { .. }) => {}
