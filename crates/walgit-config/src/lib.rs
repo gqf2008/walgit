@@ -1178,10 +1178,7 @@ pub fn expand_tilde(p: &std::path::Path) -> std::path::PathBuf {
         return home_dir().unwrap_or_else(|| p.to_path_buf());
     }
     match s.strip_prefix("~/") {
-        Some(rest) => match home_dir() {
-            Some(h) => h.join(rest),
-            None => p.to_path_buf(),
-        },
+        Some(rest) => home_dir().map_or_else(|| p.to_path_buf(), |h| h.join(rest)),
         None => p.to_path_buf(),
     }
 }
