@@ -39,7 +39,7 @@ pub async fn run(action: &ServiceAction, config: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", home.display()))?;
     let pidfile = home.join("walgit.pid");
     let log = home.join("server.log");
-    let listen = cfg.server.listen.clone();
+    let listen = cfg.server.listen.to_string();
 
     match action {
         ServiceAction::Status => status(&listen, &pidfile).await,
@@ -169,9 +169,9 @@ fn rotate_log(log: &Path) -> Result<()> {
 
 fn tail(path: &Path, lines: usize) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    let all: Vec<&str> = text.lines().collect();
-    let from = all.len().saturating_sub(lines);
-    Some(all[from..].join("\n"))
+    let mut all: Vec<&str> = text.lines().collect();
+    let tail = all.split_off(all.len().saturating_sub(lines));
+    Some(tail.join("\n"))
 }
 
 fn read_pid(pidfile: &Path) -> Option<u32> {
