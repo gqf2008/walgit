@@ -208,6 +208,7 @@ async fn healthy(listen: &str) -> bool {
         .is_some_and(|line| line.contains(" 200"))
 }
 
+#[derive(Clone, Copy)]
 enum Signal {
     Term,
     Kill,
