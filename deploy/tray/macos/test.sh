@@ -89,7 +89,6 @@ stub_walgit() { # stub_walgit <deploy-dir> <version>
 # ——更新 marker 与脚本、但二进制仍是旧版本;随后必须被回滚还原。
 if [ -n "\${WALGIT_TEST_PARTIAL_BOOTSTRAP:-}" ]; then
     printf '\${WALGIT_TEST_PARTIAL_VERSION:-0.6.0}\n' > "\$(dirname "\$0")/.skeleton-version"
-    printf 'ensure-\${WALGIT_TEST_PARTIAL_VERSION:-0.6.0}\n' > "\$(dirname "\$0")/walgit-ensure"
     printf 'run-\${WALGIT_TEST_PARTIAL_VERSION:-0.6.0}\n' > "\$(dirname "\$0")/run-walgit.sh"
 fi
 STUB
@@ -97,9 +96,8 @@ STUB
 }
 
 stub_managed() { # stub_managed <deploy-dir> <version>
-    printf 'ensure-%s\n' "$2" >"$1/walgit-ensure"
     printf 'run-%s\n' "$2" >"$1/run-walgit.sh"
-    chmod +x "$1/walgit-ensure" "$1/run-walgit.sh"
+    chmod +x "$1/run-walgit.sh"
 }
 
 # release_install_fixture <name> <old-version> <new-version> <success|rollback>
@@ -158,107 +156,11 @@ release_install_fixture() {
             || { echo "FAIL($name): deploy marker not restored" >&2; return 1; }
         "$deploy/walgit" --version | grep -q "v$old" \
             || { echo "FAIL($name): deploy binary not restored" >&2; return 1; }
-        grep -qx "ensure-$old" "$deploy/walgit-ensure" \
-            || { echo "FAIL($name): walgit-ensure not restored" >&2; return 1; }
         grep -qx "run-$old" "$deploy/run-walgit.sh" \
             || { echo "FAIL($name): run-walgit.sh not restored" >&2; return 1; }
     fi
 }
 
-
-# [server].listen 非 8081 时:真实 walgit-ensure 的 stop/start 必须用配置
-# 端口。用动态空闲端口 + 唯一 screen 会话名,避免误伤开发机上的真实服务。
-listen_fixture() {
-    local base="$TMP/listen"
-    local deploy="$base/deploy"
-    local port
-    port="$(python3 - <<'PYPORT'
-import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()
-PYPORT
-)"
-    local calls="$base/ensure.calls"
-    local rol_ensure="$PWD/walgit-ensure"
-    rm -rf "$base"
-    mkdir -p "$deploy"
-    printf 'listen = "127.0.0.1:%s"\n' "$port" >"$deploy/walgit.toml"
-    printf '#!/bin/sh\nexec python3 "%s/server.py" %s\n' "$base" "$port" >"$deploy/run-walgit.sh"
-    chmod +x "$deploy/run-walgit.sh"
-    printf '#!/bin/sh\nexit 0\n' >"$deploy/walgit"
-    chmod +x "$deploy/walgit"
-    cat >"$deploy/walgit-ensure" <<ENSURE
-#!/bin/sh
-echo "\$1" >>"$calls"
-exec "$rol_ensure" "\$@"
-ENSURE
-    chmod +x "$deploy/walgit-ensure"
-    : >"$calls"
-
-    mkdir -p "$base/bin"
-    cat >"$base/bin/screen" <<'SCREEN'
-#!/bin/sh
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -*) shift ;;
-        *) break ;;
-    esac
-done
-shift 2>/dev/null || true
-[ "${1:-}" = "bash" ] && shift
-[ "${1:-}" = "-c" ] && shift
-[ $# -ge 1 ] || exit 0
-nohup /bin/sh -c "$1" >/dev/null 2>&1 &
-echo "$!"
-SCREEN
-    chmod +x "$base/bin/screen"
-
-    cat >"$base/server.py" <<'PYSRV'
-import socket, sys
-port = int(sys.argv[1])
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", port)); srv.listen(5)
-while True:
-    try:
-        c, _ = srv.accept()
-    except OSError:
-        break
-    try:
-        c.recv(4096)
-        body = '{"status":"ok","version":"v0.4.0"}'
-        c.sendall(("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode() + body.encode())
-    except OSError:
-        pass
-    finally:
-        c.close()
-PYSRV
-    python3 "$base/server.py" "$port" >/dev/null 2>&1 &
-    local srv_pid=$!
-    sleep 1
-
-    WALGIT_SCREEN_SESSION="walgit-test-$$" WALGIT_DEPLOY_DIR="$deploy" "$deploy/walgit-ensure" stop >/dev/null 2>&1 || true
-    grep -qx stop "$calls" || { ( kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true; echo "FAIL(listen): stop not called" >&2; return 1; }
-    if kill -0 "$srv_pid" 2>/dev/null; then
-        ( kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null ) || true
-        echo "FAIL(listen): stop did not stop the listener on $port" >&2
-        return 1
-    fi
-
-    # start 必须在同一端口真正探活成功(rc=0),而不只是“被调用过”。
-    local start_rc=0
-    PATH="$base/bin:$PATH" WALGIT_SCREEN_SESSION="walgit-test-$$" WALGIT_DEPLOY_DIR="$deploy" \
-        "$deploy/walgit-ensure" start >/dev/null 2>&1 || start_rc=$?
-    local started=0
-    grep -qx start "$calls" && started=1
-    local leftover
-    leftover="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-    if [ -n "$leftover" ]; then
-        ( kill $leftover 2>/dev/null; wait 2>/dev/null ) || true
-    fi
-    [ "$start_rc" = 0 ] || { echo "FAIL(listen): start rc=$start_rc (did not listen on $port)" >&2; return 1; }
-    [ "$started" = 1 ] || { echo "FAIL(listen): start not invoked" >&2; return 1; }
-    return 0
-}
 
 bootstrap_fixture() {
     local base="$TMP/bootstrap"
@@ -580,7 +482,6 @@ update_service_fixture stopped
 # 回滚:在跑的必须恢复;停着的不许被拉起
 update_service_fixture running 1
 update_service_fixture stopped 1
-listen_fixture
 
 bash -n release-install.sh
 echo "tray macos tests: ok"
