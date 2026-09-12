@@ -1146,13 +1146,52 @@ impl Default for S3Config {
         }
     }
 }
+/// The deployment home: `~/.walgit`. Everything a local deployment owns lives
+/// under it (config, cache, logs); the bucket is still the repository, so this
+/// directory is disposable (D39) — but it must not sit on a volume slow or busy
+/// enough to stall the server, which is why it is home-relative, not a
+/// workspace/mounted path.
+pub fn deploy_home() -> std::path::PathBuf {
+    home_dir()
+        .map(|h| h.join(".walgit"))
+        // No HOME at all (a container without a passwd entry): fall back to the
+        // temp dir, which is where D39 put everything before.
+        .unwrap_or_else(|| std::env::temp_dir().join("walgit"))
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Expand a leading `~` (bare or `~/…`) to the user's home. The cache dir is
+/// the one path a config is expected to write as `~/.walgit/cache`; nothing
+/// else in the document is home-relative.
+pub fn expand_tilde(p: &std::path::Path) -> std::path::PathBuf {
+    let Some(s) = p.to_str() else {
+        return p.to_path_buf();
+    };
+    if s == "~" {
+        return home_dir().unwrap_or_else(|| p.to_path_buf());
+    }
+    match s.strip_prefix("~/") {
+        Some(rest) => match home_dir() {
+            Some(h) => h.join(rest),
+            None => p.to_path_buf(),
+        },
+        None => p.to_path_buf(),
+    }
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            // The temp dir (`/tmp` on Unix with TMPDIR honored, `%TEMP%` on
-            // Windows) — D39's disposable cache home; the standalone/example
-            // configs pin an absolute path for deployments that outlive it.
-            dir: std::env::temp_dir().join("walgit"),
+            // D39's disposable cache home, under the deployment home
+            // (`~/.walgit/cache`) — never a workspace/mounted path: the server
+            // must not block on a volume someone else is hammering.
+            dir: deploy_home().join("cache"),
             mode: CacheMode::Auto,
             max_bytes: ByteSize::gib(20),
             disk_high_watermark: 0.9,
@@ -1300,6 +1339,7 @@ impl Default for TelemetryConfig {
 impl Config {
     pub fn parse(toml_text: &str) -> Result<Config> {
         let mut cfg: Config = toml::from_str(toml_text).context("parsing walgit.toml")?;
+        cfg.cache.dir = expand_tilde(&cfg.cache.dir);
         cfg.apply_env(std::env::vars())?;
         cfg.validate()?;
         Ok(cfg)
