@@ -300,10 +300,15 @@ async fn gc_superseded_packs(
         }
     }
     if !orphan_claims.is_empty() || !takeovers.is_empty() {
-        // One CAS: release the retired ones, adopt the rest.
+        // One CAS: release the retired ones, adopt the rest. `recover` is the
+        // exact compare-and-remove list — it must carry BOTH kinds, or the
+        // adoption below is a no-op (the stale tuple is still there and `add`
+        // never overwrites an existing claim).
         let adopt: Vec<String> = takeovers.iter().map(|(c, _, _)| c.clone()).collect();
+        let mut recover: Vec<(String, String, String)> = orphan_claims.clone();
+        recover.extend(takeovers.iter().cloned());
         handle
-            .update_reclaiming(&adopt, &[], &orphan_claims, token)
+            .update_reclaiming(&adopt, &[], &recover, token)
             .await
             .map_err(|e| e.to_string())?;
         if !orphan_claims.is_empty() {
