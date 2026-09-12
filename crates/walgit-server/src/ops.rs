@@ -256,19 +256,25 @@ async fn gc_superseded_packs(
     };
     let now = std::time::SystemTime::now();
 
-    // Crash recovery: a pass that retired a marker but died before releasing its
-    // claim leaves the checksum listed forever — with no marker it can never
-    // become a candidate again, and a publisher that regenerates those bytes
-    // would be refused permanently. Only *another* owner's claim is eligible,
-    // and only once it is older than a few lease TTLs: a younger claim may still
-    // belong to a live pass whose lease we simply cannot see.
+    // Crash/lease-loss recovery. A claim whose holder died must never stay
+    // forever: with a marker still present the checksum can never be reclaimed
+    // (and every push/compact regenerating those bytes is refused); with the
+    // marker already retired it can never even become a candidate again. Either
+    // way this pass — which holds the lease — takes it over, but only once the
+    // claim is older than a few lease TTLs: a younger claim may still belong to
+    // a live pass whose lease we simply cannot see. "Not ours" is judged on
+    // `(owner, token)`: a different token of the *same* instance is a different
+    // holder.
     let grace = (lease_ttl.saturating_mul(3)).max(std::time::Duration::from_secs(300));
-    // (checksum, owner, token) of a stale claim we vetted: the release is a
-    // compare-and-remove, so a claim another pass has since taken over is left
-    // exactly as it is.
+    // Marker gone ⇒ nothing left to reclaim: release the stale claim by an
+    // exact compare-and-remove.
     let mut orphan_claims: Vec<(String, String, String)> = Vec::new();
+    // Marker still there ⇒ adopt it: the same CAS compare-removes the stale
+    // tuple and adds ours, so the pass can then finish the reclamation.
+    let mut takeovers: Vec<(String, String, String)> = Vec::new();
     for claim in handle.manifest().reclaiming.clone() {
-        if claim.owner == owner || live.contains(&claim.checksum) {
+        let ours = claim.owner == owner && claim.token == token;
+        if ours || live.contains(&claim.checksum) {
             continue;
         }
         // A missing `since` is not evidence of age: keep the claim.
@@ -280,23 +286,38 @@ async fn gc_superseded_packs(
         if !old_enough {
             continue;
         }
-        if let Ok(None) = handle
+        match handle
             .store()
             .get_bytes(&keys::superseded_key(&claim.checksum))
             .await
         {
-            orphan_claims.push((claim.checksum, claim.owner, claim.token));
+            Ok(None) => orphan_claims.push((claim.checksum, claim.owner, claim.token)),
+            Ok(Some(_)) => takeovers.push((claim.checksum, claim.owner, claim.token)),
+            Err(e) => {
+                log(format!("gc: reading marker for {} failed ({e})", claim.checksum));
+                continue;
+            }
         }
     }
-    if !orphan_claims.is_empty() {
+    if !orphan_claims.is_empty() || !takeovers.is_empty() {
+        // One CAS: release the retired ones, adopt the rest.
+        let adopt: Vec<String> = takeovers.iter().map(|(c, _, _)| c.clone()).collect();
         handle
-            .update_reclaiming(&[], &[], &orphan_claims, token)
+            .update_reclaiming(&adopt, &[], &orphan_claims, token)
             .await
             .map_err(|e| e.to_string())?;
-        log(format!(
-            "gc: released {} claim(s) whose marker was already retired",
-            orphan_claims.len()
-        ));
+        if !orphan_claims.is_empty() {
+            log(format!(
+                "gc: released {} claim(s) whose marker was already retired",
+                orphan_claims.len()
+            ));
+        }
+        if !takeovers.is_empty() {
+            log(format!(
+                "gc: took over {} stale claim(s) from dead holder(s)",
+                takeovers.len()
+            ));
+        }
     }
 
     // Collect markers that have aged past the retention window *and* whose pack
@@ -360,10 +381,13 @@ async fn gc_superseded_packs(
     let claimable: Vec<String> = checksums
         .iter()
         .filter(|c| {
+            // Only claims this pass already owns are skipped: a claim held by
+            // anyone else (another owner, or another token) was either taken
+            // over above or is fresh and must be left alone.
             !before_claim
                 .reclaiming
                 .iter()
-                .any(|r| &r.checksum == *c && r.owner != owner)
+                .any(|r| &r.checksum == *c && !(r.owner == owner && r.token == token))
         })
         .cloned()
         .collect();
@@ -542,18 +566,18 @@ async fn gc_superseded_packs(
             }
         }
         // Release last: a released claim with the marker gone would let a
-        // publisher re-adopt the checksum with no record of what happened. A
-        // pass that lost its lease releases nothing — the claim is left for the
-        // age-fenced recovery of whichever pass holds the lease next.
-        if !lost.load(Ordering::SeqCst) {
+        // publisher re-adopt the checksum with no record of what happened.
+        if lost.load(Ordering::SeqCst) {
+            // A pass that lost its lease releases nothing: the claim is left
+            // for the age-fenced recovery of whichever pass holds the lease next.
+            all_complete = false;
+        } else {
             let mut release_claims: Vec<String> = release.clone();
             release_claims.extend(reclaimed.iter().map(|(c, _)| c.clone()));
             handle
                 .update_reclaiming(&[], &release_claims, &[], token)
                 .await
                 .map_err(|e| e.to_string())?;
-        } else {
-            all_complete = false;
         }
     }
     if scanned > 0 {

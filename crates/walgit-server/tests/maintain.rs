@@ -2853,3 +2853,185 @@ async fn gc_leaves_a_fresh_claim_to_its_holder() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #175: a claim whose holder died *while its marker was still present* must be
+/// adopted by the next pass — not left forever. Otherwise the pack is never
+/// reclaimed and every push/compact regenerating those bytes is refused
+/// permanently (`WalError::Reclaiming`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_takes_over_a_stale_claim_whose_marker_still_exists() -> anyhow::Result<()> {
+    use prost::Message;
+    use walgit_proto::keys;
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::{ObjectStore, ObjectStoreExt, PutMode};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+            c.compaction.retention_superseded = std::time::Duration::from_hours(7 * 24);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // A dead pack: aged marker + bodies, plus a stale claim from a holder that
+    // died before it could finish (its marker is *still there*).
+    let dead = "d".repeat(40);
+    let mut old = walgit_proto::time::now();
+    old.seconds -= 9 * 24 * 3600;
+    step!(
+        "marker",
+        h.store().put_bytes(
+            &keys::superseded_key(&dead),
+            walgit_proto::v1::SupersededPack {
+                checksum: dead.clone(),
+                superseded_at: Some(old),
+                seq: 5,
+            }
+            .encode_to_vec(),
+            PutMode::Create,
+        )
+    )?;
+    for key in [keys::pack_key(&dead), keys::idx_key(&dead)] {
+        step!(
+            "body",
+            h.store().put_bytes(&key, vec![0u8; 32], PutMode::Create)
+        )?;
+    }
+    {
+        let (meta, bytes) = step!("manifest", h.store().get_bytes(keys::MANIFEST))?
+            .expect("repo has a manifest");
+        let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref())?;
+        let mut since = walgit_proto::time::now();
+        since.seconds -= 3600;
+        m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
+            checksum: dead.clone(),
+            since: Some(since),
+            owner: "dead-holder".into(),
+            token: "their-token".into(),
+        });
+        m.revision += 1;
+        step!(
+            "stale claim",
+            h.store().put_bytes(
+                keys::MANIFEST,
+                m.encode_to_vec(),
+                PutMode::Update(meta.version),
+            )
+        )?;
+    }
+    step!("resync", h.sync())?;
+
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+
+    step!("check", async {
+        assert!(
+            h.store().head(&keys::pack_key(&dead)).await?.is_none(),
+            "the adopter must finish the reclamation (pack reclaimed)"
+        );
+        assert!(
+            h.store().head(&keys::superseded_key(&dead)).await?.is_none(),
+            "the marker goes with the pack"
+        );
+        assert!(
+            !h.manifest().reclaiming.iter().any(|r| r.checksum == dead),
+            "the stale claim must not survive: {:?}",
+            h.manifest().reclaiming
+        );
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// #175: a claim left by a *previous pass of the same instance* (same owner,
+/// different token) with its marker already retired must be recovered too — the
+/// "not ours" test is `(owner, token)`, not `owner`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_releases_a_retired_claim_from_an_older_pass_of_the_same_instance() -> anyhow::Result<()>
+{
+    use prost::Message;
+    use walgit_proto::keys;
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+    use walgit_store::{ObjectStoreExt, PutMode};
+
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.maintenance.checkpoints = false;
+            c.compaction.enabled = false;
+            c.bundles.enabled = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.maintenance.gc_interval = std::time::Duration::from_secs(3600);
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("a.txt"), "one\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "one"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let h = step!("open", server.state.registry.open(&id))?;
+    step!("sync", h.sync())?;
+
+    // Same instance id as this pass (it is the same process), older token, no
+    // marker: an interrupted previous pass of ours.
+    let orphan = "e".repeat(40);
+    {
+        let (meta, bytes) = step!("manifest", h.store().get_bytes(keys::MANIFEST))?
+            .expect("repo has a manifest");
+        let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref())?;
+        let mut since = walgit_proto::time::now();
+        since.seconds -= 3600;
+        m.reclaiming.push(walgit_proto::v1::ReclaimingPack {
+            checksum: orphan.clone(),
+            since: Some(since),
+            owner: walgit_store::coord::instance_id().to_string(),
+            token: "token-of-a-previous-pass".into(),
+        });
+        m.revision += 1;
+        step!(
+            "claim",
+            h.store().put_bytes(
+                keys::MANIFEST,
+                m.encode_to_vec(),
+                PutMode::Update(meta.version),
+            )
+        )?;
+    }
+    step!("resync", h.sync())?;
+
+    assert!(matches!(step!("plan", next_unit(&server.state, &id))?, Unit::Gc(_)));
+    step!("gc pass", run_pass(&server.state))?;
+    assert!(
+        !h.manifest().reclaiming.iter().any(|r| r.checksum == orphan),
+        "an older token of this instance is a different holder and must be released: {:?}",
+        h.manifest().reclaiming
+    );
+    Ok(())
+}
